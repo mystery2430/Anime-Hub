@@ -1,0 +1,74 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AnimeHub",
+  "version": "0.1.0",
+  "identifier": "dev.animehub.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AnimeHub",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 360,
+        "minHeight": 480,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ipc: http://ipc.localhost; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-src 'none'",
+      "capabilities": ["default"],
+      "assetProtocol": {
+        "enable": false,
+        "scope": []
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["animehub"]
+      },
+      "mobile": {
+        "animehub": {
+          "paths": ["/anilist/callback"]
+        }
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage", "deb", "rpm"],
+    "category": "Video",
+    "shortDescription": "Anime takip ve izleme sitelerini tek yerde toplayan başlatıcı",
+    "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve AnimeCix gibi siteleri tek bir uygulama altında toplar. Her site kendi izole ve şifreli WebView oturumunda açılır; oturum verileri diskte şifreli saklanır ve yalnızca HTTPS adreslere izin verilir.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "depends": ["libayatana-appindicator3-1"]
+      }
+    },
+    "android": {
+      "minSdkVersion": 26
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

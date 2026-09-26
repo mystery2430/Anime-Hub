@@ -1,0 +1,32 @@
+# --- dependencies / build output ---
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# --- secrets: never commit these ---
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+android-signing.properties
+signing.properties
+google-services.json
+
+# --- local state that may hold session material ---
+*.bin
+*.wrapped
+
+# --- editor / OS noise ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.log

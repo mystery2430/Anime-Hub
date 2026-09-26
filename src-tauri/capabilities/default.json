@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the launcher window only. Site WebViews load external origins and are deliberately given no capabilities — Tauri withholds IPC from them, so a compromised streaming site cannot reach the Rust core.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-set-focus",
+    "core:window:allow-close",
+    "core:event:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://**" }]
+    },
+    "deep-link:default"
+  ]
+}

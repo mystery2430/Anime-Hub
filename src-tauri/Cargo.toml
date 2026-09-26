@@ -1,0 +1,102 @@
+[package]
+name = "animehub"
+version = "0.1.0"
+description = "AnimeHub — a launcher that opens anime tracking/streaming sites in isolated, encrypted WebView sessions."
+authors = ["AnimeHub contributors"]
+edition = "2021"
+rust-version = "1.77"
+license = "MIT OR Apache-2.0"
+
+# `default-run` keeps `cargo run` unambiguous when the android-plugin
+# sub-crate is part of the same workspace.
+default-run = "animehub"
+
+[lib]
+name = "animehub_lib"
+# `cdylib` + `staticlib` are required for the Android/iOS mobile entry point.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = { version = "2", features = ["serde"] }
+# Same major as `tauri_runtime::Cookie`, so cookie values round-trip without
+# a conversion layer.
+cookie = "0.18"
+# `cookie`'s expiry type is `time::OffsetDateTime`; we name it directly so
+# `Cargo` pins the same major rather than relying on a transitive re-export.
+time = "0.3"
+thiserror = "2"
+log = "0.4"
+
+# --- cryptography (used on every platform) ---
+aes-gcm = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+
+# --- HTTP client for the AniList native integration ---
+# rustls (not native-tls) so the Android cross-build does not need OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+  "http2",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time"] }
+futures-util = "0.3"
+
+[dependencies.uuid]
+version = "1"
+features = ["v4"]
+
+# --- desktop secret stores ---
+# Windows: DPAPI (`CryptProtectData`) wraps the master key, scoped to the
+# signed-in user.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+] }
+
+# Linux: XDG Secret Service (gnome-keyring / KWallet) holds the master key.
+[target.'cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))'.dependencies]
+keyring = "4"
+
+# The Keystore + Picture-in-Picture bridge.
+#
+# This is an unconditional dependency even though it only does real work on
+# Android: it exposes a no-op `init()` everywhere else so the plugin can be
+# registered in one place in `lib.rs`. Cargo resolves path dependencies
+# regardless of the target filter anyway, so gating it buys nothing.
+[dependencies.animehub-android]
+path = "./android-plugin"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Emitted by `tauri build`; enables the custom protocol / dev server plumbing.
+custom-protocol = ["tauri/custom-protocol"]
+
+# Release profile for distribution builds.
+#
+# `lto = true` + `codegen-units = 1` produces the smallest binary, but it
+# peaks at well over 2 GB of RSS while linking the GTK/WebKit crates. On a
+# small build machine run `TAURI_LOW_MEMORY=1 ./scripts/build.sh linux`,
+# which relaxes these two settings for the duration of the build and
+# restores them afterwards.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

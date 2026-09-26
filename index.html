@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>AnimeHub</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1>AnimeHub</h1>
+        </div>
+        <nav class="topbar-actions">
+          <button id="btn-settings" class="icon-btn" type="button" aria-label="Ayarlar" title="Ayarlar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7Zm7.4-3.5c0 .6-.05 1.1-.14 1.6l2 1.5-2 3.4-2.3-1a7.6 7.6 0 0 1-2.7 1.6l-.35 2.4h-4l-.35-2.4a7.6 7.6 0 0 1-2.7-1.6l-2.3 1-2-3.4 2-1.5a7.9 7.9 0 0 1 0-3.2l-2-1.5 2-3.4 2.3 1a7.6 7.6 0 0 1 2.7-1.6L9.9 2h4l.35 2.4c.98.36 1.9.9 2.7 1.6l2.3-1 2 3.4-2 1.5c.09.5.14 1 .14 1.6Z"/></svg>
+          </button>
+          <button id="btn-about" class="icon-btn" type="button" aria-label="Hakkında" title="Hakkında">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm1 15h-2v-6h2v6Zm0-8h-2V7h2v2Z"/></svg>
+          </button>
+        </nav>
+      </header>
+
+      <main id="launcher" class="launcher">
+        <div id="notice" class="notice" hidden></div>
+        <section class="group" data-category="tracking">
+          <h2 class="group-title">Takip / Veritabanı</h2>
+          <div class="grid" id="grid-tracking"></div>
+        </section>
+        <section class="group" data-category="watching">
+          <h2 class="group-title">İzleme</h2>
+          <div class="grid" id="grid-watching"></div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Site ekleme / düzenleme -->
+    <div id="modal-site" class="modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="site-modal-title">
+        <h2 id="site-modal-title">Site ekle</h2>
+        <form id="form-site" novalidate>
+          <label class="field">
+            <span>İsim</span>
+            <input name="name" type="text" maxlength="40" autocomplete="off" required />
+          </label>
+          <label class="field">
+            <span>Adres (yalnızca HTTPS)</span>
+            <input name="url" type="url" inputmode="url" placeholder="https://ornek.site" autocomplete="off" required />
+          </label>
+          <div class="field-row">
+            <label class="field">
+              <span>Kısaltma</span>
+              <input name="letter" type="text" maxlength="2" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Renk</span>
+              <input name="color" type="text" placeholder="#0ea5e9" autocomplete="off" />
+            </label>
+          </div>
+          <fieldset class="field">
+            <legend>Grup</legend>
+            <label class="radio"><input type="radio" name="category" value="watching" checked /> İzleme</label>
+            <label class="radio"><input type="radio" name="category" value="tracking" /> Takip / Veritabanı</label>
+          </fieldset>
+          <p class="form-error" id="site-error" role="alert" hidden></p>
+          <div class="modal-actions">
+            <button type="button" class="btn ghost" data-close>Vazgeç</button>
+            <button type="submit" class="btn primary">Kaydet</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Ayarlar -->
+    <div id="modal-settings" class="modal" hidden>
+      <div class="modal-card wide" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <h2 id="settings-title">Ayarlar</h2>
+        <div class="settings-body">
+          <section>
+            <h3>Güvenlik</h3>
+            <label class="switch">
+              <input type="checkbox" id="set-block-popups" />
+              <span>Yeni pencere/sekme açma isteklerini engelle</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="set-cosmetic" />
+              <span>Reklam alanlarını gizle (yalnızca görsel, sayfa koduna dokunmaz)</span>
+            </label>
+            <p class="hint" id="key-backend-hint"></p>
+          </section>
+
+          <section>
+            <h3>Engelleme listesi</h3>
+            <label class="switch">
+              <input type="checkbox" id="set-blocklist-enabled" />
+              <span>Alan adı engelleme listesi etkin</span>
+            </label>
+            <textarea id="set-blocklist" class="blocklist" spellcheck="false" rows="10"></textarea>
+            <p class="hint">
+              Satır başına bir alan adı. <code>ornek.com</code> alt alanları da kapsar,
+              <code>*.ornek.com</code> yalnızca alt alanları, <code>=ornek.com</code> yalnızca
+              kök alanı engeller. <code>#</code> ile yorum.
+            </p>
+            <div class="modal-actions">
+              <button type="button" class="btn ghost" id="btn-reset-blocklist">Varsayılana dön</button>
+              <button type="button" class="btn primary" id="btn-save-blocklist">Listeyi kaydet</button>
+            </div>
+          </section>
+
+          <section>
+            <h3>Görünüm</h3>
+            <label class="switch">
+              <input type="checkbox" id="set-fullscreen" />
+              <span>Siteleri tam ekran aç</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="set-pip" />
+              <span>Android: ana ekrana dönünce Resim-içinde-resim</span>
+            </label>
+          </section>
+
+          <section>
+            <h3>AniList</h3>
+            <p class="hint">
+              Client ID'nizi <a href="#" id="link-anilist-dev">anilist.co/settings/developer</a>
+              adresinden alabilirsiniz. Boş bırakılırsa AniList normal bir site olarak WebView'da açılır.
+            </p>
+            <label class="field">
+              <span>Client ID</span>
+              <input id="set-anilist-id" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Client Secret (opsiyonel)</span>
+              <input id="set-anilist-secret" type="password" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Redirect URI</span>
+              <input id="set-anilist-redirect" type="text" autocomplete="off" />
+            </label>
+            <div class="modal-actions">
+              <button type="button" class="btn ghost" id="btn-anilist-logout">Oturumu kapat</button>
+              <button type="button" class="btn primary" id="btn-save-anilist">Kaydet</button>
+            </div>
+            <p class="anilist-status" id="anilist-status"></p>
+          </section>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" data-close>Kapat</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hakkında -->
+    <div id="modal-about" class="modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
+        <h2 id="about-title">Hakkında</h2>
+        <dl class="about-list" id="about-list"></dl>
+        <h3>Lisans ve atıf</h3>
+        <p class="hint">
+          AnimeHub, MIT / Apache-2.0 çift lisansıyla yayınlanır. AniList entegrasyonu
+          temiz oda (clean-room) yöntemiyle, yalnızca AniList'in herkese açık OAuth 2.0 ve
+          GraphQL v2 dokümantasyonuna dayanarak yazılmıştır. Tasarım yaklaşımı için
+          <strong>Dantotsu</strong> (GPLv3, rebelonion/Dantotsu) referans alınmış,
+          ancak hiçbir kodu kopyalanmamıştır; bu proje GPLv3 ile lisanslanmaz.
+          Ayrıntılar için depodaki <code>NOTICES.md</code> dosyasına bakın.
+        </p>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" data-close>Kapat</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

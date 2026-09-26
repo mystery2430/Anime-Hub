@@ -1,0 +1,390 @@
+<div align="center">
+
+<!-- Logo gömülü (base64): önizlemede de GitHub'da da ağ olmadan yüklenir.
+     Yeniden üretmek için: scripts/build.sh icon -->
+<img src="data:image/png;base64,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" alt="AnimeHub logo" width="128" />
+
+# AnimeHub
+
+**Anime takip ve izleme sitelerini tek yerde toplayan; her siteyi kendi izole ve şifreli oturumunda açan Tauri 2 başlatıcısı.**
+
+<br/>
+
+![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?style=for-the-badge&logo=tauri&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-stable-000000?style=for-the-badge&logo=rust&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-6-646CFF?style=for-the-badge&logo=vite&logoColor=white)
+![Android](https://img.shields.io/badge/Android-26+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
+
+![Linux](https://img.shields.io/badge/Linux-do%C4%9Fruland%C4%B1-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+![Windows](https://img.shields.io/badge/Windows-derlenmedi-0078D4?style=for-the-badge&logo=windows&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-desteklenmiyor-555555?style=for-the-badge&logo=apple&logoColor=white)
+
+[![Release](https://img.shields.io/github/v/release/animehub/animehub?style=flat-square&color=62cdfe&label=s%C3%BCr%C3%BCm)](https://github.com/animehub/animehub/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/animehub/animehub/ci.yml?style=flat-square&color=62cdfe&label=CI)](https://github.com/animehub/animehub/actions)
+[![Lisans](https://img.shields.io/badge/Lisans-MIT%20%7C%20Apache--2.0-green?style=flat-square)](#lisans-ve-atıf)
+
+</div>
+
+---
+
+## ℹ️&nbsp; Proje Hakkında
+
+AnimeHub bir **başlatıcı**dır: tek bir siteye bağlanan bir istemci değil. Ekranda
+gruplanmış bir ikon ızgarası görürsünüz, birine dokunursunuz, o site kendi
+**izole** WebView penceresinde tam ekran açılır. Siteler arasında çerez,
+localStorage veya oturum sızıntısı olmaz — MAL'da giriş yapmanız AniList'i,
+AniList'te giriş yapmanız bir izleme sitesini etkilemez.
+
+İki grup vardır:
+
+| Grup | İçerik |
+|---|---|
+| **Takip / Veritabanı** | MyAnimeList, AniList. AniList ayrıca uygulama içinden OAuth ile bağlanır |
+| **İzleme** | OpenAnime, AnimeCix + sizin ekledikleriniz |
+
+Uygulama `openani.me` gibi sitelerin içeriğini **barındırmaz, indirmaz veya
+yeniden yayınlamaz**; yalnızca sizin seçtiğiniz adresi sistemin kendi WebView
+motorunda açar. Sitelerin kullanım koşullarına uymak size aittir.
+
+> [!NOTE]
+> Bu proje bir topluluk çalışmasıdır; hiçbir sitenin resmî istemcisi değildir.
+
+---
+
+## 🏗️&nbsp; Mimari Genel Bakış
+
+Tüm güvenlik politikası **Rust tarafında** uygulanır. Site WebView'ları hiçbir
+Tauri komutuna erişemez; başlatıcı arayüzü ise yalnızca beyaz listelenmiş
+komutları çağırabilir.
+
+```mermaid
+flowchart TB
+    subgraph CORE["🦀 Rust çekirdeği — src-tauri/src"]
+        direction LR
+        CMD["Komutlar<br/>commands.rs · AppState"]
+        POL["Gezinti politikası<br/>web/windows.rs<br/>on_navigation · on_new_window"]
+        REG["Site kaydı<br/>sites/registry.rs · url_policy.rs"]
+        BL["Engel listesi<br/>sites/blocklist.rs"]
+        SEC["Şifreli depo<br/>secure/ (AES-256-GCM)"]
+        AL["AniList<br/>anilist.rs"]
+    end
+
+    subgraph UI["🎨 Başlatıcı — src/"]
+        direction LR
+        MAIN["Izgara + Ayarlar<br/>main.js"]
+        TILES["Görünüm modeli<br/>logic/tiles.js"]
+        BRIDGE["invoke sarmalayıcı<br/>logic/bridge.js"]
+    end
+
+    WV1["🌐 Site WebView A<br/>(kendi profil dizini)"]
+    WV2["🌐 Site WebView B<br/>(kendi profil dizini)"]
+
+    UI -->|invoke| CMD
+    CMD --> REG
+    CMD --> SEC
+    CMD --> AL
+    CMD -->|pencere aç| POL
+    POL -->|HTTPS + engel listesi| WV1
+    POL -->|HTTPS + engel listesi| WV2
+    BL --> POL
+```
+
+| Katman | Konum | Sorumluluk |
+|---|---|---|
+| **Rust çekirdeği** | `src-tauri/src/*.rs` | Komutlar, site kaydı, URL politikası, şifreli depo, AniList OAuth, pencere açma |
+| **Güvenlik katmanı** | `secure/`, `sites/`, `web/` | AES-256-GCM depo, HTTPS zorunluluğu, alan adı engelleme, gezinti/yeni pencere reddi |
+| **Başlatıcı arayüzü** | `src/` | Izgara, site ekleme/düzenleme, Ayarlar ve Hakkında ekranları — `innerHTML` kullanmadan |
+| **Android köprüsü** | `src-tauri/android-plugin/` | AndroidKeyStore (şifreleme) + Picture-in-Picture |
+| **CI/CD** | `.github/workflows/` | Test matrisi, Android APK ve masaüstü paketlerinin otomatik derlenmesi |
+
+---
+
+## ⭐&nbsp; Öne Çıkan Özellikler
+
+### 🪟&nbsp; Site başına izole oturum
+
+Her site kendi WebView profil dizinini alır:
+`<uygulama verisi>/profiles/<site>`. Linux'ta WebKitGTK `data_directory`,
+Windows'ta WebView2 profili kullanılır; çerezler, localStorage, IndexedDB ve
+önbellek siteler arasında **hiç** kesişmez.
+
+> [!NOTE]
+> Bu kural bir **metin** kontrolüdür: herkese açık görünen ama özel bir
+> adrese çözümlenen bir alan adı (DNS rebinding) yine geçebilir, çünkü
+> guard'ı eşzamanlı tutmak için DNS çözümlemesi yapılmıyor.
+
+> [!IMPORTANT]
+> Android'de sistem WebView'ının site başına profil API'si **yoktur**.
+> Bunun yerine uygulama, site açılırken/kapanırken çerez kavanozunu şifreli
+> bir blob olarak dışa/içe aktarır. Bu çerezleri ayırır ama localStorage ve
+> IndexedDB'yi **ayırmaz**. Uygulama bunu saklamaz: ayrıştırma tam olmadığında
+> ekranda uyarı gösterir.
+
+### 🔒&nbsp; Diskte şifreli duran veriler
+
+Oturum verileri ve API anahtarları AES-256-GCM ile şifrelenir (`AHB1` zarf
+biçimi). Anahtar hiçbir zaman düz metin saklanmaz, platformun kendi anahtar
+kaynağından gelir:
+
+| Platform | Anahtar kaynağı |
+|---|---|
+| Windows | DPAPI (kullanıcı kapsamı) |
+| Linux | XDG Secret Service (GNOME Anahtarlar / KWallet) |
+| Android | AndroidKeyStore (donanım destekli) |
+| Hiçbiri yoksa | `0600` izinli dosya — **ve Hakkında ekranında bu açıkça yazar** |
+
+### 🛡️&nbsp; Sıkı gezinti politikası
+
+- **Yalnızca HTTPS.** `http://` adresi reddedilir, downgrade denemeleri
+  native `on_navigation` callback'inde engellenir.
+- **Özel/ağ içi adresler reddedilir.** `127.0.0.1`, `10.x`, `192.168.x`,
+  `169.254.x`, `::1`, link-local ve `.local` gibi hedeflere gidilemez — bir
+  sitenin sizi yerel ağınıza yönlendirmesi engellenir.
+- **Yeni pencere/sekme istekleri varsayılan olarak reddedilir**
+  (`NewWindowResponse::Deny`).
+- **Aynı özel adres kuralı gezinti sırasında da uygulanır.** Bir site sizi
+  `https://192.168.1.1/` adresine yönlendirmeye çalışırsa kesilir; bu kural
+  `tests/audit.rs` içinde regresyon testiyle kilitlidir.
+- **Alan adı engel listesi** reklam ve izleyici alanlarını istek düzeyinde
+  keser; liste koda gömülüdür ve güncellenebilir.
+
+### ➕&nbsp; Kodsuz site ekleme
+
+**Site ekle** ile ad + URL (+ isteğe bağlı harf/renk) girersiniz; site listesi
+şifreli yapılandırma dosyasına yazılır. Düzenleme, **başlatıcıdan gizleme** ve
+**çerezleri ve site verilerini temizleme** de aynı menüden yapılır — yeniden
+derleme gerekmez.
+
+Kullanıcı girişi render edilmeden önce doğrulanır: şema, özel adres kontrolü,
+punycode normalizasyonu ve tekrar eden adres tespiti. Arayüz hiçbir yerde
+`innerHTML` kullanmaz; tüm metin `textContent` ile yazılır. Bu, `npm test`
+içindeki bir testle derlenmiş çıktı üzerinde de zorlanır.
+
+### 👤&nbsp; AniList bağlantısı
+
+AniList, OAuth 2.0 **authorization code** akışıyla bağlanır ve GraphQL
+(`graphql.anilist.co`) üzerinden kitaplık + arama sorgular. `state` parametresi
+UUID v4'tür ve sabit zamanlı karşılaştırma ile doğrulanır. Dönen token şifreli
+depoya yazılır; `client_id` / `client_secret` sizindir, depoya asla girmez.
+
+> [!NOTE]
+> AniList PKCE'yi belgelemediği için akış, client secret ile kuruludur.
+> MyAnimeList v1'de **bilinçli olarak** atlandı: şimdilik düz bir başlatıcı
+> kutucuğu olarak açılır.
+
+### 📱&nbsp; Android Picture-in-Picture
+
+Android 12+ (API 31) için Ayarlar'da **"PiP'e otomatik geç"** anahtarı vardır;
+sistem PiP API'si (`PictureInPictureParams` + `setAutoEnterEnabled`)
+kullanılır. Oran 16:9 varsayılandır ve Android'in kabul ettiği sınırlara
+kırpılır.
+
+---
+
+## 📦&nbsp; Kurulum
+
+Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
+
+### 🖥️&nbsp; Linux &nbsp;·&nbsp; `x86_64 — WebKitGTK 4.1`
+
+| Yöntem | Boyut | Komut |
+|---|---|---|
+| **`.deb`** (Debian/Ubuntu) | ~3.7 MB | `sudo apt install ./AnimeHub_0.1.0_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | — | `sudo rpm -ivh animehub-0.1.0-1.x86_64.rpm` |
+| **AppImage** | — | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
+
+```bash
+sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
+```
+
+### 🖥️&nbsp; Windows &nbsp;·&nbsp; `Windows 10/11 — x86_64`
+
+| Yöntem | Boyut | Açıklama |
+|---|---|---|
+| **NSIS kurulum** | — | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
+
+> [!WARNING]
+> Paketler **kod imzalı değildir**. SmartScreen veya tarayıcı uyarısı
+> alırsanız bu beklenir.
+
+### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
+
+| Yöntem | Boyut | Açıklama |
+|---|---|---|
+| **APK** | — | Releases sayfasından ABI'nize uygun `.apk` (arm64-v8a / armeabi-v7a / x86_64) |
+
+> [!CAUTION]
+> Android tarafı **henüz bir cihazda doğrulanmadı**. Kotlin köprüsü yazıldı
+> ama derlenmedi — ayrıntılar için [Doğrulama durumu](#-doğrulama-durumu).
+
+---
+
+## 🖥️&nbsp; Platform Desteği
+
+| Platform | Durum | Paketler | Notlar |
+|---|---|---|---|
+| 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Bu depoda uçtan uca derlendi ve paketlendi |
+| 🪟 **Windows** | ⚠️ Kod hazır, derlenmedi | `.exe` (NSIS) | DPAPI + WebView2 profili; Windows runner'da derlenir |
+| 🤖 **Android** | ⚠️ Kod hazır, cihazda test edilmedi | `.apk` | Oturum izolasyonu kısmi (yalnızca çerezler) |
+| 🍎 **macOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
+| 🍏 **iOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
+
+---
+
+## ⌨️&nbsp; Kontroller
+
+| Girdi | İşlev |
+|---|---|
+| `Esc` | Açık iletişim kutusunu kapatır; hiçbiri yoksa başlatıcıya döner |
+| Android geri tuşu | `Esc` ile aynı davranış |
+| Site menüsü → **Düzenle** | Ad, adres, harf ve rengi değiştirir |
+| Site menüsü → **Başlatıcıdan gizle** | Siteyi listeden kaldırır, verisini silmez |
+| Site menüsü → **Çerezleri ve site verilerini temizle** | O sitenin tüm oturum verisini yok eder |
+
+---
+
+## 🔧&nbsp; Kaynaktan Derleme
+
+### 1. Ön gereksinimler
+
+- [Rust](https://www.rust-lang.org/tools/install) 1.98+
+- [Node.js](https://nodejs.org/) 20+
+- Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`
+- Android: SDK + NDK, `ANDROID_HOME` ve `NDK_HOME` tanımlı
+- Tümü için: [Tauri ön gereksinimleri](https://v2.tauri.app/start/prerequisites/)
+
+### 2. Klonla & çalıştır
+
+```bash
+git clone https://github.com/animehub/animehub.git
+cd animehub
+npm install
+
+npm run tauri dev      # native pencere + hot reload
+npm run dev            # yalnızca arayüz kabuğu (native özellikler olmadan)
+npm run check          # frontend + Rust testleri
+```
+
+### 3. Paketleme
+
+```bash
+./scripts/build.sh linux      # AppImage + .deb + .rpm
+./scripts/build.sh windows    # NSIS .exe (Windows'ta)
+./scripts/build.sh android    # imzalı .apk
+./scripts/build.sh test       # tüm testler
+./scripts/build.sh icon       # ikonları yeniden üret
+```
+
+> [!TIP]
+> Dağıtım profilinde LTO açık; `gtk`/WebKit crate'leri bağlanırken **2 GB'dan
+> fazla RAM** ister. Küçük bir makinede
+> `TAURI_LOW_MEMORY=1 ./scripts/build.sh linux` bu iki ayarı yalnızca derleme
+> süresince gevşetir ve çıkışta `Cargo.toml`'u geri yükler.
+
+Android imzalaması için `src-tauri/gen/android/keystore.properties` dosyasını
+`.env.example` içindeki şablona göre oluşturun. **Keystore'u asla commit
+etmeyin** — `.gitignore` bunu zaten engeller.
+
+---
+
+## 🔄&nbsp; CI/CD
+
+| İş akışı | Tetikleyici | Ne yapar |
+|---|---|---|
+| `ci.yml` | her push / PR | 3 işletim sisteminde test, `fmt`, `clippy -D warnings`, `cargo audit`, gizli anahtar taraması |
+| `release-android.yml` | `v*` etiketi | 3 ABI için imzalı `.apk`, GitHub Release'e ekler |
+| `release-desktop.yml` | `v*` etiketi | Linux `.deb`/`.rpm`/AppImage + Windows NSIS |
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Depoda **hiçbir gizli anahtar yoktur**. Android keystore'u
+`secrets.ANDROID_KEYSTORE_BASE64` üzerinden geçici dosyaya yazılır ve
+`if: always()` adımında `shred -u` ile silinir; AniList istemci bilgileri
+kullanıcının kendi cihazında, şifreli depoda tutulur.
+
+---
+
+## 🗺️&nbsp; Yol Haritası
+
+v1 bilinçli olarak dar tutuldu. Ertelenenler:
+
+- [ ] MyAnimeList native entegrasyonu (v1'de yalnızca başlatıcı kutucuğu)
+- [ ] Otomatik güncelleme kontrolü
+- [ ] Yeni bölüm bildirimleri
+- [ ] Yerel izleme geçmişi / "devam et" listesi
+- [ ] Zorunlu koyu tema
+- [ ] PIN / biyometrik kilit
+- [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
+- [ ] Windows kod imzalama ve macOS desteği
+
+---
+
+## ✅&nbsp; Doğrulama durumu
+
+Son durum, geliştirme ortamında (Linux, x86_64, 2 GB RAM) çalıştırılan
+komutlarla doğrulandı:
+
+| Komut | Sonuç |
+|---|---|
+| `cargo test --all` | **148 test geçti** (137 birim + 11 denetim), 0 hata |
+| `cargo clippy --all-targets -- -D warnings` | temiz (uyarı yok) |
+| `cargo fmt --all -- --check` | temiz |
+| `npm test` (`node --test tests/`) | **45 test geçti**, 0 hata |
+| `npm run build` | başarılı |
+| `npm run tauri build -- --bundles deb` | `AnimeHub_0.1.0_amd64.deb` (3.7 MB) |
+
+**Doğrulanmayanlar:**
+
+- **Android derlemesi ve cihaz testi.** SDK/NDK ve cihaz olmadan
+  `tauri android build` çalıştırılamadı. Kotlin köprüsü Tauri 2.11.6 eklenti
+  API'sine göre yazıldı ama **derlenmedi**.
+- **Windows derlemesi.** NSIS paketi yalnızca Windows üzerinde üretilebilir.
+- **Ayarlanmış profille Linux paketi.** Depodaki `release` profili
+  (`lto = true`) bu makinede OOM ile öldürüldü; üretilen `.deb`
+  `TAURI_LOW_MEMORY=1` ile alındı. İkili doğru, sadece biraz daha büyük.
+- **GitHub Actions iş akışları** hiçbir runner'da çalıştırılmadı.
+
+Tüm doğrulama kayıtları, bulunan güvenlik açığının ayrıntısı ve devralan
+kişiye düşen işler [`HANDOFF.md`](./HANDOFF.md) dosyasında.
+
+---
+
+## 🤝&nbsp; Katkıda Bulunma
+
+1. Değişiklikten önce [Issues](https://github.com/animehub/animehub/issues)
+   listesine bakın.
+2. `npm run check` yerelde yeşil olmalı (frontend + Rust testleri).
+3. `cargo clippy --all-targets -- -D warnings` ve `cargo fmt --check` temiz
+   olmalı — CI bunları zaten zorlar.
+4. Güvenlik katmanına dokunan değişikliklerde `tests/security.test.js`
+   içindeki varsayımları da güncelleyin.
+
+---
+
+## 📄&nbsp; Lisans ve atıf
+
+**MIT** veya **Apache-2.0** — hangisini tercih ederseniz. Metinler
+[`LICENSE-MIT`](./LICENSE-MIT) ve [`LICENSE-APACHE`](./LICENSE-APACHE)
+dosyalarında.
+
+Bu proje **temiz oda** (clean-room) bir uygulamadır: GPLv3 lisanslı
+**Dantotsu**'dan **hiçbir kod taşınmamıştır**; yalnızca API yaklaşımı
+referans alınmıştır. Bu ayrımın lisans sonuçları ve tüm atıflar
+[`NOTICES.md`](./NOTICES.md) dosyasındadır.
+
+Mimari deseni — "başlatıcı ekranı + seçilen siteyi tam ekran WebView'da açma"
+— [OpenAnime-Linux](https://github.com/tuanapi/OpenAnime-Linux) ve
+[OpenAnime-Desktops](https://github.com/Dark-Hunter-TR/OpenAnime-Desktops)
+projelerinden esinlenmiştir. Teknoloji seçimleri (Tauri 2 / Rust) bu
+projelerden alınmamıştır.
+
+---
+
+<div align="center">
+
+<sub>AnimeHub hiçbir siteyle bağlantılı değildir ve içerik barındırmaz.</sub>
+
+</div>
