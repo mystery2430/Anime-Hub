@@ -62,16 +62,15 @@ jobs:
       # are present, and otherwise produces an unsigned build. Either way no
       # secret is referenced from the repository contents.
       - uses: tauri-apps/tauri-action@v0
-        with:
-          # The shared config no longer pins Linux-only bundle targets, which
-          # made a Windows run try to build an AppImage. Name the bundles here.
-          args: ${{ matrix.label == 'windows' && '--bundles nsis' || '--bundles appimage,deb,rpm' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           WINDOWS_TIMESTAMP_URL: http://timestamp.digicert.com
         with:
+          # The shared config no longer pins Linux-only bundle targets, which
+          # made a Windows run try to build an AppImage. Name the bundles here.
+          args: ${{ matrix.label == 'windows' && '--bundles nsis' || '--bundles appimage,deb,rpm' }}
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('AnimeHub {0}', github.ref_name) || '' }}
           releaseDraft: true
