@@ -50,7 +50,7 @@
             <span>Adres (yalnızca HTTPS)</span>
             <input name="url" type="url" inputmode="url" placeholder="https://ornek.site" autocomplete="off" required />
           </label>
-          <div class="field-row">
+          <div class="field-row" id="letter-row">
             <label class="field">
               <span>Kısaltma</span>
               <input name="letter" type="text" maxlength="2" autocomplete="off" />
@@ -59,6 +59,18 @@
               <span>Renk</span>
               <input name="color" type="text" placeholder="#0ea5e9" autocomplete="off" />
             </label>
+          </div>
+          <div class="field photo-field" id="photo-field">
+            <span>Fotoğraf</span>
+            <div class="photo-row">
+              <span class="photo-preview" id="photo-preview" aria-hidden="true"></span>
+              <div class="photo-actions">
+                <button type="button" class="btn ghost" id="btn-pick-photo">Fotoğraf seç</button>
+                <button type="button" class="btn ghost" id="btn-clear-photo" hidden>Kaldır</button>
+                <p class="hint" id="photo-hint">PNG, JPEG veya WebP. Kare bir simge olarak kaydedilir.</p>
+              </div>
+            </div>
+            <input id="site-photo" type="file" accept="image/png,image/jpeg,image/webp" hidden />
           </div>
           <fieldset class="field">
             <legend>Grup</legend>

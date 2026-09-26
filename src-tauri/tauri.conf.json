@@ -48,7 +48,6 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["appimage", "deb", "rpm"],
     "category": "Video",
     "shortDescription": "Anime takip ve izleme sitelerini tek yerde toplayan başlatıcı",
     "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve AnimeCix gibi siteleri tek bir uygulama altında toplar. Her site kendi izole ve şifreli WebView oturumunda açılır; oturum verileri diskte şifreli saklanır ve yalnızca HTTPS adreslere izin verilir.",

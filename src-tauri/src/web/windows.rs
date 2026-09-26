@@ -179,28 +179,22 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     }
 
     // 2. Clear the shared jar, then load the target site's cookies.
-    window
-        .clear_all_browsing_data()
-        .map_err(|e| {
-            log::error!("çerezler temizlenemedi: {e}");
-            AppError::Other("çerezler temizlenemedi".into())
-        })?;
+    window.clear_all_browsing_data().map_err(|e| {
+        log::error!("çerezler temizlenemedi: {e}");
+        AppError::Other("çerezler temizlenemedi".into())
+    })?;
     import_cookies(&window, &site.id)?;
 
     // 3. Install the cosmetic/anti-popup script for this navigation.
-    window
-        .eval(init_script)
-        .map_err(|e| {
-            log::error!("script yüklenemedi: {e}");
-            AppError::Other("script yüklenemedi".into())
-        })?;
+    window.eval(init_script).map_err(|e| {
+        log::error!("script yüklenemedi: {e}");
+        AppError::Other("script yüklenemedi".into())
+    })?;
 
-    window
-        .navigate(url.clone())
-        .map_err(|e| {
-            log::error!("sayfa açılamadı: {e}");
-            AppError::Other("sayfa açılamadı".into())
-        })?;
+    window.navigate(url.clone()).map_err(|e| {
+        log::error!("sayfa açılamadı: {e}");
+        AppError::Other("sayfa açılamadı".into())
+    })?;
 
     *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
         site_id: site.id.clone(),
@@ -216,12 +210,10 @@ fn export_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()>
     let app = window.app_handle().clone();
     let state = app.state::<AppState>();
 
-    let live = window
-        .cookies()
-        .map_err(|e| {
-            log::error!("çerezler okunamadı: {e}");
-            AppError::Other("çerezler okunamadı".into())
-        })?;
+    let live = window.cookies().map_err(|e| {
+        log::error!("çerezler okunamadı: {e}");
+        AppError::Other("çerezler okunamadı".into())
+    })?;
     let now = crate::anilist::now_unix();
 
     let mut jar = CookieJar {

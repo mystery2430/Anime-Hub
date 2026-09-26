@@ -233,9 +233,7 @@ pub fn remove_site(state: State<'_, AppState>, id: String) -> AppResult<()> {
     persist_registry(&state)?;
     // Delete the jar before reporting success. A swallowed failure would
     // leave the site's cookies on disk after the tile is gone.
-    state
-        .provider
-        .delete_secret(&format!("cookies-{id}"))?;
+    state.provider.delete_secret(&format!("cookies-{id}"))?;
     Ok(())
 }
 
@@ -357,9 +355,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     };
     let mut n = 0;
     for id in &ids {
-        state
-            .provider
-            .delete_secret(&format!("cookies-{id}"))?;
+        state.provider.delete_secret(&format!("cookies-{id}"))?;
         n += 1;
     }
     // Desktop profile directories hold the real cookie DB. A missing

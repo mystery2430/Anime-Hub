@@ -34,6 +34,9 @@ pub enum Icon {
     },
     /// A bundled asset path, relative to the frontend root (never a URL).
     Bundled { path: String },
+    /// A user-attached photo, stored as a canonical `data:image/...;base64,`
+    /// payload inside the encrypted registry. Remote URLs are not accepted.
+    Image { data: String },
 }
 
 impl Default for Icon {
@@ -154,9 +157,8 @@ pub fn default_sites() -> Vec<Site> {
             name: "OpenAnime".into(),
             url: "https://openani.me/".into(),
             category: Category::Watching,
-            icon: Icon::Letter {
-                text: "OA".into(),
-                color: "#e11d48".into(),
+            icon: Icon::Bundled {
+                path: "logos/openanime.png".into(),
             },
             builtin: true,
             hidden: false,
@@ -167,9 +169,8 @@ pub fn default_sites() -> Vec<Site> {
             name: "AnimeCix".into(),
             url: "https://animecix.tv/".into(),
             category: Category::Watching,
-            icon: Icon::Letter {
-                text: "AC".into(),
-                color: "#7c3aed".into(),
+            icon: Icon::Bundled {
+                path: "logos/animecix.png".into(),
             },
             builtin: true,
             hidden: false,
@@ -190,6 +191,135 @@ pub struct SiteDraft {
     pub letter: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
+    /// `None` keeps the current photo on edit (and means "no photo" on add).
+    /// `Some("")` clears it. `Some(data-url)` replaces it.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// Decoded tile photos stay small enough to live in the encrypted registry.
+const ICON_DATA_MAX: usize = 192 * 1024;
+
+fn letter_icon(draft: &SiteDraft, name: &str) -> Icon {
+    Icon::Letter {
+        text: draft
+            .letter
+            .as_deref()
+            .map(sanitize_name)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(2).collect())
+            .unwrap_or_else(|| {
+                name.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .take(2)
+                    .collect::<String>()
+            })
+            .to_uppercase(),
+        color: draft
+            .color
+            .as_deref()
+            .map(|c| sanitize_color(c, "#0ea5e9"))
+            .unwrap_or_else(|| "#0ea5e9".into()),
+    }
+}
+
+/// Accept a `data:image/(png|jpeg|webp);base64,...` payload.
+///
+/// SVG and remote URLs are refused: SVG can carry script, and a remote icon
+/// host would learn which tiles this install has.
+pub fn parse_icon_image(raw: &str) -> AppResult<String> {
+    let raw = raw.trim();
+    let Some(rest) = raw.strip_prefix("data:image/") else {
+        return Err(AppError::Icon("yalnızca PNG, JPEG veya WebP".into()));
+    };
+    let Some((mime_tail, b64)) = rest.split_once(";base64,") else {
+        return Err(AppError::Icon("yalnızca PNG, JPEG veya WebP".into()));
+    };
+    if mime_tail.contains(';') || mime_tail.contains(',') {
+        return Err(AppError::Icon("yalnızca PNG, JPEG veya WebP".into()));
+    }
+    let mime = match mime_tail {
+        "png" => "image/png",
+        "jpeg" | "jpg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => return Err(AppError::Icon("yalnızca PNG, JPEG veya WebP".into())),
+    };
+    if b64.len() > ICON_DATA_MAX.saturating_mul(2) {
+        return Err(AppError::Icon("fotoğraf çok büyük".into()));
+    }
+    if !b64
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return Err(AppError::Icon("fotoğraf okunamadı".into()));
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| AppError::Icon("fotoğraf okunamadı".into()))?;
+    if bytes.is_empty() || bytes.len() > ICON_DATA_MAX {
+        return Err(AppError::Icon("fotoğraf çok büyük".into()));
+    }
+    if !image_magic(mime, &bytes) {
+        return Err(AppError::Icon("fotoğraf okunamadı".into()));
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+fn image_magic(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image/jpeg" => {
+            bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
+        }
+        "image/webp" => {
+            bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+        }
+        _ => false,
+    }
+}
+
+fn icon_for_new(draft: &SiteDraft, name: &str) -> AppResult<Icon> {
+    match draft.image.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => Ok(Icon::Image {
+            data: parse_icon_image(raw)?,
+        }),
+        None => Ok(letter_icon(draft, name)),
+    }
+}
+
+fn icon_for_update(
+    existing: &Icon,
+    builtin: bool,
+    draft: &SiteDraft,
+    name: &str,
+) -> AppResult<Icon> {
+    let incoming = draft.image.as_deref().map(str::trim);
+    if builtin {
+        if incoming.is_some_and(|s| !s.is_empty()) {
+            return Err(AppError::Icon(
+                "varsayılan sitelere fotoğraf eklenemez".into(),
+            ));
+        }
+        return Ok(existing.clone());
+    }
+    match incoming {
+        Some("") => Ok(letter_icon(draft, name)),
+        Some(raw) => Ok(Icon::Image {
+            data: parse_icon_image(raw)?,
+        }),
+        None => match existing {
+            Icon::Image { .. } | Icon::Bundled { .. } => Ok(existing.clone()),
+            Icon::Letter { .. } => {
+                if draft.letter.is_some() || draft.color.is_some() {
+                    Ok(letter_icon(draft, name))
+                } else {
+                    Ok(existing.clone())
+                }
+            }
+        },
+    }
 }
 
 impl Registry {
@@ -267,26 +397,7 @@ impl Registry {
             .map(|m| m + 1)
             .unwrap_or(0);
 
-        let icon = Icon::Letter {
-            text: draft
-                .letter
-                .as_deref()
-                .map(sanitize_name)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.chars().take(2).collect())
-                .unwrap_or_else(|| {
-                    name.chars()
-                        .filter(|c| !c.is_whitespace())
-                        .take(2)
-                        .collect::<String>()
-                })
-                .to_uppercase(),
-            color: draft
-                .color
-                .as_deref()
-                .map(|c| sanitize_color(c, "#0ea5e9"))
-                .unwrap_or_else(|| "#0ea5e9".into()),
-        };
+        let icon = icon_for_new(&draft, &name)?;
 
         let site = Site {
             id,
@@ -308,6 +419,12 @@ impl Registry {
             return Err(AppError::SiteNotFound(id.to_string()));
         }
         let (name, norm) = self.check(&draft, Some(id))?;
+        let (builtin, existing) = {
+            let site = self.sites.iter().find(|s| s.id == id).expect("checked above");
+            (site.builtin, site.icon.clone())
+        };
+        // Validate before mutating, so a rejected photo does not half-apply.
+        let icon = icon_for_update(&existing, builtin, &draft, &name)?;
         let site = self
             .sites
             .iter_mut()
@@ -316,17 +433,7 @@ impl Registry {
         site.name = name;
         site.url = norm;
         site.category = draft.category;
-        if let (Some(letter), Some(color)) = (draft.letter.as_deref(), draft.color.as_deref()) {
-            let letter = sanitize_name(letter);
-            site.icon = Icon::Letter {
-                text: if letter.is_empty() {
-                    site.name.chars().take(2).collect()
-                } else {
-                    letter.chars().take(2).collect::<String>().to_uppercase()
-                },
-                color: sanitize_color(color, "#0ea5e9"),
-            };
-        }
+        site.icon = icon;
         Ok(site.clone())
     }
 
@@ -360,6 +467,11 @@ impl Registry {
                 if let Some(next) = retired_builtin_url(&existing.id, &existing.url) {
                     existing.url = next.to_string();
                 }
+                // Older installs stored a letter disc. The shipped logo replaces
+                // that, but a photo the user attached is left alone.
+                if matches!(existing.icon, Icon::Letter { .. }) {
+                    existing.icon = b.icon.clone();
+                }
             } else {
                 self.sites.push(b);
             }
@@ -378,6 +490,7 @@ mod tests {
             category: Category::Watching,
             letter: None,
             color: None,
+            image: None,
         }
     }
 
@@ -487,6 +600,7 @@ mod tests {
             category: Category::Tracking,
             letter: None,
             color: None,
+            image: None,
         })
         .unwrap();
         let v = r.visible();
@@ -559,5 +673,66 @@ mod tests {
         assert_eq!(back.sites.len(), r.sites.len());
         assert_eq!(back.sites[2].name, "Extra");
         assert_eq!(back.version, 1);
+    }
+
+    #[test]
+    fn defaults_use_bundled_logos() {
+        let r = Registry::new_default();
+        match &r.get("builtin-openanime").unwrap().icon {
+            Icon::Bundled { path } => assert_eq!(path, "logos/openanime.png"),
+            other => panic!("openanime icon {other:?}"),
+        }
+        match &r.get("builtin-animecix").unwrap().icon {
+            Icon::Bundled { path } => assert_eq!(path, "logos/animecix.png"),
+            other => panic!("animecix icon {other:?}"),
+        }
+    }
+
+    fn tiny_png_data_url() -> String {
+        use base64::Engine as _;
+        let bytes = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!("data:image/png;base64,{b64}")
+    }
+
+    #[test]
+    fn user_photo_is_stored_and_remote_urls_are_refused() {
+        let mut r = Registry::new_default();
+        let mut d = draft("Foto", "https://foto.example/");
+        d.image = Some(tiny_png_data_url());
+        let s = r.add(d).unwrap();
+        assert!(matches!(s.icon, Icon::Image { .. }));
+
+        let mut bad = draft("Uzaktan", "https://remote.example/");
+        bad.image = Some("https://evil.example/icon.png".into());
+        assert_eq!(r.add(bad).unwrap_err().code(), "icon");
+
+        let mut svg = draft("Svg", "https://svg.example/");
+        svg.image = Some("data:image/svg+xml;base64,PHN2Zy8+".into());
+        assert_eq!(r.add(svg).unwrap_err().code(), "icon");
+    }
+
+    #[test]
+    fn builtin_rejects_photo_without_changing_the_tile() {
+        let mut r = Registry::new_default();
+        let before = r.get("builtin-openanime").unwrap().clone();
+        let mut d = draft("OpenAnime", "https://openani.me/");
+        d.image = Some(tiny_png_data_url());
+        assert_eq!(r.update("builtin-openanime", d).unwrap_err().code(), "icon");
+        assert_eq!(r.get("builtin-openanime").unwrap(), &before);
+    }
+
+    #[test]
+    fn ensure_builtins_upgrades_letter_icons_to_logos() {
+        let mut r = Registry::new_default();
+        r.sites[0].icon = Icon::Letter {
+            text: "OA".into(),
+            color: "#e11d48".into(),
+        };
+        r.ensure_builtins();
+        assert!(matches!(
+            r.get("builtin-openanime").unwrap().icon,
+            Icon::Bundled { .. }
+        ));
     }
 }

@@ -195,6 +195,7 @@ mod tests {
             category: Category::Tracking,
             letter: None,
             color: None,
+            image: None,
         })
         .unwrap();
         s.save_registry(&reg).unwrap();
@@ -218,6 +219,7 @@ mod tests {
             category: Category::Watching,
             letter: None,
             color: None,
+            image: None,
         })
         .unwrap();
         s.save_registry(&reg).unwrap();

@@ -217,6 +217,7 @@ mod tests {
                 category: crate::sites::registry::Category::Watching,
                 letter: None,
                 color: None,
+                image: None,
             })
             .unwrap();
             p.save_registry(&reg).unwrap();

@@ -46,6 +46,10 @@ pub enum AppError {
 
     #[error("Beklenmeyen hata: {0}")]
     Other(String),
+
+    /// A tile photo the user attached. The message is already safe to show.
+    #[error("{0}")]
+    Icon(String),
 }
 
 /// Serializable payload for the `invoke` boundary.
@@ -74,6 +78,7 @@ impl AppError {
             AppError::Unauthorized => "unauthorized",
             AppError::Network(_) => "network",
             AppError::Other(_) => "other",
+            AppError::Icon(_) => "icon",
         }
     }
 }

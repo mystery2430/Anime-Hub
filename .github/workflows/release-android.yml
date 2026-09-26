@@ -49,28 +49,23 @@ jobs:
       # v3 asks for the removed `tools` package and fails the job. v4 does not.
       - uses: android-actions/setup-android@v4
 
-      - uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27c
-
-      - name: Export NDK and install SDK packages
-        env:
-          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+      # Same SDK/NDK pair as CI. Tauri CLI 2.11's template compiles against
+      # API 36 and expects NDK 29.0.13846066 when it looks the toolchain up.
+      - name: Install SDK 36 and the Tauri NDK
         run: |
           set -euo pipefail
-          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
           # `yes` exits 141 when sdkmanager closes the pipe; that is not a
           # license failure. The install itself must succeed.
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install \
-            "platforms;android-35" \
+            "platforms;android-36" \
             "build-tools;35.0.0" \
-            "platform-tools"
-          # Optional: a template that asks for 36 should not fail the job
-          # before init if this cmdline-tools revision does not ship it yet.
-          sdkmanager --install "platforms;android-36" || true
+            "platform-tools" \
+            "ndk;29.0.13846066"
+          NDK_PATH="${ANDROID_HOME}/ndk/29.0.13846066"
+          test -x "${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -140,6 +135,10 @@ jobs:
           echo "keystore ready"
 
       - name: Build APK
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: npm run tauri android build -- --apk --target ${{ matrix.abi }}
 
       - name: Shred the keystore

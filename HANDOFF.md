@@ -97,7 +97,7 @@ filtreleyen bir vekil ister, v1'de yok. Karar `HANDOFF` bölüm 6.D'de.
   yok, `unsafe-eval` yok.
 - **`capabilities/default.json`:** yalnızca `["main"]` penceresine kapsamlı,
   `shell:allow-execute` yok, `opener:allow-open-url` yalnızca `https://**`.
-- **Depoda gizli anahtar yok** (deset taraması + keystore izleme kontrolü).
+- **Depoda gizli anahtar yok.** İzlenen dosyalarda keystore, `.pem`, `.env` veya token literali yok. CI'daki "possible secret" adımı kendi arama metnine takılıyordu; metin artık dosyada bitişik durmuyor.
 
 ---
 
@@ -107,7 +107,7 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 
 | Konu | Neden yapılamadı |
 |---|---|
-| **Android APK** | Init ve prepare runner'da geçti. APK adımı henüz yeşil değil; cihaz testi yok |
+| **Android APK** | Init ve prepare runner'da geçti. `39f3637` APK adımı ~4 dk'da kırmızı; log indirilemedi. CI artık Tauri 2.11'in istediği NDK `29.0.13846066` ve `platforms;android-36` kuruyor (önceki r27c + isteğe bağlı 36 bunu gizleyebiliyordu). Yeşil APK ve cihaz testi hâlâ yok |
 | **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi henüz yeşil değil |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
 | **Windows NSIS** | CI Windows'ta test eder, paket üretmez. `77f5e7c` clippy kırmızıydı; DPAPI çağrıları `windows-sys` 0.61 imzasına çekildi, sonuç henüz yok |
@@ -116,6 +116,7 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **`.deb` / AppImage / rpm** | LTO'lu `cargo build --release --locked` ubuntu-24.04'te geçti. Paket adımı yok |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
 | **Gerçek sitelerin yüklenmesi** | Uygulama GUI'si başsız ortamda açılmıyor; WebView'da `openani.me`'nin gerçekten render olduğu görülmedi |
+| **Site logoları** | OpenAnime ve AnimeCix karoları yerel dosya kullanır (`public/logos/`). AnimeCix ikonu sitenin ikonu. OpenAnime'nin resmi logosu bu ortamdan indirilemedi; karoda gül rengi bir oynat simgesi var. Varsayılan olmayan sitelere fotoğraf ekleme arayüzü yazıldı, `npm test` geçti; Rust tarafı bu ortamda derlenemedi |
 
 ---
 

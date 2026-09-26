@@ -64,7 +64,7 @@ case "$cmd" in
       echo "libwebkit2gtk-4.1-dev is required; see README" >&2
       exit 1
     fi
-    $TAURI build --bundles appimage deb rpm
+    $TAURI build --bundles appimage,deb,rpm
     ;;
 
   windows)

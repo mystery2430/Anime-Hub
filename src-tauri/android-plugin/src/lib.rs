@@ -95,13 +95,14 @@ pub fn keystore_open(purpose: String, sealed: String) -> Result<KeystoreResult> 
 pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(
+        call_plugin::<_, OkPayload>(
             CMD_ENTER_PIP,
             PipPayload {
                 num: aspect_num,
                 den: aspect_den,
             },
         )
+        .map(|r| r.ok)
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -114,7 +115,8 @@ pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
 pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SET_PIP_AUTO_ENTER, AutoEnterPayload { enabled })
+        call_plugin::<_, OkPayload>(CMD_SET_PIP_AUTO_ENTER, AutoEnterPayload { enabled })
+            .map(|r| r.ok)
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -163,6 +165,13 @@ struct PipPayload {
 #[derive(Debug, Serialize)]
 struct AutoEnterPayload {
     enabled: bool,
+}
+
+/// Kotlin resolves PiP commands with `{ "ok": bool }`, not a bare boolean.
+#[cfg(target_os = "android")]
+#[derive(Debug, Deserialize)]
+struct OkPayload {
+    ok: bool,
 }
 
 /// Send a command to the Kotlin plugin and return its decoded response.

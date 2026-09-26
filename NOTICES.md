@@ -60,7 +60,9 @@ or AnimeCix.
 MyAnimeList, AniList, OpenAnime and AnimeCix are the property of their
 respective owners. AnimeHub is an unofficial client, not endorsed by or
 affiliated with any of them; names and default URLs are used nominatively to
-identify the services.
+identify the services. The AnimeCix tile uses that site's icon for the same
+reason. The OpenAnime tile uses an original rose play mark shipped in
+`public/logos/openanime.png`, not their official logo.
 
 AniList's API is a public service — respect its
 [terms](https://anilist.co/terms) and rate limits. A client ID is issued per

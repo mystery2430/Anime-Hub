@@ -237,7 +237,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 |---|---|
 | `Esc` | Açık iletişim kutusunu kapatır; hiçbiri yoksa başlatıcıya döner |
 | Android geri tuşu | `Esc` ile aynı davranış |
-| Site menüsü → **Düzenle** | Ad, adres, harf ve rengi değiştirir |
+| Site menüsü → **Düzenle** | Ad, adres, harf ve rengi değiştirir. Varsayılan olmayan sitelere fotoğraf eklenebilir |
 | Site menüsü → **Başlatıcıdan gizle** | Siteyi listeden kaldırır, verisini silmez |
 | Site menüsü → **Çerezleri ve site verilerini temizle** | O sitenin tüm oturum verisini yok eder |
 
@@ -250,7 +250,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 - [Rust](https://www.rust-lang.org/tools/install) 1.98+
 - [Node.js](https://nodejs.org/) 20+
 - Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`
-- Android: SDK + NDK, `ANDROID_HOME` ve `NDK_HOME` tanımlı
+- Android: SDK platform 36, NDK `29.0.13846066`, `ANDROID_HOME` ve `NDK_HOME` tanımlı
 - Tümü için: [Tauri ön gereksinimleri](https://v2.tauri.app/start/prerequisites/)
 
 ### 2. Klonla & çalıştır

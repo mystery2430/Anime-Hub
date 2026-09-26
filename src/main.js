@@ -8,7 +8,13 @@
  */
 
 import { call, on, ApiError, isTauri } from "./logic/bridge.js";
-import { groupTiles, validateDraft, safeColor, CATEGORIES } from "./logic/tiles.js";
+import {
+  groupTiles,
+  validateDraft,
+  safeColor,
+  safeDataImage,
+  CATEGORIES,
+} from "./logic/tiles.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -22,6 +28,13 @@ const el = {
   formSite: document.getElementById("form-site"),
   siteError: document.getElementById("site-error"),
   siteTitle: document.getElementById("site-modal-title"),
+  letterRow: document.getElementById("letter-row"),
+  photoField: document.getElementById("photo-field"),
+  photoPreview: document.getElementById("photo-preview"),
+  photoHint: document.getElementById("photo-hint"),
+  btnPickPhoto: document.getElementById("btn-pick-photo"),
+  btnClearPhoto: document.getElementById("btn-clear-photo"),
+  sitePhoto: document.getElementById("site-photo"),
   settings: {
     blockPopups: document.getElementById("set-block-popups"),
     cosmetic: document.getElementById("set-cosmetic"),
@@ -86,6 +99,9 @@ function showFormError(message) {
 // Tiles
 // ---------------------------------------------------------------------------
 
+/** `undefined` keeps the stored photo, `""` clears it, a data URL replaces it. */
+let pendingImage;
+
 function renderTile(tile) {
   const button = document.createElement("button");
   button.type = "button";
@@ -94,11 +110,20 @@ function renderTile(tile) {
 
   const icon = document.createElement("span");
   icon.className = "tile-icon";
-  icon.textContent = tile.letters;
-  // `safeColor` already returned null-or-#hex in the view model; assigning to
-  // a single style property is not an injection sink, but keep it explicit.
-  icon.style.background = safeColor(tile.color) || "#0ea5e9";
   icon.setAttribute("aria-hidden", "true");
+  if (tile.image) {
+    icon.classList.add("has-image");
+    const img = document.createElement("img");
+    img.alt = "";
+    img.draggable = false;
+    img.src = tile.image;
+    icon.appendChild(img);
+  } else {
+    icon.textContent = tile.letters;
+    // `safeColor` already returned null-or-#hex in the view model; assigning to
+    // a single style property is not an injection sink, but keep it explicit.
+    icon.style.background = safeColor(tile.color) || "#0ea5e9";
+  }
 
   const name = document.createElement("span");
   name.className = "tile-name";
@@ -220,6 +245,21 @@ export async function backToLauncher() {
 // Site add / edit / remove
 // ---------------------------------------------------------------------------
 
+function setPhotoPreview(src, clearable = true) {
+  el.photoPreview.textContent = "";
+  if (!src) {
+    el.photoPreview.classList.remove("has-image");
+    el.btnClearPhoto.hidden = true;
+    return;
+  }
+  const img = document.createElement("img");
+  img.alt = "";
+  img.src = src;
+  el.photoPreview.appendChild(img);
+  el.photoPreview.classList.add("has-image");
+  el.btnClearPhoto.hidden = !clearable;
+}
+
 function openSiteForm(site) {
   editingId = site ? site.id : null;
   el.siteTitle.textContent = site ? "Siteyi düzenle" : "Site ekle";
@@ -228,15 +268,63 @@ function openSiteForm(site) {
   const form = el.formSite;
   form.elements.name.value = site ? site.name : "";
   form.elements.url.value = site ? site.url : "";
-  form.elements.letter.value =
-    site && site.icon && site.icon.kind === "letter" ? site.icon.text : "";
-  form.elements.color.value =
-    site && site.icon && site.icon.kind === "letter" ? site.icon.color : "";
+  form.elements.letter.value = site && !site.image ? site.letters || "" : "";
+  form.elements.color.value = site && !site.image ? site.color || "" : "";
   const category = site && site.category === "tracking" ? "tracking" : "watching";
   form.elements.category.value = category;
 
+  const builtin = Boolean(site && site.builtin);
+  el.letterRow.hidden = builtin;
+  el.photoField.hidden = false;
+  el.btnPickPhoto.hidden = builtin;
+  el.btnClearPhoto.hidden = true;
+  el.sitePhoto.disabled = builtin;
+  el.photoHint.textContent = builtin
+    ? "Varsayılan sitelerin logosu sabittir."
+    : "PNG, JPEG veya WebP. Kare bir simge olarak kaydedilir.";
+  pendingImage = undefined;
+  el.sitePhoto.value = "";
+  setPhotoPreview(site && site.image, !builtin);
+
   openModal(el.modalSite);
   form.elements.name.focus();
+}
+
+function readPhotoFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file) {
+      resolve(null);
+      return;
+    }
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      reject(new Error("Yalnızca PNG, JPEG veya WebP."));
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      reject(new Error("Fotoğraf 8 MB'dan küçük olmalı."));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Fotoğraf okunamadı."));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Fotoğraf okunamadı."));
+      img.onload = () => {
+        const side = 128;
+        const canvas = document.createElement("canvas");
+        canvas.width = side;
+        canvas.height = side;
+        const ctx = canvas.getContext("2d");
+        const scale = Math.max(side / img.width, side / img.height);
+        const w = img.width * scale;
+        const h = img.height * scale;
+        ctx.drawImage(img, (side - w) / 2, (side - h) / 2, w, h);
+        resolve(canvas.toDataURL("image/jpeg", 0.85));
+      };
+      img.src = String(reader.result || "");
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 function siteMenu(tile) {
@@ -570,6 +658,30 @@ function wireGlobal() {
   el.btnAbout.addEventListener("click", openAbout);
   [el.modalSite, el.modalSettings, el.modalAbout].forEach(wireModalClose);
 
+  el.btnPickPhoto.addEventListener("click", () => el.sitePhoto.click());
+  el.btnClearPhoto.addEventListener("click", () => {
+    pendingImage = "";
+    el.sitePhoto.value = "";
+    setPhotoPreview(null);
+  });
+  el.sitePhoto.addEventListener("change", async () => {
+    const file = el.sitePhoto.files && el.sitePhoto.files[0];
+    if (!file) return;
+    try {
+      const dataUrl = await readPhotoFile(file);
+      const safe = safeDataImage(dataUrl);
+      if (!safe) {
+        showFormError("Fotoğraf PNG, JPEG veya WebP olmalı.");
+        return;
+      }
+      pendingImage = safe;
+      setPhotoPreview(safe);
+      showFormError(null);
+    } catch (e) {
+      showFormError(e && e.message ? e.message : "Fotoğraf okunamadı.");
+    }
+  });
+
   el.formSite.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.target;
@@ -579,6 +691,7 @@ function wireGlobal() {
       letter: form.elements.letter.value,
       color: form.elements.color.value,
       category: form.elements.category.value,
+      image: el.sitePhoto.disabled ? null : pendingImage,
     });
     if (!result.ok) {
       showFormError(result.message);

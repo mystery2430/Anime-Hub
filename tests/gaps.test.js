@@ -52,6 +52,17 @@ test("android release workflow prepares the project before signing", () => {
   assert.ok(keystore > prepare, "keystore.properties is written only after gen/android exists");
   assert.match(yml, /NDK_HOME/);
   assert.match(yml, /shred -u/);
+  assert.match(yml, /platforms;android-36/);
+  assert.match(yml, /ndk;29\.0\.13846066/);
+  assert.equal(yml.includes("setup-ndk"), false);
+});
+
+test("CI android job installs the Tauri NDK instead of a mismatched one", () => {
+  const yml = read(join(ROOT, ".github/workflows/ci.yml"));
+  assert.match(yml, /platforms;android-36/);
+  assert.match(yml, /ndk;29\.0\.13846066/);
+  assert.equal(yml.includes("setup-ndk"), false);
+  assert.match(yml, /CARGO_PROFILE_RELEASE_LTO/);
 });
 
 function fakeGen(packageName) {

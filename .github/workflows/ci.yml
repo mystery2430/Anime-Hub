@@ -67,7 +67,7 @@ jobs:
           cargo fmt --all
           git -C .. diff -- src-tauri > /tmp/fmt.diff
           # The checks API returns annotations. Log blobs are not always readable.
-          node -e 'const fs=require("fs"); const diff=fs.readFileSync("/tmp/fmt.diff","utf8").slice(0,5000); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::rustfmt diff:%0A"+msg);'
+          node -e 'const fs=require("fs"); const diff=fs.readFileSync("/tmp/fmt.diff","utf8").slice(0,12000); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::rustfmt diff:%0A"+msg);'
           exit 1
 
       - name: Clippy
@@ -116,22 +116,23 @@ jobs:
       # before any compile. v4 installs cmdline-tools + platform-tools only.
       - uses: android-actions/setup-android@v4
 
-      - uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27c
-
-      - name: Export NDK and install SDK packages
-        env:
-          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+      # Tauri CLI 2.11 generates compileSdk 36 and, when NDK_HOME is unset,
+      # installs NDK 29.0.13846066. A different NDK left in NDK_HOME makes the
+      # linker lookup fail a few minutes into the APK step, and a missing
+      # platform 36 fails Gradle the same way. Install both as hard requirements.
+      - name: Install SDK 36 and the Tauri NDK
         run: |
           set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "platform-tools" \
+            "ndk;29.0.13846066"
+          NDK_PATH="${ANDROID_HOME}/ndk/29.0.13846066"
+          test -x "${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
-          # Newer templates ask for 36. Missing package must not hide a 35 failure.
-          sdkmanager --install "platforms;android-36" || true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -155,11 +156,14 @@ jobs:
         run: python3 scripts/android_prepare.py
 
       - name: Build APK
-        # The committed release profile (LTO, one codegen unit) is what ships.
-        # One rustc job keeps the link from competing with itself for RAM.
+        # Desktop release uses LTO. On the 7 GB Android runner that link OOMs
+        # after a long compile, so this job overrides the profile for the
+        # invocation only. The committed Cargo.toml profile is unchanged.
         shell: bash
         env:
           CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: |
           set +e
           npm run tauri android build -- --apk --target aarch64 > /tmp/android-build.log 2>&1
@@ -170,6 +174,14 @@ jobs:
             node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" /tmp/android-build.log "android build" || true
             exit "$status"
           fi
+
+      - name: Upload Android build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: /tmp/android-build.log
+          if-no-files-found: ignore
 
   # --------------------------------------- release profile actually links
   # The committed profile is `lto = true` + `codegen-units = 1`. That peaks
@@ -219,11 +231,15 @@ jobs:
 
       - name: No committed secrets
         run: |
-          # Fail if any credential-looking literal is tracked.
+          # Patterns are assembled so this file does not match itself, and so
+          # the frontend secret test (which scans YAML) does not either.
+          private_key="$(printf '%s %s' 'BEGIN (RSA |EC )?PRIVATE' 'KEY')"
+          aws_key="$(printf '%s_%s_%s_%s' aws secret access key)"
+          access_key="$(printf '%s[0-9A-Z]{16}' AKIA)"
           if git grep -nIE \
-            -e 'BEGIN (RSA |EC )?PRIVATE KEY' \
-            -e 'aws_secret_access_key' \
-            -e 'AKIA[0-9A-Z]{16}' \
+            -e "$private_key" \
+            -e "$aws_key" \
+            -e "$access_key" \
             -- . ':(exclude)tests/*'; then
             echo "::error::possible secret committed"
             exit 1

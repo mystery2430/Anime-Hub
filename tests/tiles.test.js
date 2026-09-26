@@ -10,6 +10,8 @@ import {
   validateSiteUrl,
   isPrivateHost,
   validateDraft,
+  safeTileImage,
+  safeDataImage,
 } from "../src/logic/tiles.js";
 
 // ---------------------------------------------------------------- safeColor
@@ -80,6 +82,7 @@ test("tileModel normalises a site into safe strings", () => {
     category: "watching",
     letters: "OA",
     color: "#e11d48",
+    image: null,
     builtin: true,
     native: false,
   });
@@ -276,6 +279,7 @@ test("validateDraft produces a clean draft", () => {
     category: "tracking",
     letter: "ms",
     color: "#abc",
+    image: null,
   });
 });
 
@@ -284,4 +288,52 @@ test("validateDraft defaults the category to watching", () => {
   assert.equal(r.draft.category, "watching");
   assert.equal(r.draft.letter, null);
   assert.equal(r.draft.color, null);
+  assert.equal(r.draft.image, null);
+});
+
+test("safeTileImage allowlists bundled logos and refuses remote URLs", () => {
+  assert.equal(
+    safeTileImage({ kind: "bundled", path: "logos/openanime.png" }),
+    "/logos/openanime.png",
+  );
+  assert.equal(
+    safeTileImage({ kind: "bundled", path: "logos/animecix.png" }),
+    "/logos/animecix.png",
+  );
+  for (const path of ["../secrets.png", "https://evil.example/a.png", "logos/other.png", ""]) {
+    assert.equal(safeTileImage({ kind: "bundled", path }), null, path);
+  }
+  assert.equal(safeTileImage({ kind: "image", data: "https://evil.example/a.png" }), null);
+  assert.equal(safeDataImage("data:image/svg+xml;base64,PHN2Zy8+"), null);
+});
+
+test("tileModel shows a bundled logo and ignores a hostile image URL", () => {
+  const logo = tileModel({
+    id: "builtin-openanime",
+    name: "OpenAnime",
+    icon: { kind: "bundled", path: "logos/openanime.png" },
+  });
+  assert.equal(logo.image, "/logos/openanime.png");
+
+  const hostile = tileModel({
+    id: "x",
+    name: "X",
+    icon: { kind: "image", data: "https://tracker.example/pixel.png" },
+  });
+  assert.equal(hostile.image, null);
+});
+
+test("validateDraft keeps a data-url photo and rejects a remote one", () => {
+  const png = "data:image/png;base64,iVBORw0KGgo=";
+  const ok = validateDraft({ name: "X", url: "https://x.example/", image: png });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.draft.image, png);
+
+  const bad = validateDraft({
+    name: "X",
+    url: "https://x.example/",
+    image: "https://evil.example/a.png",
+  });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.field, "photo");
 });

@@ -100,7 +100,7 @@ const stubState = {
       url: "https://openani.me/",
       host: "openani.me",
       category: "watching",
-      icon: { kind: "letter", text: "OA", color: "#e11d48" },
+      icon: { kind: "bundled", path: "logos/openanime.png" },
       builtin: true,
       hidden: false,
       native: false,
@@ -111,7 +111,7 @@ const stubState = {
       url: "https://animecix.tv/",
       host: "animecix.tv",
       category: "watching",
-      icon: { kind: "letter", text: "AC", color: "#7c3aed" },
+      icon: { kind: "bundled", path: "logos/animecix.png" },
       builtin: true,
       hidden: false,
       native: false,
@@ -175,11 +175,13 @@ function makeStubSite(draft) {
     url: draft.url,
     host: new URL(draft.url).hostname,
     category: draft.category || "watching",
-    icon: {
-      kind: "letter",
-      text: (draft.letter || draft.name).slice(0, 2).toUpperCase(),
-      color: draft.color || "#0ea5e9",
-    },
+    icon: draft.image
+      ? { kind: "image", data: draft.image }
+      : {
+          kind: "letter",
+          text: (draft.letter || draft.name).slice(0, 2).toUpperCase(),
+          color: draft.color || "#0ea5e9",
+        },
     builtin: false,
     hidden: false,
     native: false,

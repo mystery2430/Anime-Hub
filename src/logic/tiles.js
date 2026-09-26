@@ -15,6 +15,18 @@ export const CATEGORIES = [
 const FALLBACK_COLOR = "#0ea5e9";
 
 /**
+ * Shipped logos. The path is an allowlist, not a prefix check: a stored
+ * `../` or `https://` value must never become an `img` source.
+ */
+const BUNDLED_LOGOS = {
+  "logos/openanime.png": "/logos/openanime.png",
+  "logos/animecix.png": "/logos/animecix.png",
+};
+
+/** Largest data URL the tile renderer will accept. Matches the backend byte cap. */
+const DATA_IMAGE_MAX = 280_000;
+
+/**
  * Validate a `#rgb` / `#rrggbb` colour before it is used anywhere.
  *
  * The colour ends up in an inline `style.background`, which is a real
@@ -45,6 +57,35 @@ export function safeColor(value) {
  * is not a letter or digit is dropped, so the disc never overflows and never
  * carries markup.
  */
+/**
+ * A tile image the renderer may assign to `img.src`.
+ *
+ * Bundled logos must be on the allowlist. User photos must be a PNG, JPEG or
+ * WebP data URL. Remote URLs are rejected: fetching one would tell that host
+ * which tiles this install has.
+ */
+export function safeTileImage(icon) {
+  if (!icon || typeof icon !== "object") return null;
+  if (icon.kind === "bundled") {
+    return BUNDLED_LOGOS[String(icon.path || "")] || null;
+  }
+  if (icon.kind === "image") {
+    return safeDataImage(icon.data);
+  }
+  return null;
+}
+
+/** Canonical `data:image/(png|jpeg|webp);base64,...` or null. */
+export function safeDataImage(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > DATA_IMAGE_MAX) {
+    return null;
+  }
+  if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    return null;
+  }
+  return value;
+}
+
 export function iconLetters(name, explicit) {
   const strip = (v) => String(v ?? "").replace(/[^\p{L}\p{N}]/gu, "");
 
@@ -84,6 +125,7 @@ export function tileModel(site) {
     category: site.category === "tracking" ? "tracking" : "watching",
     letters: iconLetters(name, icon.text),
     color: safeColor(icon.color) || FALLBACK_COLOR,
+    image: safeTileImage(site.icon),
     builtin: Boolean(site.builtin),
     native: Boolean(site.native),
   };
@@ -218,6 +260,15 @@ export function validateDraft(input) {
     return { ok: false, field: "color", message: "Renk #rrggbb biçiminde olmalı." };
   }
 
+  const image = imageForDraft(input.image);
+  if (image === false) {
+    return {
+      ok: false,
+      field: "photo",
+      message: "Fotoğraf PNG, JPEG veya WebP olmalı.",
+    };
+  }
+
   return {
     ok: true,
     draft: {
@@ -226,6 +277,17 @@ export function validateDraft(input) {
       category: input.category === "tracking" ? "tracking" : "watching",
       letter: letter || null,
       color: color ? safeColor(color) : null,
+      image,
     },
   };
+}
+
+/**
+ * `undefined` / `null` means "leave the stored photo alone".
+ * `""` clears it. A data URL replaces it. Anything else is `false`.
+ */
+function imageForDraft(image) {
+  if (image == null) return null;
+  if (image === "") return "";
+  return safeDataImage(image) || false;
 }
