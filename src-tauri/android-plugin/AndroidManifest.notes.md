@@ -40,9 +40,11 @@ The scheme must match `OAUTH_SCHEME` in `src-tauri/src/lib.rs` and the
 `plugins.deep-link` block in `src-tauri/tauri.conf.json`. The redirect URI
 registered with AniList must be exactly `animehub://anilist/callback`.
 
-Tauri's deep-link plugin also generates this filter from the
-`plugins.deep-link.mobile` config on `tauri android init`, so check the
-generated manifest first and only add it by hand if it is absent.
+Tauri's deep-link plugin rewrites this filter from
+`plugins.deep-link.mobile` while building for Android. That field is a
+list of domains, not a map — a map fails the plugin build script with
+`invalid type: map, expected a sequence`. `scripts/android_prepare.py`
+still adds the filter if the generated manifest does not have it yet.
 
 ## Keystore bridge
 

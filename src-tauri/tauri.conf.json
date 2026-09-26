@@ -36,11 +36,14 @@
       "desktop": {
         "schemes": ["animehub"]
       },
-      "mobile": {
-        "animehub": {
-          "paths": ["/anilist/callback"]
+      "mobile": [
+        {
+          "scheme": ["animehub"],
+          "host": "anilist",
+          "pathPrefix": ["/callback"],
+          "appLink": false
         }
-      }
+      ]
     }
   },
   "bundle": {
