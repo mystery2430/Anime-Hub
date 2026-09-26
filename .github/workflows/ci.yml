@@ -52,23 +52,17 @@ jobs:
         run: npm test
 
       - name: Rust format
-        run: |
-          set +e
-          cargo fmt --all -- --check
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ]; then
-            cargo fmt --all
-            {
-              echo '## rustfmt diff'
-              echo '```diff'
-              git -C .. diff -- src-tauri | head -c 50000
-              echo
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
+        shell: bash
         working-directory: src-tauri
+        run: |
+          if cargo fmt --all -- --check; then
+            exit 0
+          fi
+          cargo fmt --all
+          git -C .. diff -- src-tauri > /tmp/fmt.diff
+          # The checks API returns annotations. Log blobs are not always readable.
+          node -e 'const fs=require("fs"); const diff=fs.readFileSync("/tmp/fmt.diff","utf8").slice(0,5000); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::rustfmt diff:%0A"+msg);'
+          exit 1
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
