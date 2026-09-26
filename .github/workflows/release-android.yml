@@ -46,7 +46,8 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
+      # v3 asks for the removed `tools` package and fails the job. v4 does not.
+      - uses: android-actions/setup-android@v4
 
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
