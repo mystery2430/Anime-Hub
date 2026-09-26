@@ -39,7 +39,7 @@ AniList'te giriş yapmanız bir izleme sitesini etkilemez.
 | Grup | İçerik |
 |---|---|
 | **Takip / Veritabanı** | MyAnimeList, AniList. AniList ayrıca uygulama içinden OAuth ile bağlanır |
-| **İzleme** | OpenAnime, AnimeCix + sizin ekledikleriniz |
+| **İzleme** | OpenAnime, Animecix + sizin ekledikleriniz |
 
 Uygulama `openani.me` gibi sitelerin içeriğini **barındırmaz, indirmaz veya
 yeniden yayınlamaz**; yalnızca sizin seçtiğiniz adresi sistemin kendi WebView
