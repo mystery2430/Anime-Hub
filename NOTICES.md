@@ -1,8 +1,8 @@
 # Third-party notices
 
-AnimeHub is dual-licensed under **MIT OR Apache-2.0** (see `LICENSE-MIT` and
-`LICENSE-APACHE`). This file covers the projects whose *design* informed
-AnimeHub, and the licences that apply to what actually ships.
+AnimeHub is licensed under **MIT** (see `LICENSE`). This file covers the
+projects whose *design* informed AnimeHub, and the licences that apply to
+what actually ships. Dependencies keep their own licences.
 
 ---
 
@@ -25,7 +25,7 @@ public documentation:
 - GraphQL v2 — <https://anilist.gitbook.io/anilist-apiv2-docs/>
 
 **Licence consequence:** because no GPL-covered work is copied, linked, or
-derived, AnimeHub is **not** subject to the GPL and remains MIT/Apache-2.0.
+derived, AnimeHub is **not** subject to the GPL and remains MIT.
 If you later copy Dantotsu code into this repository, the combined work
 becomes GPL-3.0-or-later, and this file plus the `license` fields in
 `src-tauri/Cargo.toml` and `package.json` must be updated to match.
@@ -60,9 +60,9 @@ or AnimeCix.
 MyAnimeList, AniList, OpenAnime and AnimeCix are the property of their
 respective owners. AnimeHub is an unofficial client, not endorsed by or
 affiliated with any of them; names and default URLs are used nominatively to
-identify the services. The AnimeCix tile uses that site's icon for the same
-reason. The OpenAnime tile uses an original rose play mark shipped in
-`public/logos/openanime.png`, not their official logo.
+identify the services. The OpenAnime and AnimeCix tiles use those sites'
+icons for the same reason. They are not AnimeHub assets and are not
+relicensed.
 
 AniList's API is a public service — respect its
 [terms](https://anilist.co/terms) and rate limits. A client ID is issued per

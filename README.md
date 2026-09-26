@@ -20,7 +20,7 @@
 
 [![Release](https://img.shields.io/github/v/release/mystery2430/Anime-Hub?style=flat-square&color=62cdfe&label=s%C3%BCr%C3%BCm)](https://github.com/mystery2430/Anime-Hub/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/mystery2430/Anime-Hub/ci.yml?style=flat-square&color=62cdfe&label=CI)](https://github.com/mystery2430/Anime-Hub/actions)
-[![Lisans](https://img.shields.io/badge/Lisans-MIT%20%7C%20Apache--2.0-green?style=flat-square)](#lisans-ve-atıf)
+[![Lisans](https://img.shields.io/badge/Lisans-MIT-green?style=flat-square)](#lisans-ve-atıf)
 
 </div>
 
@@ -378,9 +378,7 @@ kişiye düşen işler [`HANDOFF.md`](./HANDOFF.md) dosyasında.
 
 ## 📄&nbsp; Lisans ve atıf
 
-**MIT** veya **Apache-2.0** — hangisini tercih ederseniz. Metinler
-[`LICENSE-MIT`](./LICENSE-MIT) ve [`LICENSE-APACHE`](./LICENSE-APACHE)
-dosyalarında.
+**MIT.** Metin [`LICENSE`](./LICENSE) dosyasında.
 
 Bu proje **temiz oda** (clean-room) bir uygulamadır: GPLv3 lisanslı
 **Dantotsu**'dan **hiçbir kod taşınmamıştır**; yalnızca API yaklaşımı

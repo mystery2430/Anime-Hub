@@ -605,7 +605,7 @@ async function openAbout() {
         true,
       );
     }
-    appendAboutRow("Lisans", "MIT OR Apache-2.0");
+    appendAboutRow("Lisans", "MIT");
   } catch (e) {
     el.aboutList.textContent = "";
     appendAboutRow("Hata", errMessage(e), true);
