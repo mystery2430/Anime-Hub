@@ -88,6 +88,8 @@ export function toApiError(e) {
 
 // ---------------------------------------------------------------------------
 // Browser-only stub, so `npm run dev` outside Tauri still shows a launcher.
+// The shipped defaults live in `src-tauri/src/sites/registry.rs`. Keep this
+// copy in step with `default_sites()`; it is not generated.
 // ---------------------------------------------------------------------------
 
 const stubState = {

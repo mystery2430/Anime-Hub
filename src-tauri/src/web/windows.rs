@@ -57,9 +57,10 @@ fn open_on_desktop(
 
     // Re-focus an already-open session instead of stacking windows.
     if let Some(existing) = app.get_webview_window(&label) {
-        existing
-            .set_focus()
-            .map_err(|e| AppError::Other(e.to_string()))?;
+        existing.set_focus().map_err(|e| {
+            log::error!("pencere öne alınamadı: {e}");
+            AppError::Other("pencere öne alınamadı".into())
+        })?;
         return Ok(label);
     }
 
@@ -69,7 +70,10 @@ fn open_on_desktop(
     let data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|e| AppError::Storage(e.to_string()))?
+        .map_err(|e| {
+            log::error!("uygulama veri dizini alınamadı: {e}");
+            AppError::Storage("uygulama veri dizini alınamadı".into())
+        })?
         .join("profiles")
         .join(profile_dir_name(&site.id));
     std::fs::create_dir_all(&data_dir)?;
@@ -133,7 +137,10 @@ fn open_on_desktop(
         // `open_site_externally` instead.
         .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
         .build()
-        .map_err(|e| AppError::Other(format!("WebView açılamadı: {e}")))?;
+        .map_err(|e| {
+            log::error!("WebView açılamadı: {e}");
+            AppError::Other("WebView açılamadı".into())
+        })?;
 
     {
         let state = app.state::<AppState>();
@@ -174,17 +181,26 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     // 2. Clear the shared jar, then load the target site's cookies.
     window
         .clear_all_browsing_data()
-        .map_err(|e| AppError::Other(format!("çerezler temizlenemedi: {e}")))?;
+        .map_err(|e| {
+            log::error!("çerezler temizlenemedi: {e}");
+            AppError::Other("çerezler temizlenemedi".into())
+        })?;
     import_cookies(&window, &site.id)?;
 
     // 3. Install the cosmetic/anti-popup script for this navigation.
     window
         .eval(init_script)
-        .map_err(|e| AppError::Other(format!("script yüklenemedi: {e}")))?;
+        .map_err(|e| {
+            log::error!("script yüklenemedi: {e}");
+            AppError::Other("script yüklenemedi".into())
+        })?;
 
     window
         .navigate(url.clone())
-        .map_err(|e| AppError::Other(format!("sayfa açılamadı: {e}")))?;
+        .map_err(|e| {
+            log::error!("sayfa açılamadı: {e}");
+            AppError::Other("sayfa açılamadı".into())
+        })?;
 
     *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
         site_id: site.id.clone(),
@@ -202,7 +218,10 @@ fn export_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()>
 
     let live = window
         .cookies()
-        .map_err(|e| AppError::Other(e.to_string()))?;
+        .map_err(|e| {
+            log::error!("çerezler okunamadı: {e}");
+            AppError::Other("çerezler okunamadı".into())
+        })?;
     let now = crate::anilist::now_unix();
 
     let mut jar = CookieJar {
@@ -257,9 +276,10 @@ pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
     if cfg!(any(target_os = "android", target_os = "ios")) {
         // Mobile: save the jar, then send the WebView back to the launcher.
         if let Some(current) = &current {
-            if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-                let _ = export_cookies(&window, &current.site_id);
-            }
+            let window = app
+                .get_webview_window(LAUNCHER_LABEL)
+                .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
+            export_cookies(&window, &current.site_id)?;
         }
         if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
             let state = app.state::<AppState>();
@@ -269,7 +289,10 @@ pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
                 .expect("launcher_url lock")
                 .clone();
             if let Some(url) = back {
-                let _ = window.navigate(url);
+                window.navigate(url).map_err(|e| {
+                    log::error!("başlatıcıya dönülemedi: {e}");
+                    AppError::Other("başlatıcıya dönülemedi".into())
+                })?;
             }
         }
         let state = app.state::<AppState>();
@@ -279,9 +302,12 @@ pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
 
     if let Some(window) = app.get_webview_window(label) {
         if let Some(current) = &current {
-            let _ = export_cookies(&window, &current.site_id);
+            export_cookies(&window, &current.site_id)?;
         }
-        window.close().map_err(|e| AppError::Other(e.to_string()))?;
+        window.close().map_err(|e| {
+            log::error!("pencere kapatılamadı: {e}");
+            AppError::Other("pencere kapatılamadı".into())
+        })?;
     }
 
     // Only clear the tracking entry if it was this window's site.
@@ -308,8 +334,10 @@ pub fn open_externally(app: &AppHandle, raw: &str) -> AppResult<()> {
     if blocked {
         return Err(AppError::Blocked(safe.host().to_string()));
     }
-    tauri_plugin_opener::open_url(safe.as_str(), None::<&str>)
-        .map_err(|e| AppError::Other(e.to_string()))
+    tauri_plugin_opener::open_url(safe.as_str(), None::<&str>).map_err(|e| {
+        log::error!("adres tarayıcıda açılamadı: {e}");
+        AppError::Other("adres tarayıcıda açılamadı".into())
+    })
 }
 
 #[cfg(test)]

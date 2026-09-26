@@ -95,6 +95,11 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(w) = &warning {
         log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü: {w}");
     }
+    // The raw error stays in the log. The notice is a fixed sentence so a
+    // parse fragment never reaches the launcher.
+    let startup_warning = warning
+        .as_ref()
+        .map(|_| "Kayıtlı site listesi okunamadı, varsayılanlara dönüldü.".to_string());
     if !provider.backend().is_os_backed() {
         log::warn!(
             "işletim sistemi anahtar deposu bulunamadı; anahtar {} olarak saklanıyor",
@@ -111,7 +116,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         settings: Mutex::new(settings),
         blocklist: Mutex::new(blocklist),
         oauth_state: Mutex::new(None),
-        startup_warning: Mutex::new(warning),
+        startup_warning: Mutex::new(startup_warning),
         launcher_url: Mutex::new(launcher_url),
         current_site: Mutex::new(None),
     });

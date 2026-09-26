@@ -231,8 +231,11 @@ pub fn remove_site(state: State<'_, AppState>, id: String) -> AppResult<()> {
         reg.remove(&id)?;
     }
     persist_registry(&state)?;
-    // The site's cookie jar is useless once the tile is gone.
-    let _ = state.provider.delete_secret(&format!("cookies-{}", id));
+    // Delete the jar before reporting success. A swallowed failure would
+    // leave the site's cookies on disk after the tile is gone.
+    state
+        .provider
+        .delete_secret(&format!("cookies-{id}"))?;
     Ok(())
 }
 
@@ -354,22 +357,28 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     };
     let mut n = 0;
     for id in &ids {
-        if state
+        state
             .provider
-            .delete_secret(&format!("cookies-{id}"))
-            .is_ok()
-        {
-            n += 1;
-        }
+            .delete_secret(&format!("cookies-{id}"))?;
+        n += 1;
     }
-    // Desktop profile directories hold the real cookie DB, so drop them too.
+    // Desktop profile directories hold the real cookie DB. A missing
+    // directory is success; a failed delete is not.
+    let base = app.path().app_data_dir().map_err(|e| {
+        log::error!("profil dizini bulunamadı: {e}");
+        AppError::Storage("profil dizini bulunamadı".into())
+    })?;
     for id in &ids {
-        let dir = app.path().app_data_dir().ok().map(|d| {
-            d.join("profiles")
-                .join(crate::web::session::profile_dir_name(id))
-        });
-        if let Some(dir) = dir {
-            let _ = std::fs::remove_dir_all(dir);
+        let dir = base
+            .join("profiles")
+            .join(crate::web::session::profile_dir_name(id));
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::error!("profil dizini silinemedi: {e}");
+                return Err(AppError::Storage("site verisi silinemedi".into()));
+            }
         }
     }
     Ok(n)
@@ -641,12 +650,16 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
                 }
                 // Refresh rejected => the session is over.
                 Err(_) => {
-                    let _ = state.provider.delete_secret("anilist-token");
+                    if let Err(e) = state.provider.delete_secret("anilist-token") {
+                        log::error!("süresi dolmuş AniList oturumu silinemedi: {e}");
+                    }
                     return Ok(None);
                 }
             },
             None => {
-                let _ = state.provider.delete_secret("anilist-token");
+                if let Err(e) = state.provider.delete_secret("anilist-token") {
+                    log::error!("yenilenemeyen AniList oturumu silinemedi: {e}");
+                }
                 return Ok(None);
             }
         }
@@ -661,7 +674,9 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
             avatar: v.avatar_large,
         })),
         Err(AppError::Unauthorized) => {
-            let _ = state.provider.delete_secret("anilist-token");
+            if let Err(e) = state.provider.delete_secret("anilist-token") {
+                log::error!("geçersiz AniList oturumu silinemedi: {e}");
+            }
             Ok(None)
         }
         Err(e) => Err(e),
