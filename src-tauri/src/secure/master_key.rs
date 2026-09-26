@@ -275,7 +275,8 @@ mod windows {
     use super::*;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_PROMPTSTRUCT, CRYPTPROTECT_UI_FORBIDDEN,
+        CRYPT_INTEGER_BLOB,
     };
 
     const DPAPI_FILE_NAME: &str = "animehub.key.dpapi";
@@ -303,27 +304,33 @@ mod windows {
         })
     }
 
+    /// DPAPI wants a mutable byte pointer. The slice is not written.
+    fn blob_from(bytes: &[u8]) -> AppResult<CRYPT_INTEGER_BLOB> {
+        let cb_data = u32::try_from(bytes.len())
+            .map_err(|_| AppError::Keyring("veri DPAPI için çok büyük".into()))?;
+        Ok(CRYPT_INTEGER_BLOB {
+            cbData: cb_data,
+            pbData: bytes.as_ptr().cast_mut(),
+        })
+    }
+
     fn dpapi_protect(plain: &[u8]) -> AppResult<Vec<u8>> {
-        let mut data_in = CRYPT_INTEGER_BLOB {
-            cbData: plain.len() as u32,
-            pbData: plain.as_ptr().cast_mut(),
-        };
-        let mut entropy = CRYPT_INTEGER_BLOB {
-            cbData: ENTROPY.len() as u32,
-            pbData: ENTROPY.as_ptr().cast_mut(),
-        };
+        let mut data_in = blob_from(plain)?;
+        let mut entropy = blob_from(ENTROPY)?;
         let mut out = CRYPT_INTEGER_BLOB {
             cbData: 0,
             pbData: core::ptr::null_mut(),
         };
 
+        // windows-sys takes `*const` for the inputs and the unused prompt.
+        // Untyped `null_mut()` does not infer those parameter types.
         let ok = unsafe {
             CryptProtectData(
-                &mut data_in,
+                &data_in,
                 core::ptr::null(),
-                &mut entropy,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
+                &entropy,
+                core::ptr::null::<core::ffi::c_void>(),
+                core::ptr::null::<CRYPTPROTECT_PROMPTSTRUCT>(),
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut out,
             )
@@ -331,22 +338,17 @@ mod windows {
         if ok == 0 {
             return Err(AppError::Keyring("DPAPI şifrelemesi başarısız".into()));
         }
-        let blob = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+        let blob =
+            unsafe { std::slice::from_raw_parts(out.pbData, usize::from(out.cbData)) }.to_vec();
         unsafe {
-            let _ = LocalFree(out.pbData.cast());
+            let _freed = LocalFree(out.pbData.cast());
         }
         Ok(blob)
     }
 
     fn dpapi_unprotect(blob: &[u8]) -> AppResult<Zeroizing<[u8; 32]>> {
-        let mut data_in = CRYPT_INTEGER_BLOB {
-            cbData: blob.len() as u32,
-            pbData: blob.as_ptr().cast_mut(),
-        };
-        let mut entropy = CRYPT_INTEGER_BLOB {
-            cbData: ENTROPY.len() as u32,
-            pbData: ENTROPY.as_ptr().cast_mut(),
-        };
+        let mut data_in = blob_from(blob)?;
+        let mut entropy = blob_from(ENTROPY)?;
         let mut out = CRYPT_INTEGER_BLOB {
             cbData: 0,
             pbData: core::ptr::null_mut(),
@@ -354,11 +356,11 @@ mod windows {
 
         let ok = unsafe {
             CryptUnprotectData(
-                &mut data_in,
+                &data_in,
                 core::ptr::null_mut(),
-                &mut entropy,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
+                &entropy,
+                core::ptr::null::<core::ffi::c_void>(),
+                core::ptr::null::<CRYPTPROTECT_PROMPTSTRUCT>(),
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut out,
             )
@@ -368,9 +370,10 @@ mod windows {
                 "DPAPI çözülemedi — farklı bir Windows kullanıcısı olabilir".into(),
             ));
         }
-        let plain = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+        let plain =
+            unsafe { std::slice::from_raw_parts(out.pbData, usize::from(out.cbData)) }.to_vec();
         unsafe {
-            let _ = LocalFree(out.pbData.cast());
+            let _freed = LocalFree(out.pbData.cast());
         }
         let plain = Zeroizing::new(plain);
         if plain.len() != 32 {

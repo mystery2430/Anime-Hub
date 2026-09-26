@@ -123,15 +123,23 @@ pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
     }
 }
 
+/// Type-erased mobile invoke.
+///
+/// `tauri::plugin::mobile::PluginHandle` is private, and `init` is generic
+/// over the runtime, so the handle cannot be stored as `PluginHandle<Wry>`.
+/// The closure owns whatever `register_android_plugin` returned.
+#[cfg(target_os = "android")]
+type MobileCall = dyn Fn(&str, serde_json::Value) -> std::result::Result<serde_json::Value, String>
+    + Send;
+
 /// The registered plugin handle.
 ///
 /// Set exactly once by [`init`]. The free functions above are called from
 /// plain Rust (no `AppHandle` in scope), so the handle has to live in a
 /// global; it is only ever written during setup, before any command runs.
 #[cfg(target_os = "android")]
-static HANDLE: std::sync::OnceLock<
-    std::sync::Mutex<Option<tauri::plugin::mobile::PluginHandle<tauri::Wry>>>,
-> = std::sync::OnceLock::new();
+static HANDLE: std::sync::OnceLock<std::sync::Mutex<Option<Box<MobileCall>>>> =
+    std::sync::OnceLock::new();
 
 /// Wire format for the Keystore commands.
 #[cfg(target_os = "android")]
@@ -175,9 +183,9 @@ fn call_plugin<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         .as_ref()
         .ok_or_else(|| Error::Bridge("plugin henüz başlatılmamış".into()))?;
 
-    handle
-        .run_mobile_plugin::<R>(cmd, payload)
-        .map_err(|e| Error::Bridge(e.to_string()))
+    let payload = serde_json::to_value(payload).map_err(|e| Error::Bridge(e.to_string()))?;
+    let value = handle(cmd, payload).map_err(Error::Bridge)?;
+    serde_json::from_value(value).map_err(|e| Error::Bridge(e.to_string()))
 }
 
 /// Register the plugin with a Tauri app.
@@ -195,9 +203,14 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
                 // refuses to continue if the generated MainActivity package
                 // disagrees with this string.
                 let handle = api.register_android_plugin("dev.animehub.app", "AnimeHubPlugin")?;
+                let call: Box<MobileCall> = Box::new(move |cmd, payload| {
+                    handle
+                        .run_mobile_plugin(cmd, payload)
+                        .map_err(|e| e.to_string())
+                });
                 let slot = HANDLE.get_or_init(|| std::sync::Mutex::new(None));
                 if let Ok(mut guard) = slot.lock() {
-                    *guard = Some(handle);
+                    *guard = Some(call);
                 } else {
                     return Err(Box::from("Android plugin handle kaydedilemedi"));
                 }
