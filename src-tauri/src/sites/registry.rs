@@ -135,6 +135,17 @@ pub fn sanitize_color(raw: &str, fallback: &str) -> String {
     }
 }
 
+/// Shipped URL that a later release replaced. Only this exact string is
+/// rewritten; anything the user saved stays.
+fn retired_builtin_url(id: &str, url: &str) -> Option<&'static str> {
+    if id == "builtin-animecix" && (url == "https://animecix.com/" || url == "https://animecix.com")
+    {
+        Some("https://animecix.tv/")
+    } else {
+        None
+    }
+}
+
 /// The sites every install starts with.
 pub fn default_sites() -> Vec<Site> {
     vec![
@@ -154,7 +165,7 @@ pub fn default_sites() -> Vec<Site> {
         Site {
             id: "builtin-animecix".into(),
             name: "AnimeCix".into(),
-            url: "https://animecix.com/".into(),
+            url: "https://animecix.tv/".into(),
             category: Category::Watching,
             icon: Icon::Letter {
                 text: "AC".into(),
@@ -340,10 +351,16 @@ impl Registry {
     }
 
     /// Merge in any built-ins that are missing (e.g. after a partial wipe or a
-    /// downgrade of the stored document).
+    /// downgrade of the stored document). A built-in still pointing at a
+    /// retired shipped URL is moved forward. A URL the user set with
+    /// [`Self::update`] is left alone.
     pub fn ensure_builtins(&mut self) {
         for b in default_sites() {
-            if !self.sites.iter().any(|s| s.id == b.id) {
+            if let Some(existing) = self.sites.iter_mut().find(|s| s.id == b.id) {
+                if let Some(next) = retired_builtin_url(&existing.id, &existing.url) {
+                    existing.url = next.to_string();
+                }
+            } else {
                 self.sites.push(b);
             }
         }
@@ -496,6 +513,32 @@ mod tests {
         r.sites.clear();
         r.ensure_builtins();
         assert_eq!(r.sites.len(), 2);
+    }
+
+    #[test]
+    fn ensure_builtins_repoints_retired_animecix_but_not_a_user_edit() {
+        let mut r = Registry::new_default();
+        r.sites
+            .iter_mut()
+            .find(|s| s.id == "builtin-animecix")
+            .unwrap()
+            .url = "https://animecix.com/".into();
+        r.ensure_builtins();
+        assert_eq!(
+            r.get("builtin-animecix").unwrap().url,
+            "https://animecix.tv/"
+        );
+
+        r.update(
+            "builtin-animecix",
+            draft("AnimeCix", "https://animecix.net/"),
+        )
+        .unwrap();
+        r.ensure_builtins();
+        assert_eq!(
+            r.get("builtin-animecix").unwrap().url,
+            "https://animecix.net/"
+        );
     }
 
     #[test]

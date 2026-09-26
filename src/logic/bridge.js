@@ -106,8 +106,8 @@ const stubState = {
     {
       id: "builtin-animecix",
       name: "AnimeCix",
-      url: "https://animecix.com/",
-      host: "animecix.com",
+      url: "https://animecix.tv/",
+      host: "animecix.tv",
       category: "watching",
       icon: { kind: "letter", text: "AC", color: "#7c3aed" },
       builtin: true,

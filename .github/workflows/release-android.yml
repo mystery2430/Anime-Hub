@@ -127,14 +127,16 @@ jobs:
           umask 077
           test -d src-tauri/gen/android
           echo "$KEYSTORE_B64" | base64 -d > /tmp/animehub.keystore
+          # Quoted printf, not an unquoted heredoc: a secret that contains
+          # `$(...)` or backticks must not be expanded by the shell.
           # Gradle reads this path. It is created only after android init,
           # and it is deleted in the shred step below.
-          cat > src-tauri/gen/android/keystore.properties <<EOF
-          storeFile=/tmp/animehub.keystore
-          storePassword=${STORE_PASSWORD}
-          keyAlias=${KEY_ALIAS}
-          keyPassword=${KEY_PASSWORD}
-          EOF
+          {
+            printf 'storeFile=%s\n' /tmp/animehub.keystore
+            printf 'storePassword=%s\n' "$STORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } > src-tauri/gen/android/keystore.properties
           echo "keystore ready"
 
       - name: Build APK

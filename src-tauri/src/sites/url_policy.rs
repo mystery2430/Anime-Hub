@@ -248,9 +248,9 @@ mod tests {
 
     #[test]
     fn accepts_https_with_path_and_query() {
-        let s = validate_site_url("https://animecix.com/series/x?tab=1#frag").expect("valid");
-        assert_eq!(s.as_str(), "https://animecix.com/series/x?tab=1");
-        assert_eq!(s.host(), "animecix.com");
+        let s = validate_site_url("https://animecix.tv/series/x?tab=1#frag").expect("valid");
+        assert_eq!(s.as_str(), "https://animecix.tv/series/x?tab=1");
+        assert_eq!(s.host(), "animecix.tv");
     }
 
     #[test]

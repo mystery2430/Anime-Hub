@@ -38,7 +38,7 @@ fn default_sites_are_the_two_documented_ones() {
     assert_eq!(visible[0].url, "https://openani.me/");
     assert_eq!(visible[1].id, "builtin-animecix");
     assert_eq!(visible[1].name, "AnimeCix");
-    assert_eq!(visible[1].url, "https://animecix.com/");
+    assert_eq!(visible[1].url, "https://animecix.tv/");
 
     for site in &visible {
         assert_eq!(site.category, Category::Watching);
@@ -134,7 +134,7 @@ fn url_policy_accepts_legitimate_urls() {
         ("https://openani.me", "openani.me"), // kök yol eklenir
         ("https://openani.me:8080/", "openani.me"),
         ("https://openani.me/watch#bolum-3", "openani.me"), // fragment düşer
-        ("https://www.animecix.com/x", "www.animecix.com"),
+        ("https://www.animecix.tv/x", "www.animecix.tv"),
         ("  https://openani.me/  ", "openani.me"), // boşluk kırpılır
     ];
 

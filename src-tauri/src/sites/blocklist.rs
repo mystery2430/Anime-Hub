@@ -246,7 +246,7 @@ mod tests {
         let b = bl();
         for h in [
             "openani.me",
-            "animecix.com",
+            "animecix.tv",
             "anilist.co",
             "myanimelist.net",
         ] {

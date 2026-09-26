@@ -157,7 +157,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("ok", false)); return
       }
       val params = PictureInPictureParams.Builder()
-        .setAspectRatio(Rational(clampRatio(num), clampRatio(den)))
+        .setAspectRatio(safeAspectRatio(num, den))
         .build()
       val ok = activity.enterPictureInPictureMode(params)
       invoke.resolve(JSObject().put("ok", ok))
@@ -201,7 +201,22 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       return if (cleaned.isEmpty()) "default" else cleaned
     }
 
-    /** Android rejects aspect ratios outside roughly 1:2.39 .. 2.39:1. */
-    private fun clampRatio(v: Int): Int = v.coerceIn(1, 239)
+    /**
+     * Android rejects PiP ratios outside about 1:2.39 .. 2.39:1.
+     * Clamping each side on its own still allows 239:1, which
+     * `setAspectRatio` refuses.
+     */
+    private const val MAX_RATIO = 2.39
+    private const val MIN_RATIO = 0.41841 // 1 / 2.39
+
+    private fun safeAspectRatio(num: Int, den: Int): Rational {
+      val n = num.coerceAtLeast(1)
+      val d = den.coerceAtLeast(1)
+      return when {
+        n.toDouble() / d.toDouble() > MAX_RATIO -> Rational(2390, 1000)
+        n.toDouble() / d.toDouble() < MIN_RATIO -> Rational(1000, 2390)
+        else -> Rational(n, d)
+      }
+    }
   }
 }

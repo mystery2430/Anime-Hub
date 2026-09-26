@@ -141,9 +141,9 @@ test("validateSiteUrl accepts https and normalises it", () => {
 });
 
 test("validateSiteUrl keeps path and query", () => {
-  const r = validateSiteUrl("https://animecix.com/series/x?tab=1");
+  const r = validateSiteUrl("https://animecix.tv/series/x?tab=1");
   assert.equal(r.ok, true);
-  assert.equal(r.normalized, "https://animecix.com/series/x?tab=1");
+  assert.equal(r.normalized, "https://animecix.tv/series/x?tab=1");
 });
 
 test("validateSiteUrl refuses http rather than upgrading it", () => {
@@ -205,7 +205,7 @@ test("isPrivateHost catches CGNAT and multicast", () => {
 });
 
 test("isPrivateHost accepts public hosts and the CGNAT boundary", () => {
-  for (const h of ["openani.me", "animecix.com", "anilist.co", "1.1.1.1", "100.128.0.1"]) {
+  for (const h of ["openani.me", "animecix.tv", "anilist.co", "1.1.1.1", "100.128.0.1"]) {
     assert.equal(isPrivateHost(h), false, `${h} must be public`);
   }
 });
