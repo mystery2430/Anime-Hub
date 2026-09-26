@@ -40,17 +40,25 @@ The scheme must match `OAUTH_SCHEME` in `src-tauri/src/lib.rs` and the
 `plugins.deep-link` block in `src-tauri/tauri.conf.json`. The redirect URI
 registered with AniList must be exactly `animehub://anilist/callback`.
 
-Tauri's deep-link plugin also generates this filter from the
-`plugins.deep-link.mobile` config on `tauri android init`, so check the
-generated manifest first and only add it by hand if it is absent.
+Tauri's deep-link plugin rewrites this filter from
+`plugins.deep-link.mobile` while building for Android. That field is a
+list of domains, not a map — a map fails the plugin build script with
+`invalid type: map, expected a sequence`. `scripts/android_prepare.py`
+still adds the filter if the generated manifest does not have it yet.
 
 ## Keystore bridge
 
-Copy
-[`dev_animehub_app/AnimeHubPlugin.kt`](dev_animehub_app/AnimeHubPlugin.kt)
-into `src-tauri/gen/android/app/src/main/java/dev_animehub_app/`, next to the
-generated `MainActivity.kt`. No manifest entry or permission is needed:
-`AndroidKeyStore` is available to every app without a runtime permission.
+Do not copy the Kotlin file by hand. After `tauri android init`, run
+`python3 scripts/android_prepare.py`. It copies
+[`kotlin/dev/animehub/app/AnimeHubPlugin.kt`](kotlin/dev/animehub/app/AnimeHubPlugin.kt)
+next to the generated `MainActivity.kt`, adds
+`android:supportsPictureInPicture="true"` if it is missing, adds the
+`animehub://anilist/callback` intent filter if Tauri did not, and writes a
+ProGuard keep rule so R8 cannot strip a class that is only named from JNI.
+
+The script exits non-zero if the generated package is not `dev.animehub.app`.
+No manifest permission is needed for the keystore: `AndroidKeyStore` is
+available to every app without a runtime permission.
 
 ## Verification status
 

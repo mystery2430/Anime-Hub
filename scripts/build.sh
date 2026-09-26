@@ -64,7 +64,7 @@ case "$cmd" in
       echo "libwebkit2gtk-4.1-dev is required; see README" >&2
       exit 1
     fi
-    $TAURI build --bundles appimage deb rpm
+    $TAURI build --bundles appimage,deb,rpm
     ;;
 
   windows)
@@ -79,6 +79,8 @@ case "$cmd" in
     : "${ANDROID_HOME:?set ANDROID_HOME to your Android SDK}"
     : "${NDK_HOME:?set NDK_HOME to your NDK}"
     [[ -d src-tauri/gen/android ]] || $TAURI android init
+    # init does not know about the Kotlin bridge or the PiP manifest flag.
+    python3 scripts/android_prepare.py
     # Signing is picked up from gen/android/keystore.properties if present;
     # otherwise the APK is unsigned. Never commit the keystore.
     if [[ "${ANDROID_SPLIT:-0}" == "1" ]]; then

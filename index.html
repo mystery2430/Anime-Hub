@@ -50,7 +50,7 @@
             <span>Adres (yalnızca HTTPS)</span>
             <input name="url" type="url" inputmode="url" placeholder="https://ornek.site" autocomplete="off" required />
           </label>
-          <div class="field-row">
+          <div class="field-row" id="letter-row">
             <label class="field">
               <span>Kısaltma</span>
               <input name="letter" type="text" maxlength="2" autocomplete="off" />
@@ -59,6 +59,18 @@
               <span>Renk</span>
               <input name="color" type="text" placeholder="#0ea5e9" autocomplete="off" />
             </label>
+          </div>
+          <div class="field photo-field" id="photo-field">
+            <span>Fotoğraf</span>
+            <div class="photo-row">
+              <span class="photo-preview" id="photo-preview" aria-hidden="true"></span>
+              <div class="photo-actions">
+                <button type="button" class="btn ghost" id="btn-pick-photo">Fotoğraf seç</button>
+                <button type="button" class="btn ghost" id="btn-clear-photo" hidden>Kaldır</button>
+                <p class="hint" id="photo-hint">PNG, JPEG veya WebP. Kare bir simge olarak kaydedilir.</p>
+              </div>
+            </div>
+            <input id="site-photo" type="file" accept="image/png,image/jpeg,image/webp" hidden />
           </div>
           <fieldset class="field">
             <legend>Grup</legend>
@@ -160,7 +172,7 @@
         <dl class="about-list" id="about-list"></dl>
         <h3>Lisans ve atıf</h3>
         <p class="hint">
-          AnimeHub, MIT / Apache-2.0 çift lisansıyla yayınlanır. AniList entegrasyonu
+          AnimeHub, MIT lisansıyla yayınlanır. AniList entegrasyonu
           temiz oda (clean-room) yöntemiyle, yalnızca AniList'in herkese açık OAuth 2.0 ve
           GraphQL v2 dokümantasyonuna dayanarak yazılmıştır. Tasarım yaklaşımı için
           <strong>Dantotsu</strong> (GPLv3, rebelonion/Dantotsu) referans alınmış,

@@ -5,7 +5,7 @@ description = "AnimeHub — a launcher that opens anime tracking/streaming sites
 authors = ["AnimeHub contributors"]
 edition = "2021"
 rust-version = "1.77"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 # `default-run` keeps `cargo run` unambiguous when the android-plugin
 # sub-crate is part of the same workspace.

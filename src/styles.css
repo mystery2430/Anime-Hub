@@ -17,7 +17,7 @@
   --ok: #10b981;
   --radius: 14px;
   --radius-sm: 9px;
-  --tile: 104px;
+  --tile: 118px;
   --shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   color-scheme: dark;
 }
@@ -47,7 +47,10 @@ body {
 }
 
 body {
-  background: var(--bg);
+  background:
+    radial-gradient(900px 420px at 8% -12%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 58%),
+    radial-gradient(720px 380px at 100% 0%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 52%),
+    var(--bg);
   color: var(--text);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   font-size: 15px;
@@ -169,22 +172,24 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 9px;
-  padding: 14px 8px 12px;
+  gap: 10px;
+  padding: 16px 10px 13px;
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-elev);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--bg-elev) 88%, transparent);
   color: var(--text);
   cursor: pointer;
   font: inherit;
   text-align: center;
-  transition: transform 0.12s ease, border-color 0.15s, background 0.15s;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  transition: transform 0.14s ease, border-color 0.15s, background 0.15s, box-shadow 0.15s;
 }
 
 .tile:hover {
-  transform: translateY(-2px);
+  transform: translateY(-3px);
   border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
   background: var(--bg-elev-2);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
 }
 
 .tile:focus-visible {
@@ -197,17 +202,32 @@ body {
 }
 
 .tile-icon {
-  width: 52px;
-  height: 52px;
-  border-radius: 16px;
+  width: 64px;
+  height: 64px;
+  border-radius: 18px;
   display: grid;
   place-items: center;
-  font-size: 17px;
+  overflow: hidden;
+  font-size: 18px;
   font-weight: 700;
   letter-spacing: 0.02em;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.14),
+    0 8px 16px rgba(0, 0, 0, 0.22);
+}
+
+.tile-icon.has-image {
+  background: #101218;
+  text-shadow: none;
+}
+
+.tile-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .tile-name {
@@ -252,6 +272,13 @@ body {
 .tile:hover .tile-menu,
 .tile:focus-within .tile-menu {
   opacity: 1;
+}
+
+@media (hover: none) {
+  .tile-menu {
+    opacity: 1;
+    background: color-mix(in srgb, var(--bg) 72%, transparent);
+  }
 }
 
 .tile-menu:hover {
@@ -418,6 +445,51 @@ textarea:focus-visible {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+}
+
+.field-row[hidden],
+.photo-field[hidden] {
+  display: none;
+}
+
+.photo-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.photo-preview {
+  width: 64px;
+  height: 64px;
+  flex: none;
+  border-radius: 16px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 35%, var(--bg-elev-2)), var(--bg-elev-2));
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+  font-size: 20px;
+}
+
+.photo-preview:not(.has-image)::before {
+  content: "+";
+}
+
+.photo-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.photo-actions {
+  min-width: 0;
+}
+
+.photo-actions .btn {
+  margin-right: 6px;
 }
 
 .radio {

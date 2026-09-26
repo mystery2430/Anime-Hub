@@ -244,12 +244,7 @@ mod tests {
     #[test]
     fn does_not_block_unrelated_hosts() {
         let b = bl();
-        for h in [
-            "openani.me",
-            "animecix.com",
-            "anilist.co",
-            "myanimelist.net",
-        ] {
+        for h in ["openani.me", "animecix.tv", "anilist.co", "myanimelist.net"] {
             assert!(!b.is_blocked(h), "{h} must stay reachable");
         }
     }

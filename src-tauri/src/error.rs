@@ -46,6 +46,10 @@ pub enum AppError {
 
     #[error("Beklenmeyen hata: {0}")]
     Other(String),
+
+    /// A tile photo the user attached. The message is already safe to show.
+    #[error("{0}")]
+    Icon(String),
 }
 
 /// Serializable payload for the `invoke` boundary.
@@ -74,6 +78,7 @@ impl AppError {
             AppError::Unauthorized => "unauthorized",
             AppError::Network(_) => "network",
             AppError::Other(_) => "other",
+            AppError::Icon(_) => "icon",
         }
     }
 }
@@ -86,13 +91,19 @@ impl From<url::ParseError> for AppError {
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
-        AppError::Storage(e.to_string())
+        // `Display` for io errors can include a filesystem path. The UI
+        // renders this string; the detail stays in the log.
+        log::error!("dosya işlemi başarısız: {e}");
+        AppError::Storage("dosya işlemi başarısız".into())
     }
 }
 
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
-        AppError::Storage(format!("veri çözümlenemedi ({e})"))
+        // Serde errors quote a fragment of the input. That fragment can be
+        // a site list or, on a settings file, a client secret.
+        log::error!("veri çözümlenemedi: {e}");
+        AppError::Storage("veri çözümlenemedi".into())
     }
 }
 

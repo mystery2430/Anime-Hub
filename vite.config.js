@@ -8,12 +8,15 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 1420,
     strictPort: true,
+    // The preview proxy uses a non-localhost Host header.
+    allowedHosts: true,
   },
   // Allow the Tauri preview origin so the sandboxed preview works too.
   preview: {
     host: "0.0.0.0",
     port: 1420,
     strictPort: true,
+    allowedHosts: true,
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

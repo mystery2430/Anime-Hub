@@ -23,6 +23,7 @@
 use crate::error::AppError;
 use crate::sites::blocklist::Blocklist;
 use crate::sites::url_policy::navigation_allowed;
+use crate::web::dns::DnsClass;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use url::Url;
@@ -206,11 +207,34 @@ pub enum NavDecision {
     BlockedHost,
 }
 
+/// Shown when a public-looking name resolves to a private address.
+pub const DNS_REBIND_BLOCK: &str = "Alan adı özel/ağ içi bir adrese çözümlendi.";
+
 /// Decide whether a WebView navigation may proceed.
 ///
 /// `site_host` is the site the session was opened for; it is unused by the
 /// current rules but keeps the signature honest for future same-site rules.
+///
+/// This is the string policy only. Production call sites that can block the
+/// WebView thread pass a [`DnsClass`] from [`decide_navigation_dns`] so a
+/// name that *looks* public but resolves to a router or a metadata address
+/// is refused too.
 pub fn decide_navigation(url: &Url, site_host: &str, blocklist: &Blocklist) -> NavDecision {
+    decide_navigation_dns(url, site_host, blocklist, DnsClass::Unknown)
+}
+
+/// [`decide_navigation`] plus the result of a DNS lookup.
+///
+/// `DnsClass::Unknown` (timeout, NXDOMAIN, resolver error) does **not** block:
+/// a DNS outage must not make every site unopenable. A successful answer that
+/// contains any non-public address does block. The string policy still runs
+/// first, so literal private hosts keep their existing message.
+pub fn decide_navigation_dns(
+    url: &Url,
+    site_host: &str,
+    blocklist: &Blocklist,
+    dns: DnsClass,
+) -> NavDecision {
     let _ = site_host;
     if !navigation_allowed(url) {
         return NavDecision::Block(match url.scheme() {
@@ -222,16 +246,18 @@ pub fn decide_navigation(url: &Url, site_host: &str, blocklist: &Blocklist) -> N
         // Same rule as the "add site" form. Without this a site the user
         // trusts could bounce the WebView to their own router or to a cloud
         // metadata endpoint: the redirect never re-enters `validate_site_url`.
-        //
-        // Limitation: this is a *string* check. A public-looking hostname that
-        // resolves to a private address (DNS rebinding) still gets through,
-        // because resolving here would make the guard async.
         if crate::sites::url_policy::is_private_host(h) {
             return NavDecision::Block("Yerel/ağ içi adrese yönlendirme engellendi.");
         }
         if blocklist.is_blocked(h) {
             return NavDecision::BlockedHost;
         }
+    }
+    // After the string policy. A blocklisted host is already refused, so we
+    // never replace that silent decision with a toast just because DNS also
+    // happened to return a private address.
+    if matches!(dns, DnsClass::Answered { private: true }) {
+        return NavDecision::Block(DNS_REBIND_BLOCK);
     }
     NavDecision::Allow
 }
@@ -415,6 +441,7 @@ fn assert_app_error_is_send() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::dns::DnsClass;
 
     fn cookie(name: &str, value: &str) -> cookie::Cookie<'static> {
         cookie::Cookie::build((name.to_string(), value.to_string()))
@@ -552,6 +579,51 @@ mod tests {
             http_only: false,
             same_site: None,
         }
+    }
+
+    #[test]
+    fn navigation_blocks_public_name_that_resolves_private() {
+        let bl = Blocklist::default();
+        let url = Url::parse("https://rebind.example/latest/meta-data/").unwrap();
+        assert_eq!(
+            decide_navigation_dns(
+                &url,
+                "openani.me",
+                &bl,
+                DnsClass::Answered { private: true }
+            ),
+            NavDecision::Block(DNS_REBIND_BLOCK)
+        );
+        // A resolver miss must not fail closed: the string policy already
+        // accepted this host, and a DNS outage is not an attack.
+        assert_eq!(
+            decide_navigation_dns(&url, "openani.me", &bl, DnsClass::Unknown),
+            NavDecision::Allow
+        );
+        assert_eq!(
+            decide_navigation_dns(
+                &url,
+                "openani.me",
+                &bl,
+                DnsClass::Answered { private: false }
+            ),
+            NavDecision::Allow
+        );
+    }
+
+    #[test]
+    fn dns_answer_does_not_override_a_silent_blocklist_hit() {
+        let bl = Blocklist::default();
+        let url = Url::parse("https://ad.doubleclick.net/x").unwrap();
+        assert_eq!(
+            decide_navigation_dns(
+                &url,
+                "openani.me",
+                &bl,
+                DnsClass::Answered { private: true }
+            ),
+            NavDecision::BlockedHost
+        );
     }
 
     #[test]

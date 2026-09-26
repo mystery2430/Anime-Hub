@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Android-side bridges for AnimeHub: Keystore-backed encryption and Picture-in-Picture."
 edition = "2021"
 rust-version = "1.77"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [lib]
 name = "animehub_android"

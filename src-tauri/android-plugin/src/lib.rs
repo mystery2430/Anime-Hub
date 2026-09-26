@@ -8,7 +8,9 @@
 //! * **Picture-in-Picture** — `PictureInPictureParams` /
 //!   `enterPictureInPictureMode()` live on the host `Activity`.
 //!
-//! The Kotlin half lives at `src-tauri/gen/android/app/src/main/java/dev/animehub/app/`.
+//! The Kotlin half lives at
+//! `src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt` and is
+//! copied next to the generated `MainActivity.kt` by `scripts/android_prepare.py`.
 //! On every other platform these calls return [`Error::Unsupported`], which
 //! keeps the desktop build honest about what it can and cannot do.
 
@@ -93,13 +95,14 @@ pub fn keystore_open(purpose: String, sealed: String) -> Result<KeystoreResult> 
 pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(
+        call_plugin::<_, OkPayload>(
             CMD_ENTER_PIP,
             PipPayload {
                 num: aspect_num,
                 den: aspect_den,
             },
         )
+        .map(|r| r.ok)
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -112,7 +115,8 @@ pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
 pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SET_PIP_AUTO_ENTER, AutoEnterPayload { enabled })
+        call_plugin::<_, OkPayload>(CMD_SET_PIP_AUTO_ENTER, AutoEnterPayload { enabled })
+            .map(|r| r.ok)
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -121,15 +125,23 @@ pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
     }
 }
 
+/// Type-erased mobile invoke.
+///
+/// `tauri::plugin::mobile::PluginHandle` is private, and `init` is generic
+/// over the runtime, so the handle cannot be stored as `PluginHandle<Wry>`.
+/// The closure owns whatever `register_android_plugin` returned.
+#[cfg(target_os = "android")]
+type MobileCall =
+    dyn Fn(&str, serde_json::Value) -> std::result::Result<serde_json::Value, String> + Send;
+
 /// The registered plugin handle.
 ///
 /// Set exactly once by [`init`]. The free functions above are called from
 /// plain Rust (no `AppHandle` in scope), so the handle has to live in a
 /// global; it is only ever written during setup, before any command runs.
 #[cfg(target_os = "android")]
-static HANDLE: std::sync::OnceLock<
-    std::sync::Mutex<Option<tauri::plugin::mobile::PluginHandle<tauri::Wry>>>,
-> = std::sync::OnceLock::new();
+static HANDLE: std::sync::OnceLock<std::sync::Mutex<Option<Box<MobileCall>>>> =
+    std::sync::OnceLock::new();
 
 /// Wire format for the Keystore commands.
 #[cfg(target_os = "android")]
@@ -155,6 +167,13 @@ struct AutoEnterPayload {
     enabled: bool,
 }
 
+/// Kotlin resolves PiP commands with `{ "ok": bool }`, not a bare boolean.
+#[cfg(target_os = "android")]
+#[derive(Debug, Deserialize)]
+struct OkPayload {
+    ok: bool,
+}
+
 /// Send a command to the Kotlin plugin and return its decoded response.
 ///
 /// Uses `PluginHandle::run_mobile_plugin`, which serialises `payload` and
@@ -173,9 +192,9 @@ fn call_plugin<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         .as_ref()
         .ok_or_else(|| Error::Bridge("plugin henüz başlatılmamış".into()))?;
 
-    handle
-        .run_mobile_plugin::<R>(cmd, payload)
-        .map_err(|e| Error::Bridge(e.to_string()))
+    let payload = serde_json::to_value(payload).map_err(|e| Error::Bridge(e.to_string()))?;
+    let value = handle(cmd, payload).map_err(Error::Bridge)?;
+    serde_json::from_value(value).map_err(|e| Error::Bridge(e.to_string()))
 }
 
 /// Register the plugin with a Tauri app.
@@ -187,13 +206,20 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .setup(|_app, api| {
             #[cfg(target_os = "android")]
             {
-                // The package is the one Tauri generates for the app identifier:
-                // `dev.animehub.app` -> `dev_animehub_app`. Changing the
-                // identifier in tauri.conf.json means changing this too.
-                let handle = api.register_android_plugin("dev_animehub_app", "AnimeHubPlugin")?;
+                // Tauri turns the identifier `dev.animehub.app` into the Kotlin
+                // package `dev.animehub.app` (dots stay dots; they are not
+                // rewritten to underscores). `scripts/android_prepare.py`
+                // refuses to continue if the generated MainActivity package
+                // disagrees with this string.
+                let handle = api.register_android_plugin("dev.animehub.app", "AnimeHubPlugin")?;
+                let call: Box<MobileCall> = Box::new(move |cmd, payload| {
+                    handle
+                        .run_mobile_plugin(cmd, payload)
+                        .map_err(|e| e.to_string())
+                });
                 let slot = HANDLE.get_or_init(|| std::sync::Mutex::new(None));
                 if let Ok(mut guard) = slot.lock() {
-                    *guard = Some(handle);
+                    *guard = Some(call);
                 } else {
                     return Err(Box::from("Android plugin handle kaydedilemedi"));
                 }
@@ -255,5 +281,17 @@ mod tests {
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
+    }
+
+    #[test]
+    fn android_plugin_package_matches_the_app_identifier() {
+        // `scripts/android_prepare.py` reads this literal. Tauri generates
+        // `package dev.animehub.app` from the identifier; underscores would
+        // not load.
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("register_android_plugin(\"dev.animehub.app\", \"AnimeHubPlugin\")"),
+            "registration string drifted from the Kotlin package"
+        );
     }
 }

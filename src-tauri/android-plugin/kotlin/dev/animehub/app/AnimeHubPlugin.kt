@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //
 // Android half of AnimeHub's Keystore + Picture-in-Picture bridge.
 //
@@ -8,12 +8,15 @@
 // `src-tauri/gen/android/`. Copy this file next to the generated
 // `MainActivity.kt`, i.e. into:
 //
-//   src-tauri/gen/android/app/src/main/java/dev_animehub_app/
+//   src-tauri/gen/android/app/src/main/java/dev/animehub/app/
 //
-// The package name below must match the one Tauri generates for the app
-// identifier (`dev.animehub.app` -> `dev_animehub_app`), and it must match
-// the string passed to `register_android_plugin` in
-// `src-tauri/android-plugin/src/lib.rs`.
+// Do not copy by hand. `scripts/android_prepare.py` copies this file and
+// refuses to continue unless three strings are identical:
+//   * the `package` line below,
+//   * `register_android_plugin` in `android-plugin/src/lib.rs`,
+//   * the package of the generated `MainActivity.kt`.
+// Tauri keeps the dots in `dev.animehub.app`; it does not rewrite them to
+// underscores.
 //
 // VERIFICATION STATUS
 // -------------------
@@ -24,7 +27,7 @@
 // available in the environment this was written in. Treat it as unverified
 // until `npm run tauri android dev` passes on real hardware.
 
-package dev_animehub_app
+package dev.animehub.app
 
 import android.app.Activity
 import android.app.PictureInPictureParams
@@ -154,7 +157,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("ok", false)); return
       }
       val params = PictureInPictureParams.Builder()
-        .setAspectRatio(Rational(clampRatio(num), clampRatio(den)))
+        .setAspectRatio(safeAspectRatio(num, den))
         .build()
       val ok = activity.enterPictureInPictureMode(params)
       invoke.resolve(JSObject().put("ok", ok))
@@ -198,7 +201,22 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       return if (cleaned.isEmpty()) "default" else cleaned
     }
 
-    /** Android rejects aspect ratios outside roughly 1:2.39 .. 2.39:1. */
-    private fun clampRatio(v: Int): Int = v.coerceIn(1, 239)
+    /**
+     * Android rejects PiP ratios outside about 1:2.39 .. 2.39:1.
+     * Clamping each side on its own still allows 239:1, which
+     * `setAspectRatio` refuses.
+     */
+    private const val MAX_RATIO = 2.39
+    private const val MIN_RATIO = 0.41841 // 1 / 2.39
+
+    private fun safeAspectRatio(num: Int, den: Int): Rational {
+      val n = num.coerceAtLeast(1)
+      val d = den.coerceAtLeast(1)
+      return when {
+        n.toDouble() / d.toDouble() > MAX_RATIO -> Rational(2390, 1000)
+        n.toDouble() / d.toDouble() < MIN_RATIO -> Rational(1000, 2390)
+        else -> Rational(n, d)
+      }
+    }
   }
 }

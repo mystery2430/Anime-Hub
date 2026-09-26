@@ -10,8 +10,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep the Rust toolchain in one place for all jobs.
   RUST_BACKTRACE: 1
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   # ------------------------------------------------------------------ tests
@@ -21,7 +26,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        # ubuntu-24.04 ships libwebkit2gtk-4.1, which Tauri 2 requires.
+        # 22.04's default WebKit is 4.0 and fails this build.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +37,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev
+            libayatana-appindicator3-dev librsvg2-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,21 +58,166 @@ jobs:
         run: npm test
 
       - name: Rust format
-        run: cargo fmt --all -- --check
+        shell: bash
         working-directory: src-tauri
+        run: |
+          if cargo fmt --all -- --check; then
+            exit 0
+          fi
+          cargo fmt --all
+          git -C .. diff -- src-tauri > /tmp/fmt.diff
+          # The checks API returns annotations. Log blobs are not always readable.
+          node -e 'const fs=require("fs"); const diff=fs.readFileSync("/tmp/fmt.diff","utf8").slice(0,12000); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::rustfmt diff:%0A"+msg);'
+          exit 1
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        shell: bash
         working-directory: src-tauri
+        run: |
+          set +e
+          cargo clippy --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
+          status=$?
+          tail -n 40 "$RUNNER_TEMP/clippy.log" || true
+          if [ "$status" -ne 0 ]; then
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" "$RUNNER_TEMP/clippy.log" clippy || true
+            exit "$status"
+          fi
 
       - name: Rust tests
-        run: cargo test --all
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          set +e
+          cargo test --all > "$RUNNER_TEMP/cargo-test.log" 2>&1
+          status=$?
+          tail -n 40 "$RUNNER_TEMP/cargo-test.log" || true
+          if [ "$status" -ne 0 ]; then
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" "$RUNNER_TEMP/cargo-test.log" "cargo test" || true
+            exit "$status"
+          fi
+
+  # ------------------------------------------------ Android actually compiles
+  # The previous handoff could not run `tauri android build` (no SDK). This
+  # job is that missing compile: one ABI is enough to type-check the Kotlin
+  # bridge and link the Rust library. The tag workflow still builds all three.
+  android:
+    name: Android compile (aarch64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # v3 still asks sdkmanager for the removed `tools` package and fails
+      # before any compile. v4 installs cmdline-tools + platform-tools only.
+      - uses: android-actions/setup-android@v4
+
+      # Tauri CLI 2.11 generates compileSdk 36 and, when NDK_HOME is unset,
+      # installs NDK 29.0.13846066. A different NDK left in NDK_HOME makes the
+      # linker lookup fail a few minutes into the APK step, and a missing
+      # platform 36 fails Gradle the same way. Install both as hard requirements.
+      - name: Install SDK 36 and the Tauri NDK
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "platform-tools" \
+            "ndk;29.0.13846066"
+          NDK_PATH="${ANDROID_HOME}/ndk/29.0.13846066"
+          test -x "${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Initialise the Android project
+        run: npm run tauri android init
+
+      - name: Install the Kotlin bridge and PiP manifest
+        run: python3 scripts/android_prepare.py
+
+      - name: Build APK
+        # Desktop release uses LTO. On the 7 GB Android runner that link OOMs
+        # after a long compile, so this job overrides the profile for the
+        # invocation only. The committed Cargo.toml profile is unchanged.
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        run: |
+          set +e
+          npm run tauri android build -- --apk --target aarch64 > /tmp/android-build.log 2>&1
+          status=$?
+          set -e
+          tail -n 60 /tmp/android-build.log
+          if [ "$status" -ne 0 ]; then
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" /tmp/android-build.log "android build" || true
+            exit "$status"
+          fi
+
+      - name: Upload Android build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: /tmp/android-build.log
+          if-no-files-found: ignore
+
+  # --------------------------------------- release profile actually links
+  # The committed profile is `lto = true` + `codegen-units = 1`. That peaks
+  # well over 2 GB while linking WebKit and was never built on the machine
+  # that wrote it. GitHub-hosted Linux runners have 7 GB; one job, so the
+  # linker is not competing with the test matrix.
+  release-profile:
+    name: Release profile (LTO)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: cargo build --release
+        # One codegen unit plus LTO is the memory spike. Don't also fan the
+        # rustc jobs out across both cores while linking.
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: cargo build --release --locked
         working-directory: src-tauri
 
   # ------------------------------------------------- secret / hygiene audit
   audit:
     name: Dependency and secret audit
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -79,11 +231,15 @@ jobs:
 
       - name: No committed secrets
         run: |
-          # Fail if any credential-looking literal is tracked.
+          # Patterns are assembled so this file does not match itself, and so
+          # the frontend secret test (which scans YAML) does not either.
+          private_key="$(printf '%s %s' 'BEGIN (RSA |EC )?PRIVATE' 'KEY')"
+          aws_key="$(printf '%s_%s_%s_%s' aws secret access key)"
+          access_key="$(printf '%s[0-9A-Z]{16}' AKIA)"
           if git grep -nIE \
-            -e 'BEGIN (RSA |EC )?PRIVATE KEY' \
-            -e 'aws_secret_access_key' \
-            -e 'AKIA[0-9A-Z]{16}' \
+            -e "$private_key" \
+            -e "$aws_key" \
+            -e "$access_key" \
             -- . ':(exclude)tests/*'; then
             echo "::error::possible secret committed"
             exit 1
