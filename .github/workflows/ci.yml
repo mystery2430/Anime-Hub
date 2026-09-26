@@ -65,8 +65,18 @@ jobs:
           exit 1
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        shell: bash
         working-directory: src-tauri
+        run: |
+          set +e
+          cargo clippy --all-targets -- -D warnings > /tmp/clippy.log 2>&1
+          status=$?
+          set -e
+          tail -n 40 /tmp/clippy.log
+          if [ "$status" -ne 0 ]; then
+            node -e 'const fs=require("fs"); const diff=fs.readFileSync("/tmp/clippy.log","utf8").slice(-4500); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::clippy tail:%0A"+msg);'
+            exit "$status"
+          fi
 
       - name: Rust tests
         run: cargo test --all

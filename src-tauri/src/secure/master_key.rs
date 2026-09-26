@@ -12,13 +12,20 @@
 //! is reported to the About screen so the user can see what they got.
 
 use crate::error::{AppError, AppResult};
+// Only the Linux and Windows loaders materialise a key. Importing this on
+// macOS (a check-only host) is an unused-import warning under `-D warnings`.
+#[cfg(any(
+    windows,
+    all(unix, not(target_os = "android"), not(target_os = "macos"))
+))]
 use crate::secure::crypto::generate_key;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
+use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 pub const KEYRING_SERVICE: &str = "dev.animehub.app";
 pub const KEYRING_USER: &str = "master-key";
-const KEY_FILE_NAME: &str = "animehub.key";
 
 /// Human-readable name of the active backend, shown in About.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -123,6 +130,8 @@ pub fn load_master_key(dir: &Path) -> AppResult<MasterKey> {
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
 mod linux {
     use super::*;
+
+    const KEY_FILE_NAME: &str = "animehub.key";
 
     pub fn load(dir: &Path) -> AppResult<MasterKey> {
         if let Some(k) = try_secret_service()? {

@@ -340,20 +340,24 @@ Bu oturumda yeniden çalıştırılan:
 |---|---|
 | `npm test` | **49 test geçti**, 0 hata |
 
-**Doğrulanmayanlar:**
+GitHub Actions'ta doğrulananlar (`ubuntu-24.04`, PR #1):
 
-- **Android derlemesi ve cihaz testi.** Kotlin köprüsü Tauri'nin güncel
-  `JSObject` imzasına göre yazıldı ve `scripts/android_prepare.py` init
-  sonrası kopyayı/PiP yamasını kilitliyor, ama bu ortamda SDK indirilemediği
-  için APK **henüz üretilmedi**. `ci.yml` içindeki `Android compile` işi bunu
-  runner'da dener. Cihaz üzerinde PiP hâlâ denenmedi.
-- **Windows derlemesi.** NSIS paketi yalnızca Windows üzerinde üretilebilir.
-- **Ayarlanmış profille Linux paketi.** Depodaki `release` profili
-  (`lto = true`) 2 GB RAM'de OOM ile öldürüldü; üretilen `.deb`
-  `TAURI_LOW_MEMORY=1` ile alındı. `ci.yml` içindeki `Release profile (LTO)`
-  işi bunu 7 GB'lık runner'da dener. Sonuç gelmeden "doğrulandı" denmez.
-- **GitHub Actions** bu dosyalar yazılana kadar hiçbir runner'da çalışmadı.
-  İlk çalıştırma bir pull request ile tetiklenir.
+| İş | Sonuç |
+|---|---|
+| `npm test` | geçti (ubuntu, macOS, Windows) |
+| `cargo fmt --all -- --check` | geçti |
+| `cargo clippy` / `cargo test --all` | ubuntu geçti; Windows ve macOS clippy ilk koşuda platforma özel ölü import yüzünden düştü, düzeltme sonraki koşuda |
+| `cargo build --release --locked` (LTO, tek codegen unit) | **geçti** — 7 GB runner'da link OOM vermedi. Bu bir paket değil; `.deb` / AppImage / rpm ayrıca üretilmedi |
+
+**Hâlâ doğrulanmayanlar:**
+
+- **Android APK ve cihaz testi.** `tauri android init` ve
+  `scripts/android_prepare.py` runner'da geçti (`dev.animehub.app` paketi
+  uyuştu). APK adımı henüz yeşil değil. Cihaz üzerinde PiP denenmedi.
+- **Windows NSIS paketi.** Yalnızca Windows üzerinde üretilebilir; CI test
+  eder, paketlemez.
+- **İmzalı yayın APK'sı.** `release-android.yml` varsayılan dalda olmadığı
+  için `workflow_dispatch` ve etiket akışı hiç çalışmadı.
 
 Tüm doğrulama kayıtları, bulunan güvenlik açığının ayrıntısı ve devralan
 kişiye düşen işler [`HANDOFF.md`](./HANDOFF.md) dosyasında.

@@ -107,12 +107,12 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 
 | Konu | Neden yapılamadı |
 |---|---|
-| **Android derlemesi** | Android SDK/NDK kurulu değil. `tauri android build` hiç çalıştırılamadı |
-| **Kotlin köprüsü** | `android-plugin/kotlin/dev_animehub_app/AnimeHubPlugin.kt` Tauri 2.11.6 API'sine göre yazıldı ama **derlenmedi** |
+| **Android APK** | Init ve prepare runner'da geçti. APK adımı henüz yeşil değil; cihaz testi yok |
+| **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi henüz yeşil değil |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
-| **Windows derlemesi** | NSIS yalnızca Windows'ta; bu ortam Linux |
-| **GitHub Actions** | Üç workflow yazıldı ama hiçbir runner'da çalışmadı |
-| **Ayarlanmış profille paket** | 1984 MB RAM'de `lto = true` OOM veriyor |
+| **Windows NSIS** | CI Windows'ta test eder, paket üretmez |
+| **İmzalı yayın APK** | `release-android.yml` varsayılan dalda değil; dispatch/etiket hiç çalışmadı |
+| **`.deb` / AppImage / rpm** | LTO'lu `cargo build --release --locked` ubuntu-24.04'te geçti. Paket adımı yok |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
 | **Gerçek sitelerin yüklenmesi** | Uygulama GUI'si başsız ortamda açılmıyor; WebView'da `openani.me`'nin gerçekten render olduğu görülmedi |
 
@@ -140,8 +140,8 @@ dosyası `gen/android` oluşmadan yazılıyordu, ve `if:` içinde `secrets`
 kullanılıyordu (Actions bunu reddeder).
 
 Bilinen risk: Kotlin, Tauri 2 `JSObject.getInteger` / `getBoolean` /
-`put` imzalarına göre yazıldı (kaynakla karşılaştırıldı) ama **bu ortamda
-henüz derlenmedi** — aşağıdaki doğrulama kaydına bakın.
+`put` imzalarına göre yazıldı (kaynakla karşılaştırıldı). Runner'da init ve
+prepare geçti; APK adımı henüz yeşil değil.
 
 ### B. Ayarlanmış profille Linux paketi
 
@@ -151,14 +151,15 @@ henüz derlenmedi** — aşağıdaki doğrulama kaydına bakın.
 npm run tauri build -- --bundles appimage deb rpm
 ```
 
-`lto = true` + `codegen-units = 1` ile derlenip derlenmediğini doğrula.
-Burada OOM verdiği için **hiç denenemedi**.
+`lto = true` + `codegen-units = 1` ile `cargo build --release --locked`
+ubuntu-24.04 runner'da geçti (OOM yok). `.deb` / AppImage / rpm hâlâ üretilmedi.
 
 ### C. GitHub Actions'ı bir kez çalıştırmak
 
-`ci.yml`, `release-android.yml`, `release-desktop.yml`. Özellikle
-`release-android.yml`'deki keystore akışı (`secrets.ANDROID_KEYSTORE_BASE64` →
-geçici dosya → `shred -u`) hiç test edilmedi.
+`ci.yml` PR #1'de çalıştı: frontend testleri üç platformda, rustfmt, ubuntu
+clippy/test ve LTO linki geçti. `release-android.yml` varsayılan dalda
+olmadığı için dispatch/etiket hiç çalışmadı; keystore akışı
+(`secrets.ANDROID_KEYSTORE_BASE64` → geçici dosya → `shred -u`) test edilmedi.
 
 ### D. DNS rebinding — karar verildi
 
