@@ -110,7 +110,8 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **Android APK** | Init ve prepare runner'da geçti. APK adımı henüz yeşil değil; cihaz testi yok |
 | **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi henüz yeşil değil |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
-| **Windows NSIS** | CI Windows'ta test eder, paket üretmez |
+| **Windows NSIS** | CI Windows'ta test eder, paket üretmez. Windows clippy ilk yeşil koşuda DPAPI işaretçi dönüşümünde düşebilir; düzeltme sonraki koşuda |
+| **macOS** | Hedef değil. `cargo test` için anahtar, Linux yedeğiyle aynı `0600` dosyadan gelir; Keychain yok |
 | **İmzalı yayın APK** | `release-android.yml` varsayılan dalda değil; dispatch/etiket hiç çalışmadı |
 | **`.deb` / AppImage / rpm** | LTO'lu `cargo build --release --locked` ubuntu-24.04'te geçti. Paket adımı yok |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |

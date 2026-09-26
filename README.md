@@ -346,7 +346,7 @@ GitHub Actions'ta doğrulananlar (`ubuntu-24.04`, PR #1):
 |---|---|
 | `npm test` | geçti (ubuntu, macOS, Windows) |
 | `cargo fmt --all -- --check` | geçti |
-| `cargo clippy` / `cargo test --all` | ubuntu geçti; Windows ve macOS clippy ilk koşuda platforma özel ölü import yüzünden düştü, düzeltme sonraki koşuda |
+| `cargo clippy` / `cargo test --all` | ubuntu geçti. Windows clippy ve macOS testleri bu yazı sırasında henüz yeşil değildi |
 | `cargo build --release --locked` (LTO, tek codegen unit) | **geçti** — 7 GB runner'da link OOM vermedi. Bu bir paket değil; `.deb` / AppImage / rpm ayrıca üretilmedi |
 
 **Hâlâ doğrulanmayanlar:**

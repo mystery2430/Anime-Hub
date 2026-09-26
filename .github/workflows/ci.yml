@@ -69,18 +69,26 @@ jobs:
         working-directory: src-tauri
         run: |
           set +e
-          cargo clippy --all-targets -- -D warnings > /tmp/clippy.log 2>&1
+          cargo clippy --all-targets -- -D warnings > "$RUNNER_TEMP/clippy.log" 2>&1
           status=$?
-          set -e
-          tail -n 40 /tmp/clippy.log
+          tail -n 40 "$RUNNER_TEMP/clippy.log" || true
           if [ "$status" -ne 0 ]; then
-            node -e 'const fs=require("fs"); const diff=fs.readFileSync("/tmp/clippy.log","utf8").slice(-4500); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::clippy tail:%0A"+msg);'
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" "$RUNNER_TEMP/clippy.log" clippy || true
             exit "$status"
           fi
 
       - name: Rust tests
-        run: cargo test --all
+        shell: bash
         working-directory: src-tauri
+        run: |
+          set +e
+          cargo test --all > "$RUNNER_TEMP/cargo-test.log" 2>&1
+          status=$?
+          tail -n 40 "$RUNNER_TEMP/cargo-test.log" || true
+          if [ "$status" -ne 0 ]; then
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" "$RUNNER_TEMP/cargo-test.log" "cargo test" || true
+            exit "$status"
+          fi
 
   # ------------------------------------------------ Android actually compiles
   # The previous handoff could not run `tauri android build` (no SDK). This
@@ -153,7 +161,7 @@ jobs:
           set -e
           tail -n 60 /tmp/android-build.log
           if [ "$status" -ne 0 ]; then
-            node -e 'const fs=require("fs"); const raw=fs.readFileSync("/tmp/android-build.log","utf8"); const hits=raw.split("\n").filter(l=>/error|panic|FAILED|failed/i.test(l)); const diff=(hits.join("\n")||raw.slice(-4500)).slice(-4500); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::android build tail:%0A"+msg);'
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" /tmp/android-build.log "android build" || true
             exit "$status"
           fi
 

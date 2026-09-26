@@ -12,15 +12,12 @@
 //! is reported to the About screen so the user can see what they got.
 
 use crate::error::{AppError, AppResult};
-// Only the Linux and Windows loaders materialise a key. Importing this on
-// macOS (a check-only host) is an unused-import warning under `-D warnings`.
-#[cfg(any(
-    windows,
-    all(unix, not(target_os = "android"), not(target_os = "macos"))
-))]
+// Android never materialises a Rust key. Every other host does: Windows via
+// DPAPI, Linux via Secret Service or a file, macOS via the file only.
+#[cfg(not(target_os = "android"))]
 use crate::secure::crypto::generate_key;
 use std::path::Path;
-#[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "android")))]
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
@@ -116,57 +113,29 @@ pub fn load_master_key(dir: &Path) -> AppResult<MasterKey> {
 
     #[cfg(target_os = "macos")]
     {
-        // Not a shipping target, but keep `cargo check` honest on macOS hosts.
-        let _ = dir;
-        Err(AppError::Keyring(
-            "macOS desteklenen bir hedef değil".into(),
-        ))
+        // Not a shipping target. CI still runs `cargo test` here, and those
+        // tests load a real key, so use the same owner-only file as the Linux
+        // fallback rather than failing the suite.
+        unix_file::load(dir)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Linux: XDG Secret Service, with an encrypted-file fallback.
+// Unix file fallback. Linux uses this when Secret Service is absent. macOS
+// has no shipping keystore; CI still needs a real key for `cargo test`.
 // ---------------------------------------------------------------------------
-#[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
-mod linux {
+#[cfg(all(unix, not(target_os = "android")))]
+mod unix_file {
     use super::*;
 
     const KEY_FILE_NAME: &str = "animehub.key";
 
     pub fn load(dir: &Path) -> AppResult<MasterKey> {
-        if let Some(k) = try_secret_service()? {
-            return Ok(MasterKey {
-                backend: Backend::SecretService,
-                key: Some(k),
-            });
-        }
         let k = file_fallback(dir)?;
         Ok(MasterKey {
             backend: Backend::EncryptedFile,
             key: Some(k),
         })
-    }
-
-    fn try_secret_service() -> AppResult<Option<Zeroizing<[u8; 32]>>> {
-        let entry = match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            Ok(e) => e,
-            // No Secret Service running (headless, minimal session, …).
-            Err(_) => return Ok(None),
-        };
-
-        match entry.get_password() {
-            Ok(hexkey) => Ok(Some(decode_hex_key(&hexkey)?)),
-            Err(keyring::Error::NoEntry) => {
-                let key = generate_key();
-                let hex = hex::encode(key);
-                entry
-                    .set_password(&hex)
-                    .map_err(|e| AppError::Keyring(format!("anahtar kaydedilemedi: {e}")))?;
-                Ok(Some(Zeroizing::new(key)))
-            }
-            // Locked keyring, D-Bus failure, etc. — degrade rather than die.
-            Err(_) => Ok(None),
-        }
     }
 
     fn file_fallback(dir: &Path) -> AppResult<Zeroizing<[u8; 32]>> {
@@ -204,7 +173,7 @@ mod linux {
         Ok(())
     }
 
-    fn decode_hex_key(s: &str) -> AppResult<Zeroizing<[u8; 32]>> {
+    pub(super) fn decode_hex_key(s: &str) -> AppResult<Zeroizing<[u8; 32]>> {
         let bytes = hex::decode(s.trim()).map_err(|_| AppError::Crypto("anahtar bozuk".into()))?;
         if bytes.len() != 32 {
             return Err(AppError::Crypto("anahtar uzunluğu yanlış".into()));
@@ -259,6 +228,46 @@ mod linux {
 }
 
 // ---------------------------------------------------------------------------
+// Linux: XDG Secret Service, with the encrypted-file fallback above.
+// ---------------------------------------------------------------------------
+#[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
+mod linux {
+    use super::*;
+
+    pub fn load(dir: &Path) -> AppResult<MasterKey> {
+        if let Some(k) = try_secret_service()? {
+            return Ok(MasterKey {
+                backend: Backend::SecretService,
+                key: Some(k),
+            });
+        }
+        unix_file::load(dir)
+    }
+
+    fn try_secret_service() -> AppResult<Option<Zeroizing<[u8; 32]>>> {
+        let entry = match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            Ok(e) => e,
+            // No Secret Service running (headless, minimal session, …).
+            Err(_) => return Ok(None),
+        };
+
+        match entry.get_password() {
+            Ok(hexkey) => Ok(Some(unix_file::decode_hex_key(&hexkey)?)),
+            Err(keyring::Error::NoEntry) => {
+                let key = generate_key();
+                let hex = hex::encode(key);
+                entry
+                    .set_password(&hex)
+                    .map_err(|e| AppError::Keyring(format!("anahtar kaydedilemedi: {e}")))?;
+                Ok(Some(Zeroizing::new(key)))
+            }
+            // Locked keyring, D-Bus failure, etc. — degrade rather than die.
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Windows: DPAPI.
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
@@ -297,11 +306,11 @@ mod windows {
     fn dpapi_protect(plain: &[u8]) -> AppResult<Vec<u8>> {
         let mut data_in = CRYPT_INTEGER_BLOB {
             cbData: plain.len() as u32,
-            pbData: plain.as_ptr() as *mut u8,
+            pbData: plain.as_ptr().cast_mut(),
         };
         let mut entropy = CRYPT_INTEGER_BLOB {
             cbData: ENTROPY.len() as u32,
-            pbData: ENTROPY.as_ptr() as *mut u8,
+            pbData: ENTROPY.as_ptr().cast_mut(),
         };
         let mut out = CRYPT_INTEGER_BLOB {
             cbData: 0,
@@ -324,7 +333,7 @@ mod windows {
         }
         let blob = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
         unsafe {
-            LocalFree(out.pbData as *mut _);
+            let _ = LocalFree(out.pbData.cast());
         }
         Ok(blob)
     }
@@ -332,11 +341,11 @@ mod windows {
     fn dpapi_unprotect(blob: &[u8]) -> AppResult<Zeroizing<[u8; 32]>> {
         let mut data_in = CRYPT_INTEGER_BLOB {
             cbData: blob.len() as u32,
-            pbData: blob.as_ptr() as *mut u8,
+            pbData: blob.as_ptr().cast_mut(),
         };
         let mut entropy = CRYPT_INTEGER_BLOB {
             cbData: ENTROPY.len() as u32,
-            pbData: ENTROPY.as_ptr() as *mut u8,
+            pbData: ENTROPY.as_ptr().cast_mut(),
         };
         let mut out = CRYPT_INTEGER_BLOB {
             cbData: 0,
@@ -361,7 +370,7 @@ mod windows {
         }
         let plain = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
         unsafe {
-            LocalFree(out.pbData as *mut _);
+            let _ = LocalFree(out.pbData.cast());
         }
         let plain = Zeroizing::new(plain);
         if plain.len() != 32 {
