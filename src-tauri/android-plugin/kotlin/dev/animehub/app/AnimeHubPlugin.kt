@@ -8,12 +8,15 @@
 // `src-tauri/gen/android/`. Copy this file next to the generated
 // `MainActivity.kt`, i.e. into:
 //
-//   src-tauri/gen/android/app/src/main/java/dev_animehub_app/
+//   src-tauri/gen/android/app/src/main/java/dev/animehub/app/
 //
-// The package name below must match the one Tauri generates for the app
-// identifier (`dev.animehub.app` -> `dev_animehub_app`), and it must match
-// the string passed to `register_android_plugin` in
-// `src-tauri/android-plugin/src/lib.rs`.
+// Do not copy by hand. `scripts/android_prepare.py` copies this file and
+// refuses to continue unless three strings are identical:
+//   * the `package` line below,
+//   * `register_android_plugin` in `android-plugin/src/lib.rs`,
+//   * the package of the generated `MainActivity.kt`.
+// Tauri keeps the dots in `dev.animehub.app`; it does not rewrite them to
+// underscores.
 //
 // VERIFICATION STATUS
 // -------------------
@@ -24,7 +27,7 @@
 // available in the environment this was written in. Treat it as unverified
 // until `npm run tauri android dev` passes on real hardware.
 
-package dev_animehub_app
+package dev.animehub.app
 
 import android.app.Activity
 import android.app.PictureInPictureParams

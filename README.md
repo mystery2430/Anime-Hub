@@ -18,8 +18,8 @@
 ![Windows](https://img.shields.io/badge/Windows-derlenmedi-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-desteklenmiyor-555555?style=for-the-badge&logo=apple&logoColor=white)
 
-[![Release](https://img.shields.io/github/v/release/animehub/animehub?style=flat-square&color=62cdfe&label=s%C3%BCr%C3%BCm)](https://github.com/animehub/animehub/releases/latest)
-[![CI](https://img.shields.io/github/actions/workflow/status/animehub/animehub/ci.yml?style=flat-square&color=62cdfe&label=CI)](https://github.com/animehub/animehub/actions)
+[![Release](https://img.shields.io/github/v/release/mystery2430/Anime-Hub?style=flat-square&color=62cdfe&label=s%C3%BCr%C3%BCm)](https://github.com/mystery2430/Anime-Hub/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/mystery2430/Anime-Hub/ci.yml?style=flat-square&color=62cdfe&label=CI)](https://github.com/mystery2430/Anime-Hub/actions)
 [![Lisans](https://img.shields.io/badge/Lisans-MIT%20%7C%20Apache--2.0-green?style=flat-square)](#lisans-ve-atıf)
 
 </div>
@@ -107,11 +107,6 @@ Her site kendi WebView profil dizinini alır:
 Windows'ta WebView2 profili kullanılır; çerezler, localStorage, IndexedDB ve
 önbellek siteler arasında **hiç** kesişmez.
 
-> [!NOTE]
-> Bu kural bir **metin** kontrolüdür: herkese açık görünen ama özel bir
-> adrese çözümlenen bir alan adı (DNS rebinding) yine geçebilir, çünkü
-> guard'ı eşzamanlı tutmak için DNS çözümlemesi yapılmıyor.
-
 > [!IMPORTANT]
 > Android'de sistem WebView'ının site başına profil API'si **yoktur**.
 > Bunun yerine uygulama, site açılırken/kapanırken çerez kavanozunu şifreli
@@ -144,6 +139,12 @@ kaynağından gelir:
 - **Aynı özel adres kuralı gezinti sırasında da uygulanır.** Bir site sizi
   `https://192.168.1.1/` adresine yönlendirmeye çalışırsa kesilir; bu kural
   `tests/audit.rs` içinde regresyon testiyle kilitlidir.
+- **DNS rebinding.** Herkese açık görünen bir ad, gezinti veya site açılışı
+  anında özel bir adrese çözülüyorsa kesilir. Çözümleme eşzamanlı kalır
+  (kısa zaman aşımı, `web/dns.rs`); zaman aşımında metin politikası geçerli
+  kalır, DNS kesintisi siteleri kapatmaz. Sayfa yüklendikten sonra WebView'ın
+  kendi çözümleyicisiyle yapılan alt istekler (XHR/`fetch`) bu kontrolden
+  geçmez — onu kapatmak bir filtreleyen vekil ister ve v1'de yok.
 - **Alan adı engel listesi** reklam ve izleyici alanlarını istek düzeyinde
   keser; liste koda gömülüdür ve güncellenebilir.
 
@@ -255,8 +256,8 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 ### 2. Klonla & çalıştır
 
 ```bash
-git clone https://github.com/animehub/animehub.git
-cd animehub
+git clone https://github.com/mystery2430/Anime-Hub.git
+cd Anime-Hub
 npm install
 
 npm run tauri dev      # native pencere + hot reload
@@ -323,28 +324,36 @@ v1 bilinçli olarak dar tutuldu. Ertelenenler:
 
 ## ✅&nbsp; Doğrulama durumu
 
-Son durum, geliştirme ortamında (Linux, x86_64, 2 GB RAM) çalıştırılan
-komutlarla doğrulandı:
+Önceki oturumda (Linux, x86_64, 2 GB RAM) doğrulananlar:
 
 | Komut | Sonuç |
 |---|---|
-| `cargo test --all` | **148 test geçti** (137 birim + 11 denetim), 0 hata |
+| `cargo test --all` | **148 test geçti** (137 birim + 11 denetim), 0 hata — bu sayı DNS rebinding testleri eklenmeden önce |
 | `cargo clippy --all-targets -- -D warnings` | temiz (uyarı yok) |
 | `cargo fmt --all -- --check` | temiz |
-| `npm test` (`node --test tests/`) | **45 test geçti**, 0 hata |
 | `npm run build` | başarılı |
-| `npm run tauri build -- --bundles deb` | `AnimeHub_0.1.0_amd64.deb` (3.7 MB) |
+| `npm run tauri build -- --bundles deb` | `AnimeHub_0.1.0_amd64.deb` (3.7 MB), düşük bellek profiliyle |
+
+Bu oturumda yeniden çalıştırılan:
+
+| Komut | Sonuç |
+|---|---|
+| `npm test` | **49 test geçti**, 0 hata |
 
 **Doğrulanmayanlar:**
 
-- **Android derlemesi ve cihaz testi.** SDK/NDK ve cihaz olmadan
-  `tauri android build` çalıştırılamadı. Kotlin köprüsü Tauri 2.11.6 eklenti
-  API'sine göre yazıldı ama **derlenmedi**.
+- **Android derlemesi ve cihaz testi.** Kotlin köprüsü Tauri'nin güncel
+  `JSObject` imzasına göre yazıldı ve `scripts/android_prepare.py` init
+  sonrası kopyayı/PiP yamasını kilitliyor, ama bu ortamda SDK indirilemediği
+  için APK **henüz üretilmedi**. `ci.yml` içindeki `Android compile` işi bunu
+  runner'da dener. Cihaz üzerinde PiP hâlâ denenmedi.
 - **Windows derlemesi.** NSIS paketi yalnızca Windows üzerinde üretilebilir.
 - **Ayarlanmış profille Linux paketi.** Depodaki `release` profili
-  (`lto = true`) bu makinede OOM ile öldürüldü; üretilen `.deb`
-  `TAURI_LOW_MEMORY=1` ile alındı. İkili doğru, sadece biraz daha büyük.
-- **GitHub Actions iş akışları** hiçbir runner'da çalıştırılmadı.
+  (`lto = true`) 2 GB RAM'de OOM ile öldürüldü; üretilen `.deb`
+  `TAURI_LOW_MEMORY=1` ile alındı. `ci.yml` içindeki `Release profile (LTO)`
+  işi bunu 7 GB'lık runner'da dener. Sonuç gelmeden "doğrulandı" denmez.
+- **GitHub Actions** bu dosyalar yazılana kadar hiçbir runner'da çalışmadı.
+  İlk çalıştırma bir pull request ile tetiklenir.
 
 Tüm doğrulama kayıtları, bulunan güvenlik açığının ayrıntısı ve devralan
 kişiye düşen işler [`HANDOFF.md`](./HANDOFF.md) dosyasında.
@@ -353,7 +362,7 @@ kişiye düşen işler [`HANDOFF.md`](./HANDOFF.md) dosyasında.
 
 ## 🤝&nbsp; Katkıda Bulunma
 
-1. Değişiklikten önce [Issues](https://github.com/animehub/animehub/issues)
+1. Değişiklikten önce [Issues](https://github.com/mystery2430/Anime-Hub/issues)
    listesine bakın.
 2. `npm run check` yerelde yeşil olmalı (frontend + Rust testleri).
 3. `cargo clippy --all-targets -- -D warnings` ve `cargo fmt --check` temiz

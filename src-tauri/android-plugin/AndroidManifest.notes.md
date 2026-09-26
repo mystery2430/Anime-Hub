@@ -46,11 +46,17 @@ generated manifest first and only add it by hand if it is absent.
 
 ## Keystore bridge
 
-Copy
-[`dev_animehub_app/AnimeHubPlugin.kt`](dev_animehub_app/AnimeHubPlugin.kt)
-into `src-tauri/gen/android/app/src/main/java/dev_animehub_app/`, next to the
-generated `MainActivity.kt`. No manifest entry or permission is needed:
-`AndroidKeyStore` is available to every app without a runtime permission.
+Do not copy the Kotlin file by hand. After `tauri android init`, run
+`python3 scripts/android_prepare.py`. It copies
+[`kotlin/dev/animehub/app/AnimeHubPlugin.kt`](kotlin/dev/animehub/app/AnimeHubPlugin.kt)
+next to the generated `MainActivity.kt`, adds
+`android:supportsPictureInPicture="true"` if it is missing, adds the
+`animehub://anilist/callback` intent filter if Tauri did not, and writes a
+ProGuard keep rule so R8 cannot strip a class that is only named from JNI.
+
+The script exits non-zero if the generated package is not `dev.animehub.app`.
+No manifest permission is needed for the keystore: `AndroidKeyStore` is
+available to every app without a runtime permission.
 
 ## Verification status
 

@@ -1,9 +1,11 @@
-# Produces signed Android APKs, published as release assets.
+# Produces Android APKs, published as release assets when the run is a tag.
 #
-# Nothing secret lives in this file or in the repo: the keystore arrives as a
+# Nothing secret lives in this file or in the repo. The keystore arrives as a
 # base64 repository secret and is written to a temporary file that is deleted
-# at the end of the job. If `ANDROID_KEYSTORE_BASE64` is not set the APK is
-# built unsigned and clearly labelled as such.
+# at the end of the job. If the secret is absent the APK is built unsigned.
+#
+# `secrets` cannot be referenced from `if:` — GitHub rejects that — so a
+# step exports `enabled=true/false` and later steps branch on that output.
 name: Release Android
 
 on:
@@ -25,11 +27,17 @@ env:
 jobs:
   android:
     name: Android APK (${{ matrix.abi }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        abi: [aarch64, armv7, x86_64]
+        include:
+          - abi: aarch64
+            target: aarch64-linux-android
+          - abi: armv7
+            target: armv7-linux-androideabi
+          - abi: x86_64
+            target: x86_64-linux-android
     steps:
       - uses: actions/checkout@v4
 
@@ -40,15 +48,32 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: Install NDK
-        run: sdkmanager --install "ndk;27.0.12077973" "platform-tools" "build-tools;34.0.0"
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Export NDK and install SDK packages
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          # `yes` exits 141 when sdkmanager closes the pipe; that is not a
+          # license failure. The install itself must succeed.
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "platform-tools"
+          # Optional: a template that asks for 36 should not fail the job
+          # before init if this cmdline-tools revision does not ship it yet.
+          sdkmanager --install "platforms;android-36" || true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: >-
-            ${{ matrix.abi == 'aarch64' && 'aarch64-linux-android'
-             || matrix.abi == 'armv7' && 'armv7-linux-androideabi'
-             || 'x86_64-linux-android' }}
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -64,39 +89,62 @@ jobs:
       - name: Frontend tests
         run: npm test
 
-      - name: Rust tests
-        run: cargo test --all
-        working-directory: src-tauri
-
-      # --- signing material, held only for the lifetime of this job ---
-      - name: Materialise keystore
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          echo "$KEYSTORE_B64" | base64 -d > /tmp/animehub.keystore
-          # Gradle reads these; they are never written into the repo.
-          cat > src-tauri/gen/android/keystore.properties <<EOF
-          storeFile=/tmp/animehub.keystore
-          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
-          EOF
-          echo "keystore ready"
-
+      # gen/android does not exist until this step. The keystore file and the
+      # Kotlin bridge both have to be written afterwards.
       - name: Initialise the Android project
         run: npm run tauri android init
 
-      - name: Build APK
+      - name: Install the Kotlin bridge and PiP manifest
+        run: python3 scripts/android_prepare.py
+
+      - name: Detect keystore secret
+        id: signing
         env:
-          TAURI_ANDROID_SIGN: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SIGN_INPUT: ${{ github.event.inputs.sign }}
+        run: |
+          set -euo pipefail
+          # Tag pushes have no workflow input; treat that as "sign if we can".
+          # An explicit workflow_dispatch sign=false always builds unsigned.
+          if [ "${SIGN_INPUT:-true}" = "false" ] || [ -z "${KEYSTORE_B64}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "signing disabled (no secret, or sign=false)"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "signing enabled"
+          fi
+
+      - name: Materialise keystore
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -d src-tauri/gen/android
+          echo "$KEYSTORE_B64" | base64 -d > /tmp/animehub.keystore
+          # Gradle reads this path. It is created only after android init,
+          # and it is deleted in the shred step below.
+          cat > src-tauri/gen/android/keystore.properties <<EOF
+          storeFile=/tmp/animehub.keystore
+          storePassword=${STORE_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_PASSWORD}
+          EOF
+          echo "keystore ready"
+
+      - name: Build APK
         run: npm run tauri android build -- --apk --target ${{ matrix.abi }}
 
       - name: Shred the keystore
         if: always()
         run: |
-          shred -u /tmp/animehub.keystore 2>/dev/null || rm -f /tmp/animehub.keystore
+          if [ -f /tmp/animehub.keystore ]; then
+            shred -u /tmp/animehub.keystore || rm -f /tmp/animehub.keystore
+          fi
           rm -f src-tauri/gen/android/keystore.properties
 
       - uses: actions/upload-artifact@v4
@@ -108,7 +156,7 @@ jobs:
   publish:
     name: Publish release
     needs: android
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@v4

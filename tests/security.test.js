@@ -132,6 +132,7 @@ test("gitignore covers key material and build output", () => {
     "*.keystore",
     "*.jks",
     "gen/schemas",
+    "gen/android",
   ]) {
     assert.ok(gi.includes(needle), `.gitignore must list ${needle}`);
   }

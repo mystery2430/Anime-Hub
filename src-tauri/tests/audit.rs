@@ -12,7 +12,11 @@ use animehub_lib::sites::registry::{Category, Registry};
 use animehub_lib::sites::url_policy::{
     is_private_host, sanitize_cookie_component, validate_site_url, Rejection,
 };
-use animehub_lib::web::session::{decide_navigation, embed_json, profile_dir_name, NavDecision};
+use animehub_lib::web::dns::{answers_are_private, DnsClass};
+use animehub_lib::web::session::{
+    decide_navigation, decide_navigation_dns, embed_json, profile_dir_name, NavDecision,
+    DNS_REBIND_BLOCK,
+};
 use url::Url;
 
 fn blocklist() -> animehub_lib::sites::blocklist::Blocklist {
@@ -181,6 +185,30 @@ fn navigation_guard_blocks_private_hosts() {
             "{raw} gezinti guard'ından geçti"
         );
     }
+}
+
+/// **Regresyon:** DNS rebinding. Metin politikası `rebind.example` adresini
+/// herkese açık sayar; çözümleme özel bir adres döndürürse guard kesmeli.
+/// Çözümleyici cevap veremezse (zaman aşımı) metin politikası geçerli kalır —
+/// DNS kesintisi bütün siteleri kapatmamalı.
+#[test]
+fn navigation_guard_blocks_dns_rebinding() {
+    let bl = blocklist();
+    let url = Url::parse("https://rebind.example/latest/meta-data/").unwrap();
+    assert_eq!(
+        decide_navigation_dns(&url, "openani.me", &bl, DnsClass::Answered { private: true }),
+        NavDecision::Block(DNS_REBIND_BLOCK)
+    );
+    assert_eq!(
+        decide_navigation(&url, "openani.me", &bl),
+        NavDecision::Allow,
+        "string policy alone must still allow a public-looking name"
+    );
+    assert!(answers_are_private(&[
+        "1.1.1.1".parse().unwrap(),
+        "169.254.169.254".parse().unwrap(),
+    ]));
+    assert!(!answers_are_private(&["1.1.1.1".parse().unwrap()]));
 }
 
 /// Guard'ın normal gezintiyi kesmemesi gerekir; yoksa siteler bozulur.

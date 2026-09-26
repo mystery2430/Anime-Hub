@@ -8,7 +8,9 @@
 //! * **Picture-in-Picture** — `PictureInPictureParams` /
 //!   `enterPictureInPictureMode()` live on the host `Activity`.
 //!
-//! The Kotlin half lives at `src-tauri/gen/android/app/src/main/java/dev/animehub/app/`.
+//! The Kotlin half lives at
+//! `src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt` and is
+//! copied next to the generated `MainActivity.kt` by `scripts/android_prepare.py`.
 //! On every other platform these calls return [`Error::Unsupported`], which
 //! keeps the desktop build honest about what it can and cannot do.
 
@@ -187,10 +189,12 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .setup(|_app, api| {
             #[cfg(target_os = "android")]
             {
-                // The package is the one Tauri generates for the app identifier:
-                // `dev.animehub.app` -> `dev_animehub_app`. Changing the
-                // identifier in tauri.conf.json means changing this too.
-                let handle = api.register_android_plugin("dev_animehub_app", "AnimeHubPlugin")?;
+                // Tauri turns the identifier `dev.animehub.app` into the Kotlin
+                // package `dev.animehub.app` (dots stay dots; they are not
+                // rewritten to underscores). `scripts/android_prepare.py`
+                // refuses to continue if the generated MainActivity package
+                // disagrees with this string.
+                let handle = api.register_android_plugin("dev.animehub.app", "AnimeHubPlugin")?;
                 let slot = HANDLE.get_or_init(|| std::sync::Mutex::new(None));
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(handle);
@@ -255,5 +259,17 @@ mod tests {
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
+    }
+
+    #[test]
+    fn android_plugin_package_matches_the_app_identifier() {
+        // `scripts/android_prepare.py` reads this literal. Tauri generates
+        // `package dev.animehub.app` from the identifier; underscores would
+        // not load.
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("register_android_plugin(\"dev.animehub.app\", \"AnimeHubPlugin\")"),
+            "registration string drifted from the Kotlin package"
+        );
     }
 }

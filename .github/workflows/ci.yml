@@ -10,7 +10,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep the Rust toolchain in one place for all jobs.
   RUST_BACKTRACE: 1
 
 jobs:
@@ -21,7 +20,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        # ubuntu-24.04 ships libwebkit2gtk-4.1, which Tauri 2 requires.
+        # 22.04's default WebKit is 4.0 and fails this build.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev
+            libayatana-appindicator3-dev librsvg2-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,10 +63,104 @@ jobs:
         run: cargo test --all
         working-directory: src-tauri
 
+  # ------------------------------------------------ Android actually compiles
+  # The previous handoff could not run `tauri android build` (no SDK). This
+  # job is that missing compile: one ABI is enough to type-check the Kotlin
+  # bridge and link the Rust library. The tag workflow still builds all three.
+  android:
+    name: Android compile (aarch64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Export NDK and install SDK packages
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          # Newer templates ask for 36. Missing package must not hide a 35 failure.
+          sdkmanager --install "platforms;android-36" || true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Initialise the Android project
+        run: npm run tauri android init
+
+      - name: Install the Kotlin bridge and PiP manifest
+        run: python3 scripts/android_prepare.py
+
+      - name: Build APK
+        # The committed release profile (LTO, one codegen unit) is what ships.
+        # One rustc job keeps the link from competing with itself for RAM.
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: npm run tauri android build -- --apk --target aarch64
+
+  # --------------------------------------- release profile actually links
+  # The committed profile is `lto = true` + `codegen-units = 1`. That peaks
+  # well over 2 GB while linking WebKit and was never built on the machine
+  # that wrote it. GitHub-hosted Linux runners have 7 GB; one job, so the
+  # linker is not competing with the test matrix.
+  release-profile:
+    name: Release profile (LTO)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: cargo build --release
+        # One codegen unit plus LTO is the memory spike. Don't also fan the
+        # rustc jobs out across both cores while linking.
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: cargo build --release --locked
+        working-directory: src-tauri
+
   # ------------------------------------------------- secret / hygiene audit
   audit:
     name: Dependency and secret audit
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

@@ -60,9 +60,13 @@ kontrolünden önce onu çağırıyor ve `NavDecision::Block` dönüyor.
 **Regresyon testi:** `src-tauri/tests/audit.rs::navigation_guard_blocks_private_hosts`
 (7 vektör) ve `navigation_guard_allows_public_https` (yanlış pozitif koruması).
 
-**Bilinen sınır (dürüstçe):** bu bir **metin** kontrolü. Herkese açık görünen
-ama özel bir adrese çözümlenen bir alan adı (DNS rebinding) hâlâ geçer; guard'ı
-eşzamanlı tutmak için DNS çözümlemesi yapılmıyor. README'de de yazıyor.
+**Bilinen sınır (dürüstçe, güncellendi):** metin kontrolü duruyor. Üstüne,
+gezinti ve site açılışı artık alan adını kısa bir zaman aşımıyla çözüyor
+(`web/dns.rs`); cevaplardan herhangi biri özel/yerel ise kesiliyor. Çözümleyici
+zaman aşımına uğrarsa metin politikası geçerli kalır (DNS kesintisi siteleri
+kapatmasın diye). Sayfa yüklendikten sonra WebView'ın kendi çözümleyicisiyle
+giden alt istekler (`fetch` / XHR) hâlâ bu kontrolden geçmez — onu kapatmak
+filtreleyen bir vekil ister, v1'de yok. Karar `HANDOFF` bölüm 6.D'de.
 
 ---
 
@@ -118,26 +122,26 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 
 ### A. Android'i gerçekten derlemek (en kritik boşluk)
 
+El işi kopyalama kalktı. `tauri android init` sonrası:
+
 ```bash
-# SDK + NDK kur, sonra:
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-export ANDROID_HOME=…  NDK_HOME=$ANDROID_HOME/ndk/<sürüm>
-npm run tauri android init
+python3 scripts/android_prepare.py
 ```
 
-`tauri android init` sonrası **iki el işi** gerekiyor:
+Script üç dizeyi karşılaştırır ve uyuşmazsa durur: Kotlin `package` satırı,
+`register_android_plugin(...)` ve üretilen `MainActivity.kt` paketi. Tauri
+kimliği `dev.animehub.app` noktalı paket olarak üretir; eski
+`dev_animehub_app` tahmini yanlıştı ve düzeltildi. Script ayrıca PiP
+özniteliğini, eksikse OAuth intent-filter'ını ve R8 keep kuralını yazar.
+`./scripts/build.sh android` ve `release-android.yml` bunu kendisi çağırır.
 
-1. `src-tauri/android-plugin/kotlin/dev_animehub_app/AnimeHubPlugin.kt`
-   dosyasını `src-tauri/gen/android/app/src/main/java/dev_animehub_app/`
-   altına kopyala. **Üretilen paket adını kontrol et** — Rust tarafındaki
-   `register_android_plugin("dev_animehub_app", "AnimeHubPlugin")`
-   çağrısıyla birebir aynı olmalı.
-2. `AndroidManifest.xml`'e `android:supportsPictureInPicture="true"` ekle
-   (ayrıntı: `src-tauri/android-plugin/AndroidManifest.notes.md`).
+`release-android.yml` içindeki iki gerçek hata da düzeltildi: keystore
+dosyası `gen/android` oluşmadan yazılıyordu, ve `if:` içinde `secrets`
+kullanılıyordu (Actions bunu reddeder).
 
-Bilinen risk: Kotlin dosyasındaki `KeyGenParameterSpec` /
-`PictureInPictureParams` kullanımları derleyici görmedi. İlk derlemede imza
-uyuşmazlığı çıkarsa şaşırmayın.
+Bilinen risk: Kotlin, Tauri 2 `JSObject.getInteger` / `getBoolean` /
+`put` imzalarına göre yazıldı (kaynakla karşılaştırıldı) ama **bu ortamda
+henüz derlenmedi** — aşağıdaki doğrulama kaydına bakın.
 
 ### B. Ayarlanmış profille Linux paketi
 
@@ -156,16 +160,19 @@ Burada OOM verdiği için **hiç denenemedi**.
 `release-android.yml`'deki keystore akışı (`secrets.ANDROID_KEYSTORE_BASE64` →
 geçici dosya → `shred -u`) hiç test edilmedi.
 
-### D. DNS rebinding
+### D. DNS rebinding — karar verildi
 
-`decide_navigation` eşzamanlı kalmak zorunda. Çözüm seçenekleri: (1) navigasyon
-öncesi async çözümleme, (2) WebView'ın kendi bağlantı katmanında filtre,
-(3) kabul edip belgelemek (şu anki durum). Karar verilmedi.
+Seçenek (1), eşzamanlı tutularak: `on_navigation` ve `open_site` alan adını
+1200 ms zaman aşımıyla çözer; herhangi bir cevap özel/yerelse keser.
+Zaman aşımı / NXDOMAIN seçenek (3) gibi metin politikasına düşer — aksi halde
+DNS kesintisi bütün siteleri kapatır. Seçenek (2) (bağlantı katmanında vekil)
+yapılmadı: WebView alt isteklerini kendi çözer, vekil olmadan TOCTOU kapanmaz,
+ve vekil burada doğrulanamazdı. Kalan sınır README'de ve bölüm 3'te yazılı.
 
-### E. Depoyu yayınlarken
+### E. Depoyu yayınlarken — yapıldı
 
-README'deki `github.com/animehub/animehub` **yer tutucu**. Gerçek
-`kullanıcı/depo` ile değiştirilmeli (3 rozet + 2 bağlantı).
+README'deki `github.com/animehub/animehub` yer tutucusu
+`mystery2430/Anime-Hub` ile değiştirildi (rozetler, klon adresi, Issues).
 
 ---
 
@@ -192,18 +199,21 @@ cd animehub && npm install
 ## 8. Hızlı başvuru
 
 ```bash
-cd src-tauri && cargo test              # 148 test
-cd .. && node --test tests/             # 45 test
+cd src-tauri && cargo test              # birim + denetim
+npm test                                # frontend (dosya listesi; `tests/` dizini Node 22'de kırılıyor)
 npm run check                           # ikisi birden
 ./scripts/build.sh linux                # paketle
+python3 scripts/android_prepare.py      # `tauri android init` sonrası
 ```
 
 Kilit dosyalar:
 
 | Yol | Ne |
 |---|---|
-| `src-tauri/src/sites/url_policy.rs` | HTTPS + özel adres politikası (`is_private_host` burada) |
+| `src-tauri/src/sites/url_policy.rs` | HTTPS + özel adres politikası (`is_private_host`, `is_public_ip`) |
+| `src-tauri/src/web/dns.rs` | eşzamanlı DNS rebinding kontrolü |
 | `src-tauri/src/web/session.rs` | gezinti kararı, `embed_json`, çerez yakalama |
+| `scripts/android_prepare.py` | init sonrası Kotlin kopyası + PiP manifest |
 | `src-tauri/src/web/windows.rs` | `on_navigation` / `on_new_window` guard'ları |
 | `src-tauri/src/secure/` | AES-256-GCM depo + platform anahtar kaynağı |
 | `src-tauri/tests/audit.rs` | denetim + regresyon testleri |

@@ -7,8 +7,9 @@
 use crate::commands::{AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
+use crate::web::dns::{classify_host, DnsClass};
 use crate::web::session::{
-    capture, decide_navigation, profile_dir_name, restore, CookieJar, NavDecision,
+    capture, decide_navigation, profile_dir_name, restore, CookieJar, NavDecision, DNS_REBIND_BLOCK,
 };
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
@@ -94,10 +95,25 @@ fn open_on_desktop(
         .accept_first_mouse(true)
         .on_navigation(move |target: &Url| {
             let app = nav_app.clone();
-            let decision = {
+            // String policy under the lock; DNS outside it. A slow resolver
+            // must not stall every other command waiting on the blocklist.
+            let preliminary = {
                 let state = app.state::<AppState>();
                 let bl = state.blocklist.lock().expect("blocklist lock");
                 decide_navigation(target, &nav_host, &bl)
+            };
+            let decision = if preliminary == NavDecision::Allow {
+                let dns = target
+                    .host_str()
+                    .map(classify_host)
+                    .unwrap_or(DnsClass::Unknown);
+                if matches!(dns, DnsClass::Answered { private: true }) {
+                    NavDecision::Block(DNS_REBIND_BLOCK)
+                } else {
+                    NavDecision::Allow
+                }
+            } else {
+                preliminary
             };
             match decision {
                 NavDecision::Allow => true,

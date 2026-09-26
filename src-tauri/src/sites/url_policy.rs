@@ -189,6 +189,14 @@ pub fn is_private_host(host: &str) -> bool {
         || h == "metadata.google.internal"
 }
 
+/// True when `ip` is a globally routable address.
+///
+/// Shared with the DNS-rebinding check: a hostname is refused when **any**
+/// of its answers fails this test.
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    ip_is_public(&ip)
+}
+
 fn ip_is_public(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {

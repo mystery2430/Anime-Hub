@@ -282,6 +282,21 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     let safe = crate::sites::url_policy::validate_site_url(&site.url)
         .map_err(|r| AppError::InvalidUrl(r.reason().to_string()))?;
 
+    // DNS rebinding: a stored name can look public and still resolve to the
+    // user's router or a cloud metadata address. The lookup is blocking, so
+    // it runs off the async runtime. A resolver failure is not fatal — the
+    // string policy already passed, and failing closed would make every site
+    // unopenable during a DNS outage.
+    let host = safe.host().to_string();
+    let dns = tauri::async_runtime::spawn_blocking(move || crate::web::dns::classify_host(&host))
+        .await
+        .map_err(|e| AppError::Other(format!("adres çözümlenemedi: {e}")))?;
+    if matches!(dns, crate::web::dns::DnsClass::Answered { private: true }) {
+        return Err(AppError::InvalidUrl(
+            "alan adı yerel/ağ içi bir adrese çözümlendi".into(),
+        ));
+    }
+
     let injected = InjectedConfig {
         block_popups: settings.block_popups,
         hide_selectors: if settings.inject_cosmetic_rules {
