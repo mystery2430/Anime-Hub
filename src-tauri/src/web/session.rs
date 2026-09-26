@@ -440,8 +440,8 @@ fn assert_app_error_is_send() {
 
 #[cfg(test)]
 mod tests {
-    use crate::web::dns::DnsClass;
     use super::*;
+    use crate::web::dns::DnsClass;
 
     fn cookie(name: &str, value: &str) -> cookie::Cookie<'static> {
         cookie::Cookie::build((name.to_string(), value.to_string()))

@@ -52,7 +52,22 @@ jobs:
         run: npm test
 
       - name: Rust format
-        run: cargo fmt --all -- --check
+        run: |
+          set +e
+          cargo fmt --all -- --check
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            cargo fmt --all
+            {
+              echo '## rustfmt diff'
+              echo '```diff'
+              git -C .. diff -- src-tauri | head -c 50000
+              echo
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
         working-directory: src-tauri
 
       - name: Clippy

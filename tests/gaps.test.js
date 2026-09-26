@@ -8,11 +8,22 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const ROOT = new URL("..", import.meta.url).pathname;
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(p, "utf8");
+
+// GitHub's Windows runners expose `python`, not `python3`.
+function pythonBin() {
+  const candidates = process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+  for (const bin of candidates) {
+    const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
+    if (probe.status === 0) return bin;
+  }
+  return candidates[0];
+}
 
 test("README points at this repository, not the animehub/animehub placeholder", () => {
   const readme = read(join(ROOT, "README.md"));
@@ -69,7 +80,7 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
   const gen = fakeGen("dev.animehub.app");
   try {
     const run = () =>
-      spawnSync("python3", ["scripts/android_prepare.py", "--root", ROOT, "--gen", gen], {
+      spawnSync(pythonBin(), ["scripts/android_prepare.py", "--root", ROOT, "--gen", gen], {
         cwd: ROOT,
         encoding: "utf8",
       });
@@ -99,7 +110,7 @@ test("android_prepare refuses a generated package that would not load", () => {
   const gen = fakeGen("com.example.wrong");
   try {
     const result = spawnSync(
-      "python3",
+      pythonBin(),
       ["scripts/android_prepare.py", "--root", ROOT, "--gen", gen],
       { cwd: ROOT, encoding: "utf8" },
     );

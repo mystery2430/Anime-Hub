@@ -192,9 +192,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
         ];
         assert!(answers_are_private(&mixed));
-        assert!(answers_are_private(&[IpAddr::V4(Ipv4Addr::new(
-            169, 254, 169, 254
-        ))]));
+        assert!(answers_are_private(&[IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))]));
         assert!(answers_are_private(&[IpAddr::V6(Ipv6Addr::LOCALHOST)]));
         assert!(!answers_are_private(&[
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
@@ -204,42 +202,18 @@ mod tests {
 
     #[test]
     fn literals_are_classified_without_dns() {
-        assert_eq!(
-            classify_host("127.0.0.1"),
-            DnsClass::Answered { private: true }
-        );
-        assert_eq!(
-            classify_host("192.168.1.1"),
-            DnsClass::Answered { private: true }
-        );
-        assert_eq!(
-            classify_host("[::1]"),
-            DnsClass::Answered { private: true }
-        );
-        assert_eq!(
-            classify_host("1.1.1.1"),
-            DnsClass::Answered { private: false }
-        );
-        assert_eq!(
-            classify_host("8.8.8.8"),
-            DnsClass::Answered { private: false }
-        );
+        assert_eq!(classify_host("127.0.0.1"), DnsClass::Answered { private: true });
+        assert_eq!(classify_host("192.168.1.1"), DnsClass::Answered { private: true });
+        assert_eq!(classify_host("[::1]"), DnsClass::Answered { private: true });
+        assert_eq!(classify_host("1.1.1.1"), DnsClass::Answered { private: false });
+        assert_eq!(classify_host("8.8.8.8"), DnsClass::Answered { private: false });
         // Suffix policy, still no network.
-        assert_eq!(
-            classify_host("router.local"),
-            DnsClass::Answered { private: true }
-        );
-        assert_eq!(
-            classify_host("metadata.google.internal"),
-            DnsClass::Answered { private: true }
-        );
+        assert_eq!(classify_host("router.local"), DnsClass::Answered { private: true });
+        assert_eq!(classify_host("metadata.google.internal"), DnsClass::Answered { private: true });
     }
 
     #[test]
     fn literal_classification_is_cached() {
-        assert_eq!(
-            classify_host("1.1.1.1"),
-            classify_host("1.1.1.1"),
-        );
+        assert_eq!(classify_host("1.1.1.1"), classify_host("1.1.1.1"));
     }
 }
