@@ -133,9 +133,19 @@ jobs:
       - name: Build APK
         # The committed release profile (LTO, one codegen unit) is what ships.
         # One rustc job keeps the link from competing with itself for RAM.
+        shell: bash
         env:
           CARGO_BUILD_JOBS: "1"
-        run: npm run tauri android build -- --apk --target aarch64
+        run: |
+          set +e
+          npm run tauri android build -- --apk --target aarch64 > /tmp/android-build.log 2>&1
+          status=$?
+          set -e
+          tail -n 60 /tmp/android-build.log
+          if [ "$status" -ne 0 ]; then
+            node -e 'const fs=require("fs"); const diff=fs.readFileSync("/tmp/android-build.log","utf8").slice(-4500); const msg=diff.replace(/%/g,"%25").replace(/\r/g,"%0D").replace(/\n/g,"%0A"); console.log("::error::android build tail:%0A"+msg);'
+            exit "$status"
+          fi
 
   # --------------------------------------- release profile actually links
   # The committed profile is `lto = true` + `codegen-units = 1`. That peaks
