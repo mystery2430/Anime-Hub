@@ -586,7 +586,12 @@ mod tests {
         let bl = Blocklist::default();
         let url = Url::parse("https://rebind.example/latest/meta-data/").unwrap();
         assert_eq!(
-            decide_navigation_dns(&url, "openani.me", &bl, DnsClass::Answered { private: true }),
+            decide_navigation_dns(
+                &url,
+                "openani.me",
+                &bl,
+                DnsClass::Answered { private: true }
+            ),
             NavDecision::Block(DNS_REBIND_BLOCK)
         );
         // A resolver miss must not fail closed: the string policy already
@@ -611,7 +616,12 @@ mod tests {
         let bl = Blocklist::default();
         let url = Url::parse("https://ad.doubleclick.net/x").unwrap();
         assert_eq!(
-            decide_navigation_dns(&url, "openani.me", &bl, DnsClass::Answered { private: true }),
+            decide_navigation_dns(
+                &url,
+                "openani.me",
+                &bl,
+                DnsClass::Answered { private: true }
+            ),
             NavDecision::BlockedHost
         );
     }

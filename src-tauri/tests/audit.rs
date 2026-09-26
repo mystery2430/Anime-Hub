@@ -196,7 +196,12 @@ fn navigation_guard_blocks_dns_rebinding() {
     let bl = blocklist();
     let url = Url::parse("https://rebind.example/latest/meta-data/").unwrap();
     assert_eq!(
-        decide_navigation_dns(&url, "openani.me", &bl, DnsClass::Answered { private: true }),
+        decide_navigation_dns(
+            &url,
+            "openani.me",
+            &bl,
+            DnsClass::Answered { private: true }
+        ),
         NavDecision::Block(DNS_REBIND_BLOCK)
     );
     assert_eq!(
