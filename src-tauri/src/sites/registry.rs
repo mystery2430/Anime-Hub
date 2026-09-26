@@ -166,7 +166,7 @@ pub fn default_sites() -> Vec<Site> {
         },
         Site {
             id: "builtin-animecix".into(),
-            name: "AnimeCix".into(),
+            name: "Animecix".into(),
             url: "https://animecix.tv/".into(),
             category: Category::Watching,
             icon: Icon::Bundled {
@@ -273,15 +273,18 @@ fn image_magic(mime: &str, bytes: &[u8]) -> bool {
         "image/jpeg" => {
             bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
         }
-        "image/webp" => {
-            bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
-        }
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
         _ => false,
     }
 }
 
 fn icon_for_new(draft: &SiteDraft, name: &str) -> AppResult<Icon> {
-    match draft.image.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    match draft
+        .image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(raw) => Ok(Icon::Image {
             data: parse_icon_image(raw)?,
         }),
@@ -420,7 +423,11 @@ impl Registry {
         }
         let (name, norm) = self.check(&draft, Some(id))?;
         let (builtin, existing) = {
-            let site = self.sites.iter().find(|s| s.id == id).expect("checked above");
+            let site = self
+                .sites
+                .iter()
+                .find(|s| s.id == id)
+                .expect("checked above");
             (site.builtin, site.icon.clone())
         };
         // Validate before mutating, so a rejected photo does not half-apply.
@@ -498,7 +505,7 @@ mod tests {
     fn defaults_ship_openanime_and_animecix_over_https() {
         let r = Registry::new_default();
         let names: Vec<_> = r.sites.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["OpenAnime", "AnimeCix"]);
+        assert_eq!(names, vec!["OpenAnime", "Animecix"]);
         assert!(r.sites.iter().all(|s| s.url.starts_with("https://")));
         assert!(r.sites.iter().all(|s| s.builtin));
     }
@@ -614,7 +621,7 @@ mod tests {
         let s = r
             .update(
                 "builtin-animecix",
-                draft("AnimeCix", "https://animecix.net/"),
+                draft("Animecix", "https://animecix.net/"),
             )
             .unwrap();
         assert_eq!(s.url, "https://animecix.net/");
@@ -645,7 +652,7 @@ mod tests {
 
         r.update(
             "builtin-animecix",
-            draft("AnimeCix", "https://animecix.net/"),
+            draft("Animecix", "https://animecix.net/"),
         )
         .unwrap();
         r.ensure_builtins();

@@ -107,7 +107,7 @@ const stubState = {
     },
     {
       id: "builtin-animecix",
-      name: "AnimeCix",
+      name: "Animecix",
       url: "https://animecix.tv/",
       host: "animecix.tv",
       category: "watching",

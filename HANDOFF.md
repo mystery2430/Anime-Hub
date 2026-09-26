@@ -116,7 +116,7 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **`.deb` / AppImage / rpm** | LTO'lu `cargo build --release --locked` ubuntu-24.04'te geçti. Paket adımı yok |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
 | **Gerçek sitelerin yüklenmesi** | Uygulama GUI'si başsız ortamda açılmıyor; WebView'da `openani.me`'nin gerçekten render olduğu görülmedi |
-| **Site logoları** | OpenAnime ve AnimeCix karoları yerel dosya kullanır (`public/logos/`). İkisi de sitelerin kendi işaretleri; uydurma oynat simgesi kaldırıldı. Fotoğraf ekleme arayüzü yazıldı |
+| **Site logoları** | OpenAnime ve Animecix karoları yerel dosya kullanır (`public/logos/`). İkisi de sitelerin kendi işaretleri; uydurma oynat simgesi kaldırıldı. Fotoğraf ekleme arayüzü yazıldı |
 
 ---
 

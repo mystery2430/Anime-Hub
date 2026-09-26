@@ -51,16 +51,16 @@ AnimeHub is an independent project with its own package identifier
 (`dev.animehub.app`), its own name, and no shared code or data with the
 `me.openanime.mobile` application. "OpenAnime" appears in the default site
 list purely as one of the sites a user may want to open, exactly like AniList
-or AnimeCix.
+or Animecix.
 
 ---
 
 ## Trademarks and site names
 
-MyAnimeList, AniList, OpenAnime and AnimeCix are the property of their
+MyAnimeList, AniList, OpenAnime and Animecix are the property of their
 respective owners. AnimeHub is an unofficial client, not endorsed by or
 affiliated with any of them; names and default URLs are used nominatively to
-identify the services. The OpenAnime and AnimeCix tiles use those sites'
+identify the services. The OpenAnime and Animecix tiles use those sites'
 icons for the same reason. They are not AnimeHub assets and are not
 relicensed.
 

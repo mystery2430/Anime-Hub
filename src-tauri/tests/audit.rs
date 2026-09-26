@@ -37,7 +37,7 @@ fn default_sites_are_the_two_documented_ones() {
     assert_eq!(visible[0].name, "OpenAnime");
     assert_eq!(visible[0].url, "https://openani.me/");
     assert_eq!(visible[1].id, "builtin-animecix");
-    assert_eq!(visible[1].name, "AnimeCix");
+    assert_eq!(visible[1].name, "Animecix");
     assert_eq!(visible[1].url, "https://animecix.tv/");
 
     for site in &visible {

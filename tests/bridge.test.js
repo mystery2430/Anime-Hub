@@ -42,7 +42,7 @@ test("toApiError never surfaces a useless message", () => {
 test("stub serves the two shipped sites", async () => {
   const sites = await stub("list_sites");
   const names = sites.map((s) => s.name);
-  assert.deepEqual(names, ["OpenAnime", "AnimeCix"]);
+  assert.deepEqual(names, ["OpenAnime", "Animecix"]);
   assert.ok(sites.every((s) => s.url.startsWith("https://")));
 });
 

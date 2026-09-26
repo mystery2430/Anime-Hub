@@ -50,7 +50,7 @@
     "active": true,
     "category": "Video",
     "shortDescription": "Anime takip ve izleme sitelerini tek yerde toplayan başlatıcı",
-    "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve AnimeCix gibi siteleri tek bir uygulama altında toplar. Her site kendi izole ve şifreli WebView oturumunda açılır; oturum verileri diskte şifreli saklanır ve yalnızca HTTPS adreslere izin verilir.",
+    "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve Animecix gibi siteleri tek bir uygulama altında toplar. Her site kendi izole ve şifreli WebView oturumunda açılır; oturum verileri diskte şifreli saklanır ve yalnızca HTTPS adreslere izin verilir.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
