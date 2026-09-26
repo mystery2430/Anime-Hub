@@ -110,8 +110,8 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **Android APK** | Init ve prepare runner'da geçti. APK adımı henüz yeşil değil; cihaz testi yok |
 | **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi henüz yeşil değil |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
-| **Windows NSIS** | CI Windows'ta test eder, paket üretmez. Windows clippy ilk yeşil koşuda DPAPI işaretçi dönüşümünde düşebilir; düzeltme sonraki koşuda |
-| **macOS** | Hedef değil. `cargo test` için anahtar, Linux yedeğiyle aynı `0600` dosyadan gelir; Keychain yok |
+| **Windows NSIS** | CI Windows'ta test eder, paket üretmez. `77f5e7c` clippy kırmızıydı; DPAPI çağrıları `windows-sys` 0.61 imzasına çekildi, sonuç henüz yok |
+| **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
 | **İmzalı yayın APK** | `release-android.yml` varsayılan dalda değil; dispatch/etiket hiç çalışmadı |
 | **`.deb` / AppImage / rpm** | LTO'lu `cargo build --release --locked` ubuntu-24.04'te geçti. Paket adımı yok |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
@@ -142,7 +142,9 @@ kullanılıyordu (Actions bunu reddeder).
 
 Bilinen risk: Kotlin, Tauri 2 `JSObject.getInteger` / `getBoolean` /
 `put` imzalarına göre yazıldı (kaynakla karşılaştırıldı). Runner'da init ve
-prepare geçti; APK adımı henüz yeşil değil.
+prepare geçti. APK adımı önce deep-link config'inde (map yerine liste), sonra
+`PluginHandle`'ın private olmasında kırıldı. İkisi de düzeltildi; yeşil APK
+henüz yok.
 
 ### B. Ayarlanmış profille Linux paketi
 
