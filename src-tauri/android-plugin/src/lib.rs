@@ -129,8 +129,8 @@ pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
 /// over the runtime, so the handle cannot be stored as `PluginHandle<Wry>`.
 /// The closure owns whatever `register_android_plugin` returned.
 #[cfg(target_os = "android")]
-type MobileCall = dyn Fn(&str, serde_json::Value) -> std::result::Result<serde_json::Value, String>
-    + Send;
+type MobileCall =
+    dyn Fn(&str, serde_json::Value) -> std::result::Result<serde_json::Value, String> + Send;
 
 /// The registered plugin handle.
 ///
