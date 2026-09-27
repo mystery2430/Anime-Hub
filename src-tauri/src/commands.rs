@@ -652,14 +652,14 @@ pub struct AniListUser {
     pub avatar: Option<String>,
 }
 
-/// Current session, refreshing the token if it is close to expiry.
-#[tauri::command]
-pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
-    let state = app.state::<AppState>();
-    let Some(token) = load_token(&state)? else {
+/// Fetches a live AniList session pair. Handles refresh, expiry cleanup and
+/// the "not configured/signed out" case uniformly for every caller that
+/// needs an authenticated GraphQL request.
+async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListClient, Token)>> {
+    let Some(token) = load_token(state)? else {
         return Ok(None);
     };
-    let (cli, _) = match client(&state) {
+    let (cli, _) = match client(state) {
         Ok(c) => c,
         // Not configured any more: report signed-out rather than erroring.
         Err(_) => return Ok(None),
@@ -669,7 +669,7 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
         match token.refresh_token.as_deref() {
             Some(rt) => match cli.refresh(rt).await {
                 Ok(t) => {
-                    save_token(&state, &t)?;
+                    save_token(state, &t)?;
                     t
                 }
                 // Refresh rejected => the session is over.
@@ -691,6 +691,24 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
         token
     };
 
+    Ok(Some((cli, token)))
+}
+
+/// Clears a token the server rejected outright.
+fn drop_rejected_token(state: &AppState) {
+    if let Err(e) = state.provider.delete_secret("anilist-token") {
+        log::error!("geçersiz AniList oturumu silinemedi: {e}");
+    }
+}
+
+/// Current session, refreshing the token if it is close to expiry.
+#[tauri::command]
+pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
+    let state = app.state::<AppState>();
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Ok(None);
+    };
+
     match cli.viewer(&token).await {
         Ok(v) => Ok(Some(AniListUser {
             id: v.id,
@@ -698,9 +716,26 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
             avatar: v.avatar_large,
         })),
         Err(AppError::Unauthorized) => {
-            if let Err(e) = state.provider.delete_secret("anilist-token") {
-                log::error!("geçersiz AniList oturumu silinemedi: {e}");
-            }
+            drop_rejected_token(&state);
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Aggregate counters for the launcher hero bar. `None` when signed out —
+/// the frontend then shows the connect affordance instead of false zeros.
+#[tauri::command]
+pub async fn anilist_hero_stats(app: AppHandle) -> AppResult<Option<anilist::ViewerStats>> {
+    let state = app.state::<AppState>();
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Ok(None);
+    };
+
+    match cli.viewer_stats(&token).await {
+        Ok(s) => Ok(Some(s)),
+        Err(AppError::Unauthorized) => {
+            drop_rejected_token(&state);
             Ok(None)
         }
         Err(e) => Err(e),

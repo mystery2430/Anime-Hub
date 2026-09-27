@@ -37,12 +37,52 @@
 
       <main id="launcher" class="launcher">
         <div id="notice" class="notice" hidden></div>
+
+        <section class="hero">
+          <div class="hero-lead">
+            <span class="hero-mark" aria-hidden="true">A</span>
+            <div class="hero-copy">
+              <h2>Anime dünyan, tek yerde.</h2>
+              <p>Takip et, keşfet, izle. Favori sitelerine bir dokunuşta ulaş.</p>
+            </div>
+          </div>
+          <div class="hero-stats" id="hero-stats">
+            <div class="stat">
+              <span class="stat-num" id="hero-episodes">—</span>
+              <span class="stat-label">İzlenen bölüm</span>
+            </div>
+            <div class="stat">
+              <span class="stat-num" id="hero-current">—</span>
+              <span class="stat-label">Devam eden</span>
+            </div>
+            <div class="stat">
+              <span class="stat-num" id="hero-completed">—</span>
+              <span class="stat-label">Tamamlanan</span>
+            </div>
+          </div>
+          <button type="button" class="hero-cta" id="hero-cta" hidden>
+            AniList'i bağla <span aria-hidden="true">→</span>
+          </button>
+        </section>
+
         <section class="group" data-category="tracking">
-          <h2 class="group-title">Takip / Veritabanı</h2>
+          <header class="group-head">
+            <div class="group-title-row">
+              <h2 class="group-title">Takip / Veritabanı</h2>
+              <span class="group-count" id="count-tracking">0</span>
+            </div>
+            <p class="group-sub">Animelerini takip et, listelerini ve puanlarını senkronize et.</p>
+          </header>
           <div class="grid" id="grid-tracking"></div>
         </section>
         <section class="group" data-category="watching">
-          <h2 class="group-title">İzleme</h2>
+          <header class="group-head">
+            <div class="group-title-row">
+              <h2 class="group-title">İzleme</h2>
+              <span class="group-count" id="count-watching">0</span>
+            </div>
+            <p class="group-sub">Animeleri izle, kaldığın yerden devam et.</p>
+          </header>
           <div class="grid" id="grid-watching"></div>
         </section>
       </main>

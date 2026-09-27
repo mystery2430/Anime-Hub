@@ -260,6 +260,24 @@ pub struct Viewer {
     pub avatar_large: Option<String>,
 }
 
+/// Aggregate counters the launcher hero bar shows (all optional on the wire
+/// — a fresh account legitimately reports zero).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerStats {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub avatar_large: Option<String>,
+    #[serde(default)]
+    pub episodes_watched: u64,
+    /// Currently watching + rewatching entries.
+    #[serde(default)]
+    pub current: u64,
+    #[serde(default)]
+    pub completed: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MediaListStatus {
@@ -403,6 +421,22 @@ query Viewer {
   }
 }"#;
 
+/// A single GraphQL round-trip hero stats card kaynağı: toplu istatistikler.
+pub const Q_VIEWER_STATS: &str = r#"
+query ViewerStats {
+  Viewer {
+    id
+    name
+    avatar { large }
+    statistics {
+      anime {
+        episodesWatched
+        statuses { status count }
+      }
+    }
+  }
+}"#;
+
 pub const Q_LIBRARY: &str = r#"
 query Library($status: MediaListStatus, $page: Int) {
   Page(page: $page, perPage: 50) {
@@ -470,6 +504,38 @@ mod wire {
     pub struct ViewerData {
         #[serde(rename = "Viewer")]
         pub viewer: ViewerInner,
+    }
+    #[derive(Deserialize)]
+    pub struct ViewerStatsData {
+        #[serde(rename = "Viewer")]
+        pub viewer: ViewerStatsInner,
+    }
+    #[derive(Deserialize)]
+    pub struct ViewerStatsInner {
+        pub id: i64,
+        pub name: String,
+        #[serde(default)]
+        pub avatar: Option<Avatar>,
+        #[serde(default)]
+        pub statistics: Option<UserStatistics>,
+    }
+    #[derive(Deserialize)]
+    pub struct UserStatistics {
+        #[serde(default)]
+        pub anime: Option<AnimeStatistics>,
+    }
+    #[derive(Deserialize)]
+    pub struct AnimeStatistics {
+        #[serde(rename = "episodesWatched", default)]
+        pub episodes_watched: u64,
+        #[serde(default)]
+        pub statuses: Vec<StatusCount>,
+    }
+    #[derive(Deserialize)]
+    pub struct StatusCount {
+        pub status: MediaListStatus,
+        #[serde(default)]
+        pub count: u64,
     }
     #[derive(Deserialize)]
     pub struct ViewerInner {
@@ -583,6 +649,35 @@ pub fn map_viewer(d: wire::ViewerData) -> Viewer {
         id: d.viewer.id,
         name: d.viewer.name,
         avatar_large: d.viewer.avatar.and_then(|a| a.large),
+    }
+}
+
+/// Fold AniList's per-status counters into the three hero numbers. `current`
+/// crowds both `Current` and `Repeating` — a rewatch is still "devam eden".
+pub fn map_viewer_stats(d: wire::ViewerStatsData) -> ViewerStats {
+    let v = d.viewer;
+    let anime = v.statistics.and_then(|s| s.anime);
+    let episodes_watched = anime.as_ref().map(|a| a.episodes_watched).unwrap_or(0);
+    let mut current = 0u64;
+    let mut completed = 0u64;
+    if let Some(anime) = &anime {
+        for sc in &anime.statuses {
+            match sc.status {
+                MediaListStatus::Current | MediaListStatus::Repeating => {
+                    current = current.saturating_add(sc.count)
+                }
+                MediaListStatus::Completed => completed = completed.saturating_add(sc.count),
+                _ => {}
+            }
+        }
+    }
+    ViewerStats {
+        id: v.id,
+        name: v.name,
+        avatar_large: v.avatar.and_then(|a| a.large),
+        episodes_watched,
+        current,
+        completed,
     }
 }
 
@@ -740,6 +835,13 @@ impl AniListClient {
         Ok(map_viewer(d))
     }
 
+    pub async fn viewer_stats(&self, token: &Token) -> AppResult<ViewerStats> {
+        let d: wire::ViewerStatsData = self
+            .gql(token, Q_VIEWER_STATS, serde_json::json!({}))
+            .await?;
+        Ok(map_viewer_stats(d))
+    }
+
     pub async fn library(
         &self,
         token: &Token,
@@ -868,6 +970,47 @@ pub fn zeroize_secret(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_stats_folds_statuses_into_hero_numbers() {
+        let d: wire::ViewerStatsData = serde_json::from_value(serde_json::json!({
+            "Viewer": {
+                "id": 7,
+                "name": "kage",
+                "avatar": { "large": "https://x/a.png" },
+                "statistics": { "anime": {
+                    "episodesWatched": 142,
+                    "statuses": [
+                        { "status": "CURRENT", "count": 4 },
+                        { "status": "REPEATING", "count": 2 },
+                        { "status": "COMPLETED", "count": 23 },
+                        { "status": "PLANNING", "count": 9 },
+                        { "status": "DROPPED", "count": 1 }
+                    ]
+                } }
+            }
+        }))
+        .unwrap();
+        let s = map_viewer_stats(d);
+        assert_eq!(s.name, "kage");
+        assert_eq!(s.episodes_watched, 142);
+        assert_eq!(s.current, 6, "current + repeating");
+        assert_eq!(s.completed, 23);
+        assert_eq!(s.avatar_large.as_deref(), Some("https://x/a.png"));
+    }
+
+    #[test]
+    fn viewer_stats_defaults_to_zero_for_fresh_accounts() {
+        let d: wire::ViewerStatsData = serde_json::from_value(serde_json::json!({
+            "Viewer": { "id": 1, "name": "yeni" }
+        }))
+        .unwrap();
+        let s = map_viewer_stats(d);
+        assert_eq!(s.episodes_watched, 0);
+        assert_eq!(s.current, 0);
+        assert_eq!(s.completed, 0);
+        assert!(s.avatar_large.is_none());
+    }
 
     fn cfg() -> AniListConfig {
         AniListConfig {

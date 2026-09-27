@@ -22,6 +22,12 @@ import {
   applyThemeToDom,
   themeLabel,
 } from "./logic/theme.js";
+import {
+  heroModel,
+  displayHost,
+  bannerStyle,
+  bannerRgb,
+} from "./logic/hero.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -68,6 +74,39 @@ const el = {
 };
 
 el.settings.theme = document.getElementById("set-theme");
+
+el.hero = {
+  episodes: document.getElementById("hero-episodes"),
+  current: document.getElementById("hero-current"),
+  completed: document.getElementById("hero-completed"),
+  cta: document.getElementById("hero-cta"),
+};
+
+// ---------------------------------------------------------------------------
+// Hero bar (AniList istatistikleri)
+// ---------------------------------------------------------------------------
+
+function applyHero(model) {
+  el.hero.episodes.textContent = model.episodes;
+  el.hero.current.textContent = model.current;
+  el.hero.completed.textContent = model.completed;
+  el.hero.cta.hidden = model.loggedIn;
+}
+
+async function refreshHero() {
+  try {
+    const stats = await call("anilist_hero_stats");
+    applyHero(heroModel(stats));
+  } catch {
+    // Offline ya da rate limit: bağlı görünüm bozmasın diye sadece tireler.
+    applyHero(heroModel(null));
+  }
+}
+
+el.hero.cta.addEventListener("click", () => {
+  // Ayarlar → AniList bölümü her yerden aynı kapıya çıkar.
+  el.btnSettings.click();
+});
 
 /** Grid element for a category id. */
 const gridFor = (category) =>
@@ -121,29 +160,40 @@ function renderTile(tile) {
   button.className = "tile";
   button.dataset.siteId = tile.id;
 
-  const icon = document.createElement("span");
-  icon.className = "tile-icon";
-  icon.setAttribute("aria-hidden", "true");
+  const color = safeColor(tile.color) || "#6366f1";
+  button.style.setProperty("--site", bannerRgb(color));
+
+  const banner = document.createElement("span");
+  banner.className = "tile-banner";
+  banner.setAttribute("aria-hidden", "true");
   if (tile.image) {
-    icon.classList.add("has-image");
+    banner.classList.add("has-image");
     const img = document.createElement("img");
     img.alt = "";
     img.draggable = false;
     img.src = tile.image;
-    icon.appendChild(img);
+    banner.appendChild(img);
   } else {
-    icon.textContent = tile.letters;
-    // `safeColor` already returned null-or-#hex in the view model; assigning to
-    // a single style property is not an injection sink, but keep it explicit.
-    icon.style.background = safeColor(tile.color) || "#0ea5e9";
+    banner.style.background = bannerStyle(color);
+    const mark = document.createElement("span");
+    mark.className = "tile-mark";
+    mark.textContent = tile.letters;
+    banner.appendChild(mark);
   }
 
+  const body = document.createElement("span");
+  body.className = "tile-body";
   const name = document.createElement("span");
   name.className = "tile-name";
   name.textContent = tile.name;
   name.title = tile.url;
+  const host = document.createElement("span");
+  host.className = "tile-host";
+  host.textContent = displayHost(tile.url);
+  body.append(name, host);
+  if (!host.textContent) body.classList.add("no-host");
 
-  button.append(icon, name);
+  button.append(banner, body);
 
   if (tile.native) {
     const badge = document.createElement("span");
@@ -174,16 +224,25 @@ function renderAddTile() {
   button.type = "button";
   button.className = "tile tile-add";
 
-  const icon = document.createElement("span");
-  icon.className = "tile-icon";
-  icon.textContent = "+";
-  icon.setAttribute("aria-hidden", "true");
+  const banner = document.createElement("span");
+  banner.className = "tile-banner";
+  banner.setAttribute("aria-hidden", "true");
+  const plus = document.createElement("span");
+  plus.className = "tile-mark";
+  plus.textContent = "+";
+  banner.appendChild(plus);
 
-  const label = document.createElement("span");
-  label.className = "tile-name";
-  label.textContent = "Site ekle";
+  const body = document.createElement("span");
+  body.className = "tile-body";
+  const name = document.createElement("span");
+  name.className = "tile-name";
+  name.textContent = "Site ekle";
+  const host = document.createElement("span");
+  host.className = "tile-host";
+  host.textContent = "Yeni bir siteyi hub'ına ekle";
+  body.append(name, host);
 
-  button.append(icon, label);
+  button.append(banner, body);
   button.addEventListener("click", () => openSiteForm(null));
   return button;
 }
@@ -192,6 +251,9 @@ function renderLauncher(groups) {
   for (const group of groups) {
     const grid = gridFor(group.id);
     grid.textContent = "";
+
+    const count = document.getElementById(`count-${group.id}`);
+    if (count) count.textContent = String(group.tiles.length);
 
     if (group.tiles.length === 0) {
       const note = document.createElement("p");
@@ -638,6 +700,7 @@ function wireSettings() {
       await call("anilist_logout");
       el.settings.anilistStatus.textContent = "Oturum kapatıldı.";
       el.settings.anilistStatus.dataset.state = "";
+      applyHero(heroModel(null));
     } catch (e) {
       showNotice(errMessage(e));
     }
@@ -820,6 +883,7 @@ async function wireBackendEvents() {
   await on("animehub://anilist-login", (name) => {
     showNotice(`AniList girişi tamamlandı: ${name}`, "info");
     void refreshAniListStatus();
+    void refreshHero();
   });
   // The Rust side can close a site on its own (the injected back button /
   // Esc navigates to animehub://close-site, handled natively). Clear the
@@ -836,6 +900,7 @@ async function boot() {
   renderLauncher(CATEGORIES.map((c) => ({ id: c.id, title: c.title, tiles: [] })));
   await refreshLauncher();
   await wireBackendEvents();
+  void refreshHero();
 
   try {
     const warning = await call("take_startup_warning");

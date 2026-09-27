@@ -59,6 +59,7 @@ pub fn run() {
             commands::anilist_login_start,
             commands::anilist_login_callback,
             commands::anilist_status,
+            commands::anilist_hero_stats,
             commands::anilist_logout,
             commands::anilist_library,
             commands::anilist_search,
