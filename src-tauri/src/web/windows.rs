@@ -28,10 +28,10 @@ use crate::sites::registry::Site;
 #[cfg(desktop)]
 use crate::web::dns::{classify_host, DnsClass};
 use crate::web::session::profile_dir_name;
-#[cfg(desktop)]
-use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
 #[cfg(mobile)]
 use crate::web::session::{capture, restore, CookieJar};
+#[cfg(desktop)]
+use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
 use tauri::{AppHandle, Emitter, Manager};
 #[cfg(desktop)]
 use tauri::{LogicalPosition, PhysicalPosition, Position, Size, WebviewUrl};
