@@ -15,6 +15,13 @@ import {
   safeDataImage,
   CATEGORIES,
 } from "./logic/tiles.js";
+import {
+  THEMES,
+  THEME_CACHE_KEY,
+  normalizeTheme,
+  applyThemeToDom,
+  themeLabel,
+} from "./logic/theme.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -52,9 +59,15 @@ const el = {
   btnResetBlocklist: document.getElementById("btn-reset-blocklist"),
   btnSaveAnilist: document.getElementById("btn-save-anilist"),
   btnAnilistLogout: document.getElementById("btn-anilist-logout"),
+  btnAnilistLogin: document.getElementById("btn-anilist-login"),
   linkAnilistDev: document.getElementById("link-anilist-dev"),
   aboutList: document.getElementById("about-list"),
+  themeBtns: THEMES.map((t) =>
+    document.querySelector(`.theme-btn[data-theme="${t}"]`),
+  ),
 };
+
+el.settings.theme = document.getElementById("set-theme");
 
 /** Grid element for a category id. */
 const gridFor = (category) =>
@@ -441,6 +454,68 @@ function wireModalClose(modal) {
 }
 
 // ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+/** Currently applied preference; mirrored to localStorage for the first paint. */
+let themePref = normalizeTheme(
+  (() => {
+    try {
+      return localStorage.getItem(THEME_CACHE_KEY);
+    } catch {
+      return null;
+    }
+  })(),
+);
+
+function applyTheme(pref) {
+  themePref = normalizeTheme(pref);
+  applyThemeToDom(themePref);
+  for (const btn of el.themeBtns) {
+    if (!btn) continue;
+    btn.setAttribute("aria-pressed", String(btn.dataset.theme === themePref));
+    btn.title = `${themeLabel(btn.dataset.theme)} tema`;
+  }
+  if (el.settings.theme) el.settings.theme.value = themePref;
+}
+
+async function setTheme(pref) {
+  applyTheme(pref);
+  try {
+    localStorage.setItem(THEME_CACHE_KEY, themePref);
+  } catch {
+    /* private mode etc. — the backend copy still persists */
+  }
+  // Native window + WebViews (Rust applies it to every webview of the app,
+  // so site pages that respect prefers-color-scheme follow too).
+  try {
+    await call("set_window_theme", { theme: themePref });
+  } catch {
+    /* cosmetic only — never block the UI over it */
+  }
+  // Persist into the encrypted settings.
+  try {
+    await call("update_settings", { patch: { theme: themePref } });
+  } catch (e) {
+    showNotice(errMessage(e));
+  }
+}
+
+function wireTheme() {
+  for (const btn of el.themeBtns) {
+    if (!btn) continue;
+    btn.addEventListener("click", () => setTheme(btn.dataset.theme));
+  }
+  if (el.settings.theme) {
+    el.settings.theme.addEventListener("change", (e) => setTheme(e.target.value));
+  }
+}
+
+// Apply the cached choice immediately so the first paint matches; the
+// backend reconciliation in boot() may correct it afterwards.
+applyTheme(themePref);
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -456,6 +531,7 @@ async function openSettings() {
     el.settings.blocklist.value = s.blocklist.rules || "";
     el.settings.fullscreen.checked = Boolean(s.fullscreenSites);
     el.settings.pip.checked = Boolean(s.pipAutoEnter);
+    applyTheme(s.theme);
     el.settings.anilistId.value = s.anilist.clientId || "";
     el.settings.anilistSecret.value = "";
     el.settings.anilistRedirect.value = s.anilist.redirectUri || "";
@@ -465,9 +541,10 @@ async function openSettings() {
         ? " — anahtar işletim sistemi tarafından korunuyor."
         : " — işletim sistemi anahtar deposu bulunamadı; anahtar dosya izinleriyle korunuyor.");
     el.settings.anilistStatus.textContent = s.anilist.configured
-      ? "AniList yapılandırılmış."
-      : "AniList yapılandırılmamış; site WebView'da açılır.";
+      ? "AniList yapılandırılmış; giriş yapabilirsiniz."
+      : "Giriş için önce Client ID'yi kaydedin (yoksa AniList WebView'da açılır).";
     el.settings.anilistStatus.dataset.state = s.anilist.configured ? "ok" : "";
+    el.btnAnilistLogin.disabled = !s.anilist.configured;
     openModal(el.modalSettings);
     await refreshAniListStatus();
   } catch (e) {
@@ -543,6 +620,17 @@ function wireSettings() {
       },
     };
     saveSettings(patch, "AniList ayarları kaydedildi.").then(refreshAniListStatus);
+  });
+
+  el.btnAnilistLogin.addEventListener("click", async () => {
+    try {
+      const start = await call("anilist_login_start");
+      el.settings.anilistStatus.textContent =
+        "Tarayıcıda AniList girişi bekleniyor… bitince bu ekran güncellenir.";
+      await openExternal(start.url);
+    } catch (e) {
+      showNotice(errMessage(e));
+    }
   });
 
   el.btnAnilistLogout.addEventListener("click", async () => {
@@ -729,14 +817,22 @@ function wireGlobal() {
 async function wireBackendEvents() {
   await on("animehub://navigation-blocked", (message) => showNotice(String(message)));
   await on("animehub://error", (message) => showNotice(String(message)));
-  await on("animehub://anilist-login", (name) =>
-    showNotice(`AniList girişi tamamlandı: ${name}`, "info"),
-  );
+  await on("animehub://anilist-login", (name) => {
+    showNotice(`AniList girişi tamamlandı: ${name}`, "info");
+    void refreshAniListStatus();
+  });
+  // The Rust side can close a site on its own (the injected back button /
+  // Esc navigates to animehub://close-site, handled natively). Clear the
+  // label so the launcher's own "back" bookkeeping stays honest.
+  await on("animehub://site-closed", () => {
+    openSiteLabel = null;
+  });
 }
 
 async function boot() {
   wireGlobal();
   wireSettings();
+  wireTheme();
   renderLauncher(CATEGORIES.map((c) => ({ id: c.id, title: c.title, tiles: [] })));
   await refreshLauncher();
   await wireBackendEvents();
@@ -746,6 +842,23 @@ async function boot() {
     if (warning) showNotice(String(warning));
   } catch {
     /* non-fatal */
+  }
+
+  // Reconcile the theme with the encrypted settings: the localStorage mirror
+  // above only covers the first paint.
+  try {
+    const s = await call("get_settings");
+    currentSettings = s;
+    if (normalizeTheme(s.theme) !== themePref) {
+      applyTheme(s.theme);
+      try {
+        localStorage.setItem(THEME_CACHE_KEY, normalizeTheme(s.theme));
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* theme stays at the cached value */
   }
 }
 

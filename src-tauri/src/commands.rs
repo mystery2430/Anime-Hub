@@ -46,6 +46,21 @@ pub struct CurrentSite {
     pub site_id: String,
     pub host: String,
     pub window_label: String,
+    /// Desktop: `true` when opening the site is what put the window into
+    /// fullscreen, so closing it may restore the windowed state. Kept
+    /// separate so a manual fullscreen choice is never taken away.
+    pub entered_fullscreen: bool,
+}
+
+/// Launcher theme preference, persisted with the other settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePref {
+    /// Follow the OS light/dark setting (the default).
+    #[default]
+    System,
+    Dark,
+    Light,
 }
 
 /// User-adjustable preferences.
@@ -60,9 +75,14 @@ pub struct Settings {
     /// Injected CSS is cosmetic only; it never rewrites page scripts.
     #[serde(default = "default_true")]
     pub inject_cosmetic_rules: bool,
-    /// Keep the desktop window chromeless when a site is open.
-    #[serde(default = "default_true")]
+    /// Enter fullscreen while a desktop site view is open. Opt-in: sites
+    /// share the single app window, so the default keeps the normal
+    /// windowed size.
+    #[serde(default)]
     pub fullscreen_sites: bool,
+    /// Launcher theme: system / dark / light.
+    #[serde(default)]
+    pub theme: ThemePref,
     /// Android: enter Picture-in-Picture automatically on Home.
     #[serde(default)]
     pub pip_auto_enter: bool,
@@ -80,7 +100,8 @@ impl Default for Settings {
             blocklist: BlocklistState::default_state(),
             block_popups: true,
             inject_cosmetic_rules: true,
-            fullscreen_sites: true,
+            fullscreen_sites: false,
+            theme: ThemePref::System,
             pip_auto_enter: false,
             anilist: AniListConfig::default(),
         }
@@ -96,6 +117,7 @@ pub struct SettingsView {
     pub block_popups: bool,
     pub inject_cosmetic_rules: bool,
     pub fullscreen_sites: bool,
+    pub theme: ThemePref,
     pub pip_auto_enter: bool,
     pub anilist: AniListConfigView,
     pub key_backend: String,
@@ -305,6 +327,9 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         } else {
             vec![]
         },
+        // Desktop shows the site inside the launcher window, so it needs the
+        // injected back button + Esc. Mobile keeps its system-back flow.
+        close_overlay: !cfg!(any(target_os = "android", target_os = "ios")),
     };
     let init_script = build_init_script(&injected);
 
@@ -422,6 +447,7 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsView> {
         block_popups: s.block_popups,
         inject_cosmetic_rules: s.inject_cosmetic_rules,
         fullscreen_sites: s.fullscreen_sites,
+        theme: s.theme,
         pip_auto_enter: s.pip_auto_enter,
         anilist: AniListConfigView {
             configured: s.anilist.is_configured(),
@@ -457,6 +483,9 @@ pub fn update_settings(
         if let Some(v) = patch.fullscreen_sites {
             s.fullscreen_sites = v;
         }
+        if let Some(v) = patch.theme {
+            s.theme = v;
+        }
         if let Some(v) = patch.pip_auto_enter {
             s.pip_auto_enter = v;
         }
@@ -480,6 +509,8 @@ pub struct SettingsPatch {
     pub inject_cosmetic_rules: Option<bool>,
     #[serde(default)]
     pub fullscreen_sites: Option<bool>,
+    #[serde(default)]
+    pub theme: Option<ThemePref>,
     #[serde(default)]
     pub pip_auto_enter: Option<bool>,
     #[serde(default)]
@@ -751,8 +782,26 @@ pub async fn anilist_delete(app: AppHandle, entry_id: i64) -> AppResult<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// PiP / misc
+// Görünüm / PiP / misc
 // ---------------------------------------------------------------------------
+
+/// Apply the launcher theme to the native window.
+///
+/// `System` maps to `None`, which hands the choice back to the OS. WebView2
+/// and WebKitGTK both follow the same override for `prefers-color-scheme`,
+/// so the choice also reaches site pages that respect the media query.
+#[tauri::command]
+pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppResult<()> {
+    let target = match theme {
+        ThemePref::System => None,
+        ThemePref::Dark => Some(tauri::Theme::Dark),
+        ThemePref::Light => Some(tauri::Theme::Light),
+    };
+    window.set_theme(target).map_err(|e| {
+        log::error!("tema uygulanamadı: {e}");
+        AppError::Other("tema uygulanamadı".into())
+    })
+}
 
 #[tauri::command]
 pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
@@ -855,7 +904,8 @@ mod tests {
         let s = Settings::default();
         assert!(s.block_popups, "popup blocking must default on");
         assert!(s.inject_cosmetic_rules);
-        assert!(s.fullscreen_sites);
+        assert!(!s.fullscreen_sites, "site fullscreen is opt-in");
+        assert_eq!(s.theme, ThemePref::System, "theme follows the OS");
         assert!(s.blocklist.enabled);
         assert!(!s.pip_auto_enter, "PiP auto-enter is opt-in");
         assert!(!s.anilist.is_configured());
@@ -907,6 +957,7 @@ mod tests {
             block_popups: s.block_popups,
             inject_cosmetic_rules: s.inject_cosmetic_rules,
             fullscreen_sites: s.fullscreen_sites,
+            theme: s.theme,
             pip_auto_enter: s.pip_auto_enter,
             anilist: AniListConfigView {
                 configured: s.anilist.is_configured(),

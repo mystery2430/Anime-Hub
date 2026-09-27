@@ -15,7 +15,7 @@
 ![Android](https://img.shields.io/badge/Android-26+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
 
 ![Linux](https://img.shields.io/badge/Linux-do%C4%9Fruland%C4%B1-FCC624?style=for-the-badge&logo=linux&logoColor=black)
-![Windows](https://img.shields.io/badge/Windows-derlenmedi-0078D4?style=for-the-badge&logo=windows&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-do%C4%9Fruland%C4%B1-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-desteklenmiyor-555555?style=for-the-badge&logo=apple&logoColor=white)
 
 [![Release](https://img.shields.io/github/v/release/mystery2430/Anime-Hub?style=flat-square&color=62cdfe&label=s%C3%BCr%C3%BCm)](https://github.com/mystery2430/Anime-Hub/releases/latest)
@@ -29,10 +29,12 @@
 ## ℹ️&nbsp; Proje Hakkında
 
 AnimeHub bir **başlatıcı**dır: tek bir siteye bağlanan bir istemci değil. Ekranda
-gruplanmış bir ikon ızgarası görürsünüz, birine dokunursunuz, o site kendi
-**izole** WebView penceresinde tam ekran açılır. Siteler arasında çerez,
-localStorage veya oturum sızıntısı olmaz — MAL'da giriş yapmanız AniList'i,
-AniList'te giriş yapmanız bir izleme sitesini etkilemez.
+gruplanmış bir ikon ızgarası görürsünüz, birine dokunursunuz, o site ana
+pencerenin içinde kendi **izole** WebView'ında açılır (yeni pencere/sekme
+yok; üstteki geri düğmesi veya `Esc` ile starters ekranına dönersiniz).
+Siteler arasında çerez, localStorage veya oturum sızıntısı olmaz — MAL'da
+giriş yapmanız AniList'i, AniList'te giriş yapmanız bir izleme sitesini
+etkilemez.
 
 İki grup vardır:
 
@@ -82,7 +84,7 @@ flowchart TB
     CMD --> REG
     CMD --> SEC
     CMD --> AL
-    CMD -->|pencere aç| POL
+    CMD -->|site görünümü barındır| POL
     POL -->|HTTPS + engel listesi| WV1
     POL -->|HTTPS + engel listesi| WV2
     BL --> POL
@@ -90,7 +92,7 @@ flowchart TB
 
 | Katman | Konum | Sorumluluk |
 |---|---|---|
-| **Rust çekirdeği** | `src-tauri/src/*.rs` | Komutlar, site kaydı, URL politikası, şifreli depo, AniList OAuth, pencere açma |
+| **Rust çekirdeği** | `src-tauri/src/*.rs` | Komutlar, site kaydı, URL politikası, şifreli depo, AniList OAuth, site görünümünü barındırma |
 | **Güvenlik katmanı** | `secure/`, `sites/`, `web/` | AES-256-GCM depo, HTTPS zorunluluğu, alan adı engelleme, gezinti/yeni pencere reddi |
 | **Başlatıcı arayüzü** | `src/` | Izgara, site ekleme/düzenleme, Ayarlar ve Hakkında ekranları — `innerHTML` kullanmadan |
 | **Android köprüsü** | `src-tauri/android-plugin/` | AndroidKeyStore (şifreleme) + Picture-in-Picture |
@@ -100,12 +102,20 @@ flowchart TB
 
 ## ⭐&nbsp; Öne Çıkan Özellikler
 
-### 🪟&nbsp; Site başına izole oturum
+### 🪟&nbsp; Site başına izole oturum — tek pencerede
 
 Her site kendi WebView profil dizinini alır:
 `<uygulama verisi>/profiles/<site>`. Linux'ta WebKitGTK `data_directory`,
 Windows'ta WebView2 profili kullanılır; çerezler, localStorage, IndexedDB ve
 önbellek siteler arasında **hiç** kesişmez.
+
+Masaüstünde site, uygulamanın **tek penceresi içinde** siteden-siteye
+değişen bir alt WebView olarak barındırılır — tarayıcı sekmesi veya OS
+penceresi yerine. Pencere başlığı site adını gösterir; "siteleri tam ekran
+aç" **kapalı gelir** (varsayılan pencere boyutu), Ayarlar'dan açılabilir.
+Ayrıca her site WebView'ının Tauri yetkisi **yoktur**: izinler yalnızca
+başlatıcı WebView'ına kapsüllüdür, şüpheli bir site Rust komutlarına
+ulaşamaz.
 
 > [!IMPORTANT]
 > Android'de sistem WebView'ının site başına profil API'si **yoktur**.
@@ -166,6 +176,19 @@ AniList, OAuth 2.0 **authorization code** akışıyla bağlanır ve GraphQL
 (`graphql.anilist.co`) üzerinden kitaplık + arama sorgular. `state` parametresi
 UUID v4'tür ve sabit zamanlı karşılaştırma ile doğrulanır. Dönen token şifreli
 depoya yazılır; `client_id` / `client_secret` sizindir, depoya asla girmez.
+
+Bağlantı, Ayarlar → AniList bölümündeki **"AniList ile giriş yap"**
+düğmesiyle başlar: OAuth ekranı sistem tarayıcınızda açılır, yetki
+`animehub://auth` deep-link'i ile uygulamaya döner ve durum satırı
+kendiliğinden güncellenir. Client ID kaydedilmediyse düğme pasif görünür ve
+site kutucuğu siteyi WebView'da açmaya devam eder.
+
+### 🎨&nbsp; Tema: sistem / koyu / açık
+
+Üst çubuktaki üç düğmeli seçici (veya Ayarlar → Görünüm) ile tema anında
+değişir. **Sistem** modu işletim sisteminin açık/koyu tercihini canlı takip
+eder (`prefers-color-scheme`); koyu ve açık seçimleri hem arayüzü hem de
+native pencere kromunu kaplar ve şifreli ayarlara kaydedilir.
 
 > [!NOTE]
 > AniList PKCE'yi belgelemediği için akış, client secret ile kuruludur.
@@ -385,7 +408,7 @@ Bu proje **temiz oda** (clean-room) bir uygulamadır: GPLv3 lisanslı
 referans alınmıştır. Bu ayrımın lisans sonuçları ve tüm atıflar
 [`NOTICES.md`](./NOTICES.md) dosyasındadır.
 
-Mimari deseni — "başlatıcı ekranı + seçilen siteyi tam ekran WebView'da açma"
+Mimari deseni — "başlatıcı ekranı + seçilen siteyi uygulama içi WebView'da açma"
 — [OpenAnime-Linux](https://github.com/tuanapi/OpenAnime-Linux) ve
 [OpenAnime-Desktops](https://github.com/Dark-Hunter-TR/OpenAnime-Desktops)
 projelerinden esinlenmiştir. Teknoloji seçimleri (Tauri 2 / Rust) bu

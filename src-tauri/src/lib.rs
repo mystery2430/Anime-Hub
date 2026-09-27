@@ -66,6 +66,7 @@ pub fn run() {
             commands::anilist_delete,
             commands::enter_pip,
             commands::set_pip_auto_enter,
+            commands::set_window_theme,
             commands::app_info,
         ])
         .run(tauri::generate_context!())
@@ -91,6 +92,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
 
     let blocklist = Blocklist::from_rules(&settings.blocklist.rules, settings.blocklist.enabled);
+    // Captured before `settings` moves into the managed state; applied to
+    // the native window below.
+    let theme_pref = settings.theme;
 
     if let Some(w) = &warning {
         log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü: {w}");
@@ -129,6 +133,24 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(desktop)]
     if let Err(e) = app.deep_link().register_all() {
         log::warn!("deep-link şeması kaydedilemedi: {e}");
+    }
+
+    // Desktop hosts site webviews inside the launcher window: keep them
+    // glued to the window size from the first resize on.
+    crate::web::windows::install_main_window_handlers(&app.handle().clone());
+
+    // Apply the saved theme override to the native window. `System` maps to
+    // `None`: the OS decides, and both the window chrome and the WebViews'
+    // `prefers-color-scheme` follow it.
+    if let Some(w) = app.get_webview_window("main") {
+        let target = match theme_pref {
+            commands::ThemePref::System => None,
+            commands::ThemePref::Dark => Some(tauri::Theme::Dark),
+            commands::ThemePref::Light => Some(tauri::Theme::Light),
+        };
+        if let Err(e) = w.set_theme(target) {
+            log::warn!("kayıtlı tema uygulanamadı: {e}");
+        }
     }
 
     let handle = app.handle().clone();

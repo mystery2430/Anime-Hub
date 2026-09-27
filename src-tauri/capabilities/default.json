@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the launcher window only. Site WebViews load external origins and are deliberately given no capabilities — Tauri withholds IPC from them, so a compromised streaming site cannot reach the Rust core.",
-  "windows": ["main"],
+  "description": "Permissions for the launcher webview only. Sites are hosted as child WebViews inside the same window, so the grant must be scoped to the `main` webview, not the window: window-scoped grants would cover the site webviews. They load external origins and are deliberately given no capabilities — Tauri withholds IPC from them, so a compromised streaming site cannot reach the Rust core.",
+  "webviews": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-set-fullscreen",

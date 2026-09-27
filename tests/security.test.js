@@ -109,11 +109,17 @@ test("the CSP forbids remote scripts and frames", () => {
   assert.ok(!/unsafe-eval/.test(csp), "no eval");
 });
 
-test("capabilities are scoped to the launcher window only", () => {
+test("capabilities are scoped to the launcher webview only", () => {
   const cap = JSON.parse(
     read(join(ROOT, "src-tauri", "capabilities", "default.json")),
   );
-  assert.deepEqual(cap.windows, ["main"]);
+  assert.deepEqual(cap.webviews, ["main"]);
+  // Sites are child webviews inside the main window, so a window-scoped
+  // grant would silently cover them too.
+  assert.ok(
+    !cap.windows || cap.windows.length === 0,
+    "window-scoped grants would cover the site webviews",
+  );
   const ids = cap.permissions.map((p) => (typeof p === "string" ? p : p.identifier));
   assert.ok(!ids.includes("shell:allow-execute"), "no shell execution");
   // Site WebViews must not be able to open arbitrary URLs.

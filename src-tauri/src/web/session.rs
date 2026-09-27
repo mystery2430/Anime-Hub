@@ -311,13 +311,66 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
         .to_string()
     };
 
+    let overlay = if cfg.close_overlay {
+        r#"
+  // Single-window mode: a way back to the launcher that does not rely on IPC
+  // (remote pages get none). The pseudo-URL is intercepted natively by the
+  // navigation handler in web/windows.rs and turned into a close action, so
+  // following it never actually leaves the app.
+  if (CFG.closeOverlay) {
+    window.__animehubGoHome = function () {
+      document.location.assign("animehub://close-site");
+    };
+    document.addEventListener(
+      "keydown",
+      function (e) {
+        if (e.key === "Escape") window.__animehubGoHome();
+      },
+      true,
+    );
+    var animehubBackInstall = function () {
+      if (document.getElementById("__animehub-back")) return;
+      var b = document.createElement("button");
+      b.id = "__animehub-back";
+      b.type = "button";
+      b.textContent = "← AnimeHub'a dön";
+      b.setAttribute(
+        "style",
+        "position:fixed;left:14px;bottom:14px;z-index:2147483647;" +
+          "padding:9px 14px;border-radius:11px;border:1px solid rgba(255,255,255,0.28);" +
+          "background:rgba(13,16,25,0.88);color:#f2f4fa;" +
+          "font:600 13px/1.2 system-ui,sans-serif;cursor:pointer;" +
+          "box-shadow:0 6px 22px rgba(0,0,0,0.45);backdrop-filter:blur(6px);",
+      );
+      b.addEventListener(
+        "click",
+        function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          window.__animehubGoHome();
+        },
+        true,
+      );
+      (document.body || document.documentElement).appendChild(b);
+    };
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", animehubBackInstall);
+    } else {
+      animehubBackInstall();
+    }
+  }
+"#
+    } else {
+        ""
+    };
+
     format!(
         r#"(function () {{
   "use strict";
   if (window.__animehubInstalled) return;
   window.__animehubInstalled = true;
   var CFG = {payload};
-{popup_guard}{cosmetic}}})();"#
+{popup_guard}{cosmetic}{overlay}}})();"#
     )
 }
 
@@ -344,6 +397,13 @@ pub fn embed_json<T: serde::Serialize>(value: &T) -> String {
 pub struct InjectedConfig {
     pub block_popups: bool,
     pub hide_selectors: Vec<String>,
+    /// Desktop single-window mode: floating "back to launcher" button plus an
+    /// `Esc` handler inside the site view. It is a navigation to
+    /// `animehub://close-site`, which `web::windows` intercepts natively.
+    /// Mobile uses the system back gesture (and the shared-WebView flow), so
+    /// it stays off there.
+    #[serde(default)]
+    pub close_overlay: bool,
 }
 
 impl Default for InjectedConfig {
@@ -354,6 +414,7 @@ impl Default for InjectedConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            close_overlay: false,
         }
     }
 }
@@ -700,6 +761,7 @@ mod tests {
         let cfg = InjectedConfig {
             block_popups: true,
             hide_selectors: vec!["</script><script>alert(1)</script>".into()],
+            close_overlay: false,
         };
         let js = build_init_script(&cfg);
         assert!(
@@ -726,8 +788,24 @@ mod tests {
         let js = build_init_script(&InjectedConfig {
             block_popups: false,
             hide_selectors: vec![],
+            close_overlay: false,
         });
         assert!(!js.contains("window.open = function"));
+    }
+
+    #[test]
+    fn init_script_overlay_only_when_enabled() {
+        let js = build_init_script(&InjectedConfig {
+            close_overlay: true,
+            ..InjectedConfig::default()
+        });
+        assert!(js.contains("__animehub-back"));
+        assert!(js.contains("animehub://close-site"));
+        assert!(js.contains("Escape"));
+
+        let off = build_init_script(&InjectedConfig::default());
+        assert!(!off.contains("__animehub-back"));
+        assert!(!off.contains("close-site"));
     }
 
     #[test]

@@ -4,7 +4,8 @@
  * so everything here is local and the UI renders identically offline.
  */
 
-:root {
+:root,
+:root[data-theme="dark"] {
   --bg: #0b0d14;
   --bg-elev: #12151f;
   --bg-elev-2: #181c28;
@@ -22,8 +23,11 @@
   color-scheme: dark;
 }
 
+/* "system" = no data-theme attribute, so this media query keeps driving
+   live when the OS theme flips. An explicit pick sets html[data-theme]
+   and bypasses both blocks. */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme]) {
     --bg: #f5f6fa;
     --bg-elev: #ffffff;
     --bg-elev-2: #f0f2f8;
@@ -33,6 +37,17 @@
     --shadow: 0 10px 28px rgba(20, 24, 40, 0.12);
     color-scheme: light;
   }
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6fa;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #f0f2f8;
+  --line: #dfe3ee;
+  --text: #141726;
+  --text-dim: #5c6478;
+  --shadow: 0 10px 28px rgba(20, 24, 40, 0.12);
+  color-scheme: light;
 }
 
 * {
@@ -112,6 +127,29 @@ body {
   display: flex;
   gap: 6px;
   flex: none;
+  align-items: center;
+}
+
+/* ------------------------------------------------------- theme switch */
+
+.theme-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 10px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+}
+
+.theme-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+
+.theme-btn[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent) 62%, var(--bg-elev-2));
+  color: #fff;
 }
 
 .icon-btn {
@@ -423,6 +461,7 @@ fieldset.field {
 input[type="text"],
 input[type="url"],
 input[type="password"],
+select,
 textarea {
   width: 100%;
   padding: 9px 11px;
@@ -435,6 +474,7 @@ textarea {
 }
 
 input:focus-visible,
+select:focus-visible,
 textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
