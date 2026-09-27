@@ -533,7 +533,7 @@ mod wire {
     }
     #[derive(Deserialize)]
     pub struct StatusCount {
-        pub status: MediaListStatus,
+        pub status: crate::anilist::MediaListStatus,
         #[serde(default)]
         pub count: u64,
     }
