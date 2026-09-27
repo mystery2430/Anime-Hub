@@ -212,8 +212,8 @@ Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
 
 | Yöntem | Boyut | Komut |
 |---|---|---|
-| **`.deb`** (Debian/Ubuntu) | ~3.7 MB | `sudo apt install ./AnimeHub_0.1.0_amd64.deb` |
-| **`.rpm`** (Fedora/RHEL) | — | `sudo rpm -ivh animehub-0.1.0-1.x86_64.rpm` |
+| **`.deb`** (Debian/Ubuntu) | ~3.7 MB | `sudo apt install ./AnimeHub_0.2.0_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | — | `sudo rpm -ivh animehub-0.2.0-1.x86_64.rpm` |
 | **AppImage** | — | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
 
 ```bash
@@ -234,11 +234,11 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 | Yöntem | Boyut | Açıklama |
 |---|---|---|
-| **APK** | — | Releases sayfasından ABI'nize uygun `.apk` (arm64-v8a / armeabi-v7a / x86_64) |
+| **İmzalı APK** | — | Releases sayfasından ABI'nize uygun `.apk` (`animehub-aarch64-release.apk` çoğu modern telefon; `animehub-armv7-release.apk` eski 32-bit; `animehub-x86_64-release.apk` emülatör) |
 
-> [!CAUTION]
-> Android tarafı **henüz bir cihazda doğrulanmadı**. Kotlin köprüsü yazıldı
-> ama derlenmedi — ayrıntılar için [Doğrulama durumu](#-doğrulama-durumu).
+> [!NOTE]
+> APK'lar tüm CI işlerinde derleniyor ve yayın anahtarıyla imzalanıyor.
+> Henüz bir cihazda elle doğrulanmadı — sorun yaşarsanız Issue açın.
 
 ---
 
@@ -246,9 +246,9 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 | Platform | Durum | Paketler | Notlar |
 |---|---|---|---|
-| 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Bu depoda uçtan uca derlendi ve paketlendi |
-| 🪟 **Windows** | ⚠️ Kod hazır, derlenmedi | `.exe` (NSIS) | DPAPI + WebView2 profili; Windows runner'da derlenir |
-| 🤖 **Android** | ⚠️ Kod hazır, cihazda test edilmedi | `.apk` | Oturum izolasyonu kısmi (yalnızca çerezler) |
+| 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Releases sayfasındaki paketler CI sürümünde üretildi |
+| 🪟 **Windows** | ✅ Doğrulandı | `.exe` (NSIS) | DPAPI + WebView2 profili; kurulum Windows üzerinde elle doğrulandı |
+| 🤖 **Android** | ✅ Derleniyor | 3 ABI için imzalı `.apk` | Oturum izolasyonu kısmi (yalnızca çerezler); cihaz testi bekleniyor |
 | 🍎 **macOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 | 🍏 **iOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 
@@ -319,8 +319,8 @@ etmeyin** — `.gitignore` bunu zaten engeller.
 | `release-desktop.yml` | `v*` etiketi | Linux `.deb`/`.rpm`/AppImage + Windows NSIS |
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Depoda **hiçbir gizli anahtar yoktur**. Android keystore'u
@@ -372,15 +372,18 @@ GitHub Actions'ta doğrulananlar (`ubuntu-24.04`, PR #1):
 | `cargo clippy` / `cargo test --all` | ubuntu ve macOS geçti (`77f5e7c`). Windows clippy o koşuda hâlâ kırmızıydı; DPAPI imza düzeltmesi sonraki koşuda |
 | `cargo build --release --locked` (LTO, tek codegen unit) | **geçti** — 7 GB runner'da link OOM vermedi. Bu bir paket değil; `.deb` / AppImage / rpm ayrıca üretilmedi |
 
+**v0.2.0 ile yeşile dönenler:**
+
+| Doğrulama | Sonuç |
+|---|---|
+| Android APK derlemesi (aarch64, armv7, x86_64) | **yeşil** — `release-android.yml` ve PR CI'daki Android compile işi geçiyor. Derleme hataları `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla çözüldü |
+| Windows NSIS paketi | **üretildi** — `AnimeHub_0.2.0_x64-setup.exe` release varlığı |
+| İmzalı yayın APK'ları (keystore secret'ları) | bu sürümde hazırlandı |
+
 **Hâlâ doğrulanmayanlar:**
 
-- **Android APK ve cihaz testi.** `tauri android init` ve
-  `scripts/android_prepare.py` runner'da geçti (`dev.animehub.app` paketi
-  uyuştu). APK adımı henüz yeşil değil. Cihaz üzerinde PiP denenmedi.
-- **Windows NSIS paketi.** Yalnızca Windows üzerinde üretilebilir; CI test
-  eder, paketlemez.
-- **İmzalı yayın APK'sı.** `release-android.yml` varsayılan dalda olmadığı
-  için `workflow_dispatch` ve etiket akışı hiç çalışmadı.
+- **Android cihaz testi.** APK derlenip imzalanıyor; elle cihaz doğrulaması
+  yapılmadı (PiP, çerez takası, geri katmanı dahil).
 
 Tüm doğrulama kayıtları, bulunan güvenlik açığının ayrıntısı ve devralan
 kişiye düşen işler [`HANDOFF.md`](./HANDOFF.md) dosyasında.
