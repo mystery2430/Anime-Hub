@@ -4,7 +4,8 @@
  * so everything here is local and the UI renders identically offline.
  */
 
-:root {
+:root,
+:root[data-theme="dark"] {
   --bg: #0b0d14;
   --bg-elev: #12151f;
   --bg-elev-2: #181c28;
@@ -17,13 +18,15 @@
   --ok: #10b981;
   --radius: 14px;
   --radius-sm: 9px;
-  --tile: 118px;
   --shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   color-scheme: dark;
 }
 
+/* "system" = no data-theme attribute, so this media query keeps driving
+   live when the OS theme flips. An explicit pick sets html[data-theme]
+   and bypasses both blocks. */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme]) {
     --bg: #f5f6fa;
     --bg-elev: #ffffff;
     --bg-elev-2: #f0f2f8;
@@ -33,6 +36,17 @@
     --shadow: 0 10px 28px rgba(20, 24, 40, 0.12);
     color-scheme: light;
   }
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6fa;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #f0f2f8;
+  --line: #dfe3ee;
+  --text: #141726;
+  --text-dim: #5c6478;
+  --shadow: 0 10px 28px rgba(20, 24, 40, 0.12);
+  color-scheme: light;
 }
 
 * {
@@ -73,10 +87,11 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 18px;
-  padding-top: calc(14px + env(safe-area-inset-top, 0));
-  border-bottom: 1px solid var(--line);
-  background: var(--bg-elev);
+  padding: 13px 18px;
+  padding-top: calc(13px + env(safe-area-inset-top, 0));
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  background: color-mix(in srgb, var(--bg-elev) 62%, transparent);
+  backdrop-filter: blur(14px);
   position: sticky;
   top: 0;
   z-index: 5;
@@ -112,6 +127,29 @@ body {
   display: flex;
   gap: 6px;
   flex: none;
+  align-items: center;
+}
+
+/* ------------------------------------------------------- theme switch */
+
+.theme-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 10px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+}
+
+.theme-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+
+.theme-btn[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent) 62%, var(--bg-elev-2));
+  color: #fff;
 }
 
 .icon-btn {
@@ -141,55 +179,215 @@ body {
 
 /* --------------------------------------------------------------- launcher */
 
+/* Ambient arka plan: tema renginden iki yumuşak ışıma. Radar-efekti
+   değildir; cam yüzeylerin arkasında derinlik üretir. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(560px 300px at 12% -6%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 70%),
+    radial-gradient(640px 340px at 96% 4%, color-mix(in srgb, var(--accent-2) 16%, transparent), transparent 70%);
+  z-index: 0;
+}
+
+#app {
+  position: relative;
+  z-index: 1;
+}
+
 .launcher {
   flex: 1;
   padding: 18px;
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 24px;
   max-width: 1040px;
   width: 100%;
   margin: 0 auto;
 }
 
-.group-title {
-  margin: 0 0 12px;
-  font-size: 12px;
-  font-weight: 650;
-  letter-spacing: 0.09em;
+/* -------------------------------------------------------------- hero bar */
+
+.hero {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding: 20px 22px;
+  border-radius: 20px;
+  border: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+  background: color-mix(in srgb, var(--bg-elev) 66%, transparent);
+  backdrop-filter: blur(14px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 14px 34px rgba(0, 0, 0, 0.22);
+}
+
+.hero-lead {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.hero-mark {
+  flex: none;
+  width: 58px;
+  height: 58px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 26px;
+  font-weight: 800;
+  color: #fff;
+  background: linear-gradient(140deg, var(--accent), var(--accent-2));
+  box-shadow:
+    inset 0 0 0 2px rgba(255, 255, 255, 0.24),
+    inset 0 -6px 14px rgba(0, 0, 0, 0.28),
+    0 8px 24px color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+.hero-copy h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+}
+
+.hero-copy p {
+  margin: 3px 0 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.hero-stats {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+.stat {
+  min-width: 96px;
+  padding: 9px 14px;
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--bg-elev-2) 72%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  text-align: center;
+}
+
+.stat-num {
+  display: block;
+  font-size: 21px;
+  font-weight: 780;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-label {
+  display: block;
+  margin-top: 1px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--text-dim);
 }
 
+.hero-cta {
+  flex: none;
+  padding: 11px 18px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.12s;
+}
+
+.hero-cta:hover {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  transform: translateY(-1px);
+}
+
+/* ------------------------------------------------------------- grup başlığı */
+
+.group-head {
+  margin-bottom: 12px;
+}
+
+.group-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.group-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.group-count {
+  min-width: 22px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--bg-elev-2) 85%, transparent);
+  border: 1px solid var(--line);
+}
+
+.group-sub {
+  margin: 3px 0 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+/* ------------------------------------------------------------ vitrin kartları */
+
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(var(--tile), 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(172px, 1fr));
+  gap: 15px;
 }
 
 .tile {
   position: relative;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  padding: 16px 10px 13px;
+  padding: 0;
   border: 1px solid var(--line);
   border-radius: 18px;
-  background: color-mix(in srgb, var(--bg-elev) 88%, transparent);
+  background: color-mix(in srgb, var(--bg-elev) 90%, transparent);
   color: var(--text);
+  overflow: hidden;
   cursor: pointer;
   font: inherit;
-  text-align: center;
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
-  transition: transform 0.14s ease, border-color 0.15s, background 0.15s, box-shadow 0.15s;
+  text-align: left;
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s,
+    box-shadow 0.16s;
 }
 
 .tile:hover {
-  transform: translateY(-3px);
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
-  background: var(--bg-elev-2);
-  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+  transform: translateY(-4px);
+  border-color: rgb(var(--site, 99 102 241) / 0.55);
+  box-shadow:
+    0 16px 30px rgba(0, 0, 0, 0.3),
+    0 6px 22px rgb(var(--site, 99 102 241) / 0.22);
 }
 
 .tile:focus-visible {
@@ -198,75 +396,106 @@ body {
 }
 
 .tile:active {
-  transform: translateY(0);
+  transform: translateY(-1px);
 }
 
-.tile-icon {
-  width: 64px;
-  height: 64px;
-  border-radius: 18px;
+.tile-banner {
+  position: relative;
   display: grid;
   place-items: center;
+  height: 96px;
   overflow: hidden;
-  font-size: 18px;
-  font-weight: 700;
+}
+
+/* Banner üstüne doğal parlama: gradyanın plastik görünmesini kırar. */
+.tile-banner::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(120% 90% at 85% -10%, rgba(255, 255, 255, 0.22), transparent 55%),
+    linear-gradient(to top, rgba(0, 0, 0, 0.16), transparent 45%);
+  pointer-events: none;
+}
+
+.tile-mark {
+  font-size: 38px;
+  font-weight: 800;
   letter-spacing: 0.02em;
   color: #fff;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.14),
-    0 8px 16px rgba(0, 0, 0, 0.22);
+  text-shadow: 0 2px 14px rgba(0, 0, 0, 0.4);
+  position: relative;
+  z-index: 1;
 }
 
-.tile-icon.has-image {
-  background: #101218;
-  text-shadow: none;
-}
-
-.tile-icon img {
+.tile-banner.has-image img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
 }
 
+.tile-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 13px 11px;
+  min-width: 0;
+}
+
 .tile-name {
-  font-size: 12.5px;
-  font-weight: 550;
+  font-size: 13.5px;
+  font-weight: 650;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.tile-host {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tile-body.no-host {
+  padding-bottom: 14px;
+}
+
 .tile-badge {
   position: absolute;
-  top: 7px;
-  right: 7px;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.05em;
-  padding: 2px 5px;
-  border-radius: 5px;
-  background: color-mix(in srgb, var(--ok) 22%, transparent);
-  color: var(--ok);
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: rgba(10, 12, 18, 0.7);
+  color: #8ff5c9;
+  backdrop-filter: blur(4px);
 }
 
 .tile-menu {
   position: absolute;
-  top: 5px;
-  left: 5px;
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
+  top: 6px;
+  left: 6px;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
   border: none;
-  background: transparent;
-  color: var(--text-dim);
+  background: rgba(10, 12, 18, 0.55);
+  color: #fff;
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s;
+  transition: opacity 0.15s, background 0.15s;
   display: grid;
   place-items: center;
+  backdrop-filter: blur(4px);
 }
 
 .tile:hover .tile-menu,
@@ -277,31 +506,42 @@ body {
 @media (hover: none) {
   .tile-menu {
     opacity: 1;
-    background: color-mix(in srgb, var(--bg) 72%, transparent);
   }
 }
 
 .tile-menu:hover {
-  background: var(--bg-elev-2);
-  color: var(--text);
+  background: rgba(10, 12, 18, 0.85);
 }
 
+/* Ekle kartı: sınır kesikli, içerik sessiz. */
 .tile-add {
   border-style: dashed;
-  color: var(--text-dim);
+  border-color: color-mix(in srgb, var(--text-dim) 45%, transparent);
   background: transparent;
 }
 
 .tile-add:hover {
+  border-color: var(--accent);
   color: var(--text);
+  box-shadow: none;
 }
 
-.tile-add .tile-icon {
-  background: var(--bg-elev-2);
+.tile-add .tile-banner {
+  background: color-mix(in srgb, var(--bg-elev-2) 60%, transparent);
+}
+
+.tile-add .tile-banner::after {
+  background: none;
+}
+
+.tile-add .tile-mark {
   color: var(--text-dim);
-  box-shadow: inset 0 0 0 1px var(--line);
-  font-size: 24px;
   text-shadow: none;
+  font-size: 30px;
+}
+
+.tile-add .tile-host {
+  font-size: 10.5px;
 }
 
 .empty-note {
@@ -311,11 +551,33 @@ body {
   font-size: 13px;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .tile,
+  .hero-cta {
+    transition: none;
+  }
+  .tile:hover {
+    transform: none;
+  }
+}
+
 /* ---------------------------------------------------------------- notice */
 
+/* Fixed toast, above every modal (z-index 20). The notice used to sit in the
+ * launcher flow, so any message raised while a modal was open was completely
+ * hidden behind the overlay — the button looked dead. Anchored to the bottom
+ * center so it reads the same on launcher and inside dialogs. */
 .notice {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  width: min(560px, calc(100vw - 32px));
+  z-index: 60;
   border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  backdrop-filter: blur(14px);
+  box-shadow: var(--shadow);
   color: var(--text);
   border-radius: var(--radius-sm);
   padding: 10px 13px;
@@ -323,6 +585,10 @@ body {
   display: flex;
   align-items: flex-start;
   gap: 10px;
+}
+
+.notice[hidden] {
+  display: none;
 }
 
 .notice[data-kind="info"] {
@@ -423,6 +689,7 @@ fieldset.field {
 input[type="text"],
 input[type="url"],
 input[type="password"],
+select,
 textarea {
   width: 100%;
   padding: 9px 11px;
@@ -435,6 +702,7 @@ textarea {
 }
 
 input:focus-visible,
+select:focus-visible,
 textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -608,6 +876,18 @@ textarea:focus-visible {
   filter: brightness(1.08);
 }
 
+/* Disabled buttons must look disabled: without this rule the locked AniList
+ * login button rendered exactly like an active one, so pressing it did
+ * nothing with no visual explanation ("boşta çalışmıyor"). */
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn:disabled:hover {
+  filter: none;
+}
+
 .btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -633,19 +913,35 @@ textarea:focus-visible {
 /* -------------------------------------------------------------- small UI */
 
 @media (max-width: 560px) {
-  :root {
-    --tile: 88px;
-  }
-
   .launcher {
     padding: 14px;
     gap: 18px;
   }
 
-  .tile-icon {
-    width: 46px;
-    height: 46px;
-    border-radius: 14px;
+  .grid {
+    grid-template-columns: repeat(auto-fill, minmax(138px, 1fr));
+    gap: 11px;
+  }
+
+  .tile-banner {
+    height: 74px;
+  }
+
+  .tile-mark {
+    font-size: 28px;
+  }
+
+  .hero {
+    padding: 15px 16px;
+    gap: 12px;
+  }
+
+  .hero-stats {
+    width: 100%;
+  }
+
+  .stat {
+    flex: 1;
   }
 
   .tile-menu {

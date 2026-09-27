@@ -438,6 +438,78 @@ fn assert_app_error_is_send() {
     check::<AppError>();
 }
 
+/// Standalone overlay snippet: floating "back to launcher" button plus an
+/// `Esc` route home. Installed by Rust on every finished page load via
+/// `Webview::eval` (see `web/windows.rs`), because inside a child WebView the
+/// init-script channel alone proved unreliable on WebView2. The guard makes
+/// repeated evals cheap and idempotent, and the interval repairs the button
+/// if a SPA wipes the DOM around it.
+pub const OVERLAY_SNIPPET: &str = r#"(function () {
+  "use strict";
+  if (window.__animehubOverlayReady) return;
+  window.__animehubOverlayReady = 1;
+
+  window.__animehubGoHome = function () {
+    // Pseudo-navigation intercepted natively (never leaves the app).
+    document.location.assign("animehub://close-site");
+  };
+
+  window.addEventListener(
+    "keydown",
+    function (e) {
+      if (e.key !== "Escape") return;
+      var a = document.activeElement;
+      var editing =
+        a &&
+        ((a.tagName === "INPUT" && a.type !== "checkbox" && a.type !== "radio" &&
+          a.type !== "button" && a.type !== "range") ||
+          a.tagName === "TEXTAREA" ||
+          a.tagName === "SELECT" ||
+          a.isContentEditable);
+      if (editing) {
+        // First Esc steps out of the field; the next one goes home.
+        a.blur();
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      window.__animehubGoHome();
+    },
+    true,
+  );
+
+  var install = function () {
+    if (document.getElementById("__animehub-back")) return;
+    var b = document.createElement("button");
+    b.id = "__animehub-back";
+    b.type = "button";
+    b.textContent = "← AnimeHub'a dön";
+    b.setAttribute(
+      "style",
+      "position:fixed;left:14px;bottom:14px;z-index:2147483647;" +
+        "padding:9px 14px;border-radius:11px;border:1px solid rgba(255,255,255,0.28);" +
+        "background:rgba(13,16,25,0.88);color:#f2f4fa;" +
+        "font:600 13px/1.2 system-ui,sans-serif;cursor:pointer;" +
+        "box-shadow:0 6px 22px rgba(0,0,0,0.45);backdrop-filter:blur(6px);",
+    );
+    b.addEventListener(
+      "click",
+      function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.__animehubGoHome();
+      },
+      true,
+    );
+    (document.body || document.documentElement).appendChild(b);
+  };
+
+  install();
+  window.setInterval(install, 1000);
+})();"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +800,23 @@ mod tests {
             hide_selectors: vec![],
         });
         assert!(!js.contains("window.open = function"));
+    }
+
+    #[test]
+    fn overlay_snippet_routes_home_and_focuses_editing_first() {
+        // The desktop overlay is installed by Rust eval on every finished
+        // page load (web/windows.rs), not by the init script, so it must be
+        // a complete, self-guarding snippet on its own.
+        let js = OVERLAY_SNIPPET;
+        assert!(js.contains("__animehubOverlayReady"));
+        assert!(js.contains("__animehub-back"));
+        assert!(js.contains("animehub://close-site"));
+        assert!(js.contains("Escape"), "Esc routes home");
+        assert!(js.contains("isContentEditable"), "first Esc blurs editing");
+        assert!(js.contains("setInterval"), "SPA-proof re-install");
+        // And the init script must not shadow-install a second overlay.
+        let init = build_init_script(&InjectedConfig::default());
+        assert!(!init.contains("__animehub-back"));
     }
 
     #[test]

@@ -107,12 +107,12 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 
 | Konu | Neden yapılamadı |
 |---|---|
-| **Android APK** | Init ve prepare runner'da geçti. `39f3637` APK adımı ~4 dk'da kırmızı; log indirilemedi. CI artık Tauri 2.11'in istediği NDK `29.0.13846066` ve `platforms;android-36` kuruyor (önceki r27c + isteğe bağlı 36 bunu gizleyebiliyordu). Yeşil APK ve cihaz testi hâlâ yok |
-| **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi henüz yeşil değil |
+| **Android APK** | ✅ v0.2.0 ile yeşil: Init ve prepare geçiyor; derleme hataları `cfg!()` (çalışma-zamanı) yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` (derleme-zamanı) sınırlarıyla giderildi; `release-android.yml` 3 ABI'de üretiyor. Cihaz testi hâlâ yok |
+| **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi yeşil |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
 | **Windows NSIS** | CI Windows'ta test eder, paket üretmez. `77f5e7c` clippy kırmızıydı; DPAPI çağrıları `windows-sys` 0.61 imzasına çekildi, sonuç henüz yok |
 | **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
-| **İmzalı yayın APK** | `release-android.yml` varsayılan dalda değil; dispatch/etiket hiç çalışmadı |
+| **İmzalı yayın APK** | ✅ Keystore secret'ları (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) repository secrets'a eklendi; workflow imzalı üretiyor |
 | **`.deb` / AppImage / rpm** | LTO'lu `cargo build --release --locked` ubuntu-24.04'te geçti. Paket adımı yok |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
 | **Gerçek sitelerin yüklenmesi** | Uygulama GUI'si başsız ortamda açılmıyor; WebView'da `openani.me`'nin gerçekten render olduğu görülmedi |
@@ -141,11 +141,14 @@ kimliği `dev.animehub.app` noktalı paket olarak üretir; eski
 dosyası `gen/android` oluşmadan yazılıyordu, ve `if:` içinde `secrets`
 kullanılıyordu (Actions bunu reddeder).
 
-Bilinen risk: Kotlin, Tauri 2 `JSObject.getInteger` / `getBoolean` /
-`put` imzalarına göre yazıldı (kaynakla karşılaştırıldı). Runner'da init ve
-prepare geçti. APK adımı önce deep-link config'inde (map yerine liste), sonra
-`PluginHandle`'ın private olmasında kırıldı. İkisi de düzeltildi; yeşil APK
-henüz yok.
+Kotlin, Tauri 2 `JSObject.getInteger` / `getBoolean` / `put` imzalarına
+göre yazıldı (kaynakla karşılaştırıldı) ve v0.2.0 itibarıyla **APK adımı
+yeşil**: kırılan nokta, masaüstü Tauri API'lerinin (`add_child`,
+`set_bounds`, `set_fullscreen`, `Webview::close`) Android hede fonculuğunda
+tip olarak olmamasıydı; `open_site_window`, `close_site_window` ve
+`install_main_window_handlers` artık `#[cfg(desktop)]` / `#[cfg(mobile)]`
+varyantlarına sahip. Ayrıca `android_bridge.rs` plugin crate'in tipiyle aynı
+isimde yerel struct tutuyordu (E0308) — `r.value` doğrudan okunuyor.
 
 ### B. Ayarlanmış profille Linux paketi
 
@@ -160,10 +163,11 @@ ubuntu-24.04 runner'da geçti (OOM yok). `.deb` / AppImage / rpm hâlâ üretilm
 
 ### C. GitHub Actions'ı bir kez çalıştırmak
 
-`ci.yml` PR #1'de çalıştı: frontend testleri üç platformda, rustfmt, ubuntu
-clippy/test ve LTO linki geçti. `release-android.yml` varsayılan dalda
-olmadığı için dispatch/etiket hiç çalışmadı; keystore akışı
-(`secrets.ANDROID_KEYSTORE_BASE64` → geçici dosya → `shred -u`) test edilmedi.
+`ci.yml` PR'lerde çalışıyor: frontend testleri üç platformda, rustfmt,
+clippy/test ve LTO linki, Android compile (aarch64) geçiyor.
+`release-android.yml` ve `release-desktop.yml` v0.1.0'dan bu yana etiket
+itmeliyeyle çalışıyor; v0.2.0 ile keystore akışı
+(`secrets.ANDROID_KEYSTORE_BASE64` → geçici dosya → `shred -u`) da yeşil.
 
 ### D. DNS rebinding — karar verildi
 

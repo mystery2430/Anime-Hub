@@ -1,33 +1,83 @@
-//! WebView window creation and per-site session isolation.
+//! WebView session hosting and per-site isolation.
 //!
 //! This is the only place a site URL is handed to a WebView, and the only
 //! place the navigation policy is attached, so the HTTPS/blocklist rules
 //! cannot be bypassed by adding a new entry point.
+//!
+//! ## Desktop
+//! A site opens **inside the single application window** as a child WebView
+//! that covers the launcher (Tauri's multi-webview support). It is *not* a
+//! new OS window and *not* a browser tab. Crucially the child WebView still
+//! gets its own per-site profile directory, so the WebView2/WebKitGTK
+//! isolation model is unchanged: cookies, localStorage, IndexedDB and cache
+//! never cross between sites or into the launcher.
+//!
+//! The site WebView has no capabilities (see `capabilities/default.json`,
+//! scoped to the `main` webview) and loads an external origin, so it has no
+//! IPC access to the Rust core. The only way back is the injected
+//! back-button / `Esc` handler, which navigates to `animehub://close-site`;
+//! that scheme is intercepted natively below and turned into a close action.
+//!
+//! ## Android
+//! The main WebView is navigated, with the cookie jar swapped first (no
+//! per-profile data-directory API exists there).
 
 use crate::commands::{AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
+#[cfg(desktop)]
 use crate::web::dns::{classify_host, DnsClass};
-use crate::web::session::{
-    capture, decide_navigation, profile_dir_name, restore, CookieJar, NavDecision, DNS_REBIND_BLOCK,
-};
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use crate::web::session::profile_dir_name;
+#[cfg(mobile)]
+use crate::web::session::{capture, restore, CookieJar};
+#[cfg(desktop)]
+use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
+use tauri::{AppHandle, Emitter, Manager};
+#[cfg(desktop)]
+use tauri::{LogicalPosition, PhysicalPosition, Position, Size, WebviewUrl};
 use url::Url;
 
-/// Label of the launcher window.
+/// Label of the launcher window (and of the launcher webview inside it).
 pub const LAUNCHER_LABEL: &str = "main";
 
-/// Prefix for site window labels.
+/// Prefix for site webview labels.
 const SITE_LABEL_PREFIX: &str = "site-";
 
-/// Window label used for a site session.
+/// Title shown while no site is open.
+pub const LAUNCHER_TITLE: &str = "AnimeHub";
+
+/// Pseudo-navigation the injected overlay uses to ask for the site to close.
+/// Intercepted below; it never leaves the app.
+const CLOSE_SCHEME: &str = "animehub";
+const CLOSE_HOST: &str = "close-site";
+
+/// Window/webview label used for a site session.
 pub fn label_for(site_id: &str) -> String {
     format!("{SITE_LABEL_PREFIX}{}", profile_dir_name(site_id))
 }
 
 /// Open a site.
 ///
-/// Returns the window label that now hosts the site.
+/// Returns the webview label that now hosts the site.
+///
+/// The dispatch is compile-time, not runtime: `open_in_main_window` calls
+/// `add_child` / `set_fullscreen`, which do not exist in tauri's mobile
+/// builds, so even a `cfg!()`-guarded branch would fail to compile on
+/// Android.
+#[cfg(mobile)]
+pub fn open_site_window(
+    app: AppHandle,
+    site: &Site,
+    url: &Url,
+    init_script: &str,
+    _fullscreen: bool,
+) -> AppResult<String> {
+    open_on_mobile(&app, site, url, init_script)
+}
+
+/// Desktop variant: a child WebView inside the main window, per-site profile
+/// kept.
+#[cfg(desktop)]
 pub fn open_site_window(
     app: AppHandle,
     site: &Site,
@@ -35,34 +85,38 @@ pub fn open_site_window(
     init_script: &str,
     fullscreen: bool,
 ) -> AppResult<String> {
-    if cfg!(any(target_os = "android", target_os = "ios")) {
-        open_on_mobile(&app, site, url, init_script)
-    } else {
-        open_on_desktop(app, site, url, init_script, fullscreen)
-    }
+    open_in_main_window(&app, site, url, init_script, fullscreen)
 }
 
 // ---------------------------------------------------------------------------
-// Desktop: one window per site, each with its own profile directory.
+// Desktop: a child WebView inside the main window, per-site profile kept.
 // ---------------------------------------------------------------------------
 
-fn open_on_desktop(
-    app: AppHandle,
+#[cfg(desktop)]
+fn open_in_main_window(
+    app: &AppHandle,
     site: &Site,
     url: &Url,
     init_script: &str,
     fullscreen: bool,
 ) -> AppResult<String> {
     let label = label_for(&site.id);
+    let window = app
+        .get_webview_window(LAUNCHER_LABEL)
+        .ok_or_else(|| AppError::Other("ana pencere bulunamadı".into()))?;
 
-    // Re-focus an already-open session instead of stacking windows.
-    if let Some(existing) = app.get_webview_window(&label) {
-        existing.set_focus().map_err(|e| {
+    // Already showing this exact site: nothing to stack, just focus.
+    if app.get_webview(&label).is_some() {
+        window.set_focus().map_err(|e| {
             log::error!("pencere öne alınamadı: {e}");
             AppError::Other("pencere öne alınamadı".into())
         })?;
         return Ok(label);
     }
+
+    // One site at a time inside the single window: close a previous session
+    // (saving its jar) before opening the next.
+    close_current_child(app)?;
 
     // Per-site profile directory: WebKitGTK's data directory on Linux, and on
     // Windows the WebView2 user-data folder. This is what makes cookies,
@@ -80,24 +134,40 @@ fn open_on_desktop(
 
     let host = site.host();
     let nav_host = host.clone();
+    let nav_label = label.clone();
     // A separate clone for the navigation closure: the builder borrows `app`
     // for its own lifetime, so the closure cannot also move out of it.
     let nav_app = app.clone();
 
-    // The builder stores the manager for the window's lifetime, so it
-    // needs an owned handle; `AppHandle` is a cheap refcounted clone.
-    let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url.clone()))
-        .title(site.name.clone())
+    let size = window.inner_size().map_err(|e| {
+        log::error!("pencere boyutu okunamadı: {e}");
+        AppError::Other("pencere boyutu okunamadı".into())
+    })?;
+
+    // `add_child` takes the *builder* and constructs the WebView on the main
+    // thread; `WebviewBuilder` has no standalone `build`.
+    let builder = tauri::WebviewBuilder::new(&label, WebviewUrl::External(url.clone()))
+        // The child shares the site's own profile directory, never the
+        // launcher's. See the module docs for the isolation contract.
         .data_directory(data_dir)
         .initialization_script(init_script)
-        .visible(true)
         .focused(true)
-        .fullscreen(fullscreen)
-        // A site must never be able to talk to the Rust core. Tauri already
-        // withholds IPC from external origins; this keeps the intent explicit
-        // and blocks any future config drift.
-        .accept_first_mouse(true)
         .on_navigation(move |target: &Url| {
+            // The injected "back" affordance navigates to this pseudo-URL.
+            // Close the session instead of following it. The close is spawned
+            // so the WebView is not torn down from inside its own callback.
+            if target.scheme() == CLOSE_SCHEME {
+                if target.host_str() == Some(CLOSE_HOST) {
+                    let app = nav_app.clone();
+                    let label = nav_label.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = close_site_window(&app, &label) {
+                            log::error!("site oturumu kapatılamadı: {e}");
+                        }
+                    });
+                }
+                return false;
+            }
             let app = nav_app.clone();
             // String policy under the lock; DNS outside it. A slow resolver
             // must not stall every other command waiting on the blocklist.
@@ -136,11 +206,49 @@ fn open_on_desktop(
         // pages, app stores, "open in browser") go to the system browser via
         // `open_site_externally` instead.
         .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
-        .build()
+        // The way back (back button + Esc) is installed with a Rust-side
+        // eval on every finished load: inside a child WebView the
+        // document-start init script alone proved unreliable on WebView2.
+        // `OVERLAY_SNIPPET` self-guards, so repeated installs are no-ops,
+        // and it heals itself if a SPA wipes the DOM around the button.
+        .on_page_load(|webview, payload| {
+            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                return;
+            }
+            if let Err(e) = webview.eval(crate::web::session::OVERLAY_SNIPPET) {
+                log::warn!("geri dönüş katmanı kurulamadı: {e}");
+            }
+        });
+
+    // `add_child` lives on the bare `Window`, not on `WebviewWindow`; same
+    // window, different handle type.
+    let host_window = app
+        .get_window(LAUNCHER_LABEL)
+        .ok_or_else(|| AppError::Other("ana pencere bulunamadı".into()))?;
+    host_window
+        .add_child(
+            builder,
+            Position::Logical(LogicalPosition::new(0.0, 0.0)),
+            Size::Physical(size),
+        )
         .map_err(|e| {
-            log::error!("WebView açılamadı: {e}");
-            AppError::Other("WebView açılamadı".into())
+            log::error!("WebView pencereye eklenemedi: {e}");
+            AppError::Other("WebView pencereye eklenemedi".into())
         })?;
+
+    // "Open sites fullscreen" is opt-in (default off). Track whether *we*
+    // entered fullscreen so close can restore the previous windowed state
+    // without stealing a fullscreen the user chose by hand.
+    let already_fs = window.is_fullscreen().unwrap_or(false);
+    let entered_fullscreen = fullscreen && !already_fs;
+    if entered_fullscreen {
+        if let Err(e) = window.set_fullscreen(true) {
+            log::warn!("tam ekrana geçilemedi: {e}");
+        }
+    }
+    if let Err(e) = window.set_title(&site.name) {
+        log::warn!("pencere başlığı ayarlanamadı: {e}");
+    }
 
     {
         let state = app.state::<AppState>();
@@ -148,19 +256,74 @@ fn open_on_desktop(
             site_id: site.id.clone(),
             host,
             window_label: label.clone(),
+            entered_fullscreen,
         };
         *state.current_site.lock().expect("current_site lock") = Some(value);
     }
 
-    // Keep a handle alive so the window is not dropped mid-build.
-    let _ = window;
     Ok(label)
+}
+
+/// Close whichever site webview is currently shown inside the main window,
+/// if any. Used before hosting a new one.
+#[cfg(desktop)]
+fn close_current_child(app: &AppHandle) -> AppResult<()> {
+    let label = {
+        let state = app.state::<AppState>();
+        let current = state.current_site.lock().expect("current_site lock");
+        current
+            .as_ref()
+            .filter(|c| c.window_label != LAUNCHER_LABEL)
+            .map(|c| c.window_label.clone())
+    };
+    match label {
+        Some(label) => close_site_window(app, &label),
+        None => Ok(()),
+    }
+}
+
+/// Watch the main window so the hosted site webview tracks its size.
+///
+/// Installed once during `setup`. The launcher webview resizes itself; the
+/// child webview must be re-bounded explicitly on every window resize.
+/// `Webview::set_bounds` is desktop-only, so the mobile variant is a no-op.
+#[cfg(mobile)]
+pub fn install_main_window_handlers(_app: &AppHandle) {}
+
+#[cfg(desktop)]
+pub fn install_main_window_handlers(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
+        return;
+    };
+    let app_handle = app.clone();
+    window.on_window_event(move |event| {
+        let tauri::WindowEvent::Resized(size) = event else {
+            return;
+        };
+        let app = app_handle.clone();
+        let label = {
+            let state = app.state::<AppState>();
+            let current = state.current_site.lock().expect("current_site lock");
+            current.as_ref().map(|c| c.window_label.clone())
+        };
+        if let Some(label) = label {
+            if let Some(child) = app.get_webview(&label) {
+                if let Err(e) = child.set_bounds(tauri::Rect {
+                    position: Position::Physical(PhysicalPosition::new(0, 0)),
+                    size: Size::Physical(*size),
+                }) {
+                    log::warn!("site görünümü yeniden boyutlandırılamadı: {e}");
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Mobile: a single WebView, isolated by swapping the cookie jar.
 // ---------------------------------------------------------------------------
 
+#[cfg(mobile)]
 fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
     let window = app
         .get_webview_window(LAUNCHER_LABEL)
@@ -200,6 +363,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         site_id: site.id.clone(),
         host: site.host(),
         window_label: LAUNCHER_LABEL.into(),
+        entered_fullscreen: false,
     });
 
     Ok(LAUNCHER_LABEL.to_string())
@@ -207,13 +371,29 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 
 /// Save the WebView's current cookie jar into the named site's encrypted blob.
 fn export_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()> {
-    let app = window.app_handle().clone();
-    let state = app.state::<AppState>();
-
     let live = window.cookies().map_err(|e| {
         log::error!("çerezler okunamadı: {e}");
         AppError::Other("çerezler okunamadı".into())
     })?;
+    export_cookies_from(live, window.app_handle(), site_id)
+}
+
+/// Same as [`export_cookies`] but for a bare child `Webview` (desktop).
+#[cfg(desktop)]
+fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<()> {
+    let live = webview.cookies().map_err(|e| {
+        log::error!("çerezler okunamadı: {e}");
+        AppError::Other("çerezler okunamadı".into())
+    })?;
+    export_cookies_from(live, webview.app_handle(), site_id)
+}
+
+fn export_cookies_from(
+    live: Vec<cookie::Cookie<'static>>,
+    app: &AppHandle,
+    site_id: &str,
+) -> AppResult<()> {
+    let state = app.state::<AppState>();
     let now = crate::anilist::now_unix();
 
     let mut jar = CookieJar {
@@ -252,7 +432,10 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()>
 }
 
 /// Close a site session, persisting its cookies first.
-pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
+///
+/// Mobile: save the jar, then send the single WebView back to the launcher.
+#[cfg(mobile)]
+pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
         // Bind first: the `MutexGuard` temporary must be dropped before
@@ -265,48 +448,104 @@ pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
         value
     };
 
-    if cfg!(any(target_os = "android", target_os = "ios")) {
-        // Mobile: save the jar, then send the WebView back to the launcher.
-        if let Some(current) = &current {
-            let window = app
-                .get_webview_window(LAUNCHER_LABEL)
-                .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
-            export_cookies(&window, &current.site_id)?;
-        }
-        if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-            let state = app.state::<AppState>();
-            let back = state
-                .launcher_url
-                .lock()
-                .expect("launcher_url lock")
-                .clone();
-            if let Some(url) = back {
-                window.navigate(url).map_err(|e| {
-                    log::error!("başlatıcıya dönülemedi: {e}");
-                    AppError::Other("başlatıcıya dönülemedi".into())
-                })?;
-            }
-        }
-        let state = app.state::<AppState>();
-        *state.current_site.lock().expect("current_site lock") = None;
-        return Ok(());
+    if let Some(current) = &current {
+        let window = app
+            .get_webview_window(LAUNCHER_LABEL)
+            .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
+        export_cookies(&window, &current.site_id)?;
     }
-
-    if let Some(window) = app.get_webview_window(label) {
-        if let Some(current) = &current {
-            export_cookies(&window, &current.site_id)?;
+    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+        let state = app.state::<AppState>();
+        let back = state
+            .launcher_url
+            .lock()
+            .expect("launcher_url lock")
+            .clone();
+        if let Some(url) = back {
+            window.navigate(url).map_err(|e| {
+                log::error!("başlatıcıya dönülemedi: {e}");
+                AppError::Other("başlatıcıya dönülemedi".into())
+            })?;
         }
-        window.close().map_err(|e| {
-            log::error!("pencere kapatılamadı: {e}");
-            AppError::Other("pencere kapatılamadı".into())
+    }
+    let closed_site = current.as_ref().map(|c| c.site_id.clone());
+    let state = app.state::<AppState>();
+    *state.current_site.lock().expect("current_site lock") = None;
+    if let Some(site_id) = closed_site {
+        let _ = app.emit("animehub://site-closed", site_id);
+    }
+    Ok(())
+}
+
+/// Close a site session, persisting its cookies first.
+///
+/// Desktop: remove the child webview; the launcher underneath reappears.
+/// Uses `Webview::close` / `set_fullscreen`, which do not exist on mobile.
+#[cfg(desktop)]
+pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
+    let current = {
+        let state = app.state::<AppState>();
+        // Bind first: the `MutexGuard` temporary must be dropped before
+        // `state`, whose borrow it holds.
+        let value = state
+            .current_site
+            .lock()
+            .expect("current_site lock")
+            .clone();
+        value
+    };
+    // `label` comes from the launcher UI, which tracks the label it was
+    // given at open time. If it has gone stale (the session was already
+    // closed via the overlay), fall back to the tracked current site.
+    let child_label = current
+        .as_ref()
+        .filter(|c| c.window_label != LAUNCHER_LABEL)
+        .map(|c| c.window_label.clone())
+        .unwrap_or_else(|| label.to_string());
+
+    if let Some(child) = app.get_webview(&child_label) {
+        // Desktop profiles persist cookies on disk; this jar export is the
+        // same belt-and-braces snapshot the old per-window flow took.
+        if let Some(cur) = current.as_ref().filter(|c| c.window_label == child_label) {
+            export_cookies_webview(&child, &cur.site_id)?;
+        }
+        child.close().map_err(|e| {
+            log::error!("site görünümü kapatılamadı: {e}");
+            AppError::Other("site görünümü kapatılamadı".into())
         })?;
     }
 
-    // Only clear the tracking entry if it was this window's site.
-    let matches_current = current.as_ref().is_some_and(|c| c.window_label == label);
-    if matches_current {
+    let mut closed_site = None;
+    {
         let state = app.state::<AppState>();
-        *state.current_site.lock().expect("current_site lock") = None;
+        let mut guard = state.current_site.lock().expect("current_site lock");
+        if guard
+            .as_ref()
+            .is_some_and(|c| c.window_label == child_label)
+        {
+            closed_site = guard.as_ref().map(|c| c.site_id.clone());
+            *guard = None;
+        }
+    }
+
+    // Restore the launcher's chrome: own title again, and leave fullscreen
+    // only when *we* were the ones who entered it.
+    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+        if let Err(e) = window.set_title(LAUNCHER_TITLE) {
+            log::warn!("pencere başlığı geri alınamadı: {e}");
+        }
+        if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
+            if let Err(e) = window.set_fullscreen(false) {
+                log::warn!("tam ekrandan çıkılamadı: {e}");
+            }
+        }
+        if let Err(e) = window.set_focus() {
+            log::debug!("pencere odaklanamadı: {e}");
+        }
+    }
+
+    if let Some(site_id) = closed_site {
+        let _ = app.emit("animehub://site-closed", site_id);
     }
     Ok(())
 }

@@ -15,6 +15,19 @@ import {
   safeDataImage,
   CATEGORIES,
 } from "./logic/tiles.js";
+import {
+  THEMES,
+  THEME_CACHE_KEY,
+  normalizeTheme,
+  applyThemeToDom,
+  themeLabel,
+} from "./logic/theme.js";
+import {
+  heroModel,
+  displayHost,
+  bannerStyle,
+  bannerRgb,
+} from "./logic/hero.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -52,9 +65,48 @@ const el = {
   btnResetBlocklist: document.getElementById("btn-reset-blocklist"),
   btnSaveAnilist: document.getElementById("btn-save-anilist"),
   btnAnilistLogout: document.getElementById("btn-anilist-logout"),
+  btnAnilistLogin: document.getElementById("btn-anilist-login"),
   linkAnilistDev: document.getElementById("link-anilist-dev"),
   aboutList: document.getElementById("about-list"),
+  themeBtns: THEMES.map((t) =>
+    document.querySelector(`.theme-btn[data-theme="${t}"]`),
+  ),
 };
+
+el.settings.theme = document.getElementById("set-theme");
+
+el.hero = {
+  episodes: document.getElementById("hero-episodes"),
+  current: document.getElementById("hero-current"),
+  completed: document.getElementById("hero-completed"),
+  cta: document.getElementById("hero-cta"),
+};
+
+// ---------------------------------------------------------------------------
+// Hero bar (AniList istatistikleri)
+// ---------------------------------------------------------------------------
+
+function applyHero(model) {
+  el.hero.episodes.textContent = model.episodes;
+  el.hero.current.textContent = model.current;
+  el.hero.completed.textContent = model.completed;
+  el.hero.cta.hidden = model.loggedIn;
+}
+
+async function refreshHero() {
+  try {
+    const stats = await call("anilist_hero_stats");
+    applyHero(heroModel(stats));
+  } catch {
+    // Offline ya da rate limit: bağlı görünüm bozmasın diye sadece tireler.
+    applyHero(heroModel(null));
+  }
+}
+
+el.hero.cta.addEventListener("click", () => {
+  // Ayarlar → AniList bölümü her yerden aynı kapıya çıkar.
+  el.btnSettings.click();
+});
 
 /** Grid element for a category id. */
 const gridFor = (category) =>
@@ -108,29 +160,40 @@ function renderTile(tile) {
   button.className = "tile";
   button.dataset.siteId = tile.id;
 
-  const icon = document.createElement("span");
-  icon.className = "tile-icon";
-  icon.setAttribute("aria-hidden", "true");
+  const color = safeColor(tile.color) || "#6366f1";
+  button.style.setProperty("--site", bannerRgb(color));
+
+  const banner = document.createElement("span");
+  banner.className = "tile-banner";
+  banner.setAttribute("aria-hidden", "true");
   if (tile.image) {
-    icon.classList.add("has-image");
+    banner.classList.add("has-image");
     const img = document.createElement("img");
     img.alt = "";
     img.draggable = false;
     img.src = tile.image;
-    icon.appendChild(img);
+    banner.appendChild(img);
   } else {
-    icon.textContent = tile.letters;
-    // `safeColor` already returned null-or-#hex in the view model; assigning to
-    // a single style property is not an injection sink, but keep it explicit.
-    icon.style.background = safeColor(tile.color) || "#0ea5e9";
+    banner.style.background = bannerStyle(color);
+    const mark = document.createElement("span");
+    mark.className = "tile-mark";
+    mark.textContent = tile.letters;
+    banner.appendChild(mark);
   }
 
+  const body = document.createElement("span");
+  body.className = "tile-body";
   const name = document.createElement("span");
   name.className = "tile-name";
   name.textContent = tile.name;
   name.title = tile.url;
+  const host = document.createElement("span");
+  host.className = "tile-host";
+  host.textContent = displayHost(tile.url);
+  body.append(name, host);
+  if (!host.textContent) body.classList.add("no-host");
 
-  button.append(icon, name);
+  button.append(banner, body);
 
   if (tile.native) {
     const badge = document.createElement("span");
@@ -161,16 +224,25 @@ function renderAddTile() {
   button.type = "button";
   button.className = "tile tile-add";
 
-  const icon = document.createElement("span");
-  icon.className = "tile-icon";
-  icon.textContent = "+";
-  icon.setAttribute("aria-hidden", "true");
+  const banner = document.createElement("span");
+  banner.className = "tile-banner";
+  banner.setAttribute("aria-hidden", "true");
+  const plus = document.createElement("span");
+  plus.className = "tile-mark";
+  plus.textContent = "+";
+  banner.appendChild(plus);
 
-  const label = document.createElement("span");
-  label.className = "tile-name";
-  label.textContent = "Site ekle";
+  const body = document.createElement("span");
+  body.className = "tile-body";
+  const name = document.createElement("span");
+  name.className = "tile-name";
+  name.textContent = "Site ekle";
+  const host = document.createElement("span");
+  host.className = "tile-host";
+  host.textContent = "Yeni bir siteyi hub'ına ekle";
+  body.append(name, host);
 
-  button.append(icon, label);
+  button.append(banner, body);
   button.addEventListener("click", () => openSiteForm(null));
   return button;
 }
@@ -179,6 +251,9 @@ function renderLauncher(groups) {
   for (const group of groups) {
     const grid = gridFor(group.id);
     grid.textContent = "";
+
+    const count = document.getElementById(`count-${group.id}`);
+    if (count) count.textContent = String(group.tiles.length);
 
     if (group.tiles.length === 0) {
       const note = document.createElement("p");
@@ -441,6 +516,68 @@ function wireModalClose(modal) {
 }
 
 // ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+/** Currently applied preference; mirrored to localStorage for the first paint. */
+let themePref = normalizeTheme(
+  (() => {
+    try {
+      return localStorage.getItem(THEME_CACHE_KEY);
+    } catch {
+      return null;
+    }
+  })(),
+);
+
+function applyTheme(pref) {
+  themePref = normalizeTheme(pref);
+  applyThemeToDom(themePref);
+  for (const btn of el.themeBtns) {
+    if (!btn) continue;
+    btn.setAttribute("aria-pressed", String(btn.dataset.theme === themePref));
+    btn.title = `${themeLabel(btn.dataset.theme)} tema`;
+  }
+  if (el.settings.theme) el.settings.theme.value = themePref;
+}
+
+async function setTheme(pref) {
+  applyTheme(pref);
+  try {
+    localStorage.setItem(THEME_CACHE_KEY, themePref);
+  } catch {
+    /* private mode etc. — the backend copy still persists */
+  }
+  // Native window + WebViews (Rust applies it to every webview of the app,
+  // so site pages that respect prefers-color-scheme follow too).
+  try {
+    await call("set_window_theme", { theme: themePref });
+  } catch {
+    /* cosmetic only — never block the UI over it */
+  }
+  // Persist into the encrypted settings.
+  try {
+    await call("update_settings", { patch: { theme: themePref } });
+  } catch (e) {
+    showNotice(errMessage(e));
+  }
+}
+
+function wireTheme() {
+  for (const btn of el.themeBtns) {
+    if (!btn) continue;
+    btn.addEventListener("click", () => setTheme(btn.dataset.theme));
+  }
+  if (el.settings.theme) {
+    el.settings.theme.addEventListener("change", (e) => setTheme(e.target.value));
+  }
+}
+
+// Apply the cached choice immediately so the first paint matches; the
+// backend reconciliation in boot() may correct it afterwards.
+applyTheme(themePref);
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -456,6 +593,7 @@ async function openSettings() {
     el.settings.blocklist.value = s.blocklist.rules || "";
     el.settings.fullscreen.checked = Boolean(s.fullscreenSites);
     el.settings.pip.checked = Boolean(s.pipAutoEnter);
+    applyTheme(s.theme);
     el.settings.anilistId.value = s.anilist.clientId || "";
     el.settings.anilistSecret.value = "";
     el.settings.anilistRedirect.value = s.anilist.redirectUri || "";
@@ -465,9 +603,10 @@ async function openSettings() {
         ? " — anahtar işletim sistemi tarafından korunuyor."
         : " — işletim sistemi anahtar deposu bulunamadı; anahtar dosya izinleriyle korunuyor.");
     el.settings.anilistStatus.textContent = s.anilist.configured
-      ? "AniList yapılandırılmış."
-      : "AniList yapılandırılmamış; site WebView'da açılır.";
+      ? "AniList yapılandırılmış; giriş yapabilirsiniz."
+      : "Giriş için önce Client ID'yi kaydedin (yoksa AniList WebView'da açılır).";
     el.settings.anilistStatus.dataset.state = s.anilist.configured ? "ok" : "";
+    el.btnAnilistLogin.disabled = !s.anilist.configured;
     openModal(el.modalSettings);
     await refreshAniListStatus();
   } catch (e) {
@@ -545,11 +684,30 @@ function wireSettings() {
     saveSettings(patch, "AniList ayarları kaydedildi.").then(refreshAniListStatus);
   });
 
+  el.btnAnilistLogin.addEventListener("click", async () => {
+    try {
+      const start = await call("anilist_login_start");
+      el.settings.anilistStatus.dataset.state = "";
+      el.settings.anilistStatus.textContent =
+        "Tarayıcıda AniList girişi bekleniyor… bitince bu ekran güncellenir.";
+      await openExternal(start.url);
+    } catch (e) {
+      // Mirror into the modal's own status line: the global toast is easy to
+      // dismiss, and a failure here (e.g. client_id not configured) is
+      // exactly what made this button look dead.
+      const msg = errMessage(e);
+      el.settings.anilistStatus.dataset.state = "error";
+      el.settings.anilistStatus.textContent = msg;
+      showNotice(msg);
+    }
+  });
+
   el.btnAnilistLogout.addEventListener("click", async () => {
     try {
       await call("anilist_logout");
       el.settings.anilistStatus.textContent = "Oturum kapatıldı.";
       el.settings.anilistStatus.dataset.state = "";
+      applyHero(heroModel(null));
     } catch (e) {
       showNotice(errMessage(e));
     }
@@ -729,23 +887,50 @@ function wireGlobal() {
 async function wireBackendEvents() {
   await on("animehub://navigation-blocked", (message) => showNotice(String(message)));
   await on("animehub://error", (message) => showNotice(String(message)));
-  await on("animehub://anilist-login", (name) =>
-    showNotice(`AniList girişi tamamlandı: ${name}`, "info"),
-  );
+  await on("animehub://anilist-login", (name) => {
+    showNotice(`AniList girişi tamamlandı: ${name}`, "info");
+    void refreshAniListStatus();
+    void refreshHero();
+  });
+  // The Rust side can close a site on its own (the injected back button /
+  // Esc navigates to animehub://close-site, handled natively). Clear the
+  // label so the launcher's own "back" bookkeeping stays honest.
+  await on("animehub://site-closed", () => {
+    openSiteLabel = null;
+  });
 }
 
 async function boot() {
   wireGlobal();
   wireSettings();
+  wireTheme();
   renderLauncher(CATEGORIES.map((c) => ({ id: c.id, title: c.title, tiles: [] })));
   await refreshLauncher();
   await wireBackendEvents();
+  void refreshHero();
 
   try {
     const warning = await call("take_startup_warning");
     if (warning) showNotice(String(warning));
   } catch {
     /* non-fatal */
+  }
+
+  // Reconcile the theme with the encrypted settings: the localStorage mirror
+  // above only covers the first paint.
+  try {
+    const s = await call("get_settings");
+    currentSettings = s;
+    if (normalizeTheme(s.theme) !== themePref) {
+      applyTheme(s.theme);
+      try {
+        localStorage.setItem(THEME_CACHE_KEY, normalizeTheme(s.theme));
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* theme stays at the cached value */
   }
 }
 

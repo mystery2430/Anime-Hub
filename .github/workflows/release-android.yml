@@ -141,6 +141,21 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: npm run tauri android build -- --apk --target ${{ matrix.abi }}
 
+      # Gradle writes the per-target output under a generic name (e.g.
+      # `app-universal-release.apk`), which loses the ABI and collides when
+      # merged at publish time. Stage it under an ABI-qualified name instead;
+      # the unsigned/signed suffix of the original is preserved.
+      - name: Collect APK under an ABI-qualified name
+        run: |
+          set -euo pipefail
+          mkdir -p dist-apk
+          f=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -1)
+          test -n "$f"
+          suffix=""
+          case "$(basename "$f")" in *unsigned*) suffix="-unsigned" ;; esac
+          cp "$f" "dist-apk/animehub-${{ matrix.abi }}-release${suffix}.apk"
+          ls -la dist-apk
+
       - name: Shred the keystore
         if: always()
         run: |
@@ -152,7 +167,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: animehub-android-${{ matrix.abi }}
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          path: dist-apk/*.apk
           if-no-files-found: error
 
   publish:

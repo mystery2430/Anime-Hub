@@ -315,8 +315,8 @@ mod windows {
     }
 
     fn dpapi_protect(plain: &[u8]) -> AppResult<Vec<u8>> {
-        let mut data_in = blob_from(plain)?;
-        let mut entropy = blob_from(ENTROPY)?;
+        let data_in = blob_from(plain)?;
+        let entropy = blob_from(ENTROPY)?;
         let mut out = CRYPT_INTEGER_BLOB {
             cbData: 0,
             pbData: core::ptr::null_mut(),
@@ -338,8 +338,9 @@ mod windows {
         if ok == 0 {
             return Err(AppError::Keyring("DPAPI şifrelemesi başarısız".into()));
         }
-        let blob =
-            unsafe { std::slice::from_raw_parts(out.pbData, usize::from(out.cbData)) }.to_vec();
+        // `std` has no `From<u32> for usize` (not lossless on 16-bit), so a
+        // plain widening cast is the way; `cbData` is a `u32` byte count.
+        let blob = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
         unsafe {
             let _freed = LocalFree(out.pbData.cast());
         }
@@ -347,8 +348,8 @@ mod windows {
     }
 
     fn dpapi_unprotect(blob: &[u8]) -> AppResult<Zeroizing<[u8; 32]>> {
-        let mut data_in = blob_from(blob)?;
-        let mut entropy = blob_from(ENTROPY)?;
+        let data_in = blob_from(blob)?;
+        let entropy = blob_from(ENTROPY)?;
         let mut out = CRYPT_INTEGER_BLOB {
             cbData: 0,
             pbData: core::ptr::null_mut(),
@@ -370,8 +371,7 @@ mod windows {
                 "DPAPI çözülemedi — farklı bir Windows kullanıcısı olabilir".into(),
             ));
         }
-        let plain =
-            unsafe { std::slice::from_raw_parts(out.pbData, usize::from(out.cbData)) }.to_vec();
+        let plain = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
         unsafe {
             let _freed = LocalFree(out.pbData.cast());
         }

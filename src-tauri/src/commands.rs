@@ -13,7 +13,7 @@ use crate::web::session::{build_init_script, CookieJar, InjectedConfig};
 use crate::web::windows;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
 // State
@@ -46,6 +46,21 @@ pub struct CurrentSite {
     pub site_id: String,
     pub host: String,
     pub window_label: String,
+    /// Desktop: `true` when opening the site is what put the window into
+    /// fullscreen, so closing it may restore the windowed state. Kept
+    /// separate so a manual fullscreen choice is never taken away.
+    pub entered_fullscreen: bool,
+}
+
+/// Launcher theme preference, persisted with the other settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePref {
+    /// Follow the OS light/dark setting (the default).
+    #[default]
+    System,
+    Dark,
+    Light,
 }
 
 /// User-adjustable preferences.
@@ -60,9 +75,14 @@ pub struct Settings {
     /// Injected CSS is cosmetic only; it never rewrites page scripts.
     #[serde(default = "default_true")]
     pub inject_cosmetic_rules: bool,
-    /// Keep the desktop window chromeless when a site is open.
-    #[serde(default = "default_true")]
+    /// Enter fullscreen while a desktop site view is open. Opt-in: sites
+    /// share the single app window, so the default keeps the normal
+    /// windowed size.
+    #[serde(default)]
     pub fullscreen_sites: bool,
+    /// Launcher theme: system / dark / light.
+    #[serde(default)]
+    pub theme: ThemePref,
     /// Android: enter Picture-in-Picture automatically on Home.
     #[serde(default)]
     pub pip_auto_enter: bool,
@@ -80,7 +100,8 @@ impl Default for Settings {
             blocklist: BlocklistState::default_state(),
             block_popups: true,
             inject_cosmetic_rules: true,
-            fullscreen_sites: true,
+            fullscreen_sites: false,
+            theme: ThemePref::System,
             pip_auto_enter: false,
             anilist: AniListConfig::default(),
         }
@@ -96,6 +117,7 @@ pub struct SettingsView {
     pub block_popups: bool,
     pub inject_cosmetic_rules: bool,
     pub fullscreen_sites: bool,
+    pub theme: ThemePref,
     pub pip_auto_enter: bool,
     pub anilist: AniListConfigView,
     pub key_backend: String,
@@ -422,6 +444,7 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsView> {
         block_popups: s.block_popups,
         inject_cosmetic_rules: s.inject_cosmetic_rules,
         fullscreen_sites: s.fullscreen_sites,
+        theme: s.theme,
         pip_auto_enter: s.pip_auto_enter,
         anilist: AniListConfigView {
             configured: s.anilist.is_configured(),
@@ -457,6 +480,9 @@ pub fn update_settings(
         if let Some(v) = patch.fullscreen_sites {
             s.fullscreen_sites = v;
         }
+        if let Some(v) = patch.theme {
+            s.theme = v;
+        }
         if let Some(v) = patch.pip_auto_enter {
             s.pip_auto_enter = v;
         }
@@ -480,6 +506,8 @@ pub struct SettingsPatch {
     pub inject_cosmetic_rules: Option<bool>,
     #[serde(default)]
     pub fullscreen_sites: Option<bool>,
+    #[serde(default)]
+    pub theme: Option<ThemePref>,
     #[serde(default)]
     pub pip_auto_enter: Option<bool>,
     #[serde(default)]
@@ -562,6 +590,38 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
         *s = Some(state_value);
     }
+
+    // Desktop loopback flow: when the redirect URI points at a local HTTP
+    // address (the built-in default does, http://127.0.0.1:17395), nothing
+    // else would receive the OAuth redirect — the browser would land on a
+    // dead port and the login would silently hang. Serve the single request
+    // in the background and finish the login through the same events the
+    // deep-link handler already uses. A custom-scheme redirect skips this:
+    // the OS delivers it to the deep-link handler in lib.rs instead.
+    if let Some(port) = anilist::loopback_port(&cfg.redirect_uri) {
+        let handle = app.clone();
+        let redirect_uri = cfg.redirect_uri.clone();
+        tauri::async_runtime::spawn(async move {
+            let flow: AppResult<AniListUser> = async {
+                let listener = anilist::LoopbackListener::bind_port(port).await?;
+                let target = listener
+                    .wait_for_callback(std::time::Duration::from_secs(300))
+                    .await?;
+                let callback = anilist::absolute_callback(&redirect_uri, &target)?;
+                anilist_login_callback(handle.clone(), callback).await
+            }
+            .await;
+            match flow {
+                Ok(user) => {
+                    let _ = handle.emit("animehub://anilist-login", user.name);
+                }
+                Err(e) => {
+                    let _ = handle.emit("animehub://error", e.to_string());
+                }
+            }
+        });
+    }
+
     Ok(LoginStart {
         url,
         redirect_uri: cli.config().redirect_uri.clone(),
@@ -624,14 +684,14 @@ pub struct AniListUser {
     pub avatar: Option<String>,
 }
 
-/// Current session, refreshing the token if it is close to expiry.
-#[tauri::command]
-pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
-    let state = app.state::<AppState>();
-    let Some(token) = load_token(&state)? else {
+/// Fetches a live AniList session pair. Handles refresh, expiry cleanup and
+/// the "not configured/signed out" case uniformly for every caller that
+/// needs an authenticated GraphQL request.
+async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListClient, Token)>> {
+    let Some(token) = load_token(state)? else {
         return Ok(None);
     };
-    let (cli, _) = match client(&state) {
+    let (cli, _) = match client(state) {
         Ok(c) => c,
         // Not configured any more: report signed-out rather than erroring.
         Err(_) => return Ok(None),
@@ -641,7 +701,7 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
         match token.refresh_token.as_deref() {
             Some(rt) => match cli.refresh(rt).await {
                 Ok(t) => {
-                    save_token(&state, &t)?;
+                    save_token(state, &t)?;
                     t
                 }
                 // Refresh rejected => the session is over.
@@ -663,6 +723,24 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
         token
     };
 
+    Ok(Some((cli, token)))
+}
+
+/// Clears a token the server rejected outright.
+fn drop_rejected_token(state: &AppState) {
+    if let Err(e) = state.provider.delete_secret("anilist-token") {
+        log::error!("geçersiz AniList oturumu silinemedi: {e}");
+    }
+}
+
+/// Current session, refreshing the token if it is close to expiry.
+#[tauri::command]
+pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
+    let state = app.state::<AppState>();
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Ok(None);
+    };
+
     match cli.viewer(&token).await {
         Ok(v) => Ok(Some(AniListUser {
             id: v.id,
@@ -670,9 +748,26 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
             avatar: v.avatar_large,
         })),
         Err(AppError::Unauthorized) => {
-            if let Err(e) = state.provider.delete_secret("anilist-token") {
-                log::error!("geçersiz AniList oturumu silinemedi: {e}");
-            }
+            drop_rejected_token(&state);
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Aggregate counters for the launcher hero bar. `None` when signed out —
+/// the frontend then shows the connect affordance instead of false zeros.
+#[tauri::command]
+pub async fn anilist_hero_stats(app: AppHandle) -> AppResult<Option<anilist::ViewerStats>> {
+    let state = app.state::<AppState>();
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Ok(None);
+    };
+
+    match cli.viewer_stats(&token).await {
+        Ok(s) => Ok(Some(s)),
+        Err(AppError::Unauthorized) => {
+            drop_rejected_token(&state);
             Ok(None)
         }
         Err(e) => Err(e),
@@ -751,8 +846,26 @@ pub async fn anilist_delete(app: AppHandle, entry_id: i64) -> AppResult<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// PiP / misc
+// Görünüm / PiP / misc
 // ---------------------------------------------------------------------------
+
+/// Apply the launcher theme to the native window.
+///
+/// `System` maps to `None`, which hands the choice back to the OS. WebView2
+/// and WebKitGTK both follow the same override for `prefers-color-scheme`,
+/// so the choice also reaches site pages that respect the media query.
+#[tauri::command]
+pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppResult<()> {
+    let target = match theme {
+        ThemePref::System => None,
+        ThemePref::Dark => Some(tauri::Theme::Dark),
+        ThemePref::Light => Some(tauri::Theme::Light),
+    };
+    window.set_theme(target).map_err(|e| {
+        log::error!("tema uygulanamadı: {e}");
+        AppError::Other("tema uygulanamadı".into())
+    })
+}
 
 #[tauri::command]
 pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
@@ -855,7 +968,8 @@ mod tests {
         let s = Settings::default();
         assert!(s.block_popups, "popup blocking must default on");
         assert!(s.inject_cosmetic_rules);
-        assert!(s.fullscreen_sites);
+        assert!(!s.fullscreen_sites, "site fullscreen is opt-in");
+        assert_eq!(s.theme, ThemePref::System, "theme follows the OS");
         assert!(s.blocklist.enabled);
         assert!(!s.pip_auto_enter, "PiP auto-enter is opt-in");
         assert!(!s.anilist.is_configured());
@@ -907,6 +1021,7 @@ mod tests {
             block_popups: s.block_popups,
             inject_cosmetic_rules: s.inject_cosmetic_rules,
             fullscreen_sites: s.fullscreen_sites,
+            theme: s.theme,
             pip_auto_enter: s.pip_auto_enter,
             anilist: AniListConfigView {
                 configured: s.anilist.is_configured(),

@@ -1,6 +1,6 @@
 [package]
 name = "animehub"
-version = "0.1.0"
+version = "0.2.0"
 description = "AnimeHub — a launcher that opens anime tracking/streaming sites in isolated, encrypted WebView sessions."
 authors = ["AnimeHub contributors"]
 edition = "2021"
@@ -20,7 +20,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.11", features = [] }
+# `unstable` gates Tauri's multi-webview APIs (Window::add_child + the `site-*`
+# WebViews in web/windows.rs); it only unlocks extra stable-runtime APIs —
+# no behavior change for the existing single-webview paths.
+tauri = { version = "2.11", features = ["unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
 serde = { version = "1", features = ["derive"] }
