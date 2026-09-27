@@ -876,6 +876,18 @@ textarea:focus-visible {
   filter: brightness(1.08);
 }
 
+/* Disabled buttons must look disabled: without this rule the locked AniList
+ * login button rendered exactly like an active one, so pressing it did
+ * nothing with no visual explanation ("boşta çalışmıyor"). */
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn:disabled:hover {
+  filter: none;
+}
+
 .btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;

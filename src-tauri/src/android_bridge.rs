@@ -5,25 +5,18 @@
 //! `PictureInPictureParams` — are only reachable from the JVM side.
 
 use crate::error::{AppError, AppResult};
-use serde::{Deserialize, Serialize};
-
-/// Result of a Keystore encrypt/decrypt round trip.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeystoreResult {
-    pub value: String,
-}
 
 /// Encrypt `plaintext` with the Android Keystore-backed key.
 ///
 /// The raw key never leaves the secure hardware / TEE; Rust only ever sees
 /// ciphertext. `purpose` is bound into the alias so two stores cannot swap
-/// blobs.
+/// blobs. The plugin crate returns its own `KeystoreResult` — read `.value`
+/// straight off it rather than restating the type under the same name.
 #[cfg(target_os = "android")]
 pub fn keystore_seal(purpose: &str, plaintext: &[u8]) -> AppResult<String> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(plaintext);
-    let r: KeystoreResult = animehub_android::keystore_seal(purpose.into(), b64)
+    let r = animehub_android::keystore_seal(purpose.into(), b64)
         .map_err(|e| AppError::Keyring(e.to_string()))?;
     Ok(r.value)
 }
@@ -32,7 +25,7 @@ pub fn keystore_seal(purpose: &str, plaintext: &[u8]) -> AppResult<String> {
 #[cfg(target_os = "android")]
 pub fn keystore_open(purpose: &str, sealed: &str) -> AppResult<Vec<u8>> {
     use base64::Engine as _;
-    let r: KeystoreResult = animehub_android::keystore_open(purpose.into(), sealed.to_string())
+    let r = animehub_android::keystore_open(purpose.into(), sealed.to_string())
         .map_err(|e| AppError::Keyring(e.to_string()))?;
     base64::engine::general_purpose::STANDARD
         .decode(r.value)

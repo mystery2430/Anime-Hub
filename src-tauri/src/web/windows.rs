@@ -25,13 +25,16 @@
 use crate::commands::{AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
+#[cfg(desktop)]
 use crate::web::dns::{classify_host, DnsClass};
-use crate::web::session::{
-    capture, decide_navigation, profile_dir_name, restore, CookieJar, NavDecision, DNS_REBIND_BLOCK,
-};
-use tauri::{
-    AppHandle, Emitter, LogicalPosition, Manager, PhysicalPosition, Position, Size, WebviewUrl,
-};
+use crate::web::session::profile_dir_name;
+#[cfg(desktop)]
+use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
+#[cfg(mobile)]
+use crate::web::session::{capture, restore, CookieJar};
+use tauri::{AppHandle, Emitter, Manager};
+#[cfg(desktop)]
+use tauri::{LogicalPosition, PhysicalPosition, Position, Size, WebviewUrl};
 use url::Url;
 
 /// Label of the launcher window (and of the launcher webview inside it).
@@ -56,6 +59,25 @@ pub fn label_for(site_id: &str) -> String {
 /// Open a site.
 ///
 /// Returns the webview label that now hosts the site.
+///
+/// The dispatch is compile-time, not runtime: `open_in_main_window` calls
+/// `add_child` / `set_fullscreen`, which do not exist in tauri's mobile
+/// builds, so even a `cfg!()`-guarded branch would fail to compile on
+/// Android.
+#[cfg(mobile)]
+pub fn open_site_window(
+    app: AppHandle,
+    site: &Site,
+    url: &Url,
+    init_script: &str,
+    _fullscreen: bool,
+) -> AppResult<String> {
+    open_on_mobile(&app, site, url, init_script)
+}
+
+/// Desktop variant: a child WebView inside the main window, per-site profile
+/// kept.
+#[cfg(desktop)]
 pub fn open_site_window(
     app: AppHandle,
     site: &Site,
@@ -63,17 +85,14 @@ pub fn open_site_window(
     init_script: &str,
     fullscreen: bool,
 ) -> AppResult<String> {
-    if cfg!(any(target_os = "android", target_os = "ios")) {
-        open_on_mobile(&app, site, url, init_script)
-    } else {
-        open_in_main_window(&app, site, url, init_script, fullscreen)
-    }
+    open_in_main_window(&app, site, url, init_script, fullscreen)
 }
 
 // ---------------------------------------------------------------------------
 // Desktop: a child WebView inside the main window, per-site profile kept.
 // ---------------------------------------------------------------------------
 
+#[cfg(desktop)]
 fn open_in_main_window(
     app: &AppHandle,
     site: &Site,
@@ -247,6 +266,7 @@ fn open_in_main_window(
 
 /// Close whichever site webview is currently shown inside the main window,
 /// if any. Used before hosting a new one.
+#[cfg(desktop)]
 fn close_current_child(app: &AppHandle) -> AppResult<()> {
     let label = {
         let state = app.state::<AppState>();
@@ -266,10 +286,12 @@ fn close_current_child(app: &AppHandle) -> AppResult<()> {
 ///
 /// Installed once during `setup`. The launcher webview resizes itself; the
 /// child webview must be re-bounded explicitly on every window resize.
+/// `Webview::set_bounds` is desktop-only, so the mobile variant is a no-op.
+#[cfg(mobile)]
+pub fn install_main_window_handlers(_app: &AppHandle) {}
+
+#[cfg(desktop)]
 pub fn install_main_window_handlers(app: &AppHandle) {
-    if cfg!(any(target_os = "android", target_os = "ios")) {
-        return;
-    }
     let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
         return;
     };
@@ -301,6 +323,7 @@ pub fn install_main_window_handlers(app: &AppHandle) {
 // Mobile: a single WebView, isolated by swapping the cookie jar.
 // ---------------------------------------------------------------------------
 
+#[cfg(mobile)]
 fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
     let window = app
         .get_webview_window(LAUNCHER_LABEL)
@@ -356,6 +379,7 @@ fn export_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()>
 }
 
 /// Same as [`export_cookies`] but for a bare child `Webview` (desktop).
+#[cfg(desktop)]
 fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<()> {
     let live = webview.cookies().map_err(|e| {
         log::error!("çerezler okunamadı: {e}");
@@ -408,7 +432,10 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()>
 }
 
 /// Close a site session, persisting its cookies first.
-pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
+///
+/// Mobile: save the jar, then send the single WebView back to the launcher.
+#[cfg(mobile)]
+pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
         // Bind first: the `MutexGuard` temporary must be dropped before
@@ -421,40 +448,52 @@ pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
         value
     };
 
-    if cfg!(any(target_os = "android", target_os = "ios")) {
-        // Mobile: save the jar, then send the WebView back to the launcher.
-        if let Some(current) = &current {
-            let window = app
-                .get_webview_window(LAUNCHER_LABEL)
-                .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
-            export_cookies(&window, &current.site_id)?;
-        }
-        if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-            let state = app.state::<AppState>();
-            let back = state
-                .launcher_url
-                .lock()
-                .expect("launcher_url lock")
-                .clone();
-            if let Some(url) = back {
-                window.navigate(url).map_err(|e| {
-                    log::error!("başlatıcıya dönülemedi: {e}");
-                    AppError::Other("başlatıcıya dönülemedi".into())
-                })?;
-            }
-        }
-        let closed_site = current.as_ref().map(|c| c.site_id.clone());
-        let state = app.state::<AppState>();
-        *state.current_site.lock().expect("current_site lock") = None;
-        if let Some(site_id) = closed_site {
-            let _ = app.emit("animehub://site-closed", site_id);
-        }
-        return Ok(());
+    if let Some(current) = &current {
+        let window = app
+            .get_webview_window(LAUNCHER_LABEL)
+            .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
+        export_cookies(&window, &current.site_id)?;
     }
+    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+        let state = app.state::<AppState>();
+        let back = state
+            .launcher_url
+            .lock()
+            .expect("launcher_url lock")
+            .clone();
+        if let Some(url) = back {
+            window.navigate(url).map_err(|e| {
+                log::error!("başlatıcıya dönülemedi: {e}");
+                AppError::Other("başlatıcıya dönülemedi".into())
+            })?;
+        }
+    }
+    let closed_site = current.as_ref().map(|c| c.site_id.clone());
+    let state = app.state::<AppState>();
+    *state.current_site.lock().expect("current_site lock") = None;
+    if let Some(site_id) = closed_site {
+        let _ = app.emit("animehub://site-closed", site_id);
+    }
+    Ok(())
+}
 
-    // ------------------------------------------------------------------
-    // Desktop: remove the child webview; the launcher underneath reappears.
-    // ------------------------------------------------------------------
+/// Close a site session, persisting its cookies first.
+///
+/// Desktop: remove the child webview; the launcher underneath reappears.
+/// Uses `Webview::close` / `set_fullscreen`, which do not exist on mobile.
+#[cfg(desktop)]
+pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
+    let current = {
+        let state = app.state::<AppState>();
+        // Bind first: the `MutexGuard` temporary must be dropped before
+        // `state`, whose borrow it holds.
+        let value = state
+            .current_site
+            .lock()
+            .expect("current_site lock")
+            .clone();
+        value
+    };
     // `label` comes from the launcher UI, which tracks the label it was
     // given at open time. If it has gone stale (the session was already
     // closed via the overlay), fall back to the tracked current site.
