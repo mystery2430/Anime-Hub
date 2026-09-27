@@ -687,11 +687,18 @@ function wireSettings() {
   el.btnAnilistLogin.addEventListener("click", async () => {
     try {
       const start = await call("anilist_login_start");
+      el.settings.anilistStatus.dataset.state = "";
       el.settings.anilistStatus.textContent =
         "Tarayıcıda AniList girişi bekleniyor… bitince bu ekran güncellenir.";
       await openExternal(start.url);
     } catch (e) {
-      showNotice(errMessage(e));
+      // Mirror into the modal's own status line: the global toast is easy to
+      // dismiss, and a failure here (e.g. client_id not configured) is
+      // exactly what made this button look dead.
+      const msg = errMessage(e);
+      el.settings.anilistStatus.dataset.state = "error";
+      el.settings.anilistStatus.textContent = msg;
+      showNotice(msg);
     }
   });
 

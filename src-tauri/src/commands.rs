@@ -13,7 +13,7 @@ use crate::web::session::{build_init_script, CookieJar, InjectedConfig};
 use crate::web::windows;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
 // State
@@ -590,6 +590,38 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
         *s = Some(state_value);
     }
+
+    // Desktop loopback flow: when the redirect URI points at a local HTTP
+    // address (the built-in default does, http://127.0.0.1:17395), nothing
+    // else would receive the OAuth redirect — the browser would land on a
+    // dead port and the login would silently hang. Serve the single request
+    // in the background and finish the login through the same events the
+    // deep-link handler already uses. A custom-scheme redirect skips this:
+    // the OS delivers it to the deep-link handler in lib.rs instead.
+    if let Some(port) = anilist::loopback_port(&cfg.redirect_uri) {
+        let handle = app.clone();
+        let redirect_uri = cfg.redirect_uri.clone();
+        tauri::async_runtime::spawn(async move {
+            let flow: AppResult<AniListUser> = async {
+                let listener = anilist::LoopbackListener::bind_port(port).await?;
+                let target = listener
+                    .wait_for_callback(std::time::Duration::from_secs(300))
+                    .await?;
+                let callback = anilist::absolute_callback(&redirect_uri, &target)?;
+                anilist_login_callback(handle.clone(), callback).await
+            }
+            .await;
+            match flow {
+                Ok(user) => {
+                    let _ = handle.emit("animehub://anilist-login", user.name);
+                }
+                Err(e) => {
+                    let _ = handle.emit("animehub://error", e.to_string());
+                }
+            }
+        });
+    }
+
     Ok(LoginStart {
         url,
         redirect_uri: cli.config().redirect_uri.clone(),

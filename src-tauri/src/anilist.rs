@@ -898,9 +898,35 @@ pub struct LoopbackListener {
     redirect_uri: String,
 }
 
+/// Port of a loopback redirect URI (`http://127.0.0.1:17395/callback`),
+/// or `None` for any other form (custom scheme, remote host).
+///
+/// The login command consults this to decide whether a local HTTP listener
+/// must catch the OAuth redirect; it only makes sense to bind a port the
+/// registered redirect actually points at.
+pub fn loopback_port(redirect_uri: &str) -> Option<u16> {
+    let url = url::Url::parse(redirect_uri).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host != "127.0.0.1" && host != "localhost" {
+        return None;
+    }
+    url.port_or_known_default()
+}
+
 impl LoopbackListener {
+    /// Random-port variant, used by unit tests.
     pub async fn bind() -> AppResult<Self> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        Self::bind_port(0).await
+    }
+
+    /// Bind the loopback listener on a concrete port. The port must match the
+    /// redirect URI registered at AniList, otherwise the browser will never
+    /// reach us after the user grants access.
+    pub async fn bind_port(port: u16) -> AppResult<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
         let port = listener.local_addr()?.port();
         Ok(LoopbackListener {
             listener,
@@ -1094,6 +1120,25 @@ mod tests {
     fn parse_callback_requires_both_fields() {
         assert!(parse_callback("http://127.0.0.1:1/callback?code=a").is_err());
         assert!(parse_callback("http://127.0.0.1:1/callback?state=b").is_err());
+    }
+
+    #[test]
+    fn loopback_port_accepts_local_http_uris() {
+        assert_eq!(
+            loopback_port("http://127.0.0.1:17395/callback"),
+            Some(17395)
+        );
+        assert_eq!(loopback_port("http://localhost:8080/cb"), Some(8080));
+        // Default port of the scheme applies when none is written.
+        assert_eq!(loopback_port("http://127.0.0.1/callback"), Some(80));
+    }
+
+    #[test]
+    fn loopback_port_rejects_everything_else() {
+        assert_eq!(loopback_port("animehub://anilist/callback"), None);
+        assert_eq!(loopback_port("http://example.com:8080/cb"), None);
+        assert_eq!(loopback_port("https://127.0.0.1:443/cb"), None);
+        assert_eq!(loopback_port("hiç-url-değil"), None);
     }
 
     #[test]
