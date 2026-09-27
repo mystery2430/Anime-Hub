@@ -186,7 +186,20 @@ fn open_in_main_window(
         // Every new-window request is denied. Legit external links (payment
         // pages, app stores, "open in browser") go to the system browser via
         // `open_site_externally` instead.
-        .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny);
+        .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
+        // The way back (back button + Esc) is installed with a Rust-side
+        // eval on every finished load: inside a child WebView the
+        // document-start init script alone proved unreliable on WebView2.
+        // `OVERLAY_SNIPPET` self-guards, so repeated installs are no-ops,
+        // and it heals itself if a SPA wipes the DOM around the button.
+        .on_page_load(|webview, payload| {
+            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                return;
+            }
+            if let Err(e) = webview.eval(crate::web::session::OVERLAY_SNIPPET) {
+                log::warn!("geri dönüş katmanı kurulamadı: {e}");
+            }
+        });
 
     // `add_child` lives on the bare `Window`, not on `WebviewWindow`; same
     // window, different handle type.

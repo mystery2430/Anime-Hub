@@ -327,9 +327,6 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         } else {
             vec![]
         },
-        // Desktop shows the site inside the launcher window, so it needs the
-        // injected back button + Esc. Mobile keeps its system-back flow.
-        close_overlay: !cfg!(any(target_os = "android", target_os = "ios")),
     };
     let init_script = build_init_script(&injected);
 

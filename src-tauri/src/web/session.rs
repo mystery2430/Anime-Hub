@@ -311,66 +311,13 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
         .to_string()
     };
 
-    let overlay = if cfg.close_overlay {
-        r#"
-  // Single-window mode: a way back to the launcher that does not rely on IPC
-  // (remote pages get none). The pseudo-URL is intercepted natively by the
-  // navigation handler in web/windows.rs and turned into a close action, so
-  // following it never actually leaves the app.
-  if (CFG.closeOverlay) {
-    window.__animehubGoHome = function () {
-      document.location.assign("animehub://close-site");
-    };
-    document.addEventListener(
-      "keydown",
-      function (e) {
-        if (e.key === "Escape") window.__animehubGoHome();
-      },
-      true,
-    );
-    var animehubBackInstall = function () {
-      if (document.getElementById("__animehub-back")) return;
-      var b = document.createElement("button");
-      b.id = "__animehub-back";
-      b.type = "button";
-      b.textContent = "← AnimeHub'a dön";
-      b.setAttribute(
-        "style",
-        "position:fixed;left:14px;bottom:14px;z-index:2147483647;" +
-          "padding:9px 14px;border-radius:11px;border:1px solid rgba(255,255,255,0.28);" +
-          "background:rgba(13,16,25,0.88);color:#f2f4fa;" +
-          "font:600 13px/1.2 system-ui,sans-serif;cursor:pointer;" +
-          "box-shadow:0 6px 22px rgba(0,0,0,0.45);backdrop-filter:blur(6px);",
-      );
-      b.addEventListener(
-        "click",
-        function (e) {
-          e.preventDefault();
-          e.stopPropagation();
-          window.__animehubGoHome();
-        },
-        true,
-      );
-      (document.body || document.documentElement).appendChild(b);
-    };
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", animehubBackInstall);
-    } else {
-      animehubBackInstall();
-    }
-  }
-"#
-    } else {
-        ""
-    };
-
     format!(
         r#"(function () {{
   "use strict";
   if (window.__animehubInstalled) return;
   window.__animehubInstalled = true;
   var CFG = {payload};
-{popup_guard}{cosmetic}{overlay}}})();"#
+{popup_guard}{cosmetic}}})();"#
     )
 }
 
@@ -397,13 +344,6 @@ pub fn embed_json<T: serde::Serialize>(value: &T) -> String {
 pub struct InjectedConfig {
     pub block_popups: bool,
     pub hide_selectors: Vec<String>,
-    /// Desktop single-window mode: floating "back to launcher" button plus an
-    /// `Esc` handler inside the site view. It is a navigation to
-    /// `animehub://close-site`, which `web::windows` intercepts natively.
-    /// Mobile uses the system back gesture (and the shared-WebView flow), so
-    /// it stays off there.
-    #[serde(default)]
-    pub close_overlay: bool,
 }
 
 impl Default for InjectedConfig {
@@ -414,7 +354,6 @@ impl Default for InjectedConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            close_overlay: false,
         }
     }
 }
@@ -498,6 +437,78 @@ fn assert_app_error_is_send() {
     fn check<T: Send>() {}
     check::<AppError>();
 }
+
+/// Standalone overlay snippet: floating "back to launcher" button plus an
+/// `Esc` route home. Installed by Rust on every finished page load via
+/// `Webview::eval` (see `web/windows.rs`), because inside a child WebView the
+/// init-script channel alone proved unreliable on WebView2. The guard makes
+/// repeated evals cheap and idempotent, and the interval repairs the button
+/// if a SPA wipes the DOM around it.
+pub const OVERLAY_SNIPPET: &str = r#"(function () {
+  "use strict";
+  if (window.__animehubOverlayReady) return;
+  window.__animehubOverlayReady = 1;
+
+  window.__animehubGoHome = function () {
+    // Pseudo-navigation intercepted natively (never leaves the app).
+    document.location.assign("animehub://close-site");
+  };
+
+  window.addEventListener(
+    "keydown",
+    function (e) {
+      if (e.key !== "Escape") return;
+      var a = document.activeElement;
+      var editing =
+        a &&
+        ((a.tagName === "INPUT" && a.type !== "checkbox" && a.type !== "radio" &&
+          a.type !== "button" && a.type !== "range") ||
+          a.tagName === "TEXTAREA" ||
+          a.tagName === "SELECT" ||
+          a.isContentEditable);
+      if (editing) {
+        // First Esc steps out of the field; the next one goes home.
+        a.blur();
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      window.__animehubGoHome();
+    },
+    true,
+  );
+
+  var install = function () {
+    if (document.getElementById("__animehub-back")) return;
+    var b = document.createElement("button");
+    b.id = "__animehub-back";
+    b.type = "button";
+    b.textContent = "← AnimeHub'a dön";
+    b.setAttribute(
+      "style",
+      "position:fixed;left:14px;bottom:14px;z-index:2147483647;" +
+        "padding:9px 14px;border-radius:11px;border:1px solid rgba(255,255,255,0.28);" +
+        "background:rgba(13,16,25,0.88);color:#f2f4fa;" +
+        "font:600 13px/1.2 system-ui,sans-serif;cursor:pointer;" +
+        "box-shadow:0 6px 22px rgba(0,0,0,0.45);backdrop-filter:blur(6px);",
+    );
+    b.addEventListener(
+      "click",
+      function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.__animehubGoHome();
+      },
+      true,
+    );
+    (document.body || document.documentElement).appendChild(b);
+  };
+
+  install();
+  window.setInterval(install, 1000);
+})();"#;
 
 #[cfg(test)]
 mod tests {
@@ -761,7 +772,6 @@ mod tests {
         let cfg = InjectedConfig {
             block_popups: true,
             hide_selectors: vec!["</script><script>alert(1)</script>".into()],
-            close_overlay: false,
         };
         let js = build_init_script(&cfg);
         assert!(
@@ -788,24 +798,25 @@ mod tests {
         let js = build_init_script(&InjectedConfig {
             block_popups: false,
             hide_selectors: vec![],
-            close_overlay: false,
         });
         assert!(!js.contains("window.open = function"));
     }
 
     #[test]
-    fn init_script_overlay_only_when_enabled() {
-        let js = build_init_script(&InjectedConfig {
-            close_overlay: true,
-            ..InjectedConfig::default()
-        });
+    fn overlay_snippet_routes_home_and_focuses_editing_first() {
+        // The desktop overlay is installed by Rust eval on every finished
+        // page load (web/windows.rs), not by the init script, so it must be
+        // a complete, self-guarding snippet on its own.
+        let js = OVERLAY_SNIPPET;
+        assert!(js.contains("__animehubOverlayReady"));
         assert!(js.contains("__animehub-back"));
         assert!(js.contains("animehub://close-site"));
-        assert!(js.contains("Escape"));
-
-        let off = build_init_script(&InjectedConfig::default());
-        assert!(!off.contains("__animehub-back"));
-        assert!(!off.contains("close-site"));
+        assert!(js.contains("Escape"), "Esc routes home");
+        assert!(js.contains("isContentEditable"), "first Esc blurs editing");
+        assert!(js.contains("setInterval"), "SPA-proof re-install");
+        // And the init script must not shadow-install a second overlay.
+        let init = build_init_script(&InjectedConfig::default());
+        assert!(!init.contains("__animehub-back"));
     }
 
     #[test]
