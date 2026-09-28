@@ -1,8 +1,9 @@
 # Produces Android APKs, published as release assets when the run is a tag.
 #
-# Nothing secret lives in this file or in the repo. The keystore arrives as a
-# base64 repository secret and is written to a temporary file that is deleted
-# at the end of the job. If the secret is absent the APK is built unsigned.
+# Nothing secret lives in this file or in the repo. The keystore arrives as
+# base64 environment secrets (environment `keystore`) and is written to a
+# temporary file that is deleted at the end of the job. If the secret is
+# absent the APK is built unsigned.
 #
 # `secrets` cannot be referenced from `if:` — GitHub rejects that — so a
 # step exports `enabled=true/false` and later steps branch on that output.
@@ -28,6 +29,10 @@ jobs:
   android:
     name: Android APK (${{ matrix.abi }})
     runs-on: ubuntu-24.04
+    # The four keystore secrets live on the `keystore` environment (not at
+    # repository level); without this key `${{ secrets.* }}` resolves empty
+    # and the job silently builds unsigned APKs.
+    environment: keystore
     strategy:
       fail-fast: false
       matrix:

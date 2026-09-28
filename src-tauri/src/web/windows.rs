@@ -27,9 +27,11 @@ use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
 use crate::web::dns::{classify_host, DnsClass};
-use crate::web::session::profile_dir_name;
-#[cfg(mobile)]
-use crate::web::session::{capture, restore, CookieJar};
+// `capture`/`restore`/`CookieJar` used to sit behind `#[cfg(mobile)]`, but
+// `export_cookies_from` and `import_cookies` below are shared with the
+// desktop child-webview path — hence E0425/E0422 on the desktop release
+// build. Unconditional import.
+use crate::web::session::{capture, profile_dir_name, restore, CookieJar};
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
 use tauri::{AppHandle, Emitter, Manager};

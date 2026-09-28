@@ -1,7 +1,8 @@
 // Print a short GitHub Actions annotation from a build log.
 // Log blobs from this runner are not always downloadable; the checks API
 // returns annotations, and the step summary is on the run page.
-const fs = require("fs");
+// package.json sets "type": "module"; keep this file ESM.
+import fs from "node:fs";
 
 const logPath = process.argv[2];
 const label = process.argv[3] || "log";
