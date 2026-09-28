@@ -34,3 +34,5 @@ Thumbs.db
 .vscode/
 *.swp
 *.log
+__pycache__/
+*.pyc

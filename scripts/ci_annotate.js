@@ -15,10 +15,12 @@ try {
 }
 
 const interesting = raw.split(/\r?\n/).filter((line) =>
-  /error(\[|:)|warning:|FAILED|panicked|could not compile|test result:|^\s*-->/i.test(line),
+  /error(\[|:)|warning:|FAILED|panicked|could not compile|test result:|^\s*-->|What went wrong|Execution failed|Caused by|^\s*>\s/i.test(
+    line,
+  ),
 );
-const picked = (interesting.length ? interesting : raw.split(/\r?\n/).slice(-12)).slice(-12);
-const text = picked.join("\n").slice(0, 900);
+const picked = (interesting.length ? interesting : raw.split(/\r?\n/).slice(-12)).slice(-20);
+const text = picked.join("\n").slice(0, 1800);
 
 const msg = text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 console.log(`::error::${label}:%0A${msg}`);
