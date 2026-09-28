@@ -84,6 +84,17 @@ function fakeGen(packageName) {
 </manifest>
 `,
   );
+  writeFileSync(
+    join(gen, "app/build.gradle.kts"),
+    `plugins {
+    id("com.android.application")
+}
+
+android {
+    compileSdk = 36
+}
+`,
+  );
   return gen;
 }
 
@@ -106,12 +117,18 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(xml, /android:host="anilist"/);
     const rules = read(join(gen, "app/proguard-rules.pro"));
     assert.match(rules, /-keep class dev\.animehub\.app\.AnimeHubPlugin/);
+    const gradle = read(join(gen, "app/build.gradle.kts"));
+    assert.match(gradle, /signingConfigs\.create\("release"\)/);
+    assert.match(gradle, /keystore\.properties/);
 
     const second = run();
     assert.equal(second.status, 0, second.stderr || second.stdout);
     const xml2 = read(join(gen, "app/src/main/AndroidManifest.xml"));
     assert.equal(xml2.split("supportsPictureInPicture").length - 1, 1);
     assert.equal(xml2.split('android:scheme="animehub"').length - 1, 1);
+    // signing block injected exactly once (marker pair, not duplicated)
+    const gradle2 = read(join(gen, "app/build.gradle.kts"));
+    assert.equal(gradle2.split("AnimeHub release signing").length - 1, 2);
   } finally {
     rmSync(gen, { recursive: true, force: true });
   }
