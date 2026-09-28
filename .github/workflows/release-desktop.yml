@@ -63,19 +63,52 @@ jobs:
         run: cargo test --all
         working-directory: src-tauri
 
-      # `tauri-action` signs Windows installers when the certificate secrets
-      # are present, and otherwise produces an unsigned build. Either way no
-      # secret is referenced from the repository contents.
+      # Windows Authenticode signing is opt-in through repository secrets and
+      # rides on bundle.windows.signCommand (src-tauri/tauri.windows-signing.
+      # conf.json -> scripts/sign_windows.ps1). `tauri-action` itself reads no
+      # signing configuration; without secrets the bundle stays unsigned and
+      # no secret is referenced from the repository contents.
+      #
+      # Credential modes (see scripts/sign_windows.ps1):
+      #   WINDOWS_SIGN_CMD    - vendor command template for cloud-HSM tools
+      #                         (jsign, SSL.com eSigner, trusted-signing-cli).
+      #                         Any secrets the tool needs (e.g. the
+      #                         SSL_COM_* set) must also be forwarded in the
+      #                         env block of this step; keep passwords out of
+      #                         the template itself.
+      #   WINDOWS_CERTIFICATE - base64-encoded .pfx plus
+      #                         WINDOWS_CERTIFICATE_PASSWORD (exportable key).
+      - name: Prepare Windows signing
+        id: win-sign
+        if: matrix.label == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_SIGN_CMD: ${{ secrets.WINDOWS_SIGN_CMD }}
+        run: |
+          if ($env:WINDOWS_CERTIFICATE -or $env:WINDOWS_SIGN_CMD) {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+            "args=--config src-tauri/tauri.windows-signing.conf.json" >> $env:GITHUB_OUTPUT
+            Write-Host "Windows signing enabled"
+          } else {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            "args=" >> $env:GITHUB_OUTPUT
+            Write-Host "No Windows signing secrets; the bundle will be unsigned"
+          }
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGN_CMD: ${{ secrets.WINDOWS_SIGN_CMD }}
           WINDOWS_TIMESTAMP_URL: http://timestamp.digicert.com
         with:
           # The shared config no longer pins Linux-only bundle targets, which
           # made a Windows run try to build an AppImage. Name the bundles here.
-          args: ${{ matrix.label == 'windows' && '--bundles nsis' || '--bundles appimage,deb,rpm' }}
+          # steps.win-sign appends the signing config overlay on Windows only,
+          # and only when signing secrets exist.
+          args: ${{ matrix.label == 'windows' && '--bundles nsis' || '--bundles appimage,deb,rpm' }} ${{ steps.win-sign.outputs.args }}
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('AnimeHub {0}', github.ref_name) || '' }}
           # Must stay false: the Android workflow publishes the tag's release
@@ -83,3 +116,29 @@ jobs:
           # draft (422). With false, both workflows merge into one release.
           releaseDraft: false
           prerelease: false
+
+      # scripts/sign_windows.ps1 already validates every file it signs; this
+      # re-checks the shipped artifacts so an unsigned installer can never
+      # reach the release silently. target/release holds only the final
+      # application executable(s); build scripts live under build/ and deps/.
+      - name: Verify Windows signatures
+        if: matrix.label == 'windows' && steps.win-sign.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targets = @(Get-ChildItem src-tauri/target/release -Filter *.exe -File)
+          $targets += @(Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe -File)
+          if ($targets.Count -eq 0) {
+            throw 'no Windows executables found to verify'
+          }
+          foreach ($file in $targets) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            Write-Host ("{0}: {1}" -f $file.FullName, $signature.Status)
+            if ($signature.Status -ne 'Valid') {
+              throw "signature status for $($file.Name) is $($signature.Status), expected Valid"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "signature for $($file.Name) has no timestamp"
+            }
+          }
+          Write-Host 'All Windows artifacts are signed and timestamped'
