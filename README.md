@@ -226,9 +226,12 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 |---|---|---|
 | **NSIS kurulum** | — | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
-> [!WARNING]
-> Paketler **kod imzalı değildir**. SmartScreen veya tarayıcı uyarısı
-> alırsanız bu beklenir.
+> [!NOTE]
+> Windows paketleri [SignPath Foundation](https://signpath.org) kod imzalama
+> sertifikasıyla imzalanır: imzalı paketler sonraki sürümden itibaren
+> yayınlanır (`0.2.0` kurulumları henüz imzasızdır). SmartScreen uyarısı,
+> imza itibarı birikene kadar çıkabilir — o zamana kadar "Ek bilgi" →
+> "Yine de çalıştır" ile devam edebilirsiniz.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
