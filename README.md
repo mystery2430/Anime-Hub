@@ -338,8 +338,6 @@ v1 bilinçli olarak dar tutuldu. Ertelenenler:
 - [ ] Otomatik güncelleme kontrolü
 - [ ] Yeni bölüm bildirimleri
 - [ ] Yerel izleme geçmişi / "devam et" listesi
-- [ ] Zorunlu koyu tema
-- [ ] PIN / biyometrik kilit
 - [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
 - [ ] Windows kod imzalama ve macOS desteği
 
