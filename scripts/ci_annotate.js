@@ -21,13 +21,27 @@ let gradleBlock = "";
 const gm = raw.match(/FAILURE: Build failed[\s\S]{0,2200}?BUILD FAILED[^\n]*/);
 if (gm) gradleBlock = gm[0].split(/\r?\n/).filter((l) => l.length < 300).join("\n");
 
-const interesting = raw.split(/\r?\n/).filter((line) =>
+// Rust/cargo error lines with a few context lines each (the caret snippet
+// and the `--> location` line carry the actual diagnostic).
+const lines = raw.split(/\r?\n/);
+const context = [];
+lines.forEach((line, i) => {
+  if (/^(\x1b\[[0-9;]*m)*error(\[|:)/i.test(line) && !/could not compile/i.test(line)) {
+    context.push(...lines.slice(i, i + 5));
+  }
+});
+const contextBlock = [...new Set(context)].slice(0, 40).join("\n");
+
+const interesting = lines.filter((line) =>
   /error(\[|:)|warning:|FAILED|panicked|could not compile|test result:|^\s*-->|What went wrong|Execution failed|Caused by|^\s*>\s/i.test(
     line,
   ),
 );
-const picked = (interesting.length ? interesting : raw.split(/\r?\n/).slice(-12)).slice(-20);
-const text = (gradleBlock ? gradleBlock + "\n--\n" : "") + picked.join("\n");
+const picked = (interesting.length ? interesting : lines.slice(-12)).slice(-20);
+const text =
+  (gradleBlock ? gradleBlock + "\n--\n" : "") +
+  (contextBlock ? contextBlock + "\n--\n" : "") +
+  picked.join("\n");
 const finalText = text.slice(0, 4000);
 
 const msg = finalText.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
