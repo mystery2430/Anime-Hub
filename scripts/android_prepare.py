@@ -33,7 +33,7 @@ android {
     if (ksFile.exists()) {
         val ks = java.util.Properties()
         ksFile.inputStream().use { ks.load(it) }
-        signingConfigs.create("release") {
+        signingConfigs.maybeCreate("release").apply {
             storeFile = java.io.File(ks.getProperty("storeFile"))
             storePassword = ks.getProperty("storePassword")
             keyAlias = ks.getProperty("keyAlias")

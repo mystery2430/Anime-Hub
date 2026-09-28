@@ -144,7 +144,16 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           CARGO_PROFILE_RELEASE_LTO: "off"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-        run: npm run tauri android build -- --apk --target ${{ matrix.abi }}
+        # tee the log: runner log blobs are not always downloadable, but
+        # ci_annotate.js re-emits the interesting lines as check annotations.
+        run: |
+          set -o pipefail
+          npm run tauri android build -- --apk --target ${{ matrix.abi }} \
+            2>&1 | tee /tmp/android-build.log
+
+      - name: Annotate build failure
+        if: failure()
+        run: node scripts/ci_annotate.js /tmp/android-build.log "android build" || true
 
       # Gradle writes the per-target output under a generic name (e.g.
       # `app-universal-release.apk`), which loses the ABI and collides when

@@ -118,7 +118,7 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     const rules = read(join(gen, "app/proguard-rules.pro"));
     assert.match(rules, /-keep class dev\.animehub\.app\.AnimeHubPlugin/);
     const gradle = read(join(gen, "app/build.gradle.kts"));
-    assert.match(gradle, /signingConfigs\.create\("release"\)/);
+    assert.match(gradle, /signingConfigs\.maybeCreate\("release"\)/);
     assert.match(gradle, /keystore\.properties/);
 
     const second = run();
