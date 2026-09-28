@@ -29,9 +29,9 @@ use crate::sites::registry::Site;
 use crate::web::dns::{classify_host, DnsClass};
 // `capture`/`CookieJar` back the shared export path (mobile jar swap and
 // desktop child-webview snapshot); `restore` only serves the mobile import.
-use crate::web::session::{capture, profile_dir_name, CookieJar};
 #[cfg(mobile)]
 use crate::web::session::restore;
+use crate::web::session::{capture, profile_dir_name, CookieJar};
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
 use tauri::{AppHandle, Emitter, Manager};
