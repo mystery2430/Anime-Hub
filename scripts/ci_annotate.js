@@ -3,6 +3,7 @@
 // returns annotations, and the step summary is on the run page.
 // package.json sets "type": "module"; keep this file ESM.
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 
 const logPath = process.argv[2];
 const label = process.argv[3] || "log";
@@ -13,6 +14,9 @@ try {
 } catch (err) {
   raw = String(err);
 }
+// Cargo/clippy colour the diagnostics; the ANSI resets between `error` and
+// `:` used to break every regex below. Strip escapes up front.
+raw = raw.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 
 // Gradle prints the actual cause between these two markers; the generic
 // line filter misses it (e.g. "A problem occurred evaluating project ':app'"),
@@ -59,7 +63,6 @@ try {
 // Job logs live on a host this sandbox cannot download. A pull-request
 // comment is readable through the GitHub API. execFileSync so the process
 // does not exit before the request finishes.
-const { execFileSync } = require("child_process");
 const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
 const repo = process.env.GITHUB_REPOSITORY;
 const pr = process.env.PR_NUMBER;
