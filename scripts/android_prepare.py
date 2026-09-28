@@ -22,6 +22,29 @@ import sys
 from pathlib import Path
 
 PIP_ATTR = 'android:supportsPictureInPicture="true"'
+SIGN_MARKER = "AnimeHub release signing"
+# Tauri v2's generated Android template has no signing config at all, so a
+# release build is always unsigned unless we inject one. The block is a
+# no-op when keystore.properties is absent (dev builds stay unsigned).
+SIGN_BLOCK = """
+// >>> %s (injected by scripts/android_prepare.py) >>>
+android {
+    val ksFile = rootProject.file("keystore.properties")
+    if (ksFile.exists()) {
+        val ks = java.util.Properties()
+        ksFile.inputStream().use { ks.load(it) }
+        signingConfigs.create("release") {
+            storeFile = java.io.File(ks.getProperty("storeFile"))
+            storePassword = ks.getProperty("storePassword")
+            keyAlias = ks.getProperty("keyAlias")
+            keyPassword = ks.getProperty("keyPassword")
+        }
+        buildTypes.getByName("release").signingConfig =
+            signingConfigs.getByName("release")
+    }
+}
+// <<< %s <<<
+""" % (SIGN_MARKER, SIGN_MARKER)
 DEEP_LINK = """        <intent-filter>
             <action android:name="android.intent.action.VIEW" />
             <category android:name="android.intent.category.DEFAULT" />
@@ -148,6 +171,14 @@ def prepare(root: Path, gen: Path) -> list[str]:
     proguard = gen / "app" / "proguard-rules.pro"
     ensure_proguard(proguard, package, class_name)
     notes.append(f"proguard keep for {package}.{class_name}")
+
+    gradle = gen / "app" / "build.gradle.kts"
+    text = gradle.read_text(encoding="utf-8")
+    if SIGN_MARKER in text:
+        notes.append(f"signing config already present in {gradle}")
+    else:
+        gradle.write_text(text + SIGN_BLOCK, encoding="utf-8")
+        notes.append(f"injected release signing config into {gradle}")
     return notes
 
 

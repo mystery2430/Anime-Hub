@@ -154,7 +154,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist-apk
-          f=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -1)
+          # Prefer the signed APK: once a signingConfig is active Gradle
+          # names it without `-unsigned`; fall back to unsigned dev builds.
+          f=$(find src-tauri/gen/android/app/build/outputs/apk \
+                -name "*.apk" ! -name "*unsigned*" | head -1)
+          if [ -z "$f" ]; then
+            f=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -1)
+          fi
           test -n "$f"
           suffix=""
           case "$(basename "$f")" in *unsigned*) suffix="-unsigned" ;; esac
