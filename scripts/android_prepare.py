@@ -28,13 +28,16 @@ SIGN_MARKER = "AnimeHub release signing"
 # no-op when keystore.properties is absent (dev builds stay unsigned).
 SIGN_BLOCK = """
 // >>> %s (injected by scripts/android_prepare.py) >>>
+// No java.* qualified references here: Gradle's Kotlin DSL script
+// compiler rejects them (Unresolved reference: util/io). The template
+// already imports java.util.Properties at the top; file() is Project's.
 android {
     val ksFile = rootProject.file("keystore.properties")
     if (ksFile.exists()) {
-        val ks = java.util.Properties()
+        val ks = Properties()
         ksFile.inputStream().use { ks.load(it) }
         signingConfigs.maybeCreate("release").apply {
-            storeFile = java.io.File(ks.getProperty("storeFile"))
+            storeFile = file(ks.getProperty("storeFile"))
             storePassword = ks.getProperty("storePassword")
             keyAlias = ks.getProperty("keyAlias")
             keyPassword = ks.getProperty("keyPassword")
@@ -177,6 +180,8 @@ def prepare(root: Path, gen: Path) -> list[str]:
     if SIGN_MARKER in text:
         notes.append(f"signing config already present in {gradle}")
     else:
+        if "import java.util.Properties" not in text:
+            text = "import java.util.Properties\n" + text
         gradle.write_text(text + SIGN_BLOCK, encoding="utf-8")
         notes.append(f"injected release signing config into {gradle}")
     return notes
