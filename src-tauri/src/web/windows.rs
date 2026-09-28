@@ -27,9 +27,11 @@ use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
 use crate::web::dns::{classify_host, DnsClass};
-use crate::web::session::profile_dir_name;
+// `capture`/`CookieJar` back the shared export path (mobile jar swap and
+// desktop child-webview snapshot); `restore` only serves the mobile import.
 #[cfg(mobile)]
-use crate::web::session::{capture, restore, CookieJar};
+use crate::web::session::restore;
+use crate::web::session::{capture, profile_dir_name, CookieJar};
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
 use tauri::{AppHandle, Emitter, Manager};
@@ -370,6 +372,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 }
 
 /// Save the WebView's current cookie jar into the named site's encrypted blob.
+#[cfg(mobile)]
 fn export_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()> {
     let live = window.cookies().map_err(|e| {
         log::error!("çerezler okunamadı: {e}");
@@ -410,6 +413,7 @@ fn export_cookies_from(
 }
 
 /// Load a site's encrypted cookie jar into the WebView.
+#[cfg(mobile)]
 fn import_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()> {
     let app = window.app_handle().clone();
     let state = app.state::<AppState>();

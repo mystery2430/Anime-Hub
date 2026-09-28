@@ -78,5 +78,8 @@ jobs:
           args: ${{ matrix.label == 'windows' && '--bundles nsis' || '--bundles appimage,deb,rpm' }}
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('AnimeHub {0}', github.ref_name) || '' }}
-          releaseDraft: true
+          # Must stay false: the Android workflow publishes the tag's release
+          # as non-draft, and GitHub refuses to demote a published release to
+          # draft (422). With false, both workflows merge into one release.
+          releaseDraft: false
           prerelease: false
