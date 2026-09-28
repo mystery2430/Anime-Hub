@@ -332,7 +332,7 @@ kullanıcının kendi cihazında, şifreli depoda tutulur.
 
 ## 🗺️&nbsp; Yol Haritası
 
-v1 bilinçli olarak dar tutuldu. Ertelenenler:
+v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 - [ ] MyAnimeList native entegrasyonu (v1'de yalnızca başlatıcı kutucuğu)
 - [ ] Otomatik güncelleme kontrolü
@@ -340,6 +340,8 @@ v1 bilinçli olarak dar tutuldu. Ertelenenler:
 - [ ] Yerel izleme geçmişi / "devam et" listesi
 - [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
 - [ ] Windows kod imzalama ve macOS desteği
+- [ ] Her hangi bir programa dayanmayan cookie şifreleme
+
 
 ---
 
