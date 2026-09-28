@@ -212,9 +212,9 @@ Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
 
 | Yöntem | Boyut | Komut |
 |---|---|---|
-| **`.deb`** (Debian/Ubuntu) | ~3.7 MB | `sudo apt install ./AnimeHub_0.2.0_amd64.deb` |
-| **`.rpm`** (Fedora/RHEL) | — | `sudo rpm -ivh animehub-0.2.0-1.x86_64.rpm` |
-| **AppImage** | — | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
+| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.2.0_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.2.0-1.x86_64.rpm` |
+| **AppImage** | ~75 MB | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
 
 ```bash
 sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
@@ -224,7 +224,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 | Yöntem | Boyut | Açıklama |
 |---|---|---|
-| **NSIS kurulum** | — | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
+| **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
 > Windows paketleri [SignPath Foundation](https://signpath.org) kod imzalama
@@ -237,7 +237,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 | Yöntem | Boyut | Açıklama |
 |---|---|---|
-| **İmzalı APK** | — | Releases sayfasından ABI'nize uygun `.apk` (`animehub-aarch64-release.apk` çoğu modern telefon; `animehub-armv7-release.apk` eski 32-bit; `animehub-x86_64-release.apk` emülatör) |
+| **İmzalı APK** | ~7–11 MB | Releases sayfasından ABI'nize uygun `.apk` (`animehub-aarch64-release.apk` çoğu modern telefon; `animehub-armv7-release.apk` eski 32-bit; `animehub-x86_64-release.apk` emülatör) |
 
 > [!NOTE]
 > APK'lar tüm CI işlerinde derleniyor ve yayın anahtarıyla imzalanıyor.
@@ -273,7 +273,8 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 ### 1. Ön gereksinimler
 
-- [Rust](https://www.rust-lang.org/tools/install) 1.98+
+- [Rust](https://www.rust-lang.org/tools/install) — güncel stable önerilir
+  (MSRV `1.77`, bkz. `src-tauri/Cargo.toml`)
 - [Node.js](https://nodejs.org/) 20+
 - Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`
 - Android: SDK platform 36, NDK `29.0.13846066`, `ANDROID_HOME` ve `NDK_HOME` tanımlı
@@ -322,14 +323,17 @@ etmeyin** — `.gitignore` bunu zaten engeller.
 | `release-desktop.yml` | `v*` etiketi | Linux `.deb`/`.rpm`/AppImage + Windows NSIS |
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag vX.Y.Z          # sürüm etiketi; iki release iş akışını da tetikler
+git push origin vX.Y.Z
 ```
 
 Depoda **hiçbir gizli anahtar yoktur**. Android keystore'u
 `secrets.ANDROID_KEYSTORE_BASE64` üzerinden geçici dosyaya yazılır ve
 `if: always()` adımında `shred -u` ile silinir; AniList istemci bilgileri
-kullanıcının kendi cihazında, şifreli depoda tutulur.
+kullanıcının kendi cihazında, şifreli depoda tutulur. Windows kod imzalama
+da yalnızca GitHub secret'larına bağlıdır (`WINDOWS_CERTIFICATE` /
+`WINDOWS_SIGN_CMD` + ilgili şifreler) — secret yoksa paketler imzasız
+üretilir.
 
 ---
 
@@ -344,52 +348,32 @@ v1 bilinçli olarak dar tutuldu. Ertelenenler:
 - [ ] Zorunlu koyu tema
 - [ ] PIN / biyometrik kilit
 - [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
-- [ ] Windows kod imzalama ve macOS desteği
+- [ ] Windows kod imzalama (SignPath Foundation başvurusu sürüyor)
+- [ ] macOS desteği
 
 ---
 
 ## ✅&nbsp; Doğrulama durumu
 
-Önceki oturumda (Linux, x86_64, 2 GB RAM) doğrulananlar:
-
-| Komut | Sonuç |
-|---|---|
-| `cargo test --all` | **148 test geçti** (137 birim + 11 denetim), 0 hata — bu sayı DNS rebinding testleri eklenmeden önce |
-| `cargo clippy --all-targets -- -D warnings` | temiz (uyarı yok) |
-| `cargo fmt --all -- --check` | temiz |
-| `npm run build` | başarılı |
-| `npm run tauri build -- --bundles deb` | `AnimeHub_0.1.0_amd64.deb` (3.7 MB), düşük bellek profiliyle |
-
-Bu oturumda yeniden çalıştırılan:
-
-| Komut | Sonuç |
-|---|---|
-| `npm test` | **49 test geçti**, 0 hata |
-
-GitHub Actions'ta doğrulananlar (`ubuntu-24.04`, PR #1):
-
-| İş | Sonuç |
-|---|---|
-| `npm test` | geçti (ubuntu, macOS, Windows) |
-| `cargo fmt --all -- --check` | geçti |
-| `cargo clippy` / `cargo test --all` | ubuntu ve macOS geçti (`77f5e7c`). Windows clippy o koşuda hâlâ kırmızıydı; DPAPI imza düzeltmesi sonraki koşuda |
-| `cargo build --release --locked` (LTO, tek codegen unit) | **geçti** — 7 GB runner'da link OOM vermedi. Bu bir paket değil; `.deb` / AppImage / rpm ayrıca üretilmedi |
-
-**v0.2.0 ile yeşile dönenler:**
-
 | Doğrulama | Sonuç |
 |---|---|
-| Android APK derlemesi (aarch64, armv7, x86_64) | **yeşil** — `release-android.yml` ve PR CI'daki Android compile işi geçiyor. Derleme hataları `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla çözüldü |
-| Windows NSIS paketi | **üretildi** — `AnimeHub_0.2.0_x64-setup.exe` release varlığı |
-| İmzalı yayın APK'ları (keystore secret'ları) | bu sürümde hazırlandı |
+| `npm test` | **65 test geçti**, 0 hata |
+| `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | GitHub Actions'ta yeşil — Tests işi `ubuntu-24.04`, `macos-latest` ve `windows-latest` üzerinde |
+| `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
+| `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
+| Android APK derlemesi (aarch64, armv7, x86_64) | yeşil — `release-android.yml` ve CI'daki Android compile işi; `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla |
+| **v0.2.0 yayın paketleri** | doğrulandı: 3 **imzalı** APK + `AnimeHub_0.2.0_x64-setup.exe` + `.deb`/`.rpm`/AppImage; `main` CI'sı tam yeşil |
+| Windows kurulumu | Windows üzerinde elle doğrulandı (DPAPI + WebView2 profili) |
 
 **Hâlâ doğrulanmayanlar:**
 
 - **Android cihaz testi.** APK derlenip imzalanıyor; elle cihaz doğrulaması
   yapılmadı (PiP, çerez takası, geri katmanı dahil).
+- **İmzalı Windows paketi.** Kod imzalama altyapısı CI'da hazır; SignPath
+  sertifikası bağlandığında ilk imzalı sürümle doğrulanacak.
 
-Tüm doğrulama kayıtları, bulunan güvenlik açığının ayrıntısı ve devralan
-kişiye düşen işler [`HANDOFF.md`](./HANDOFF.md) dosyasında.
+Tüm doğrulama kayıtları ve devralan kişiye düşen işler
+[`HANDOFF.md`](./HANDOFF.md) dosyasında.
 
 ---
 
