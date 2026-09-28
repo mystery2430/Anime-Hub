@@ -14,21 +14,29 @@ try {
   raw = String(err);
 }
 
+// Gradle prints the actual cause between these two markers; the generic
+// line filter misses it (e.g. "A problem occurred evaluating project ':app'"),
+// so lift the whole block verbatim.
+let gradleBlock = "";
+const gm = raw.match(/FAILURE: Build failed[\s\S]{0,2200}?BUILD FAILED[^\n]*/);
+if (gm) gradleBlock = gm[0].split(/\r?\n/).filter((l) => l.length < 300).join("\n");
+
 const interesting = raw.split(/\r?\n/).filter((line) =>
   /error(\[|:)|warning:|FAILED|panicked|could not compile|test result:|^\s*-->|What went wrong|Execution failed|Caused by|^\s*>\s/i.test(
     line,
   ),
 );
 const picked = (interesting.length ? interesting : raw.split(/\r?\n/).slice(-12)).slice(-20);
-const text = picked.join("\n").slice(0, 1800);
+const text = (gradleBlock ? gradleBlock + "\n--\n" : "") + picked.join("\n");
+const finalText = text.slice(0, 4000);
 
-const msg = text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+const msg = finalText.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 console.log(`::error::${label}:%0A${msg}`);
 
 try {
   const summary = process.env.GITHUB_STEP_SUMMARY;
   if (summary) {
-    fs.appendFileSync(summary, `\n### ${label}\n\n\`\`\`\n${text}\n\`\`\`\n`);
+    fs.appendFileSync(summary, `\n### ${label}\n\n\`\`\`\n${finalText}\n\`\`\`\n`);
   }
 } catch {
   // The annotation above is the part CI can read back.
