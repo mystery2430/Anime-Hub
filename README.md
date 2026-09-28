@@ -339,17 +339,16 @@ da yalnızca GitHub secret'larına bağlıdır (`WINDOWS_CERTIFICATE` /
 
 ## 🗺️&nbsp; Yol Haritası
 
-v1 bilinçli olarak dar tutuldu. Ertelenenler:
+v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 - [ ] MyAnimeList native entegrasyonu (v1'de yalnızca başlatıcı kutucuğu)
 - [ ] Otomatik güncelleme kontrolü
 - [ ] Yeni bölüm bildirimleri
 - [ ] Yerel izleme geçmişi / "devam et" listesi
-- [ ] Zorunlu koyu tema
-- [ ] PIN / biyometrik kilit
 - [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
 - [ ] Windows kod imzalama (SignPath Foundation başvurusu sürüyor)
 - [ ] macOS desteği
+- [ ] Her hangi bir programa dayanmayan cookie şifreleme
 
 ---
 
