@@ -345,7 +345,6 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 - [ ] Otomatik güncelleme kontrolü
 - [ ] Yeni bölüm bildirimleri
 - [ ] Yerel izleme geçmişi / "devam et" listesi
-- [ ] Windows kod imzalama
 - [ ] macOS desteği
 - [ ] Her hangi bir programa dayanmayan cookie şifreleme
 
@@ -369,9 +368,6 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
   yapılmadı (PiP, çerez takası, localStorage/IndexedDB şifreli aktarımı ve
   geri katmanı dahil). IndexedDB aktarımının kayıpsız olmadığı bilinir:
   ikincil indeksler ve Blob değerleri taşınmaz.
-- **İmzalı Windows paketi.** Kod imzalama altyapısı CI'da hazır; sertifika
-  bağlandığında (alternatifler: Certum OV, Microsoft Store) ilk imzalı
-  sürümle doğrulanacak.
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.
