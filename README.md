@@ -333,15 +333,6 @@ etmeyin** — `.gitignore` bunu zaten engeller.
 ```bash
 git tag vX.Y.Z          # sürüm etiketi; iki release iş akışını da tetikler
 git push origin vX.Y.Z
-```
-
-Depoda **hiçbir gizli anahtar yoktur**. Android keystore'u
-`secrets.ANDROID_KEYSTORE_BASE64` üzerinden geçici dosyaya yazılır ve
-`if: always()` adımında `shred -u` ile silinir; AniList istemci bilgileri
-kullanıcının kendi cihazında, şifreli depoda tutulur. Windows kod imzalama
-da yalnızca GitHub secret'larına bağlıdır (`WINDOWS_CERTIFICATE` /
-`WINDOWS_SIGN_CMD` + ilgili şifreler) — secret yoksa paketler imzasız
-üretilir.
 
 ---
 
@@ -353,8 +344,7 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 - [ ] Otomatik güncelleme kontrolü
 - [ ] Yeni bölüm bildirimleri
 - [ ] Yerel izleme geçmişi / "devam et" listesi
-- [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
-- [ ] Windows kod imzalama (SignPath Foundation programı değerlendiriliyor — Certum OV / Microsoft Store alternatifleri açık)
+- [ ] Windows kod imzalama
 - [ ] macOS desteği
 - [ ] Her hangi bir programa dayanmayan cookie şifreleme
 
