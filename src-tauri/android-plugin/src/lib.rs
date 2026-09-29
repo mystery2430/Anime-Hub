@@ -124,14 +124,16 @@ pub fn localstorage_export(purpose: String) -> Result<KeystoreResult> {
     }
 }
 
-/// Restore a [`localstorage_export`] blob into the currently loaded page's
-/// `localStorage`. The blob is opened with the same `purpose` key alias.
+/// Restore a [`localstorage_export`] blob into the currently loaded page.
 pub fn localstorage_import(purpose: String, sealed: String) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
         call_plugin(
             CMD_LOCALSTORAGE_IMPORT,
-            PurposeValuePayload { purpose, value: sealed },
+            PurposeValuePayload {
+                purpose,
+                value: sealed,
+            },
         )
     }
     #[cfg(not(target_os = "android"))]
@@ -161,7 +163,10 @@ pub fn indexeddb_import(purpose: String, sealed: String) -> Result<OkResult> {
     {
         call_plugin(
             CMD_INDEXEDDB_IMPORT,
-            PurposeValuePayload { purpose, value: sealed },
+            PurposeValuePayload {
+                purpose,
+                value: sealed,
+            },
         )
     }
     #[cfg(not(target_os = "android"))]
@@ -420,8 +425,9 @@ mod tests {
             CMD_INDEXEDDB_EXPORT,
             CMD_INDEXEDDB_IMPORT,
         ] {
+            let marker = format!("fun {cmd}(");
             assert!(
-                kt.contains(&format!("fun {cmd}(")),
+                kt.contains(&marker),
                 "Kotlin side is missing `fun {cmd}(`"
             );
         }

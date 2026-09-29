@@ -199,14 +199,8 @@ mod tests {
         assert!(!set_pip_auto_enter(true).unwrap());
         assert_eq!(keystore_seal("p", b"x").unwrap_err().code(), "keyring");
         assert_eq!(keystore_open("p", "x").unwrap_err().code(), "keyring");
-        assert_eq!(
-            localstorage_export("p").unwrap_err().code(),
-            "keyring"
-        );
-        assert_eq!(
-            localstorage_import("p", "x").unwrap_err().code(),
-            "keyring"
-        );
+        assert_eq!(localstorage_export("p").unwrap_err().code(), "keyring");
+        assert_eq!(localstorage_import("p", "x").unwrap_err().code(), "keyring");
         assert_eq!(indexeddb_export("p").unwrap_err().code(), "keyring");
         assert_eq!(indexeddb_import("p", "x").unwrap_err().code(), "keyring");
     }

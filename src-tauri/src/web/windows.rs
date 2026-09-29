@@ -492,12 +492,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 
     // Live-session sync: Android may kill the process without running the
     // close path, so the blobs are refreshed on an interval while open.
-    spawn_session_sync(
-        app.clone(),
-        LAUNCHER_LABEL.to_string(),
-        site.id.clone(),
-        site.host(),
-    );
+    spawn_session_sync(app.clone(), LAUNCHER_LABEL.to_string(), site.id.clone(), site.host());
 
     // 4. Restore the target site's web storage once its page is loaded.
     //    `localStorage` is origin-scoped: writing before the site page is the
@@ -544,8 +539,14 @@ fn export_site_storage(app: &AppHandle, site_id: &str) {
     let state = app.state::<AppState>();
     let purpose = format!("site-{site_id}");
     for (kind, result) in [
-        ("localstorage", crate::android_bridge::localstorage_export(&purpose)),
-        ("indexeddb", crate::android_bridge::indexeddb_export(&purpose)),
+        (
+            "localstorage",
+            crate::android_bridge::localstorage_export(&purpose),
+        ),
+        (
+            "indexeddb",
+            crate::android_bridge::indexeddb_export(&purpose),
+        ),
     ] {
         match result {
             // An empty export means the page had no storage yet — storing an
@@ -816,8 +817,12 @@ pub fn open_externally(app: &AppHandle, raw: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::Settings;
     use crate::secure::SecretProvider;
+    use crate::secure::master_key::load_master_key;
     use crate::secure::store::SecureStore;
+    use crate::sites::blocklist::Blocklist;
+    use std::sync::Mutex;
 
     #[test]
     fn labels_are_unique_per_site_and_filesystem_safe() {
@@ -839,23 +844,24 @@ mod tests {
     /// Minimal app state over a real temp-dir store, for ownership checks.
     fn state_with_current_site(site_id: Option<&str>) -> AppState {
         let dir = tempfile::tempdir().unwrap();
-        let key = crate::secure::master_key::load_master_key(dir.path()).expect("key");
+        let key = load_master_key(dir.path()).expect("key");
         let provider = SecureStore::new(&key, dir.path()).expect("store");
         let (registry, warning) = provider.load_registry();
+        let current = site_id.map(|id| CurrentSite {
+            site_id: id.to_string(),
+            host: "a.example".into(),
+            window_label: LAUNCHER_LABEL.into(),
+            entered_fullscreen: false,
+        });
         AppState {
             provider: Box::new(provider),
-            registry: std::sync::Mutex::new(registry),
-            settings: std::sync::Mutex::new(crate::commands::Settings::default()),
-            blocklist: std::sync::Mutex::new(crate::sites::blocklist::Blocklist::default()),
-            oauth_state: std::sync::Mutex::new(None),
-            startup_warning: std::sync::Mutex::new(warning),
-            launcher_url: std::sync::Mutex::new(None),
-            current_site: std::sync::Mutex::new(site_id.map(|id| CurrentSite {
-                site_id: id.to_string(),
-                host: "a.example".into(),
-                window_label: LAUNCHER_LABEL.into(),
-                entered_fullscreen: false,
-            })),
+            registry: Mutex::new(registry),
+            settings: Mutex::new(Settings::default()),
+            blocklist: Mutex::new(Blocklist::default()),
+            oauth_state: Mutex::new(None),
+            startup_warning: Mutex::new(warning),
+            launcher_url: Mutex::new(None),
+            current_site: Mutex::new(current),
         }
     }
 
