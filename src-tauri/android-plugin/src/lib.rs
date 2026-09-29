@@ -1,12 +1,17 @@
 //! Android-side bridges for AnimeHub.
 //!
-//! Two platform features have no Rust API and must go through the JVM:
+//! Three platform features have no Rust API and must go through the JVM:
 //!
 //! * **AndroidKeyStore** — an AES/GCM key that never leaves the secure
 //!   hardware. Rust hands over plaintext and gets ciphertext back, so the raw
 //!   key is never present in this process.
 //! * **Picture-in-Picture** — `PictureInPictureParams` /
 //!   `enterPictureInPictureMode()` live on the host `Activity`.
+//! * **Per-site WebView storage** — on Android the system WebView has no
+//!   per-profile data directory, so `localStorage` / IndexedDB are
+//!   exported/imported (and Keystore-sealed) from Kotlin via
+//!   `evaluateJavascript`, the only synchronous-enough channel the app has
+//!   into the shared WebView.
 //!
 //! The Kotlin half lives at
 //! `src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt` and is
@@ -31,21 +36,31 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Shape returned by the Kotlin Keystore functions.
+/// Shape returned by the Kotlin Keystore/storage-export functions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeystoreResult {
     pub value: String,
 }
 
+/// Shape returned by the Kotlin storage-import and PiP functions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OkResult {
+    pub ok: bool,
+}
+
 // ---------------------------------------------------------------------------
-// Mobile command names
+// Mobile command names — must match the `@Command` methods in the Kotlin file.
 // ---------------------------------------------------------------------------
 
 pub const CMD_KEYSTORE_SEAL: &str = "keystore_seal";
 pub const CMD_KEYSTORE_OPEN: &str = "keystore_open";
 pub const CMD_ENTER_PIP: &str = "enter_pip";
 pub const CMD_SET_PIP_AUTO_ENTER: &str = "set_pip_auto_enter";
+pub const CMD_LOCALSTORAGE_EXPORT: &str = "localstorage_export";
+pub const CMD_LOCALSTORAGE_IMPORT: &str = "localstorage_import";
+pub const CMD_INDEXEDDB_EXPORT: &str = "indexeddb_export";
+pub const CMD_INDEXEDDB_IMPORT: &str = "indexeddb_import";
 
 /// Alias under which the Kotlin side is registered.
 pub const PLUGIN_ALIAS: &str = "animehub-android";
@@ -59,7 +74,7 @@ pub fn keystore_seal(purpose: String, plaintext_b64: String) -> Result<KeystoreR
     {
         call_plugin(
             CMD_KEYSTORE_SEAL,
-            KeystorePayload {
+            PurposeValuePayload {
                 purpose,
                 value: plaintext_b64,
             },
@@ -78,10 +93,75 @@ pub fn keystore_open(purpose: String, sealed: String) -> Result<KeystoreResult> 
     {
         call_plugin(
             CMD_KEYSTORE_OPEN,
-            KeystorePayload {
+            PurposeValuePayload {
                 purpose,
                 value: sealed,
             },
+        )
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (purpose, sealed);
+        Err(Error::Unsupported)
+    }
+}
+
+/// Export the shared WebView's `localStorage` as Keystore-sealed base64.
+///
+/// Blocks until the page's JS has been evaluated and the blob sealed, so the
+/// caller can rely on the export being complete when this returns. The page
+/// must still be the site whose storage is being exported — call this before
+/// navigating away.
+pub fn localstorage_export(purpose: String) -> Result<KeystoreResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(CMD_LOCALSTORAGE_EXPORT, PurposePayload { purpose })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = purpose;
+        Err(Error::Unsupported)
+    }
+}
+
+/// Restore a [`localstorage_export`] blob into the currently loaded page's
+/// `localStorage`. The blob is opened with the same `purpose` key alias.
+pub fn localstorage_import(purpose: String, sealed: String) -> Result<OkResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(
+            CMD_LOCALSTORAGE_IMPORT,
+            PurposeValuePayload { purpose, value: sealed },
+        )
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (purpose, sealed);
+        Err(Error::Unsupported)
+    }
+}
+
+/// Export the shared WebView's IndexedDB databases (best effort: document
+/// values only — indexes, key paths and exotic key types are not preserved).
+pub fn indexeddb_export(purpose: String) -> Result<KeystoreResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(CMD_INDEXEDDB_EXPORT, PurposePayload { purpose })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = purpose;
+        Err(Error::Unsupported)
+    }
+}
+
+/// Restore an [`indexeddb_export`] blob into the currently loaded page.
+pub fn indexeddb_import(purpose: String, sealed: String) -> Result<OkResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(
+            CMD_INDEXEDDB_IMPORT,
+            PurposeValuePayload { purpose, value: sealed },
         )
     }
     #[cfg(not(target_os = "android"))]
@@ -95,7 +175,7 @@ pub fn keystore_open(purpose: String, sealed: String) -> Result<KeystoreResult> 
 pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
-        call_plugin::<_, OkPayload>(
+        call_plugin::<_, OkResult>(
             CMD_ENTER_PIP,
             PipPayload {
                 num: aspect_num,
@@ -115,7 +195,7 @@ pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
 pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
-        call_plugin::<_, OkPayload>(CMD_SET_PIP_AUTO_ENTER, AutoEnterPayload { enabled })
+        call_plugin::<_, OkResult>(CMD_SET_PIP_AUTO_ENTER, AutoEnterPayload { enabled })
             .map(|r| r.ok)
     }
     #[cfg(not(target_os = "android"))]
@@ -143,13 +223,22 @@ type MobileCall =
 static HANDLE: std::sync::OnceLock<std::sync::Mutex<Option<Box<MobileCall>>>> =
     std::sync::OnceLock::new();
 
-/// Wire format for the Keystore commands.
+/// Wire format for `{ purpose, value }` commands (keystore seal/open and both
+/// storage imports).
 #[cfg(target_os = "android")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct KeystorePayload {
+struct PurposeValuePayload {
     purpose: String,
     value: String,
+}
+
+/// Wire format for the export commands, which only need the key purpose.
+#[cfg(target_os = "android")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PurposePayload {
+    purpose: String,
 }
 
 /// Wire format for `enter_pip`.
@@ -167,17 +256,12 @@ struct AutoEnterPayload {
     enabled: bool,
 }
 
-/// Kotlin resolves PiP commands with `{ "ok": bool }`, not a bare boolean.
-#[cfg(target_os = "android")]
-#[derive(Debug, Deserialize)]
-struct OkPayload {
-    ok: bool,
-}
-
 /// Send a command to the Kotlin plugin and return its decoded response.
 ///
 /// Uses `PluginHandle::run_mobile_plugin`, which serialises `payload` and
-/// deserialises the `JSObject` the Kotlin side resolves with.
+/// deserialises the `JSObject` the Kotlin side resolves with. The call blocks
+/// the current thread until Kotlin resolves the invoke — that is what makes
+/// the JS-evaluation round-trips usable from synchronous Rust.
 #[cfg(target_os = "android")]
 fn call_plugin<P: serde::Serialize, R: serde::de::DeserializeOwned>(
     cmd: &str,
@@ -252,6 +336,22 @@ mod tests {
             ));
             assert!(matches!(enter_pip(16, 9), Err(Error::Unsupported)));
             assert!(matches!(set_pip_auto_enter(true), Err(Error::Unsupported)));
+            assert!(matches!(
+                localstorage_export("p".into()),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(
+                localstorage_import("p".into(), "eA==".into()),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(
+                indexeddb_export("p".into()),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(
+                indexeddb_import("p".into(), "eA==".into()),
+                Err(Error::Unsupported)
+            ));
         }
     }
 
@@ -260,6 +360,12 @@ mod tests {
         let json = r#"{"value":"SGVsbG8="}"#;
         let r: KeystoreResult = serde_json::from_str(json).unwrap();
         assert_eq!(r.value, "SGVsbG8=");
+    }
+
+    #[test]
+    fn ok_result_deserialises_from_kotlin() {
+        let r: OkResult = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(r.ok);
     }
 
     #[test]
@@ -280,6 +386,10 @@ mod tests {
         assert_eq!(CMD_KEYSTORE_OPEN, "keystore_open");
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
+        assert_eq!(CMD_LOCALSTORAGE_EXPORT, "localstorage_export");
+        assert_eq!(CMD_LOCALSTORAGE_IMPORT, "localstorage_import");
+        assert_eq!(CMD_INDEXEDDB_EXPORT, "indexeddb_export");
+        assert_eq!(CMD_INDEXEDDB_IMPORT, "indexeddb_import");
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
     }
 
@@ -293,5 +403,27 @@ mod tests {
             src.contains("register_android_plugin(\"dev.animehub.app\", \"AnimeHubPlugin\")"),
             "registration string drifted from the Kotlin package"
         );
+    }
+
+    #[test]
+    fn kotlin_file_declares_every_command() {
+        // Command names must exist as `fun <name>` on the Kotlin side; a
+        // missing method would fail only at runtime on a device.
+        let kt = include_str!("../kotlin/dev/animehub/app/AnimeHubPlugin.kt");
+        for cmd in [
+            CMD_KEYSTORE_SEAL,
+            CMD_KEYSTORE_OPEN,
+            CMD_ENTER_PIP,
+            CMD_SET_PIP_AUTO_ENTER,
+            CMD_LOCALSTORAGE_EXPORT,
+            CMD_LOCALSTORAGE_IMPORT,
+            CMD_INDEXEDDB_EXPORT,
+            CMD_INDEXEDDB_IMPORT,
+        ] {
+            assert!(
+                kt.contains(&format!("fun {cmd}(")),
+                "Kotlin side is missing `fun {cmd}(`"
+            );
+        }
     }
 }

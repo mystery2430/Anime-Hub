@@ -19,8 +19,11 @@
 //! that scheme is intercepted natively below and turned into a close action.
 //!
 //! ## Android
-//! The main WebView is navigated, with the cookie jar swapped first (no
-//! per-profile data-directory API exists there).
+//! The system WebView has no per-profile data-directory API, so the main
+//! WebView is navigated with a full state swap: cookies are exported/imported
+//! as before, and `localStorage` / IndexedDB are additionally exported into
+//! Keystore-sealed blobs on leave and restored after the target page loads
+//! (storage is origin-scoped, so the restore must wait for the page).
 
 use crate::commands::{AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
@@ -322,7 +325,8 @@ pub fn install_main_window_handlers(app: &AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
-// Mobile: a single WebView, isolated by swapping the cookie jar.
+// Mobile: a single WebView, isolated by swapping cookies + localStorage +
+// IndexedDB (the platform has no per-profile data directory).
 // ---------------------------------------------------------------------------
 
 #[cfg(mobile)]
@@ -333,7 +337,10 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 
     let state = app.state::<AppState>();
 
-    // 1. Export the outgoing site's cookies before anything is cleared.
+    // 1. Export the outgoing site's cookies and web storage while its page is
+    //    still the loaded origin — `localStorage`/IndexedDB reads must happen
+    //    before anything is cleared or navigated. The storage export is
+    //    best-effort and never blocks the switch.
     if let Some(current) = state
         .current_site
         .lock()
@@ -341,6 +348,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         .clone()
     {
         export_cookies(&window, &current.site_id)?;
+        export_site_storage(app, &current.site_id);
     }
 
     // 2. Clear the shared jar, then load the target site's cookies.
@@ -350,7 +358,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     })?;
     import_cookies(&window, &site.id)?;
 
-    // 3. Install the cosmetic/anti-popup script for this navigation.
+    // 3. Install the cosmetic/anti-popup script and navigate.
     window.eval(init_script).map_err(|e| {
         log::error!("script yüklenemedi: {e}");
         AppError::Other("script yüklenemedi".into())
@@ -368,7 +376,110 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         entered_fullscreen: false,
     });
 
+    // 4. Restore the target site's web storage once its page is loaded.
+    //    `localStorage` is origin-scoped: writing before the site page is the
+    //    loaded document would land in the launcher's origin. A small watcher
+    //    thread polls the WebView URL (sites open rarely; a dedicated thread
+    //    keeps this off the async runtime) and then runs the blocking
+    //    restore. `import_site_storage` re-checks that the session is still
+    //    this site's, so a watcher left behind by a quick close can never
+    //    write into another site's origin.
+    let watcher_app = app.clone();
+    let watcher_window = window;
+    let watcher_site_id = site.id.clone();
+    let watcher_host = site.host();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                log::warn!("site deposu geri yükleme zaman aşımı: {watcher_site_id}");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let loaded = watcher_window
+                .url()
+                .ok()
+                .is_some_and(|u| u.host_str() == Some(watcher_host.as_str()));
+            if loaded {
+                break;
+            }
+        }
+        import_site_storage(&watcher_app, &watcher_site_id);
+    });
+
     Ok(LAUNCHER_LABEL.to_string())
+}
+
+/// Export the live site's `localStorage` and IndexedDB into per-site sealed
+/// secrets.
+///
+/// Best-effort by design: a failed export is logged and costs the site its
+/// stored state on the next visit, but never blocks closing or switching.
+/// Must run while the site page is still the loaded origin.
+#[cfg(mobile)]
+fn export_site_storage(app: &AppHandle, site_id: &str) {
+    let state = app.state::<AppState>();
+    let purpose = format!("site-{site_id}");
+    for (kind, result) in [
+        ("localstorage", crate::android_bridge::localstorage_export(&purpose)),
+        ("indexeddb", crate::android_bridge::indexeddb_export(&purpose)),
+    ] {
+        match result {
+            // An empty export means the page had no storage yet — storing an
+            // empty blob would only add noise, skip it.
+            Ok(sealed) if !sealed.is_empty() => {
+                let name = format!("{kind}-{site_id}");
+                if let Err(e) = state.provider.put_secret(&name, sealed.as_bytes()) {
+                    log::warn!("{kind} blob'u kaydedilemedi ({site_id}): {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("{kind} dışa aktarılamadı ({site_id}): {e}"),
+        }
+    }
+}
+
+/// Restore a site's `localStorage` and IndexedDB into the currently loaded
+/// page.
+///
+/// Refuses to run unless `site_id` is still the current session, so a stale
+/// watcher can never write one site's state into another site's origin.
+#[cfg(mobile)]
+fn import_site_storage(app: &AppHandle, site_id: &str) {
+    {
+        let state = app.state::<AppState>();
+        let current = state.current_site.lock().expect("current_site lock");
+        if !current.as_ref().is_some_and(|c| c.site_id == site_id) {
+            return;
+        }
+    }
+    let state = app.state::<AppState>();
+    let purpose = format!("site-{site_id}");
+    for kind in ["localstorage", "indexeddb"] {
+        let sealed = match state.provider.get_secret(&format!("{kind}-{site_id}")) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(e) => {
+                log::warn!("{kind} blob'u okunamadı ({site_id}): {e}");
+                continue;
+            }
+        };
+        let Ok(sealed) = String::from_utf8(sealed.to_vec()) else {
+            log::warn!("{kind} blob'u bozuk ({site_id})");
+            continue;
+        };
+        if sealed.is_empty() {
+            continue;
+        }
+        let result = if kind == "localstorage" {
+            crate::android_bridge::localstorage_import(&purpose, &sealed)
+        } else {
+            crate::android_bridge::indexeddb_import(&purpose, &sealed)
+        };
+        if let Err(e) = result {
+            log::warn!("{kind} geri yüklenemedi ({site_id}): {e}");
+        }
+    }
 }
 
 /// Save the WebView's current cookie jar into the named site's encrypted blob.
@@ -435,9 +546,11 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()>
     Ok(())
 }
 
-/// Close a site session, persisting its cookies first.
+/// Close a site session, persisting its cookies and web storage first.
 ///
-/// Mobile: save the jar, then send the single WebView back to the launcher.
+/// Mobile: save the jar and the sealed localStorage/IndexedDB blobs (the site
+/// page is still loaded here, so the storage export reads the right origin),
+/// then send the single WebView back to the launcher.
 #[cfg(mobile)]
 pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
     let current = {
@@ -457,6 +570,9 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
             .get_webview_window(LAUNCHER_LABEL)
             .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
         export_cookies(&window, &current.site_id)?;
+        // The live page is still this site's origin; after the navigate below
+        // the storage would be unreachable until the next visit.
+        export_site_storage(app, &current.site_id);
     }
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         let state = app.state::<AppState>();

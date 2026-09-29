@@ -108,7 +108,8 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | Konu | Neden yapılamadı |
 |---|---|
 | **Android APK** | ✅ v0.2.0 ile yeşil: Init ve prepare geçiyor; derleme hataları `cfg!()` (çalışma-zamanı) yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` (derleme-zamanı) sınırlarıyla giderildi; `release-android.yml` 3 ABI'de üretiyor. Cihaz testi hâlâ yok |
-| **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi yeşil |
+| **Android localStorage/IndexedDB izolasyonu** | Yazıldı, cihazda doğrulanmadı: Kotlin tarafında `localstorage_export/import` + `indexeddb_export/import` komutları (`evaluateJavascript` ile sayfa deposunu okur/yazar, AndroidKeyStore ile mühürler); Rust tarafında `open_on_mobile`/`close_site_window` çıkışta mühürlü blob'u kaydeder, açılışta sayfa yüklendikten sonra (URL yoklayan watcher + oturum sahipliği kontrolü) geri yükler. IndexedDB **en iyi çaba**: ikincil indeks/key path/Blob taşınmaz. Sandbox'ta Rust toolchain yok — derleme doğrulaması CI'a kaldı |
+| **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi yeşil. Depolama komutları bu doğrulamanın öncesinde yazıldı, yeniden derleme gerektirir |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
 | **Windows NSIS** | CI Windows'ta test eder, paket üretmez. `77f5e7c` clippy kırmızıydı; DPAPI çağrıları `windows-sys` 0.61 imzasına çekildi, sonuç henüz yok |
 | **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |

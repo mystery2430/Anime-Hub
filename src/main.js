@@ -295,7 +295,7 @@ async function openSite(tile) {
     openSiteLabel = opened.label;
     if (!opened.isolated) {
       showNotice(
-        "Android'de depolama izolasyonu çerez düzeyindedir; localStorage paylaşımlı kalır.",
+        "Android'de oturum verileri (çerez + localStorage/IndexedDB) site geçişlerinde şifreli blob'lara aktarılır; IndexedDB en iyi çaba ilkesiyle taşınır.",
         "info",
       );
     }
@@ -759,7 +759,7 @@ async function openAbout() {
     if (info.androidIsolationNote) {
       appendAboutRow(
         "Oturum izolasyonu",
-        "Android: çerez düzeyinde (localStorage paylaşımlı)",
+        "Android: çerez + localStorage/IndexedDB şifreli aktarımı (IndexedDB en iyi çaba)",
         true,
       );
     }
