@@ -426,10 +426,7 @@ mod tests {
             CMD_INDEXEDDB_IMPORT,
         ] {
             let marker = format!("fun {cmd}(");
-            assert!(
-                kt.contains(&marker),
-                "Kotlin side is missing `fun {cmd}(`"
-            );
+            assert!(kt.contains(&marker), "Kotlin side is missing `fun {cmd}(`");
         }
     }
 }

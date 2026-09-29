@@ -492,7 +492,12 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 
     // Live-session sync: Android may kill the process without running the
     // close path, so the blobs are refreshed on an interval while open.
-    spawn_session_sync(app.clone(), LAUNCHER_LABEL.to_string(), site.id.clone(), site.host());
+    spawn_session_sync(
+        app.clone(),
+        LAUNCHER_LABEL.to_string(),
+        site.id.clone(),
+        site.host(),
+    );
 
     // 4. Restore the target site's web storage once its page is loaded.
     //    `localStorage` is origin-scoped: writing before the site page is the
@@ -818,9 +823,9 @@ pub fn open_externally(app: &AppHandle, raw: &str) -> AppResult<()> {
 mod tests {
     use super::*;
     use crate::commands::Settings;
-    use crate::secure::SecretProvider;
     use crate::secure::master_key::load_master_key;
     use crate::secure::store::SecureStore;
+    use crate::secure::SecretProvider;
     use crate::sites::blocklist::Blocklist;
     use std::sync::Mutex;
 
