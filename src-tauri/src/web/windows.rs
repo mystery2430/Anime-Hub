@@ -56,6 +56,23 @@ pub const LAUNCHER_TITLE: &str = "AnimeHub";
 const CLOSE_SCHEME: &str = "animehub";
 const CLOSE_HOST: &str = "close-site";
 
+/// How often a live site session is snapshotted into the encrypted store.
+///
+/// The close-time export remains the authoritative final write; this interval
+/// only bounds what a crash (or an Android process kill, which skips the
+/// close path entirely) can lose.
+const SESSION_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Safety valve: a sync thread ends itself after this long even if the
+/// ownership checks somehow never fire.
+const SESSION_SYNC_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
+/// Android storage dumps are much heavier than a cookie read (a full
+/// IndexedDB scan on the page), so they run every Nth cookie tick rather than
+/// every tick.
+#[cfg(mobile)]
+const STORAGE_SYNC_EVERY_N_TICKS: u32 = 10;
+
 /// Window/webview label used for a site session.
 pub fn label_for(site_id: &str) -> String {
     format!("{SITE_LABEL_PREFIX}{}", profile_dir_name(site_id))
@@ -266,6 +283,10 @@ fn open_in_main_window(
         *state.current_site.lock().expect("current_site lock") = Some(value);
     }
 
+    // Live-session sync: snapshot the session into the encrypted store on a
+    // fixed interval until the site is closed or another site takes over.
+    spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
+
     Ok(label)
 }
 
@@ -325,6 +346,99 @@ pub fn install_main_window_handlers(app: &AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// Live-session sync: periodic encrypted snapshots while a site is open.
+// ---------------------------------------------------------------------------
+
+/// `true` while `site_id` still owns the live session.
+///
+/// Shared by the sync loop and the mobile restore path: every background
+/// write into a site's blob must re-derive ownership from the *current* state
+/// rather than trust a value captured when the thread was spawned, so a stale
+/// thread can never write one site's session data into another site's blob.
+fn session_is_current(state: &AppState, site_id: &str) -> bool {
+    let current = state.current_site.lock().expect("current_site lock");
+    current.as_ref().is_some_and(|c| c.site_id == site_id)
+}
+
+/// Snapshot the live session into the encrypted store on a fixed interval.
+///
+/// Desktop variant: cookies only — localStorage/IndexedDB already live in the
+/// per-site profile directory that the WebView itself persists. The loop
+/// exits on the first tick after the session ends (site closed, another site
+/// opened, or the child webview is gone without a close event).
+#[cfg(desktop)]
+fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: String) {
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        loop {
+            std::thread::sleep(SESSION_SYNC_INTERVAL);
+            if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
+                log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
+                return;
+            }
+            {
+                let state = app.state::<AppState>();
+                if !session_is_current(&state, &site_id) {
+                    return;
+                }
+            }
+            let Some(child) = app.get_webview(&label) else {
+                return;
+            };
+            if let Err(e) = export_cookies_webview(&child, &site_id) {
+                log::warn!("dönemsel çerez eşitlemesi başarısız ({site_id}): {e}");
+            }
+        }
+    });
+}
+
+/// Mobile variant: cookies every tick, and localStorage/IndexedDB every
+/// [`STORAGE_SYNC_EVERY_N_TICKS`] ticks.
+///
+/// Android can kill the process without ever running the close path, so the
+/// blobs must stay fresh while the session lives. Every write is guarded by
+/// both session ownership and a loaded-origin check: storage reads only make
+/// sense while the site's own page is the loaded document, and skipping the
+/// tick otherwise costs nothing.
+#[cfg(mobile)]
+fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: String) {
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
+            return;
+        };
+        let mut tick: u32 = 0;
+        loop {
+            std::thread::sleep(SESSION_SYNC_INTERVAL);
+            if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
+                log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
+                return;
+            }
+            {
+                let state = app.state::<AppState>();
+                if !session_is_current(&state, &site_id) {
+                    return;
+                }
+            }
+            let loaded = window
+                .url()
+                .ok()
+                .is_some_and(|u| u.host_str() == Some(host.as_str()));
+            if !loaded {
+                continue;
+            }
+            tick = tick.wrapping_add(1);
+            if let Err(e) = export_cookies(&window, &site_id) {
+                log::warn!("dönemsel çerez eşitlemesi başarısız ({site_id}): {e}");
+            }
+            if tick % STORAGE_SYNC_EVERY_N_TICKS == 0 {
+                export_site_storage(&app, &site_id);
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Mobile: a single WebView, isolated by swapping cookies + localStorage +
 // IndexedDB (the platform has no per-profile data directory).
 // ---------------------------------------------------------------------------
@@ -375,6 +489,15 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         window_label: LAUNCHER_LABEL.into(),
         entered_fullscreen: false,
     });
+
+    // Live-session sync: Android may kill the process without running the
+    // close path, so the blobs are refreshed on an interval while open.
+    spawn_session_sync(
+        app.clone(),
+        LAUNCHER_LABEL.to_string(),
+        site.id.clone(),
+        site.host(),
+    );
 
     // 4. Restore the target site's web storage once its page is loaded.
     //    `localStorage` is origin-scoped: writing before the site page is the
@@ -448,8 +571,7 @@ fn export_site_storage(app: &AppHandle, site_id: &str) {
 fn import_site_storage(app: &AppHandle, site_id: &str) {
     {
         let state = app.state::<AppState>();
-        let current = state.current_site.lock().expect("current_site lock");
-        if !current.as_ref().is_some_and(|c| c.site_id == site_id) {
+        if !session_is_current(&state, site_id) {
             return;
         }
     }
@@ -694,6 +816,8 @@ pub fn open_externally(app: &AppHandle, raw: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure::SecretProvider;
+    use crate::secure::store::SecureStore;
 
     #[test]
     fn labels_are_unique_per_site_and_filesystem_safe() {
@@ -710,5 +834,55 @@ mod tests {
     fn site_labels_cannot_collide_with_the_launcher() {
         assert_ne!(label_for(LAUNCHER_LABEL), LAUNCHER_LABEL);
         assert!(label_for("anything").starts_with(SITE_LABEL_PREFIX));
+    }
+
+    /// Minimal app state over a real temp-dir store, for ownership checks.
+    fn state_with_current_site(site_id: Option<&str>) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::secure::master_key::load_master_key(dir.path()).expect("key");
+        let provider = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = provider.load_registry();
+        AppState {
+            provider: Box::new(provider),
+            registry: std::sync::Mutex::new(registry),
+            settings: std::sync::Mutex::new(crate::commands::Settings::default()),
+            blocklist: std::sync::Mutex::new(crate::sites::blocklist::Blocklist::default()),
+            oauth_state: std::sync::Mutex::new(None),
+            startup_warning: std::sync::Mutex::new(warning),
+            launcher_url: std::sync::Mutex::new(None),
+            current_site: std::sync::Mutex::new(site_id.map(|id| CurrentSite {
+                site_id: id.to_string(),
+                host: "a.example".into(),
+                window_label: LAUNCHER_LABEL.into(),
+                entered_fullscreen: false,
+            })),
+        }
+    }
+
+    #[test]
+    fn session_ownership_gates_every_background_write() {
+        // No session: nothing is current, sync and restore must both refuse.
+        let state = state_with_current_site(None);
+        assert!(!session_is_current(&state, "s1"));
+
+        // Live session: only its own site matches; a stale thread holding a
+        // different site id is rejected.
+        let state = state_with_current_site(Some("s1"));
+        assert!(session_is_current(&state, "s1"));
+        assert!(!session_is_current(&state, "s2"));
+    }
+
+    #[test]
+    fn sync_intervals_are_sane() {
+        // A crash loses at most one interval of session changes; keep that
+        // bounded but not chatty.
+        assert!(SESSION_SYNC_INTERVAL.as_secs() >= 15);
+        assert!(SESSION_SYNC_INTERVAL.as_secs() <= 300);
+        // The safety valve must always outlive many intervals.
+        assert!(SESSION_SYNC_MAX_LIFETIME > SESSION_SYNC_INTERVAL * 100);
+        #[cfg(mobile)]
+        {
+            assert!(STORAGE_SYNC_EVERY_N_TICKS >= 2, "storage dumps are heavy");
+        }
     }
 }

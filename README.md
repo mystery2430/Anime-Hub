@@ -121,11 +121,13 @@ ulaşamaz.
 > Android'de sistem WebView'ının site başına profil API'si **yoktur**.
 > Bunun yerine uygulama, site açılırken/kapanırken **tüm oturum verisini**
 > şifreli blob'lara aktarır: çerez kavanozuna ek olarak `localStorage` ve
-> IndexedDB de AndroidKeyStore ile mühürlenir ve hedef sitenin sayfası
-> yüklendiğinde geri yüklenir. IndexedDB aktarımı **en iyi çaba** ilkesiyle
-> çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler, key path ve
-> Blob türü değerler korunmaz). Bu mekanizma henüz bir cihazda doğrulanmadı;
-> doğrulama tamamlanana kadar ayrıştırma eksik kalırsa ekranda uyarı gösterilir.
+> IndexedDB de AndroidKeyStore ile mühürlenir, hedef sitenin sayfası
+> yüklendiğinde geri yüklenir ve oturum açıkken 30 saniyede bir (depo
+> blob'ları daha seyrek) tazelenir. IndexedDB aktarımı **en iyi çaba**
+> ilkesiyle çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler,
+> key path ve Blob türü değerler korunmaz). Bu mekanizma henüz bir cihazda
+> doğrulanmadı; doğrulama tamamlanana kadar ayrıştırma eksik kalırsa ekranda
+> uyarı gösterilir.
 
 ### 🔒&nbsp; Diskte şifreli duran veriler
 
@@ -139,6 +141,13 @@ kaynağından gelir:
 | Linux | XDG Secret Service (GNOME Anahtarlar / KWallet) |
 | Android | AndroidKeyStore (donanım destekli) |
 | Hiçbiri yoksa | `0600` izinli dosya — **ve Hakkında ekranında bu açıkça yazar** |
+
+**Canlı oturum eşitlemesi:** site açıkken çerezler (Android'de ayrıca
+localStorage/IndexedDB, daha seyrek aralıkla) 30 saniyede bir şifreli depoya
+eşitlenir; kapanış anındaki export son ve yetkili yazım olarak kalır. Böylece
+bir çökme ya da Android'in süreci öldürmesi en fazla bir aralıklik oturum
+değişikliğini kaybettirir. Her arka plan yazımı, oturum sahipliği kontrolüyle
+bir sitenin verisini asla başka bir sitenin blob'una yazamaz.
 
 ### 🛡️&nbsp; Sıkı gezinti politikası
 
