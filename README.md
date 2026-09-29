@@ -227,11 +227,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
-> Windows paketleri [SignPath Foundation](https://signpath.org) kod imzalama
-> sertifikasıyla imzalanır: imzalı paketler sonraki sürümden itibaren
-> yayınlanır (`0.2.0` kurulumları henüz imzasızdır). SmartScreen uyarısı,
-> imza itibarı birikene kadar çıkabilir — o zamana kadar "Ek bilgi" →
-> "Yine de çalıştır" ile devam edebilirsiniz.
+> **Windows paketleri henüz kod imzalı değildir (0.2.0 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — SignPath Foundation sertifikası bağlandığında imzalı sürümler burada duyurulacak.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
@@ -346,7 +342,7 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 - [ ] Yeni bölüm bildirimleri
 - [ ] Yerel izleme geçmişi / "devam et" listesi
 - [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
-- [ ] Windows kod imzalama (SignPath Foundation başvurusu sürüyor)
+- [ ] Windows kod imzalama (SignPath Foundation programı değerlendiriliyor)
 - [ ] macOS desteği
 - [ ] Her hangi bir programa dayanmayan cookie şifreleme
 
