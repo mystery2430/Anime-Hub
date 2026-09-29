@@ -224,8 +224,8 @@ Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
 
 | Yöntem | Boyut | Komut |
 |---|---|---|
-| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.2.0_amd64.deb` |
-| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.2.0-1.x86_64.rpm` |
+| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.0_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.3.0-1.x86_64.rpm` |
 | **AppImage** | ~75 MB | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
 
 ```bash
@@ -239,7 +239,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
-> **Windows paketleri henüz kod imzalı değildir (0.2.0 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (SignPath Foundation programı değerlendiriliyor / alternatifler: Certum OV, Microsoft Store) duyurulacak.
+> **Windows paketleri henüz kod imzalı değildir (0.3.0 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (SignPath Foundation programı değerlendiriliyor / alternatifler: Certum OV, Microsoft Store) duyurulacak.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
@@ -333,6 +333,7 @@ etmeyin** — `.gitignore` bunu zaten engeller.
 ```bash
 git tag vX.Y.Z          # sürüm etiketi; iki release iş akışını da tetikler
 git push origin vX.Y.Z
+```
 
 ---
 
@@ -368,8 +369,9 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
   yapılmadı (PiP, çerez takası, localStorage/IndexedDB şifreli aktarımı ve
   geri katmanı dahil). IndexedDB aktarımının kayıpsız olmadığı bilinir:
   ikincil indeksler ve Blob değerleri taşınmaz.
-- **İmzalı Windows paketi.** Kod imzalama altyapısı CI'da hazır; SignPath
-  sertifikası bağlandığında ilk imzalı sürümle doğrulanacak.
+- **İmzalı Windows paketi.** Kod imzalama altyapısı CI'da hazır; sertifika
+  bağlandığında (alternatifler: Certum OV, Microsoft Store) ilk imzalı
+  sürümle doğrulanacak.
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.
