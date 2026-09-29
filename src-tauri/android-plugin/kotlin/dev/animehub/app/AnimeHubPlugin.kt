@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// Android half of AnimeHub's Keystore + Picture-in-Picture bridge.
+// Android half of AnimeHub's Keystore + Picture-in-Picture + web-storage
+// bridge.
 //
 // INSTALLATION
 // ------------
@@ -22,10 +23,21 @@
 // -------------------
 // Written against the Tauri 2.11.6 plugin API
 // (`@TauriPlugin`, `Plugin`, `@Command`, `Invoke`, `JSObject`) and the
-// standard Android APIs listed in the imports. It has NOT been compiled or
-// run here: that needs the Android SDK + NDK and a device, which are not
-// available in the environment this was written in. Treat it as unverified
-// until `npm run tauri android dev` passes on real hardware.
+// standard Android APIs listed in the imports. The Keystore and PiP halves
+// predate this note; the localStorage/IndexedDB half has NOT been compiled or
+// run on a device yet (the build environment has no Android SDK/NDK). Treat
+// it as unverified until `npm run tauri android dev` passes on real hardware.
+//
+// STORAGE ISOLATION CONTRACT (localStorage/IndexedDB commands)
+// ------------------------------------------------------------
+// The Rust side calls `*_export` only while the site page is still the loaded
+// document and `*_import` only after the target page has loaded (it polls the
+// WebView URL first). `run_mobile_plugin` blocks until the invoke resolves,
+// and `evaluateJavascript` delivers its callback on the UI thread — so an
+// export really has captured the page's storage when Rust regains control.
+// The injected scripts are constants with no string interpolation of page
+// data; restored state enters the page as a parsed JSON literal, never as
+// concatenated source text.
 
 package dev.animehub.app
 
@@ -49,23 +61,16 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-/**
- * Bridges the two Android-only features AnimeHub needs:
- *
- *  - **AndroidKeyStore**: an AES/GCM key that never leaves the secure
- *    hardware. Rust sends plaintext, gets base64 ciphertext back, so the raw
- *    key is never present in the Rust process.
- *  - **Picture-in-Picture**: `PictureInPictureParams` /
- *    `enterPictureInPictureMode()` live on the host Activity.
- *
- * Command names must stay in sync with `CMD_*` in
- * `src-tauri/android-plugin/src/lib.rs`.
- */
 @TauriPlugin
 class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
+  /** The shared WebView, handed to the plugin by Tauri at startup. */
+  private var sharedWebView: WebView? = null
+
   override fun load(webView: WebView) {
-    // No webview state needed; the bridges are Activity/Keystore only.
+    // On Android the launcher and the sites share this single WebView, so
+    // keeping the reference is all the storage commands need.
+    sharedWebView = webView
   }
 
   // ------------------------------------------------------------------ Keystore
@@ -119,27 +124,160 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  /** Return the existing key for `purpose`, generating one on first use. */
-  private fun keyFor(purpose: String): SecretKey {
-    val alias = "$KEY_ALIAS_PREFIX${sanitize(purpose)}"
-    val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-    (ks.getKey(alias, null) as? SecretKey)?.let { return it }
+  // ------------------------------------------------- localStorage / IndexedDB
 
-    val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
-    generator.init(
-      KeyGenParameterSpec.Builder(
-        alias,
-        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-      )
-        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-        .setKeySize(256)
-        // The key stays in the keystore; Android may keep it in secure
-        // hardware depending on the device.
-        .setRandomizedEncryptionRequired(true)
-        .build()
-    )
-    return generator.generateKey()
+  /**
+   * Dump the loaded page's `localStorage` and resolve with the Keystore-sealed
+   * base64 blob.
+   *
+   * The script returns the object itself (not a `JSON.stringify` string), so
+   * the `evaluateJavascript` callback receives exactly the JSON text we want
+   * to encrypt — no double encoding to undo.
+   */
+  @Command
+  fun localstorage_export(invoke: Invoke) {
+    val purpose = invoke.getArgs().getString("purpose") ?: run {
+      invoke.reject("purpose gerekli"); return
+    }
+    val webView = sharedWebView ?: run {
+      invoke.reject("WebView hazır değil"); return
+    }
+    webView.evaluateJavascript(
+      "(function(){var o={};for(var i=0;i<localStorage.length;i++){" +
+        "var k=localStorage.key(i);o[k]=localStorage.getItem(k);}return o;})()"
+    ) { result ->
+      if (result == null || result == "null") {
+        // Context torn down mid-evaluation (navigation won the race): report
+        // an empty payload rather than half a jar.
+        invoke.resolve(JSObject().put("value", ""))
+        return@evaluateJavascript
+      }
+      try {
+        invoke.resolve(JSObject().put("value", seal(purpose, result)))
+      } catch (e: Exception) {
+        invoke.reject("localStorage şifrelemesi başarısız: ${e.message}", e)
+      }
+    }
+  }
+
+  /** Restore a [`localstorage_export`] blob into the loaded page. */
+  @Command
+  fun localstorage_import(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val purpose = args.getString("purpose") ?: run {
+      invoke.reject("purpose gerekli"); return
+    }
+    val sealed = args.getString("value") ?: run {
+      invoke.reject("value gerekli"); return
+    }
+    try {
+      val json = openSealed(purpose, sealed)
+      if (json.isEmpty()) {
+        invoke.resolve(JSObject().put("ok", true)); return
+      }
+      val webView = sharedWebView ?: run {
+        invoke.reject("WebView hazır değil"); return
+      }
+      // Valid JSON is a valid JS object literal, so the payload is embedded
+      // directly — never interpolated as source text.
+      val js = "(function(){try{var d=$json;localStorage.clear();" +
+        "for(var k in d){localStorage.setItem(k,d[k]);}}catch(e){}})();"
+      webView.evaluateJavascript(js, null)
+      invoke.resolve(JSObject().put("ok", true))
+    } catch (e: Exception) {
+      invoke.reject("localStorage çözülemedi", e)
+    }
+  }
+
+  /**
+   * Dump the loaded page's IndexedDB databases (best effort) and resolve with
+   * the Keystore-sealed base64 blob.
+   *
+   * Fidelity notes, by design: document *values* are captured via
+   * `getAll`/`getAllKeys` pairs, so original keys survive; secondary indexes,
+   * key paths and auto-increment counters are **not** reconstructed, and
+   * structured-clone-only values (Blob, etc.) are dropped by
+   * `JSON.stringify`. Good enough for the auth/setting state sites in scope
+   * keep in IndexedDB; anything richer is a documented limitation.
+   */
+  @Command
+  fun indexeddb_export(invoke: Invoke) {
+    val purpose = invoke.getArgs().getString("purpose") ?: run {
+      invoke.reject("purpose gerekli"); return
+    }
+    val webView = sharedWebView ?: run {
+      invoke.reject("WebView hazır değil"); return
+    }
+    // `evaluateJavascript` awaits a returned Promise (API 21+), so the async
+    // IIFE below resolves the callback with the finished dump.
+    webView.evaluateJavascript(EXPORT_IDB_JS) { result ->
+      if (result == null || result == "null") {
+        invoke.resolve(JSObject().put("value", ""))
+        return@evaluateJavascript
+      }
+      try {
+        invoke.resolve(JSObject().put("value", seal(purpose, result)))
+      } catch (e: Exception) {
+        invoke.reject("IndexedDB şifrelemesi başarısız: ${e.message}", e)
+      }
+    }
+  }
+
+  /** Restore an [`indexeddb_export`] blob into the loaded page. */
+  @Command
+  fun indexeddb_import(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val purpose = args.getString("purpose") ?: run {
+      invoke.reject("purpose gerekli"); return
+    }
+    val sealed = args.getString("value") ?: run {
+      invoke.reject("value gerekli"); return
+    }
+    try {
+      val json = openSealed(purpose, sealed)
+      if (json.isEmpty()) {
+        invoke.resolve(JSObject().put("ok", true)); return
+      }
+      val webView = sharedWebView ?: run {
+        invoke.reject("WebView hazır değil"); return
+      }
+      // Same no-interpolation rule: the payload becomes a parsed literal.
+      val js = "(async function(){try{var d=$json;" +
+        "for(var name in d){var spec=d[name];" +
+        "var db=await new Promise(function(res,rej){var r=indexedDB.open(name,spec.version||1);" +
+        "r.onupgradeneeded=function(){var b=r.result;" +
+        "for(var sn in spec.stores){if(!b.objectStoreNames.contains(sn))b.createObjectStore(sn);}};" +
+        "r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)}});" +
+        "for(var sn in spec.stores){await new Promise(function(res,rej){" +
+        "var tx=db.transaction(sn,'readwrite');var st=tx.objectStore(sn);" +
+        "spec.stores[sn].forEach(function(row){st.put(row.value,row.key);});" +
+        "tx.oncomplete=function(){res()};tx.onerror=function(){rej(tx.error)}});}" +
+        "db.close();}}catch(e){}})();"
+      webView.evaluateJavascript(js, null)
+      invoke.resolve(JSObject().put("ok", true))
+    } catch (e: Exception) {
+      invoke.reject("IndexedDB çözülemedi", e)
+    }
+  }
+
+  /** Seal a JSON payload with the Keystore key for `purpose` (IV-prefixed b64). */
+  private fun seal(purpose: String, plaintext: String): String {
+    val cipher = Cipher.getInstance(TRANSFORMATION)
+    cipher.init(Cipher.ENCRYPT_MODE, keyFor(purpose))
+    val ct = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
+    return Base64.encodeToString(cipher.iv + ct, Base64.NO_WRAP)
+  }
+
+  /** Open a [`seal`] blob; an empty payload short-circuits to `""`. */
+  private fun openSealed(purpose: String, sealed: String): String {
+    if (sealed.isEmpty()) return ""
+    val combined = Base64.decode(sealed, Base64.NO_WRAP)
+    if (combined.size <= GCM_IV_LENGTH) return ""
+    val iv = combined.copyOfRange(0, GCM_IV_LENGTH)
+    val ct = combined.copyOfRange(GCM_IV_LENGTH, combined.size)
+    val cipher = Cipher.getInstance(TRANSFORMATION)
+    cipher.init(Cipher.DECRYPT_MODE, keyFor(purpose), GCMParameterSpec(GCM_TAG_BITS, iv))
+    return String(cipher.doFinal(ct), Charsets.UTF_8)
   }
 
   // ------------------------------------------------------------------- PiP
@@ -194,6 +332,68 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_IV_LENGTH = 12
     private const val GCM_TAG_BITS = 128
+
+    /**
+     * Best-effort dump of every IndexedDB database on the current origin:
+     * `{ "<db>": { "version": n, "stores": { "<store>": [ {key, value} ] } } }`.
+     * Returns `"{}"` (never `null`) on any internal failure so the caller can
+     * treat a missing dump and an empty one identically.
+     */
+    private val EXPORT_IDB_JS = """
+        (async function(){
+          var out={};
+          function openDb(name,version){return new Promise(function(res,rej){
+            var r=indexedDB.open(name,version||undefined);
+            r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)};});}
+          try{
+            var dbs=await indexedDB.databases();
+            for(var i=0;i<dbs.length;i++){
+              var name=dbs[i].name;if(!name)continue;
+              var db=await openDb(name,dbs[i].version);
+              var stores={};
+              for(var j=0;j<db.objectStoreNames.length;j++){
+                var sn=db.objectStoreNames[j];
+                var rows=await new Promise(function(res,rej){
+                  var tx=db.transaction(sn,'readonly');
+                  var st=tx.objectStore(sn);
+                  var keys=st.getAllKeys();var vals=st.getAll();
+                  var failed=function(){rej(keys.error||vals.error||new Error('getAll'))};
+                  keys.onsuccess=function(){vals.onsuccess=function(){
+                    res(vals.result.map(function(v,k){return{key:keys.result[k],value:v}}))};
+                    vals.onerror=failed};
+                  keys.onerror=failed;vals.onerror=failed;});
+                stores[sn]=rows;
+              }
+              out[name]={version:db.version,stores:stores};
+              db.close();
+            }
+          }catch(e){return '{}';}
+          return out;
+        })()
+    """.trimIndent().replace("\n", "")
+
+    /** Return the existing key for `purpose`, generating one on first use. */
+    private fun keyFor(purpose: String): SecretKey {
+      val alias = "$KEY_ALIAS_PREFIX${sanitize(purpose)}"
+      val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+      (ks.getKey(alias, null) as? SecretKey)?.let { return it }
+
+      val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+      generator.init(
+        KeyGenParameterSpec.Builder(
+          alias,
+          KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+          .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+          .setKeySize(256)
+          // The key stays in the keystore; Android may keep it in secure
+          // hardware depending on the device.
+          .setRandomizedEncryptionRequired(true)
+          .build()
+      )
+      return generator.generateKey()
+    }
 
     /** Keep a key alias inside the character set the keystore accepts. */
     private fun sanitize(purpose: String): String {

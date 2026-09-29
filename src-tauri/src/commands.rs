@@ -253,9 +253,14 @@ pub fn remove_site(state: State<'_, AppState>, id: String) -> AppResult<()> {
         reg.remove(&id)?;
     }
     persist_registry(&state)?;
-    // Delete the jar before reporting success. A swallowed failure would
-    // leave the site's cookies on disk after the tile is gone.
+    // Delete the jar and the sealed web-storage blobs before reporting
+    // success. A swallowed failure would leave the site's session data on
+    // disk after the tile is gone.
     state.provider.delete_secret(&format!("cookies-{id}"))?;
+    state
+        .provider
+        .delete_secret(&format!("localstorage-{id}"))?;
+    state.provider.delete_secret(&format!("indexeddb-{id}"))?;
     Ok(())
 }
 
@@ -378,6 +383,11 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     let mut n = 0;
     for id in &ids {
         state.provider.delete_secret(&format!("cookies-{id}"))?;
+        // The web-storage blobs are part of the site's session data.
+        state
+            .provider
+            .delete_secret(&format!("localstorage-{id}"))?;
+        state.provider.delete_secret(&format!("indexeddb-{id}"))?;
         n += 1;
     }
     // Desktop profile directories hold the real cookie DB. A missing

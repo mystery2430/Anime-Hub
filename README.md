@@ -119,10 +119,15 @@ ulaşamaz.
 
 > [!IMPORTANT]
 > Android'de sistem WebView'ının site başına profil API'si **yoktur**.
-> Bunun yerine uygulama, site açılırken/kapanırken çerez kavanozunu şifreli
-> bir blob olarak dışa/içe aktarır. Bu çerezleri ayırır ama localStorage ve
-> IndexedDB'yi **ayırmaz**. Uygulama bunu saklamaz: ayrıştırma tam olmadığında
-> ekranda uyarı gösterir.
+> Bunun yerine uygulama, site açılırken/kapanırken **tüm oturum verisini**
+> şifreli blob'lara aktarır: çerez kavanozuna ek olarak `localStorage` ve
+> IndexedDB de AndroidKeyStore ile mühürlenir, hedef sitenin sayfası
+> yüklendiğinde geri yüklenir ve oturum açıkken 30 saniyede bir (depo
+> blob'ları daha seyrek) tazelenir. IndexedDB aktarımı **en iyi çaba**
+> ilkesiyle çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler,
+> key path ve Blob türü değerler korunmaz). Bu mekanizma henüz bir cihazda
+> doğrulanmadı; doğrulama tamamlanana kadar ayrıştırma eksik kalırsa ekranda
+> uyarı gösterilir.
 
 ### 🔒&nbsp; Diskte şifreli duran veriler
 
@@ -136,6 +141,13 @@ kaynağından gelir:
 | Linux | XDG Secret Service (GNOME Anahtarlar / KWallet) |
 | Android | AndroidKeyStore (donanım destekli) |
 | Hiçbiri yoksa | `0600` izinli dosya — **ve Hakkında ekranında bu açıkça yazar** |
+
+**Canlı oturum eşitlemesi:** site açıkken çerezler (Android'de ayrıca
+localStorage/IndexedDB, daha seyrek aralıkla) 30 saniyede bir şifreli depoya
+eşitlenir; kapanış anındaki export son ve yetkili yazım olarak kalır. Böylece
+bir çökme ya da Android'in süreci öldürmesi en fazla bir aralıklik oturum
+değişikliğini kaybettirir. Her arka plan yazımı, oturum sahipliği kontrolüyle
+bir sitenin verisini asla başka bir sitenin blob'una yazamaz.
 
 ### 🛡️&nbsp; Sıkı gezinti politikası
 
@@ -227,11 +239,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
-> Windows paketleri [SignPath Foundation](https://signpath.org) kod imzalama
-> sertifikasıyla imzalanır: imzalı paketler sonraki sürümden itibaren
-> yayınlanır (`0.2.0` kurulumları henüz imzasızdır). SmartScreen uyarısı,
-> imza itibarı birikene kadar çıkabilir — o zamana kadar "Ek bilgi" →
-> "Yine de çalıştır" ile devam edebilirsiniz.
+> **Windows paketleri henüz kod imzalı değildir (0.2.0 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (SignPath Foundation programı değerlendiriliyor / alternatifler: Certum OV, Microsoft Store) duyurulacak.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
@@ -251,7 +259,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 |---|---|---|---|
 | 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Releases sayfasındaki paketler CI sürümünde üretildi |
 | 🪟 **Windows** | ✅ Doğrulandı | `.exe` (NSIS) | DPAPI + WebView2 profili; kurulum Windows üzerinde elle doğrulandı |
-| 🤖 **Android** | ✅ Derleniyor | 3 ABI için imzalı `.apk` | Oturum izolasyonu kısmi (yalnızca çerezler); cihaz testi bekleniyor |
+| 🤖 **Android** | ✅ Derleniyor | 3 ABI için imzalı `.apk` | Çerez + localStorage/IndexedDB şifreli blob aktarımıyla oturum ayrımı; cihaz testi bekleniyor |
 | 🍎 **macOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 | 🍏 **iOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 
@@ -346,7 +354,7 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 - [ ] Yeni bölüm bildirimleri
 - [ ] Yerel izleme geçmişi / "devam et" listesi
 - [ ] Android'de tam oturum izolasyonu (localStorage/IndexedDB dahil)
-- [ ] Windows kod imzalama (SignPath Foundation başvurusu sürüyor)
+- [ ] Windows kod imzalama (SignPath Foundation programı değerlendiriliyor — Certum OV / Microsoft Store alternatifleri açık)
 - [ ] macOS desteği
 - [ ] Her hangi bir programa dayanmayan cookie şifreleme
 
@@ -367,7 +375,9 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 **Hâlâ doğrulanmayanlar:**
 
 - **Android cihaz testi.** APK derlenip imzalanıyor; elle cihaz doğrulaması
-  yapılmadı (PiP, çerez takası, geri katmanı dahil).
+  yapılmadı (PiP, çerez takası, localStorage/IndexedDB şifreli aktarımı ve
+  geri katmanı dahil). IndexedDB aktarımının kayıpsız olmadığı bilinir:
+  ikincil indeksler ve Blob değerleri taşınmaz.
 - **İmzalı Windows paketi.** Kod imzalama altyapısı CI'da hazır; SignPath
   sertifikası bağlandığında ilk imzalı sürümle doğrulanacak.
 

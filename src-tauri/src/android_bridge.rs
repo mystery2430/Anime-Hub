@@ -1,8 +1,8 @@
 //! Android-specific bridges.
 //!
-//! Both are implemented in Kotlin (see `src-tauri/android-plugin/`) because the
-//! platform APIs involved — `AndroidKeyStore` and
-//! `PictureInPictureParams` — are only reachable from the JVM side.
+//! All are implemented in Kotlin (see `src-tauri/android-plugin/`) because the
+//! platform APIs involved — `AndroidKeyStore`, `PictureInPictureParams`,
+//! `evaluateJavascript` — are only reachable from the JVM side.
 
 use crate::error::{AppError, AppResult};
 
@@ -32,7 +32,52 @@ pub fn keystore_open(purpose: &str, sealed: &str) -> AppResult<Vec<u8>> {
         .map_err(|_| AppError::Crypto("base64 çözülemedi".into()))
 }
 
-/// Stub for non-Android builds so call sites stay uniform.
+/// Export the live WebView's `localStorage`, Keystore-sealed, as base64.
+///
+/// Blocks until the page JS ran and the blob was sealed, so the export is
+/// complete on return. Must be called while the site page is still loaded.
+#[cfg(target_os = "android")]
+pub fn localstorage_export(purpose: &str) -> AppResult<String> {
+    let r = animehub_android::localstorage_export(purpose.into())
+        .map_err(|e| AppError::Keyring(e.to_string()))?;
+    Ok(r.value)
+}
+
+/// Restore a [`localstorage_export`] blob into the currently loaded page.
+#[cfg(target_os = "android")]
+pub fn localstorage_import(purpose: &str, sealed: &str) -> AppResult<()> {
+    let r = animehub_android::localstorage_import(purpose.into(), sealed.to_string())
+        .map_err(|e| AppError::Keyring(e.to_string()))?;
+    if !r.ok {
+        return Err(AppError::Storage("localStorage geri yüklenemedi".into()));
+    }
+    Ok(())
+}
+
+/// Export the live WebView's IndexedDB databases (best effort), sealed.
+#[cfg(target_os = "android")]
+pub fn indexeddb_export(purpose: &str) -> AppResult<String> {
+    let r = animehub_android::indexeddb_export(purpose.into())
+        .map_err(|e| AppError::Keyring(e.to_string()))?;
+    Ok(r.value)
+}
+
+/// Restore an [`indexeddb_export`] blob into the currently loaded page.
+#[cfg(target_os = "android")]
+pub fn indexeddb_import(purpose: &str, sealed: &str) -> AppResult<()> {
+    let r = animehub_android::indexeddb_import(purpose.into(), sealed.to_string())
+        .map_err(|e| AppError::Keyring(e.to_string()))?;
+    if !r.ok {
+        return Err(AppError::Storage("IndexedDB geri yüklenemedi".into()));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Desktop stubs: same signatures, honest failures, so call sites compile and
+// stay uniform on every platform.
+// ---------------------------------------------------------------------------
+
 #[cfg(not(target_os = "android"))]
 pub fn keystore_seal(_purpose: &str, _plaintext: &[u8]) -> AppResult<String> {
     Err(AppError::Keyring(
@@ -44,6 +89,34 @@ pub fn keystore_seal(_purpose: &str, _plaintext: &[u8]) -> AppResult<String> {
 pub fn keystore_open(_purpose: &str, _sealed: &str) -> AppResult<Vec<u8>> {
     Err(AppError::Keyring(
         "Keystore yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn localstorage_export(_purpose: &str) -> AppResult<String> {
+    Err(AppError::Keyring(
+        "Depolama aktarımı yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn localstorage_import(_purpose: &str, _sealed: &str) -> AppResult<()> {
+    Err(AppError::Keyring(
+        "Depolama aktarımı yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn indexeddb_export(_purpose: &str) -> AppResult<String> {
+    Err(AppError::Keyring(
+        "Depolama aktarımı yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn indexeddb_import(_purpose: &str, _sealed: &str) -> AppResult<()> {
+    Err(AppError::Keyring(
+        "Depolama aktarımı yalnızca Android'de kullanılabilir".into(),
     ))
 }
 
@@ -126,5 +199,9 @@ mod tests {
         assert!(!set_pip_auto_enter(true).unwrap());
         assert_eq!(keystore_seal("p", b"x").unwrap_err().code(), "keyring");
         assert_eq!(keystore_open("p", "x").unwrap_err().code(), "keyring");
+        assert_eq!(localstorage_export("p").unwrap_err().code(), "keyring");
+        assert_eq!(localstorage_import("p", "x").unwrap_err().code(), "keyring");
+        assert_eq!(indexeddb_export("p").unwrap_err().code(), "keyring");
+        assert_eq!(indexeddb_import("p", "x").unwrap_err().code(), "keyring");
     }
 }
