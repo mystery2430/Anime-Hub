@@ -142,8 +142,8 @@ pub fn parse_fields(raw: &str) -> Fields {
             // `Sezon 2` / `Bölüm 5`: the number follows the word. In
             // `3. Sezon 5. Bölüm` the number *precedes* the word, so a number
             // in front of it wins and this word carries nothing.
-            let after_number = i > 0
-                && number(&toks[i - 1].text).is_some_and(|n| !is_year(n) && n > 0);
+            let after_number =
+                i > 0 && number(&toks[i - 1].text).is_some_and(|n| !is_year(n) && n > 0);
             if !after_number {
                 if let Some(n) = toks.get(i + 1).and_then(|t| number(&t.text)) {
                     match marker {
@@ -267,10 +267,7 @@ fn tokenize(raw: &str) -> Vec<Token> {
         }
     }
     if !cur.is_empty() {
-        out.push(Token {
-            text: cur,
-            dotted,
-        });
+        out.push(Token { text: cur, dotted });
     }
     out
 }
@@ -403,10 +400,41 @@ fn ordinal_season(text: &str) -> Option<u32> {
 /// Quality, codec, language and boilerplate tokens that are not the title.
 fn is_junk(text: &str) -> bool {
     const JUNK: [&str; 35] = [
-        "1080p", "720p", "480p", "360p", "2160p", "4k", "x264", "x265", "h264", "h265", "hevc",
-        "av1", "aac", "webdl", "webrip", "web", "dl", "bluray", "bd", "dvdrip", "hdrip", "hdtv",
-        "sub", "subs", "subbed", "dub", "dubbed", "multi", "turkce", "altyazili", "izle", "hd",
-        "full", "uncensored", "censored",
+        "1080p",
+        "720p",
+        "480p",
+        "360p",
+        "2160p",
+        "4k",
+        "x264",
+        "x265",
+        "h264",
+        "h265",
+        "hevc",
+        "av1",
+        "aac",
+        "webdl",
+        "webrip",
+        "web",
+        "dl",
+        "bluray",
+        "bd",
+        "dvdrip",
+        "hdrip",
+        "hdtv",
+        "sub",
+        "subs",
+        "subbed",
+        "dub",
+        "dubbed",
+        "multi",
+        "turkce",
+        "altyazili",
+        "izle",
+        "hd",
+        "full",
+        "uncensored",
+        "censored",
     ];
     if JUNK.contains(&text) {
         return true;

@@ -273,9 +273,7 @@ pub fn validate(desc: &mut Descriptor) -> AppResult<()> {
     validate_path(&desc.endpoint.path, "endpoint.path", PATH_MAX)?;
     if let Some(method) = &desc.endpoint.method {
         if !method.eq_ignore_ascii_case("get") {
-            return Err(AppError::Watch(
-                "adaptör ucu yalnızca GET olabilir".into(),
-            ));
+            return Err(AppError::Watch("adaptör ucu yalnızca GET olabilir".into()));
         }
     }
 
@@ -772,10 +770,7 @@ mod tests {
 
     #[test]
     fn reads_a_file_name_row() {
-        let raw = SAMPLE.replace(
-            "{ \"pointer\": \"/title\" }",
-            "{ \"filename\": \"/name\" }",
-        );
+        let raw = SAMPLE.replace("{ \"pointer\": \"/title\" }", "{ \"filename\": \"/name\" }");
         let desc = parse(&raw).expect("geçerli");
         let body = json!({
             "data": { "items": [ { "name": "mushokus3_b5.a256" } ] }

@@ -352,12 +352,7 @@ mod tests {
         throttle.record_request(NOW - 100).expect("1");
         throttle.record_request(NOW - 50).expect("2");
 
-        assert_eq!(
-            throttle.decide(NOW),
-            Decision::Wait {
-                secs: HOUR - 100,
-            }
-        );
+        assert_eq!(throttle.decide(NOW), Decision::Wait { secs: HOUR - 100 });
         // Once the oldest of the two ages out, the slot frees again.
         assert_eq!(throttle.decide(NOW + HOUR - 50), Decision::Allow);
     }
@@ -370,9 +365,7 @@ mod tests {
 
         assert_eq!(
             throttle.decide(NOW),
-            Decision::Wait {
-                secs: DAY - 2 * HOUR,
-            }
+            Decision::Wait { secs: DAY - 2 * HOUR }
         );
     }
 

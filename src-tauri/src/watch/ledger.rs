@@ -171,10 +171,7 @@ impl Ledger {
             // stays in the listing does not age out of the ledger.
             self.observe(site_id, release, now);
             let key = key(site_id, &release.title, release.season, release.episode);
-            let announced = self
-                .entries
-                .get(&key)
-                .is_some_and(|entry| entry.announced);
+            let announced = self.entries.get(&key).is_some_and(|entry| entry.announced);
             if !announced {
                 unseen.push(release.clone());
             }
