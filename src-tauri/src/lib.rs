@@ -7,6 +7,7 @@
 //! * [`commands`] — the `invoke` surface
 //! * [`secure`] — AES-GCM envelopes, platform key sources, document store
 //! * [`sites`] — URL policy, site registry, blocklist
+//! * [`watch`] — new-episode engine: descriptors, seen ledger, pacing
 //! * [`web`] — WebView session isolation and window policy
 
 pub mod android_bridge;
@@ -15,6 +16,7 @@ pub mod commands;
 pub mod error;
 pub mod secure;
 pub mod sites;
+pub mod watch;
 pub mod web;
 
 use commands::AppState;

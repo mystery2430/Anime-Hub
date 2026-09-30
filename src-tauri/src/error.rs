@@ -38,6 +38,11 @@ pub enum AppError {
     #[error("AniList hatası: {0}")]
     AniList(String),
 
+    /// New-episode engine: a descriptor, a pace or a fetch problem. The
+    /// message is written for the person who wrote the adapter file.
+    #[error("Bildirim motoru: {0}")]
+    Watch(String),
+
     #[error("AniList ile oturum açılmamış.")]
     Unauthorized,
 
@@ -75,6 +80,7 @@ impl AppError {
             AppError::Crypto(_) => "crypto",
             AppError::Keyring(_) => "keyring",
             AppError::AniList(_) => "anilist",
+            AppError::Watch(_) => "watch",
             AppError::Unauthorized => "unauthorized",
             AppError::Network(_) => "network",
             AppError::Other(_) => "other",
