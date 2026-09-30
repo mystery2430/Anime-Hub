@@ -114,9 +114,13 @@ pub struct UserLimits {
 pub enum Decision {
     Allow,
     /// Not yet: wait this many seconds.
-    Wait { secs: i64 },
+    Wait {
+        secs: i64,
+    },
     /// The breaker is open; the host is left alone.
-    Paused { secs: i64 },
+    Paused {
+        secs: i64,
+    },
 }
 
 /// Per-host pacing state, persisted so a restart cannot reset the backoff.
@@ -197,9 +201,9 @@ impl Throttle {
                 self.prune_history(now);
                 Ok(())
             }
-            Decision::Wait { secs } => Err(AppError::Watch(format!(
-                "istek çok erken; {secs} sn sonra"
-            ))),
+            Decision::Wait { secs } => {
+                Err(AppError::Watch(format!("istek çok erken; {secs} sn sonra")))
+            }
             Decision::Paused { .. } => {
                 // Asking while the breaker is open is itself a breach: the
                 // pause is renewed rather than shortened.
@@ -365,7 +369,9 @@ mod tests {
 
         assert_eq!(
             throttle.decide(NOW),
-            Decision::Wait { secs: DAY - 2 * HOUR }
+            Decision::Wait {
+                secs: DAY - 2 * HOUR
+            }
         );
     }
 
