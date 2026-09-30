@@ -744,7 +744,11 @@ mod tests {
         let desc = sample();
         let body = json!({
             "data": { "items": [
-                { "title": "Show A - Bölüm 5", "episode": 5, "url": "https://example-anime.test/a/5" },
+                {
+                    "title": "Show A - Bölüm 5",
+                    "episode": 5,
+                    "url": "https://example-anime.test/a/5"
+                },
                 { "title": "Show B", "episode": "Bölüm 12", "url": "https://evil.test/b/12" },
                 { "title": "Show C" }
             ]},
