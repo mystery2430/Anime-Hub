@@ -19,12 +19,12 @@
     "check": "npm run test && npm run test:rust"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.12.0",
-    "@tauri-apps/plugin-deep-link": "^2.6.0",
-    "@tauri-apps/plugin-opener": "^2.7.0"
+    "@tauri-apps/api": "~2.11.1",
+    "@tauri-apps/plugin-deep-link": "~2.4.10",
+    "@tauri-apps/plugin-opener": "~2.5.5"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.12.0",
+    "@tauri-apps/cli": "~2.11.5",
     "vite": "^8.3.1"
   },
   "engines": {

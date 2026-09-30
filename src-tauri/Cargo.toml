@@ -23,6 +23,10 @@ tauri-build = { version = "2", features = [] }
 # `unstable` gates Tauri's multi-webview APIs (Window::add_child + the `site-*`
 # WebViews in web/windows.rs); it only unlocks extra stable-runtime APIs —
 # no behavior change for the existing single-webview paths.
+#
+# KEEP IN SYNC: `@tauri-apps/api` and the plugin npm packages in package.json
+# must stay on the same major.minor as these crates — `tauri build` refuses to
+# run on a mismatch ("Found version mismatched Tauri packages").
 tauri = { version = "2.11", features = ["unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
