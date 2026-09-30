@@ -70,30 +70,32 @@ impl Speed {
     /// file still imports and simply gets the engine's pace.
     pub fn resolve(descriptor: Option<DescriptorLimits>, user: Option<UserLimits>) -> Self {
         let mut speed = Speed::ceiling();
-
-        for interval in [
-            user.and_then(|u| u.min_interval_secs),
-            descriptor.and_then(|d| d.min_interval_secs),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let wanted = i64::from(interval).clamp(speed.min_interval_secs, MAX_INTERVAL_SECS);
-            speed.min_interval_secs = speed.min_interval_secs.max(wanted);
+        if let Some(interval) = user.and_then(|u| u.min_interval_secs) {
+            speed.slow_down_interval(i64::from(interval));
         }
-
-        for per_day in [
-            user.and_then(|u| u.max_per_day),
-            descriptor.and_then(|d| d.max_requests_per_day),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            speed.max_per_day = speed.max_per_day.min(per_day.max(1));
+        if let Some(interval) = descriptor.and_then(|d| d.min_interval_secs) {
+            speed.slow_down_interval(i64::from(interval));
         }
-
+        if let Some(per_day) = user.and_then(|u| u.max_per_day) {
+            speed.slow_down_per_day(per_day);
+        }
+        if let Some(per_day) = descriptor.and_then(|d| d.max_requests_per_day) {
+            speed.slow_down_per_day(per_day);
+        }
         // The hourly ceiling never moves: no configuration buys a burst.
         speed
+    }
+
+    /// Never faster than the pace already agreed; the cap keeps a site from
+    /// being configured into uselessness.
+    fn slow_down_interval(&mut self, secs: i64) {
+        let wanted = secs.clamp(self.min_interval_secs, MAX_INTERVAL_SECS);
+        self.min_interval_secs = self.min_interval_secs.max(wanted);
+    }
+
+    /// Never more requests a day than the limit already agreed.
+    fn slow_down_per_day(&mut self, per_day: u32) {
+        self.max_per_day = self.max_per_day.min(per_day.max(1));
     }
 }
 
@@ -321,7 +323,8 @@ mod tests {
             min_interval_secs: Some(u32::MAX),
             max_per_day: None,
         };
-        assert_eq!(Speed::resolve(None, Some(absurd)).min_interval_secs, MAX_INTERVAL_SECS);
+        let clamped = Speed::resolve(None, Some(absurd));
+        assert_eq!(clamped.min_interval_secs, MAX_INTERVAL_SECS);
     }
 
     #[test]
@@ -333,11 +336,13 @@ mod tests {
         assert_eq!(
             throttle.decide(NOW + 1),
             Decision::Wait {
-                secs: CEILING_MIN_INTERVAL_SECS - 1
+                secs: CEILING_MIN_INTERVAL_SECS - 1,
             }
         );
-        assert!(throttle.record_request(NOW + 1).is_err(), "erken istek reddedilir");
-        assert_eq!(throttle.decide(NOW + CEILING_MIN_INTERVAL_SECS), Decision::Allow);
+        let early = throttle.record_request(NOW + 1);
+        assert!(early.is_err(), "erken istek reddedilir");
+        let later = throttle.decide(NOW + CEILING_MIN_INTERVAL_SECS);
+        assert_eq!(later, Decision::Allow);
     }
 
     #[test]
@@ -350,7 +355,7 @@ mod tests {
         assert_eq!(
             throttle.decide(NOW),
             Decision::Wait {
-                secs: HOUR - 100
+                secs: HOUR - 100,
             }
         );
         // Once the oldest of the two ages out, the slot frees again.
@@ -366,7 +371,7 @@ mod tests {
         assert_eq!(
             throttle.decide(NOW),
             Decision::Wait {
-                secs: DAY - 2 * HOUR
+                secs: DAY - 2 * HOUR,
             }
         );
     }
@@ -424,7 +429,8 @@ mod tests {
         throttle.record_ok(NOW + 5_000);
         assert_eq!(throttle.backoff_level, 0);
         assert_eq!(throttle.rate_limits_seen, 0);
-        assert_eq!(throttle.decide(NOW + 5_000 + CEILING_MIN_INTERVAL_SECS), Decision::Allow);
+        let later = NOW + 5_000 + CEILING_MIN_INTERVAL_SECS;
+        assert_eq!(throttle.decide(later), Decision::Allow);
     }
 
     #[test]

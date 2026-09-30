@@ -199,8 +199,8 @@ pub fn parse(raw: &str) -> AppResult<Descriptor> {
 
 /// Parse a file that holds one descriptor or an array of them.
 pub fn load_many(raw: &str) -> AppResult<Vec<Descriptor>> {
-    let value: Value = serde_json::from_str(raw)
-        .map_err(|e| AppError::Watch(format!("JSON çözümlenemedi: {}", excerpt(&e.to_string()))))?;
+    let parsed: Result<Value, _> = serde_json::from_str(raw);
+    let value = parsed.map_err(|e| decode_error("JSON çözümlenemedi", &e))?;
     let items = match value {
         Value::Array(items) => items,
         single => vec![single],
@@ -213,13 +213,10 @@ pub fn load_many(raw: &str) -> AppResult<Vec<Descriptor>> {
 
     let mut out: Vec<Descriptor> = Vec::new();
     for item in items {
-        let mut desc: Descriptor = serde_json::from_value(item).map_err(|e| {
-            AppError::Watch(format!("adaptör okunamadı: {}", excerpt(&e.to_string())))
-        })?;
+        let parsed: Result<Descriptor, _> = serde_json::from_value(item);
+        let mut desc = parsed.map_err(|e| decode_error("adaptör okunamadı", &e))?;
         validate(&mut desc)?;
-        let duplicate = out
-            .iter()
-            .any(|d| d.host == desc.host && d.endpoint.path == desc.endpoint.path);
+        let duplicate = out.iter().any(|d| same_endpoint(d, &desc));
         if duplicate {
             return Err(AppError::Watch(format!(
                 "aynı host ve uç iki kez tanımlanmış: {}",
@@ -232,8 +229,8 @@ pub fn load_many(raw: &str) -> AppResult<Vec<Descriptor>> {
 }
 
 fn decode(raw: &str) -> AppResult<Descriptor> {
-    serde_json::from_str(raw)
-        .map_err(|e| AppError::Watch(format!("adaptör okunamadı: {}", excerpt(&e.to_string()))))
+    let parsed: Result<Descriptor, _> = serde_json::from_str(raw);
+    parsed.map_err(|e| decode_error("adaptör okunamadı", &e))
 }
 
 /// Check a descriptor and normalise the parts that have one spelling
@@ -257,7 +254,6 @@ pub fn validate(desc: &mut Descriptor) -> AppResult<()> {
     }
 
     desc.host = desc.host.trim().to_lowercase();
-    let bad_host_char = |c: char| matches!(c, '/' | ':' | '@' | '?' | '#' | ' ' | '\\');
     if desc.host.is_empty() || desc.host.len() > 253 || desc.host.contains(bad_host_char) {
         return Err(AppError::Watch(
             "host alanına yalnızca alan adı yazılır (şema, yol veya port olmadan)".into(),
@@ -265,8 +261,8 @@ pub fn validate(desc: &mut Descriptor) -> AppResult<()> {
     }
     // The same policy the launcher applies to a site: HTTPS-only, public
     // host, no embedded credentials.
-    let safe = validate_site_url(&format!("https://{}/", desc.host))
-        .map_err(|r| AppError::Watch(format!("host reddedildi: {}", r.reason())))?;
+    let candidate = format!("https://{}/", desc.host);
+    let safe = validate_site_url(&candidate).map_err(|r| host_rejected(r.reason()))?;
     if safe.host() != desc.host {
         return Err(AppError::Watch(format!(
             "host normalleştirilemedi: {}",
@@ -302,12 +298,7 @@ pub fn validate(desc: &mut Descriptor) -> AppResult<()> {
     desc.endpoint.headers = headers;
 
     for (key, value) in &desc.endpoint.query {
-        if key.is_empty()
-            || key.len() > 64
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-        {
+        if !is_query_key(key) {
             return Err(AppError::Watch(format!(
                 "sorgu parametresi adı geçersiz: {}",
                 sanitize_name(key)
@@ -369,7 +360,7 @@ fn check_field(spec: &FieldSpec, field: &str, kind: FieldKind) -> AppResult<()> 
         }
         _ => {
             return Err(AppError::Watch(format!(
-                "{field} için pointer/constant/filename alanlarından tam olarak biri dolu olmalı ({} bulundu)",
+                "{field}: pointer/constant/filename'den tam olarak biri dolu olmalı ({})",
                 spec.kind()
             )));
         }
@@ -397,7 +388,7 @@ fn validate_path(path: &str, field: &str, max: usize) -> AppResult<()> {
         return Err(AppError::Watch(format!("{field} çok uzun")));
     }
     if path.chars().any(|c| c.is_control() || c == ' ') {
-        return Err(AppError::Watch(format!("{field} kontrol karakteri içeriyor")));
+        return Err(control_char_error(field));
     }
     if path.split('/').any(|part| part == "..") {
         return Err(AppError::Watch(format!("{field} üst dizine çıkamaz")));
@@ -459,7 +450,10 @@ pub fn coerce_number(value: &Value) -> Option<u32> {
             if let Ok(n) = trimmed.parse::<u32>() {
                 return Some(n);
             }
-            normalize::episode_from_text(trimmed).or_else(|| normalize::season_from_text(trimmed))
+            if let Some(n) = normalize::episode_from_text(trimmed) {
+                return Some(n);
+            }
+            normalize::season_from_text(trimmed)
         }
         _ => None,
     }
@@ -492,12 +486,55 @@ pub fn coerce_text(value: &Value) -> Option<String> {
     Some(text.chars().take(VALUE_MAX).collect())
 }
 
-fn value_of<'a>(spec: &FieldSpec, row: &'a Value) -> Option<&'a Value> {
+fn value_of<'a>(spec: &'a FieldSpec, row: &'a Value) -> Option<&'a Value> {
     match (&spec.pointer, &spec.constant, &spec.filename) {
         (Some(path), _, _) | (_, _, Some(path)) => resolve_pointer(row, path),
         (_, Some(value), _) => Some(value),
         _ => None,
     }
+}
+
+/// Two descriptors that would poll the same endpoint.
+fn same_endpoint(a: &Descriptor, b: &Descriptor) -> bool {
+    a.host == b.host && a.endpoint.path == b.endpoint.path
+}
+
+/// A host that the site policy refuses (private range, bad scheme, …).
+fn host_rejected(reason: &str) -> AppError {
+    AppError::Watch(format!("host reddedildi: {reason}"))
+}
+
+/// The address of a request could not be built at all.
+fn bad_address() -> AppError {
+    AppError::Watch("istek adresi kurulamadı".into())
+}
+
+/// A field name that a validator rejected.
+fn control_char_error(field: &str) -> AppError {
+    AppError::Watch(format!("{field} kontrol karakteri içeriyor"))
+}
+
+/// A character a host name may never contain.
+fn bad_host_char(c: char) -> bool {
+    matches!(c, '/' | ':' | '@' | '?' | '#' | ' ' | '\\')
+}
+
+/// Query parameter names: short, ASCII, and free of the separators that
+/// would let one parameter smuggle in another.
+fn is_query_key(key: &str) -> bool {
+    const EXTRA: [u8; 3] = [b'_', b'-', b'.'];
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || EXTRA.contains(&b))
+}
+
+/// A JSON decode failure with the parser's own words, clipped: a serde
+/// message can quote part of the file, so the text reaching the UI is short
+/// and free of control characters.
+fn decode_error(label: &str, error: &serde_json::Error) -> AppError {
+    AppError::Watch(format!("{label}: {}", excerpt(&error.to_string())))
 }
 
 /// Read the rows out of a decoded response body.
@@ -521,7 +558,7 @@ pub fn extract_rows(desc: &Descriptor, body: &Value) -> Vec<Row> {
 }
 
 fn read_row(desc: &Descriptor, item: &Value) -> Option<Row> {
-    let mut title;
+    let title;
     let mut season = None;
     let mut episode = None;
 
@@ -533,7 +570,8 @@ fn read_row(desc: &Descriptor, item: &Value) -> Option<Row> {
         season = fields.season;
         episode = fields.episode;
     } else {
-        title = normalize::canonical_title(&coerce_text(value_of(&desc.extract.title, item)?)?);
+        let raw = coerce_text(value_of(&desc.extract.title, item)?)?;
+        title = normalize::canonical_title(&raw);
     }
 
     if let Some(spec) = &desc.extract.season {
@@ -559,8 +597,7 @@ fn read_row(desc: &Descriptor, item: &Value) -> Option<Row> {
 /// query parameters in sorted order so a descriptor has one canonical form.
 pub fn request_url(desc: &Descriptor) -> AppResult<url::Url> {
     let raw = format!("https://{}{}", desc.host, desc.endpoint.path);
-    let mut url = url::Url::parse(&raw)
-        .map_err(|_| AppError::Watch("istek adresi kurulamadı".into()))?;
+    let mut url = url::Url::parse(&raw).map_err(|_| bad_address())?;
     // The host is never taken from response data, so this can only fail if
     // validation was bypassed.
     if url.host_str() != Some(desc.host.as_str()) {
@@ -633,14 +670,23 @@ mod tests {
         assert!(parse(&typo).is_err());
 
         // The engine always sends GET; a descriptor cannot ask for more.
-        let post = SAMPLE.replace("\"path\": \"/api/latest\"", "\"path\": \"/api/latest\", \"method\": \"POST\"");
+        let post = SAMPLE.replace(
+            "\"path\": \"/api/latest\"",
+            "\"path\": \"/api/latest\", \"method\": \"POST\"",
+        );
         let err = parse(&post).expect_err("POST reddedilmeli");
         assert!(err.to_string().contains("GET"));
     }
 
     #[test]
     fn refuses_private_hosts_and_hosts_with_paths() {
-        for host in ["localhost", "127.0.0.1", "192.168.1.10", "10.0.0.5", "example.test/api"] {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "192.168.1.10",
+            "10.0.0.5",
+            "example.test/api",
+        ] {
             let raw = SAMPLE.replace("example-anime.test", host);
             assert!(parse(&raw).is_err(), "{host} reddedilmeliydi");
         }
@@ -680,7 +726,10 @@ mod tests {
             "a/b": 1,
             "m~n": 2
         });
-        assert_eq!(resolve_pointer(&doc, "/data/items/1/title"), Some(&json!("B")));
+        assert_eq!(
+            resolve_pointer(&doc, "/data/items/1/title"),
+            Some(&json!("B"))
+        );
         assert_eq!(resolve_pointer(&doc, "/a~1b"), Some(&json!(1)));
         assert_eq!(resolve_pointer(&doc, "/m~0n"), Some(&json!(2)));
         assert_eq!(resolve_pointer(&doc, "/data/items/9"), None);
@@ -705,7 +754,11 @@ mod tests {
         assert_eq!(rows.len(), 2, "bölüm numarası olmayan satır atlanır");
         assert_eq!(rows[0].title, "show a");
         assert_eq!(rows[0].episode, 5);
-        assert_eq!(rows[0].season, Some(2), "sabit alan pointer'ı geçersiz kılar");
+        assert_eq!(
+            rows[0].season,
+            Some(2),
+            "sabit alan pointer'ı geçersiz kılar"
+        );
         assert_eq!(rows[1].title, "show b");
         assert_eq!(rows[1].episode, 12);
         // Rows keep only the pinned host's own links.

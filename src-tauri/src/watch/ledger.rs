@@ -302,7 +302,7 @@ mod tests {
                     notices[0],
                     Notice::Digest {
                         count: 3,
-                        episode: release("show a", 2)
+                        episode: release("show a", 2),
                     }
                 );
             }
@@ -314,7 +314,11 @@ mod tests {
     fn two_fresh_episodes_are_announced_separately() {
         let mut ledger = Ledger::default();
         ledger.plan(SITE, &[release("show a", 1)], NOW);
-        let turn = ledger.plan(SITE, &[release("show a", 2), release("show a", 3)], NOW + 600);
+        let turn = ledger.plan(
+            SITE,
+            &[release("show a", 2), release("show a", 3)],
+            NOW + 600,
+        );
         match turn {
             Turn::Announce(notices) => assert_eq!(notices.len(), 2),
             other => panic!("iki bildirim bekleniyordu: {other:?}"),
@@ -336,7 +340,10 @@ mod tests {
     #[test]
     fn observing_twice_keeps_the_first_sighting() {
         let mut ledger = Ledger::default();
-        assert_eq!(ledger.observe(SITE, &release("show a", 5), NOW), Observation::Fresh);
+        assert_eq!(
+            ledger.observe(SITE, &release("show a", 5), NOW),
+            Observation::Fresh
+        );
         assert_eq!(
             ledger.observe(SITE, &release("show a", 5), NOW + 300),
             Observation::Known
@@ -358,7 +365,10 @@ mod tests {
             episode: 5,
         };
         assert_eq!(ledger.observe(SITE, &other_season, NOW), Observation::Fresh);
-        assert_eq!(ledger.observe("site-b", &release("show a", 5), NOW), Observation::Fresh);
+        assert_eq!(
+            ledger.observe("site-b", &release("show a", 5), NOW),
+            Observation::Fresh
+        );
     }
 
     #[test]
@@ -372,7 +382,11 @@ mod tests {
         assert_eq!(ledger.len(), 1);
         // Re-adding the site baselines again instead of announcing.
         assert_eq!(
-            ledger.plan(SITE, &[release("show a", 1), release("show a", 2)], NOW + 60),
+            ledger.plan(
+                SITE,
+                &[release("show a", 1), release("show a", 2)],
+                NOW + 60
+            ),
             Turn::Baseline { recorded: 2 }
         );
     }

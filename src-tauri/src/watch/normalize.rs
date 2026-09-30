@@ -550,6 +550,9 @@ mod tests {
         // `1080p` must not become episode 80 of season … anything.
         assert_eq!(parse_release("Show 1080p Bölüm 3"), Some(rel("show", 1, 3)));
         assert_eq!(glued_marker("1080p"), None);
-        assert_eq!(glued_marker("ep13"), Some((String::new(), Marker::Episode, 13)));
+        assert_eq!(
+            glued_marker("ep13"),
+            Some((String::new(), Marker::Episode, 13))
+        );
     }
 }
