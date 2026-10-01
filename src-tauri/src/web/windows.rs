@@ -480,12 +480,14 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     //    its page is still loaded. Cookie snapshots remain site-scoped; the
     //    localStorage/IndexedDB blob is stricter and is written only if the
     //    exact scheme/host/port still matches the registered origin.
-    if let Some(current) = state
+    // Bind the clone before entering the body so the MutexGuard is dropped
+    // before storage export re-checks ownership through `current_site`.
+    let outgoing = state
         .current_site
         .lock()
         .expect("current_site lock")
-        .clone()
-    {
+        .clone();
+    if let Some(current) = outgoing {
         export_cookies(&window, &current.site_id)?;
         export_site_storage(app, &current.site_id, &current.origin);
     }
