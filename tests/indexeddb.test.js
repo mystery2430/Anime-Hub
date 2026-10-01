@@ -14,12 +14,12 @@ const KOTLIN_PATH = join(
 );
 const KOTLIN = readFileSync(KOTLIN_PATH, "utf8");
 
-function rawKotlinString(name) {
-  const match = KOTLIN.match(
-    new RegExp(`private val ${name} = """\\n([\\s\\S]*?)\\n    """.trimIndent\\(\\)`),
+function rawKotlinString(name, source = KOTLIN) {
+  const match = source.match(
+    new RegExp(`private val ${name} = """\\r?\\n([\\s\\S]*?)\\r?\\n    """.trimIndent\\(\\)`),
   );
   assert.ok(match, `could not find ${name} Kotlin raw string`);
-  const lines = match[1].split("\n");
+  const lines = match[1].replace(/\r\n/g, "\n").split("\n");
   const indent = Math.min(
     ...lines.filter((line) => line.trim()).map((line) => line.match(/^ */)[0].length),
   );
@@ -352,6 +352,12 @@ async function importSnapshot(indexedDB, snapshot) {
   const importFunction = vm.runInNewContext(`(${IMPORT_JS})`, context);
   return importFunction(jsonPayload(snapshot), "__animehub_test");
 }
+
+test("Kotlin raw-string extraction accepts Windows CRLF checkouts", () => {
+  const crlfSource = KOTLIN.replace(/\n/g, "\r\n");
+  assert.equal(rawKotlinString("EXPORT_IDB_JS", crlfSource), EXPORT_JS);
+  assert.equal(rawKotlinString("IMPORT_IDB_JS", crlfSource), IMPORT_JS);
+});
 
 test("Android IndexedDB bridge JS parses and uses a bounded, explicit async bridge", () => {
   assert.doesNotThrow(() => new Function(`return (${EXPORT_JS});`));
