@@ -43,7 +43,7 @@ thiserror = "2"
 log = "0.4"
 
 # --- cryptography (used on every platform) ---
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 rand = "0.8"
 sha2 = "0.10"
 subtle = "2"
