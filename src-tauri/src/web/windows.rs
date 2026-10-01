@@ -34,9 +34,9 @@ use crate::web::dns::{classify_host, DnsClass};
 // desktop child-webview snapshot); `restore` only serves the mobile import.
 #[cfg(mobile)]
 use crate::web::session::restore;
-use crate::web::session::{capture, origin_key, profile_dir_name, CookieJar};
 #[cfg(mobile)]
 use crate::web::session::url_has_origin;
+use crate::web::session::{capture, origin_key, profile_dir_name, CookieJar};
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
 use tauri::{AppHandle, Emitter, Manager};
@@ -931,21 +931,13 @@ mod tests {
     #[test]
     fn storage_writes_are_bound_to_the_current_site_origin() {
         let state = state_with_current_site(Some("s1"));
-        assert!(session_is_current_origin(
-            &state,
-            "s1",
-            "https://a.example"
-        ));
+        assert!(session_is_current_origin(&state, "s1", "https://a.example"));
         assert!(!session_is_current_origin(
             &state,
             "s1",
             "https://a.example:8443"
         ));
-        assert!(!session_is_current_origin(
-            &state,
-            "s1",
-            "http://a.example"
-        ));
+        assert!(!session_is_current_origin(&state, "s1", "http://a.example"));
         assert!(!session_is_current_origin(
             &state,
             "s2",

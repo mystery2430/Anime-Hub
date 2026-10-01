@@ -60,10 +60,22 @@ The script exits non-zero if the generated package is not `dev.animehub.app`.
 No manifest permission is needed for the keystore: `AndroidKeyStore` is
 available to every app without a runtime permission.
 
+## IndexedDB snapshot bridge
+
+`AnimeHubPlugin.kt` exports schema (database version, object-store key path and
+auto-increment setting, plus index definitions) and rows. The JSON-safe tagged
+value format round-trips Blob/File, binary buffers and typed arrays, Date,
+BigInt, Map/Set, RegExp, arrays, and plain objects. Legacy v1 snapshots remain
+importable. Cyclic or unsupported custom objects fail the export rather than
+being silently dropped. Limits are 50,000 rows per store, 8 MiB of binary data,
+16 MiB of JSON, and a 30-second bridge timeout. Export and import payloads
+cross the WebView bridge in bounded chunks; import JSON is base64-encoded so
+site-controlled JSON is never interpolated into JavaScript source. The snapshot
+is sealed with the Android Keystore key.
+
 ## Verification status
 
 The manifest snippets above use stable Android attributes and the Tauri 2
-generated project layout, but **they have not been built or run here** — that
-requires the Android SDK + NDK, which were not available in the environment
-this project was written in. Confirm with `npm run tauri android dev` on a
-real device before shipping.
+generated project layout. CI compiles the Android bridge, but a physical-device
+verification of Android storage restoration is still outstanding. Confirm with
+`npm run tauri android dev` on a real device before shipping.

@@ -125,11 +125,17 @@ ulaşamaz.
 > yüklendiğinde geri yüklenir ve oturum açıkken 30 saniyede bir (depo
 > blob'ları daha seyrek) tazelenir. Depo geri yükleme/eşitlemesi host adıyla
 > yetinmez; **şema + host + etkin port** eşleşmelidir. Aynı alan adındaki
-> başka port veya şemaya başka sitenin verisi yazılmaz. IndexedDB aktarımı
-> **en iyi çaba** ilkesiyle çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler,
-> key path ve Blob türü değerler korunmaz). Bu mekanizma henüz bir cihazda
-> doğrulanmadı; doğrulama tamamlanana kadar ayrıştırma eksik kalırsa ekranda
-> uyarı gösterilir.
+> başka port veya şemaya başka sitenin verisi yazılmaz. IndexedDB anlık görüntüsü
+> veritabanı sürümünü, object store `keyPath`/`autoIncrement` ayarlarını,
+> ikincil indeksleri ve satır anahtarlarını korur. `Blob`/`File`, `ArrayBuffer` ve
+> typed array, `Date`, `BigInt`, `Map`/`Set`, `RegExp`, dizi ve düz nesne değerleri
+> JSON için etiketlenip geri yüklenir. Önceki v1 anlık görüntü biçimi içe aktarmada
+> uyumludur. Döngüsel ya da desteklenmeyen nesne değerleri sessizce atılmaz;
+> aktarımı başarısız kılar. Kaynak kullanımı için her store başına 50.000 satır,
+> toplam 8 MiB ikili veri ve 16 MiB JSON sınırı vardır; dışa/içe aktarma verisi
+> WebView köprüsünden sınırlı parçalara bölünerek taşınır (içe aktarımda JSON
+> Base64 kodlanır) ve 30 saniyelik zaman aşımı tamamlanmayı açıkça doğrular. Fiziksel cihaz doğrulaması
+> henüz yapılmadı; hata olursa anlık görüntü sessizce başarılı sayılmaz.
 
 ### 🔒&nbsp; Diskte şifreli duran veriler
 
