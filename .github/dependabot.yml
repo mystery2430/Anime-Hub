@@ -1,0 +1,58 @@
+version: 2
+# Bağımlılık güvenlik güncellemeleri: haftalık, gruplanmış PR'lar.
+#
+# GitHub Actions PR'ları yalnız yorum/sürüm değiştirir; Rust ve npm PR'ları
+# CI'dan geçmeden birleştirilmez. Kilit dosyaları (`Cargo.lock`,
+# `package-lock.json`) her PR'da birlikte güncellenir.
+updates:
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      rust-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Android tarafı ayrı bir crate; kök çalışma alanına dahil değil.
+  - package-ecosystem: cargo
+    directory: /src-tauri/android-plugin
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      rust-android-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        patterns: ["*"]

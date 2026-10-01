@@ -28,7 +28,7 @@ jobs:
           - platform: ubuntu-24.04
             label: linux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux system dependencies
         if: matrix.label == 'linux'
@@ -44,9 +44,9 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci
@@ -96,7 +96,7 @@ jobs:
             Write-Host "No Windows signing secrets; the bundle will be unsigned"
           }
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}

@@ -37,15 +37,27 @@ lines.forEach((line, i) => {
 const contextBlock = [...new Set(context)].slice(0, 40).join("\n");
 
 const interesting = lines.filter((line) =>
-  /error(\[|:)|warning:|FAILED|panicked|could not compile|test result:|^\s*-->|What went wrong|Execution failed|Caused by|^\s*>\s/i.test(
+  /error(\[|:)|warning:|FAILED|panicked|could not compile|test result:|^\s*-->|What went wrong|Execution failed|Caused by|npm ERR!|Traceback|No such file|not found|^\s*>\s/i.test(
     line,
   ),
 );
 const picked = (interesting.length ? interesting : lines.slice(-12)).slice(-20);
-const text =
-  (gradleBlock ? gradleBlock + "\n--\n" : "") +
-  (contextBlock ? contextBlock + "\n--\n" : "") +
-  picked.join("\n");
+
+// The last lines always go in: a tool can fail with a single message that
+// matches none of the patterns above (the Android job printed only the npm
+// banner once), and without them the annotation says nothing at all.
+const tail = lines.filter((line) => line.trim() !== "").slice(-25);
+const tailBlock = tail.join("\n").slice(0, 1600);
+
+const parts = [];
+if (gradleBlock) parts.push(gradleBlock);
+if (contextBlock) parts.push(contextBlock);
+// Skip the tail when it is already the tail of `picked` (avoids a duplicate).
+if (tailBlock && !picked.join("\n").includes(tail[tail.length - 1])) {
+  parts.push(tailBlock);
+}
+parts.push(picked.join("\n"));
+const text = parts.join("\n--\n");
 const finalText = text.slice(0, 4000);
 
 const msg = finalText.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");

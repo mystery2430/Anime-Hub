@@ -22,8 +22,9 @@ export default defineConfig({
   build: {
     target: ["es2021", "chrome100", "safari13"],
     // Android's system WebView lags behind desktop Chrome; keep the output
-    // conservative so nothing needs a runtime polyfill.
-    minify: "esbuild",
+    // conservative so nothing needs a runtime polyfill. Vite 8 minifies with
+    // its own (Rust) minifier, so no separate esbuild dependency is needed.
+    minify: true,
     sourcemap: false,
     rollupOptions: {
       output: {

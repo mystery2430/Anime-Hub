@@ -11,7 +11,7 @@
 
 ![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?style=for-the-badge&logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-stable-000000?style=for-the-badge&logo=rust&logoColor=white)
-![Vite](https://img.shields.io/badge/Vite-6-646CFF?style=for-the-badge&logo=vite&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-8-646CFF?style=for-the-badge&logo=vite&logoColor=white)
 ![Android](https://img.shields.io/badge/Android-26+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
 
 ![Linux](https://img.shields.io/badge/Linux-do%C4%9Fruland%C4%B1-FCC624?style=for-the-badge&logo=linux&logoColor=black)
@@ -224,8 +224,8 @@ Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
 
 | Yöntem | Boyut | Komut |
 |---|---|---|
-| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.0_amd64.deb` |
-| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.3.0-1.x86_64.rpm` |
+| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.1_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.3.1-1.x86_64.rpm` |
 | **AppImage** | ~75 MB | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
 
 ```bash
@@ -239,7 +239,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
-> **Windows paketleri henüz kod imzalı değildir (0.3.0 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (SignPath Foundation programı değerlendiriliyor / alternatifler: Certum OV, Microsoft Store) duyurulacak.
+> **Windows paketleri henüz kod imzalı değildir (0.3.1 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
@@ -343,7 +343,6 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 - [ ] MyAnimeList native entegrasyonu (v1'de yalnızca başlatıcı kutucuğu)
 - [ ] Otomatik güncelleme kontrolü
-- [ ] Yeni bölüm bildirimleri
 - [ ] Yerel izleme geçmişi / "devam et" listesi
 - [ ] macOS desteği
 - [ ] Her hangi bir programa dayanmayan cookie şifreleme
@@ -359,8 +358,10 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
 | Android APK derlemesi (aarch64, armv7, x86_64) | yeşil — `release-android.yml` ve CI'daki Android compile işi; `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla |
-| **v0.2.0 yayın paketleri** | doğrulandı: 3 **imzalı** APK + `AnimeHub_0.2.0_x64-setup.exe` + `.deb`/`.rpm`/AppImage; `main` CI'sı tam yeşil |
+| **v0.3.0 yayın paketleri** | doğrulandı: 3 **imzalı** APK + `AnimeHub_0.3.0_x64-setup.exe` + `.deb`/`.rpm`/AppImage (7/7 asset); `main` CI'sı tam yeşil |
 | Windows kurulumu | Windows üzerinde elle doğrulandı (DPAPI + WebView2 profili) |
+| Bağımlılık güvenliği | `npm audit` → 0 açık; `cargo audit` CI'da her koşuda; Dependabot (cargo/npm/actions) haftalık güncelleme açar; açık bildirimi için [SECURITY.md](./SECURITY.md) |
+| Frontend derlemesi | CI'da `npm run build` (Vite 8 + rolldown) her PR'da koşar; sürüm yayınında `tauri build` aynı adımı kullanır |
 
 **Hâlâ doğrulanmayanlar:**
 
@@ -383,6 +384,9 @@ Tüm doğrulama kayıtları ve devralan kişiye düşen işler
    olmalı — CI bunları zaten zorlar.
 4. Güvenlik katmanına dokunan değişikliklerde `tests/security.test.js`
    içindeki varsayımları da güncelleyin.
+5. Bağımlılık güncellemeleri Dependabot ile haftalık gelir; güvenlik açığı
+   bildirimi için herkese açık issue açmayın — [SECURITY.md](./SECURITY.md)
+   içindeki özel kanalı kullanın.
 
 ---
 
