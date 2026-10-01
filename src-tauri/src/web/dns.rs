@@ -15,7 +15,7 @@
 use crate::sites::url_policy::{is_private_host, is_public_ip};
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long a navigation may wait on the resolver before falling back to the
@@ -43,6 +43,45 @@ pub enum DnsClass {
     Unknown,
 }
 
+/// One in-flight lookup shared by concurrent navigations to the same host.
+/// Without this gate, simultaneous redirects can each spawn a resolver thread
+/// and wait for the same answer, stalling the WebView unnecessarily.
+struct LookupFlight {
+    result: Mutex<Option<DnsClass>>,
+    ready: Condvar,
+}
+
+impl LookupFlight {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> DnsClass {
+        let deadline = Instant::now() + LOOKUP_TIMEOUT;
+        let mut result = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(class) = *result {
+                return class;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return DnsClass::Unknown;
+            }
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(result, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            result = next;
+            if timeout.timed_out() && result.is_none() {
+                return DnsClass::Unknown;
+            }
+        }
+    }
+}
+
 /// True when a set of resolved addresses must not be navigated to.
 ///
 /// An empty answer is treated as private: there is no public address to pin,
@@ -51,10 +90,49 @@ pub fn answers_are_private(addrs: &[IpAddr]) -> bool {
     addrs.is_empty() || addrs.iter().copied().any(|ip| !is_public_ip(ip))
 }
 
+fn in_flight_lookups() -> &'static Mutex<HashMap<String, Arc<LookupFlight>>> {
+    static LOOKUPS: OnceLock<Mutex<HashMap<String, Arc<LookupFlight>>>> = OnceLock::new();
+    LOOKUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Join an existing host lookup or become its sole resolver.
+fn start_lookup(key: &str) -> (Arc<LookupFlight>, bool) {
+    let mut lookups = in_flight_lookups()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(flight) = lookups.get(key) {
+        return (Arc::clone(flight), false);
+    }
+    let flight = Arc::new(LookupFlight::new());
+    lookups.insert(key.to_string(), Arc::clone(&flight));
+    (flight, true)
+}
+
+/// Publish a lookup result and remove only the flight we own.
+fn finish_lookup(key: &str, flight: &Arc<LookupFlight>, result: DnsClass) {
+    {
+        let mut lookups = in_flight_lookups()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if lookups
+            .get(key)
+            .is_some_and(|active| Arc::ptr_eq(active, flight))
+        {
+            lookups.remove(key);
+        }
+    }
+    {
+        let mut slot = flight.result.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(result);
+    }
+    flight.ready.notify_all();
+}
+
 /// Classify `host` for the navigation guard.
 ///
 /// Literal and suffix-private hosts (`127.0.0.1`, `*.local`, …) never touch
 /// the network. Everything else is resolved with [`LOOKUP_TIMEOUT`].
+/// Concurrent misses for the same host share one resolver thread/result.
 pub fn classify_host(host: &str) -> DnsClass {
     let key = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if key.is_empty() {
@@ -80,12 +158,24 @@ pub fn classify_host(host: &str) -> DnsClass {
         return class;
     }
 
+    let (flight, is_resolver) = start_lookup(&key);
+    if !is_resolver {
+        return flight.wait();
+    }
+    // A previous flight may have filled the cache between our first cache
+    // read and becoming leader. Recheck to avoid a redundant resolver call.
+    if let Some(class) = cache_get(&key) {
+        finish_lookup(&key, &flight, class);
+        return class;
+    }
+
     let class = lookup_with_timeout(&key);
     match class {
-        DnsClass::Answered { private: true } => cache_put(key, class, PRIVATE_TTL),
-        DnsClass::Answered { private: false } => cache_put(key, class, PUBLIC_TTL),
+        DnsClass::Answered { private: true } => cache_put(key.clone(), class, PRIVATE_TTL),
+        DnsClass::Answered { private: false } => cache_put(key.clone(), class, PUBLIC_TTL),
         DnsClass::Unknown => {}
     }
+    finish_lookup(&key, &flight, class);
     class
 }
 
@@ -105,9 +195,8 @@ fn lookup_with_timeout(host: &str) -> DnsClass {
     let host = host.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     // Detach: on timeout the lookup thread exits on its own when the
-    // resolver finally returns. A launcher does not navigate often enough
-    // for a stuck resolver to pile these up, and the cache lock below
-    // serialises callers so they share one in-flight miss.
+    // resolver finally returns. The per-host flight above ensures concurrent
+    // navigations share this one resolver instead of spawning duplicates.
     std::thread::spawn(move || {
         let _ = tx.send(resolve_ips(&host));
     });
@@ -179,6 +268,28 @@ fn cache_put(key: String, class: DnsClass, ttl: Duration) {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn concurrent_misses_for_one_host_share_a_lookup() {
+        let key = "single-flight-test.example";
+        let (leader, is_resolver) = start_lookup(key);
+        assert!(is_resolver);
+
+        let (follower, is_resolver) = start_lookup(key);
+        assert!(!is_resolver);
+        assert!(Arc::ptr_eq(&leader, &follower));
+
+        let waiting = std::thread::spawn(move || follower.wait());
+        let result = DnsClass::Answered { private: false };
+        finish_lookup(key, &leader, result);
+        assert_eq!(waiting.join().unwrap(), result);
+
+        // Completion removes the flight so a later cache miss can resolve
+        // afresh after its cache TTL expires.
+        let (next, is_resolver) = start_lookup(key);
+        assert!(is_resolver);
+        finish_lookup(key, &next, DnsClass::Unknown);
+    }
 
     #[test]
     fn empty_answer_is_private() {

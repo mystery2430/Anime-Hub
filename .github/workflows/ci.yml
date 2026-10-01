@@ -55,7 +55,16 @@ jobs:
       - run: npm ci
 
       - name: Frontend tests
-        run: npm test
+        shell: bash
+        run: |
+          set +e
+          npm test > "$RUNNER_TEMP/frontend-test.log" 2>&1
+          status=$?
+          tail -n 40 "$RUNNER_TEMP/frontend-test.log" || true
+          if [ "$status" -ne 0 ]; then
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" "$RUNNER_TEMP/frontend-test.log" "frontend tests" || true
+            exit "$status"
+          fi
 
       # The release workflows build the frontend through `tauri build`; running
       # it here too means a broken Vite config fails on the PR, not on the tag.

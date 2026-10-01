@@ -123,11 +123,19 @@ ulaşamaz.
 > şifreli blob'lara aktarır: çerez kavanozuna ek olarak `localStorage` ve
 > IndexedDB de AndroidKeyStore ile mühürlenir, hedef sitenin sayfası
 > yüklendiğinde geri yüklenir ve oturum açıkken 30 saniyede bir (depo
-> blob'ları daha seyrek) tazelenir. IndexedDB aktarımı **en iyi çaba**
-> ilkesiyle çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler,
-> key path ve Blob türü değerler korunmaz). Bu mekanizma henüz bir cihazda
-> doğrulanmadı; doğrulama tamamlanana kadar ayrıştırma eksik kalırsa ekranda
-> uyarı gösterilir.
+> blob'ları daha seyrek) tazelenir. Depo geri yükleme/eşitlemesi host adıyla
+> yetinmez; **şema + host + etkin port** eşleşmelidir. Aynı alan adındaki
+> başka port veya şemaya başka sitenin verisi yazılmaz. IndexedDB anlık görüntüsü
+> veritabanı sürümünü, object store `keyPath`/`autoIncrement` ayarlarını,
+> ikincil indeksleri ve satır anahtarlarını korur. `Blob`/`File`, `ArrayBuffer` ve
+> typed array, `Date`, `BigInt`, `Map`/`Set`, `RegExp`, dizi ve düz nesne değerleri
+> JSON için etiketlenip geri yüklenir. Önceki v1 anlık görüntü biçimi içe aktarmada
+> uyumludur. Döngüsel ya da desteklenmeyen nesne değerleri sessizce atılmaz;
+> aktarımı başarısız kılar. Kaynak kullanımı için her store başına 50.000 satır,
+> toplam 8 MiB ikili veri ve 16 MiB JSON sınırı vardır; dışa/içe aktarma verisi
+> WebView köprüsünden sınırlı parçalara bölünerek taşınır (içe aktarımda JSON
+> Base64 kodlanır) ve 30 saniyelik zaman aşımı tamamlanmayı açıkça doğrular. Fiziksel cihaz doğrulaması
+> henüz yapılmadı; hata olursa anlık görüntü sessizce başarılı sayılmaz.
 
 ### 🔒&nbsp; Diskte şifreli duran veriler
 
@@ -162,9 +170,10 @@ bir sitenin verisini asla başka bir sitenin blob'una yazamaz.
   `https://192.168.1.1/` adresine yönlendirmeye çalışırsa kesilir; bu kural
   `tests/audit.rs` içinde regresyon testiyle kilitlidir.
 - **DNS rebinding.** Herkese açık görünen bir ad, gezinti veya site açılışı
-  anında özel bir adrese çözülüyorsa kesilir. Çözümleme eşzamanlı kalır
-  (kısa zaman aşımı, `web/dns.rs`); zaman aşımında metin politikası geçerli
-  kalır, DNS kesintisi siteleri kapatmaz. Sayfa yüklendikten sonra WebView'ın
+  anında özel bir adrese çözülüyorsa kesilir. Çözümleme kısa zaman aşımıyla
+  çalışır (`web/dns.rs`); aynı host için eşzamanlı gezinmeler tek DNS
+  sorgusunun sonucunu paylaşır. Zaman aşımında metin politikası geçerli kalır,
+  DNS kesintisi siteleri kapatmaz. Sayfa yüklendikten sonra WebView'ın
   kendi çözümleyicisiyle yapılan alt istekler (XHR/`fetch`) bu kontrolden
   geçmez — onu kapatmak bir filtreleyen vekil ister ve v1'de yok.
 - **Alan adı engel listesi** reklam ve izleyici alanlarını istek düzeyinde
@@ -353,22 +362,24 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 | Doğrulama | Sonuç |
 |---|---|
-| `npm test` | **65 test geçti**, 0 hata |
-| `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | GitHub Actions'ta yeşil — Tests işi `ubuntu-24.04`, `macos-latest` ve `windows-latest` üzerinde |
+| `npm test` | **71 test geçti**, 0 hata |
+| `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | CI'da `ubuntu-24.04`, `macos-latest` ve `windows-latest` üzerinde çalışır |
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
 | Android APK derlemesi (aarch64, armv7, x86_64) | yeşil — `release-android.yml` ve CI'daki Android compile işi; `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla |
-| **v0.3.0 yayın paketleri** | doğrulandı: 3 **imzalı** APK + `AnimeHub_0.3.0_x64-setup.exe` + `.deb`/`.rpm`/AppImage (7/7 asset); `main` CI'sı tam yeşil |
+| **v0.3.1 yayın paketleri** | doğrulandı: 3 **imzalı** APK + Windows NSIS kurulum dosyası + Linux `.deb`/`.rpm`/AppImage (7/7 asset) |
 | Windows kurulumu | Windows üzerinde elle doğrulandı (DPAPI + WebView2 profili) |
 | Bağımlılık güvenliği | `npm audit` → 0 açık; `cargo audit` CI'da her koşuda; Dependabot (cargo/npm/actions) haftalık güncelleme açar; açık bildirimi için [SECURITY.md](./SECURITY.md) |
 | Frontend derlemesi | CI'da `npm run build` (Vite 8 + rolldown) her PR'da koşar; sürüm yayınında `tauri build` aynı adımı kullanır |
 
 **Hâlâ doğrulanmayanlar:**
 
-- **Android cihaz testi.** APK derlenip imzalanıyor; elle cihaz doğrulaması
-  yapılmadı (PiP, çerez takası, localStorage/IndexedDB şifreli aktarımı ve
-  geri katmanı dahil). IndexedDB aktarımının kayıpsız olmadığı bilinir:
-  ikincil indeksler ve Blob değerleri taşınmaz.
+- **Android cihaz testi.** APK derlenip imzalanıyor; PiP, çerez takası,
+  localStorage/IndexedDB şifreli aktarımı ve geri yükleme akışı henüz fiziksel
+  cihazda elle doğrulanmadı. IndexedDB v2 aktarım kodu şemayı, ikincil
+  indeksleri, satır anahtarlarını ve desteklenen structured-clone değerlerini
+  korur; v1 anlık görüntülerini içe aktarma uyumluluğu da vardır. Gerçek
+  WebView/AndroidKeyStore uçtan uca davranışı cihaz testi bekliyor.
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.

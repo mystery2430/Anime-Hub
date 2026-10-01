@@ -210,6 +210,20 @@ pub enum NavDecision {
 /// Shown when a public-looking name resolves to a private address.
 pub const DNS_REBIND_BLOCK: &str = "Alan adı özel/ağ içi bir adrese çözümlendi.";
 
+/// Canonical serialisation of a URL's origin (scheme, host, and effective port).
+///
+/// Android uses a single shared WebView and stores each site's origin-scoped
+/// storage in a separate encrypted blob. A host-only comparison would also
+/// treat a sibling service on a different port as the same origin.
+pub fn origin_key(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+/// Whether `url` belongs to the exact origin that owns a stored session.
+pub fn url_has_origin(url: &Url, expected_origin: &str) -> bool {
+    origin_key(url) == expected_origin
+}
+
 /// Decide whether a WebView navigation may proceed.
 ///
 /// `site_host` is the site the session was opened for; it is unused by the
@@ -523,6 +537,36 @@ mod tests {
             .http_only(true)
             .same_site(cookie::SameSite::Lax)
             .build()
+    }
+
+    #[test]
+    fn storage_origin_match_includes_scheme_host_and_effective_port() {
+        let registered = Url::parse("https://media.example/watch").unwrap();
+        let expected = origin_key(&registered);
+
+        assert!(url_has_origin(
+            &Url::parse("https://media.example/other-path").unwrap(),
+            &expected
+        ));
+        assert!(
+            url_has_origin(
+                &Url::parse("https://media.example:443/other-path").unwrap(),
+                &expected
+            ),
+            "default HTTPS port is the same origin"
+        );
+        assert!(!url_has_origin(
+            &Url::parse("https://media.example:8443/").unwrap(),
+            &expected
+        ));
+        assert!(!url_has_origin(
+            &Url::parse("http://media.example/").unwrap(),
+            &expected
+        ));
+        assert!(!url_has_origin(
+            &Url::parse("https://sub.media.example/").unwrap(),
+            &expected
+        ));
     }
 
     #[test]

@@ -56,10 +56,13 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.security.KeyStore
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import org.json.JSONObject
+import org.json.JSONTokener
 
 @TauriPlugin
 class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
@@ -190,15 +193,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   /**
-   * Dump the loaded page's IndexedDB databases (best effort) and resolve with
-   * the Keystore-sealed base64 blob.
-   *
-   * Fidelity notes, by design: document *values* are captured via
-   * `getAll`/`getAllKeys` pairs, so original keys survive; secondary indexes,
-   * key paths and auto-increment counters are **not** reconstructed, and
-   * structured-clone-only values (Blob, etc.) are dropped by
-   * `JSON.stringify`. Good enough for the auth/setting state sites in scope
-   * keep in IndexedDB; anything richer is a documented limitation.
+   * Export IndexedDB with schema and common structured-clone values preserved.
+   * The page work is asynchronous, so it signals completion through a random
+   * one-shot window key; `evaluateJavascript` itself does not await Promises.
    */
   @Command
   fun indexeddb_export(invoke: Invoke) {
@@ -208,22 +205,49 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val webView = sharedWebView ?: run {
       invoke.reject("WebView hazır değil"); return
     }
-    // `evaluateJavascript` awaits a returned Promise (API 21+), so the async
-    // IIFE below resolves the callback with the finished dump.
-    webView.evaluateJavascript(EXPORT_IDB_JS) { result ->
-      if (result == null || result == "null") {
-        invoke.resolve(JSObject().put("value", ""))
-        return@evaluateJavascript
+    val stateKey = "__animehub_idb_${UUID.randomUUID().toString().replace("-", "")}"
+    val resultKey = "${stateKey}_result"
+    val stateLiteral = JSONObject.quote(stateKey)
+    val resultLiteral = JSONObject.quote(resultKey)
+    val js = "(function(){var s=$stateLiteral,r=$resultLiteral;window[s]='pending';" +
+      "($EXPORT_IDB_JS)().then(function(snapshot){if(window[s]==='cancelled'){delete window[s];delete window[r];return;}try{" +
+      "var json=JSON.stringify(snapshot);var size=typeof TextEncoder==='function'?new TextEncoder().encode(json).length:json.length;" +
+      "if(!json||json.length>$MAX_IDB_SNAPSHOT_CHARS||size>$MAX_IDB_SNAPSHOT_BYTES)throw new Error();" +
+      "window[r]=json;window[s]='done';}catch(e){window[s]='error';}}," +
+      "function(){if(window[s]==='cancelled'){delete window[s];delete window[r];return;}window[s]='error';});return true;})()"
+    try {
+      webView.evaluateJavascript(js) { started ->
+        if (started != "true") {
+          webView.evaluateJavascript(
+            "(function(){window[$stateLiteral]='cancelled';delete window[$resultLiteral];return true;})()",
+            null,
+          )
+          invoke.reject("IndexedDB dışa aktarımı başlatılamadı")
+          return@evaluateJavascript
+        }
+        awaitJavascriptResult(webView, stateKey, resultKey) { encoded ->
+          if (encoded == null) {
+            invoke.reject("IndexedDB dışa aktarılamadı")
+            return@awaitJavascriptResult
+          }
+          try {
+            val json = JSONTokener(encoded).nextValue() as? String
+              ?: throw IllegalArgumentException("JSON string bekleniyordu")
+            if (json.toByteArray(Charsets.UTF_8).size > MAX_IDB_SNAPSHOT_BYTES) {
+              throw IllegalArgumentException("IndexedDB anlık görüntüsü çok büyük")
+            }
+            invoke.resolve(JSObject().put("value", seal(purpose, json)))
+          } catch (e: Exception) {
+            invoke.reject("IndexedDB şifrelemesi başarısız: ${e.message}", e)
+          }
+        }
       }
-      try {
-        invoke.resolve(JSObject().put("value", seal(purpose, result)))
-      } catch (e: Exception) {
-        invoke.reject("IndexedDB şifrelemesi başarısız: ${e.message}", e)
-      }
+    } catch (e: Exception) {
+      invoke.reject("IndexedDB dışa aktarımı başlatılamadı", e)
     }
   }
 
-  /** Restore an [`indexeddb_export`] blob into the loaded page. */
+  /** Restore an [`indexeddb_export`] blob, preserving its stores and indexes. */
   @Command
   fun indexeddb_import(invoke: Invoke) {
     val args = invoke.getArgs()
@@ -234,30 +258,248 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.reject("value gerekli"); return
     }
     try {
+      if (sealed.length > MAX_IDB_SEALED_CHARS) {
+        invoke.reject("IndexedDB anlık görüntüsü çok büyük"); return
+      }
       val json = openSealed(purpose, sealed)
       if (json.isEmpty()) {
         invoke.resolve(JSObject().put("ok", true)); return
       }
+      if (json.toByteArray(Charsets.UTF_8).size > MAX_IDB_SNAPSHOT_BYTES) {
+        invoke.reject("IndexedDB anlık görüntüsü çok büyük"); return
+      }
       val webView = sharedWebView ?: run {
         invoke.reject("WebView hazır değil"); return
       }
-      // Same no-interpolation rule: the payload becomes a parsed literal.
-      val js = "(async function(){try{var d=$json;" +
-        "for(var name in d){var spec=d[name];" +
-        "var db=await new Promise(function(res,rej){var r=indexedDB.open(name,spec.version||1);" +
-        "r.onupgradeneeded=function(){var b=r.result;" +
-        "for(var sn in spec.stores){if(!b.objectStoreNames.contains(sn))b.createObjectStore(sn);}};" +
-        "r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)}});" +
-        "for(var sn in spec.stores){await new Promise(function(res,rej){" +
-        "var tx=db.transaction(sn,'readwrite');var st=tx.objectStore(sn);" +
-        "spec.stores[sn].forEach(function(row){st.put(row.value,row.key);});" +
-        "tx.oncomplete=function(){res()};tx.onerror=function(){rej(tx.error)}});}" +
-        "db.close();}}catch(e){}})();"
-      webView.evaluateJavascript(js, null)
-      invoke.resolve(JSObject().put("ok", true))
+      val payload = Base64.encodeToString(json.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+      val stateKey = "__animehub_idb_${UUID.randomUUID().toString().replace("-", "")}"
+      val resultKey = "${stateKey}_result"
+      val payloadKey = "${stateKey}_payload"
+      val stateLiteral = JSONObject.quote(stateKey)
+      val resultLiteral = JSONObject.quote(resultKey)
+      val payloadLiteral = JSONObject.quote(payloadKey)
+      val bootstrap = "(function(){window[$stateLiteral]='pending';window[$resultLiteral]=null;" +
+        "window[$payloadLiteral]=[];return true;})()"
+      webView.evaluateJavascript(bootstrap) { started ->
+        if (started != "true") {
+          webView.evaluateJavascript(
+            "(function(){window[$stateLiteral]='cancelled';delete window[$resultLiteral];" +
+              "delete window[$payloadLiteral];return true;})()",
+            null,
+          )
+          invoke.reject("IndexedDB geri yüklemesi başlatılamadı")
+          return@evaluateJavascript
+        }
+        awaitJavascriptResult(webView, stateKey, resultKey, payloadKey) { result ->
+          if (result == "true") {
+            invoke.resolve(JSObject().put("ok", true))
+          } else {
+            invoke.reject("IndexedDB geri yüklenemedi")
+          }
+        }
+        appendJavascriptPayload(webView, payload, payloadKey) { uploaded ->
+          if (!uploaded) {
+            webView.evaluateJavascript(
+              "(function(){if(window[$stateLiteral]!=='cancelled')window[$stateLiteral]='error';" +
+                "delete window[$payloadLiteral];return true;})()",
+              null,
+            )
+          } else {
+            val startImport = "(function(){var s=$stateLiteral,r=$resultLiteral,p=$payloadLiteral;" +
+              "if(window[s]!=='pending'||!Array.isArray(window[p]))return false;" +
+              "var encoded=window[p].join('');delete window[p];" +
+              "($IMPORT_IDB_JS)(encoded,s).then(function(ok){" +
+              "if(window[s]==='cancelled'){delete window[s];delete window[r];return;}" +
+              "window[r]=!!ok;window[s]='done';},function(){" +
+              "if(window[s]==='cancelled'){delete window[s];delete window[r];return;}window[s]='error';});" +
+              "return true;})()"
+            try {
+              webView.evaluateJavascript(startImport) { result ->
+                if (result != "true") {
+                  webView.evaluateJavascript(
+                    "(function(){if(window[$stateLiteral]!=='cancelled')window[$stateLiteral]='error';" +
+                      "delete window[$payloadLiteral];return true;})()",
+                    null,
+                  )
+                }
+              }
+            } catch (e: Exception) {
+              webView.evaluateJavascript(
+                "(function(){if(window[$stateLiteral]!=='cancelled')window[$stateLiteral]='error';" +
+                  "delete window[$payloadLiteral];return true;})()",
+                null,
+              )
+            }
+          }
+        }
+      }
     } catch (e: Exception) {
       invoke.reject("IndexedDB çözülemedi", e)
     }
+  }
+
+  /** Append base64 chunks without sending a Binder-sized JavaScript string. */
+  private fun appendJavascriptPayload(
+    webView: WebView,
+    payload: String,
+    payloadKey: String,
+    onComplete: (Boolean) -> Unit,
+  ) {
+    val payloadLiteral = JSONObject.quote(payloadKey)
+
+    fun sendNext(offset: Int) {
+      if (offset >= payload.length) {
+        onComplete(true)
+        return
+      }
+      val end = minOf(offset + IDB_TRANSFER_CHUNK_CHARS, payload.length)
+      val chunkLiteral = JSONObject.quote(payload.substring(offset, end))
+      val js = "(function(){var p=window[$payloadLiteral];if(!Array.isArray(p))return false;" +
+        "p.push($chunkLiteral);return true;})()"
+      try {
+        webView.evaluateJavascript(js) { result ->
+          if (result == "true") sendNext(end) else onComplete(false)
+        }
+      } catch (_: Exception) {
+        onComplete(false)
+      }
+    }
+
+    sendNext(0)
+  }
+
+  /**
+   * Poll a one-shot asynchronous page operation until it reports a result.
+   * Large string results are fetched in bounded chunks; completion is delivered
+   * on the WebView thread and timeouts cancel any pending page-side work.
+   */
+  private fun awaitJavascriptResult(
+    webView: WebView,
+    stateKey: String,
+    resultKey: String,
+    payloadKey: String? = null,
+    onResult: (String?) -> Unit,
+  ) {
+    val stateLiteral = JSONObject.quote(stateKey)
+    val resultLiteral = JSONObject.quote(resultKey)
+    val payloadLiteral = payloadKey?.let { JSONObject.quote(it) }
+    val deletePayload = payloadLiteral?.let { "delete window[$it];" } ?: ""
+    val pollScript = "(function(){var s=window[$stateLiteral];" +
+      "if(s==='pending')return 'pending';" +
+      "if(s==='error'||s==='cancelled'){delete window[$stateLiteral];delete window[$resultLiteral];" +
+      "$deletePayload return 'error';}" +
+      "if(s==='done'){var r=window[$resultLiteral];delete window[$stateLiteral];" +
+      "if(typeof r==='string'){$deletePayload return 'string:'+r.length;}" +
+      "delete window[$resultLiteral];$deletePayload return 'value:'+String(r);}return 'missing';})()"
+    val cleanupScript = "(function(){window[$stateLiteral]='cancelled';delete window[$resultLiteral];" +
+      "$deletePayload return true;})()"
+    val cleanupResultScript = "(function(){delete window[$resultLiteral];$deletePayload return true;})()"
+    var finished = false
+    var timeout: Runnable? = null
+
+    fun finish(result: String?) {
+      if (finished) return
+      finished = true
+      timeout?.let { webView.removeCallbacks(it) }
+      onResult(result)
+    }
+
+    fun cancelPageOperation() {
+      try {
+        webView.evaluateJavascript(cleanupScript, null)
+      } catch (_: Exception) {
+        // The WebView may already be detached or navigating away.
+      }
+    }
+
+    fun readChunk(offset: Int, length: Int, builder: StringBuilder) {
+      if (finished) return
+      if (offset >= length) {
+        try {
+          webView.evaluateJavascript(cleanupResultScript, null)
+        } catch (_: Exception) {
+          // The snapshot is already in memory; cleanup is best effort.
+        }
+        finish(builder.toString())
+        return
+      }
+      val end = minOf(offset + IDB_TRANSFER_CHUNK_CHARS, length)
+      val chunkScript = "(function(){var v=window[$resultLiteral];" +
+        "if(typeof v!=='string'||v.length<$end)return null;return v.slice($offset,$end);})()"
+      try {
+        webView.evaluateJavascript(chunkScript) { raw ->
+          if (finished) return@evaluateJavascript
+          try {
+            val chunk = raw?.let { JSONTokener(it).nextValue() as? String }
+              ?: throw IllegalArgumentException("JavaScript chunk was not a string")
+            if (chunk.length != end - offset) throw IllegalArgumentException("JavaScript chunk size mismatch")
+            builder.append(chunk)
+            readChunk(end, length, builder)
+          } catch (_: Exception) {
+            cancelPageOperation()
+            finish(null)
+          }
+        }
+      } catch (_: Exception) {
+        cancelPageOperation()
+        finish(null)
+      }
+    }
+
+    timeout = Runnable {
+      if (!finished) {
+        cancelPageOperation()
+        finish(null)
+      }
+    }
+    if (!webView.postDelayed(timeout!!, IDB_OPERATION_TIMEOUT_MS)) {
+      cancelPageOperation()
+      finish(null)
+      return
+    }
+
+    fun poll() {
+      if (finished) return
+      try {
+        webView.evaluateJavascript(pollScript) { raw ->
+          if (finished) return@evaluateJavascript
+          try {
+            val response = raw?.let { JSONTokener(it).nextValue() as? String }
+              ?: throw IllegalArgumentException("JavaScript operation returned no status")
+            when {
+              response == "pending" -> {
+                if (!webView.postDelayed({ poll() }, IDB_POLL_INTERVAL_MS)) {
+                  cancelPageOperation()
+                  finish(null)
+                }
+              }
+              response == "error" || response == "missing" -> finish(null)
+              response.startsWith("string:") -> {
+                val length = response.removePrefix("string:").toIntOrNull()
+                if (length == null || length < 0 || length > MAX_IDB_SNAPSHOT_CHARS) {
+                  cancelPageOperation()
+                  finish(null)
+                } else {
+                  readChunk(0, length, StringBuilder(length))
+                }
+              }
+              response.startsWith("value:") -> finish(response.removePrefix("value:"))
+              else -> {
+                cancelPageOperation()
+                finish(null)
+              }
+            }
+          } catch (_: Exception) {
+            cancelPageOperation()
+            finish(null)
+          }
+        }
+      } catch (_: Exception) {
+        cancelPageOperation()
+        finish(null)
+      }
+    }
+    poll()
   }
 
   /** Seal a JSON payload with the Keystore key for `purpose` (IV-prefixed b64). */
@@ -272,7 +514,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   private fun openSealed(purpose: String, sealed: String): String {
     if (sealed.isEmpty()) return ""
     val combined = Base64.decode(sealed, Base64.NO_WRAP)
-    if (combined.size <= GCM_IV_LENGTH) return ""
+    if (combined.size < GCM_IV_LENGTH + GCM_TAG_BITS / 8) {
+      throw IllegalArgumentException("Şifreli değer çok kısa")
+    }
     val iv = combined.copyOfRange(0, GCM_IV_LENGTH)
     val ct = combined.copyOfRange(GCM_IV_LENGTH, combined.size)
     val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -333,44 +577,439 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     private const val GCM_IV_LENGTH = 12
     private const val GCM_TAG_BITS = 128
 
+    private const val IDB_OPERATION_TIMEOUT_MS = 30_000L
+    private const val IDB_POLL_INTERVAL_MS = 50L
+    private const val IDB_TRANSFER_CHUNK_CHARS = 48 * 1024
+    private const val MAX_IDB_SNAPSHOT_BYTES = 16 * 1024 * 1024
+    private const val MAX_IDB_SNAPSHOT_CHARS = MAX_IDB_SNAPSHOT_BYTES
+    private const val MAX_IDB_SEALED_CHARS = 24 * 1024 * 1024
+
     /**
-     * Best-effort dump of every IndexedDB database on the current origin:
-     * `{ "<db>": { "version": n, "stores": { "<store>": [ {key, value} ] } } }`.
-     * Returns `"{}"` (never `null`) on any internal failure so the caller can
-     * treat a missing dump and an empty one identically.
+     * Export database schema and rows. Object values are encoded into
+     * JSON-safe tagged records so Blob/File, dates, binary buffers and common
+     * structured-clone containers survive the JavaScript bridge.
      */
     private val EXPORT_IDB_JS = """
-        (async function(){
-          var out={};
-          function openDb(name,version){return new Promise(function(res,rej){
-            var r=indexedDB.open(name,version||undefined);
-            r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)};});}
-          try{
-            var dbs=await indexedDB.databases();
-            for(var i=0;i<dbs.length;i++){
-              var name=dbs[i].name;if(!name)continue;
-              var db=await openDb(name,dbs[i].version);
-              var stores={};
-              for(var j=0;j<db.objectStoreNames.length;j++){
-                var sn=db.objectStoreNames[j];
-                var rows=await new Promise(function(res,rej){
-                  var tx=db.transaction(sn,'readonly');
-                  var st=tx.objectStore(sn);
-                  var keys=st.getAllKeys();var vals=st.getAll();
-                  var failed=function(){rej(keys.error||vals.error||new Error('getAll'))};
-                  keys.onsuccess=function(){vals.onsuccess=function(){
-                    res(vals.result.map(function(v,k){return{key:keys.result[k],value:v}}))};
-                    vals.onerror=failed};
-                  keys.onerror=failed;vals.onerror=failed;});
-                stores[sn]=rows;
-              }
-              out[name]={version:db.version,stores:stores};
-              db.close();
+        async function() {
+          var maxBinaryBytes = 8 * 1024 * 1024;
+          var maxRowsPerStore = 50000;
+          var budget = {binaryBytes: 0};
+          function reserveBinary(size) {
+            if (size > maxBinaryBytes - budget.binaryBytes) throw new Error('binary limit');
+            budget.binaryBytes += size;
+          }
+          function requestValue(request) {
+            return new Promise(function(resolve, reject) {
+              request.onsuccess = function() { resolve(request.result); };
+              request.onerror = function() { reject(request.error || new Error('IDB request')); };
+            });
+          }
+          function blobToBase64(blob) {
+            return new Promise(function(resolve, reject) {
+              var reader = new FileReader();
+              reader.onload = function() {
+                var value = String(reader.result || '');
+                var comma = value.indexOf(',');
+                if (comma < 0) reject(new Error('Blob encoding'));
+                else resolve(value.slice(comma + 1));
+              };
+              reader.onerror = function() { reject(reader.error || new Error('Blob read')); };
+              reader.onabort = function() { reject(new Error('Blob read aborted')); };
+              reader.readAsDataURL(blob);
+            });
+          }
+          function bytesToBase64(bytes) {
+            var chunks = [];
+            for (var offset = 0; offset < bytes.length; offset += 32768) {
+              var end = Math.min(offset + 32768, bytes.length);
+              var chunk = '';
+              for (var i = offset; i < end; i++) chunk += String.fromCharCode(bytes[i]);
+              chunks.push(chunk);
             }
-          }catch(e){return '{}';}
-          return out;
-        })()
-    """.trimIndent().replace("\n", "")
+            return btoa(chunks.join(''));
+          }
+          async function encodeValue(value, seen) {
+            if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+            if (typeof value === 'number') {
+              if (Number.isNaN(value)) return {t:'number',v:'NaN'};
+              if (value === Infinity) return {t:'number',v:'Infinity'};
+              if (value === -Infinity) return {t:'number',v:'-Infinity'};
+              if (Object.is(value, -0)) return {t:'number',v:'-0'};
+              return value;
+            }
+            if (typeof value === 'undefined') return {t:'undefined'};
+            if (typeof value === 'bigint') return {t:'bigint',v:value.toString()};
+            if (typeof value === 'function' || typeof value === 'symbol') throw new Error('unsupported value');
+            if (seen.has(value)) throw new Error('cyclic value');
+            seen.add(value);
+            try {
+              if (value instanceof Date) {
+                var dateValue = value.getTime();
+                return {t:'date',v:Number.isNaN(dateValue) ? 'NaN' : dateValue};
+              }
+              if (typeof Blob !== 'undefined' && value instanceof Blob) {
+                reserveBinary(value.size);
+                var isFile = typeof File !== 'undefined' && value instanceof File;
+                var blobRecord = {t:isFile ? 'file' : 'blob',mime:value.type,data:await blobToBase64(value)};
+                if (isFile) {
+                  blobRecord.name = value.name;
+                  blobRecord.lastModified = value.lastModified;
+                }
+                return blobRecord;
+              }
+              if (value instanceof ArrayBuffer) {
+                reserveBinary(value.byteLength);
+                return {t:'arraybuffer',data:bytesToBase64(new Uint8Array(value))};
+              }
+              if (ArrayBuffer.isView(value)) {
+                var viewBytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+                reserveBinary(viewBytes.byteLength);
+                var viewKind = value instanceof DataView ? 'DataView' : value.constructor.name;
+                return {t:'typedarray',kind:viewKind,data:bytesToBase64(viewBytes)};
+              }
+              if (Array.isArray(value)) {
+                var items = [];
+                for (var a = 0; a < value.length; a++) {
+                  items.push(a in value ? await encodeValue(value[a], seen) : {t:'hole'});
+                }
+                return {t:'array',v:items};
+              }
+              if (value instanceof Map) {
+                var entries = [];
+                for (var pair of value.entries()) {
+                  entries.push([await encodeValue(pair[0], seen), await encodeValue(pair[1], seen)]);
+                }
+                return {t:'map',v:entries};
+              }
+              if (value instanceof Set) {
+                var members = [];
+                for (var member of value.values()) members.push(await encodeValue(member, seen));
+                return {t:'set',v:members};
+              }
+              if (value instanceof RegExp) return {t:'regexp',source:value.source,flags:value.flags,lastIndex:value.lastIndex};
+              var prototype = Object.getPrototypeOf(value);
+              if (prototype !== Object.prototype && prototype !== null) throw new Error('unsupported object');
+              var properties = [];
+              var propertyNames = Object.keys(value);
+              for (var p = 0; p < propertyNames.length; p++) {
+                var propertyName = propertyNames[p];
+                properties.push([propertyName, await encodeValue(value[propertyName], seen)]);
+              }
+              return {t:'object',nullPrototype:prototype === null,v:properties};
+            } finally {
+              seen.delete(value);
+            }
+          }
+          function openDatabase(name, version) {
+            return new Promise(function(resolve, reject) {
+              var request = typeof version === 'number' ? indexedDB.open(name, version) : indexedDB.open(name);
+              request.onsuccess = function() { resolve(request.result); };
+              request.onerror = function() { reject(request.error || new Error('IDB open')); };
+              request.onblocked = function() { reject(new Error('IDB open blocked')); };
+            });
+          }
+          var databaseInfo = await indexedDB.databases();
+          if (!databaseInfo || typeof databaseInfo.length !== 'number') throw new Error('database listing unavailable');
+          var databases = Object.create(null);
+          for (var d = 0; d < databaseInfo.length; d++) {
+            var info = databaseInfo[d];
+            var databaseName = info.name;
+            if (!databaseName) continue;
+            var database = await openDatabase(databaseName, info.version);
+            try {
+              var stores = Object.create(null);
+              for (var s = 0; s < database.objectStoreNames.length; s++) {
+                var storeName = database.objectStoreNames.item(s);
+                var transaction = database.transaction(storeName, 'readonly');
+                var store = transaction.objectStore(storeName);
+                var storeKeyPath = store.keyPath;
+                var storeAutoIncrement = store.autoIncrement;
+                var indexes = [];
+                for (var ix = 0; ix < store.indexNames.length; ix++) {
+                  var index = store.index(store.indexNames.item(ix));
+                  indexes.push({name:index.name,keyPath:index.keyPath,unique:index.unique,multiEntry:index.multiEntry});
+                }
+                var keyRequest = store.getAllKeys(undefined, maxRowsPerStore + 1);
+                var valueRequest = store.getAll(undefined, maxRowsPerStore + 1);
+                var results = await Promise.all([requestValue(keyRequest), requestValue(valueRequest)]);
+                var keys = results[0];
+                var values = results[1];
+                if (keys.length > maxRowsPerStore) throw new Error('IDB row limit');
+                if (keys.length !== values.length) throw new Error('IDB row mismatch');
+                var rows = [];
+                for (var r = 0; r < keys.length; r++) {
+                  rows.push({
+                    key: await encodeValue(keys[r], new WeakSet()),
+                    value: await encodeValue(values[r], new WeakSet())
+                  });
+                }
+                stores[storeName] = {
+                  keyPath:storeKeyPath,
+                  autoIncrement:storeAutoIncrement,
+                  indexes:indexes,
+                  rows:rows
+                };
+              }
+              databases[databaseName] = {version:database.version,stores:stores};
+            } finally {
+              database.close();
+            }
+          }
+          return {format:'animehub-idb',version:2,databases:databases};
+        }
+    """.trimIndent()
+
+    /** Accepts both legacy v1 row dumps and the schema-preserving v2 envelope. */
+    private val IMPORT_IDB_JS = """
+        async function(encoded, stateKey) {
+          function ensureActive() {
+            if (window[stateKey] === 'cancelled') throw new Error('cancelled');
+          }
+          function decodeBase64Utf8(value) {
+            var binary = atob(value);
+            var bytes = new Uint8Array(binary.length);
+            for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            if (typeof TextDecoder !== 'undefined') return new TextDecoder('utf-8', {fatal:true}).decode(bytes);
+            throw new Error('UTF-8 decoder unavailable');
+          }
+          function bytesFromBase64(value) {
+            var binary = atob(value);
+            var bytes = new Uint8Array(binary.length);
+            for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes;
+          }
+          function decodeValue(value) {
+            if (value === null || typeof value !== 'object' || !value.t) return value;
+            switch (value.t) {
+              case 'undefined': return undefined;
+              case 'hole': return undefined;
+              case 'number':
+                if (value.v === 'NaN') return NaN;
+                if (value.v === 'Infinity') return Infinity;
+                if (value.v === '-Infinity') return -Infinity;
+                if (value.v === '-0') return -0;
+                throw new Error('bad number');
+              case 'bigint': return BigInt(value.v);
+              case 'date': return new Date(value.v === 'NaN' ? NaN : value.v);
+              case 'blob': return new Blob([bytesFromBase64(value.data)], {type:value.mime || ''});
+              case 'file':
+                if (typeof File === 'undefined') throw new Error('File unavailable');
+                return new File([bytesFromBase64(value.data)], value.name || '', {
+                  type:value.mime || '',lastModified:value.lastModified || 0
+                });
+              case 'arraybuffer': return bytesFromBase64(value.data).buffer;
+              case 'typedarray': {
+                var bytes = bytesFromBase64(value.data);
+                if (value.kind === 'DataView') return new DataView(bytes.buffer);
+                var allowed = ['Int8Array','Uint8Array','Uint8ClampedArray','Int16Array','Uint16Array',
+                  'Int32Array','Uint32Array','Float32Array','Float64Array','BigInt64Array','BigUint64Array'];
+                if (allowed.indexOf(value.kind) < 0 || typeof window[value.kind] !== 'function') throw new Error('typed array unavailable');
+                return new window[value.kind](bytes.buffer);
+              }
+              case 'array': {
+                var array = new Array(value.v.length);
+                for (var a = 0; a < value.v.length; a++) {
+                  if (!value.v[a] || value.v[a].t !== 'hole') array[a] = decodeValue(value.v[a]);
+                }
+                return array;
+              }
+              case 'map': {
+                var map = new Map();
+                value.v.forEach(function(pair) { map.set(decodeValue(pair[0]), decodeValue(pair[1])); });
+                return map;
+              }
+              case 'set': {
+                var set = new Set();
+                value.v.forEach(function(member) { set.add(decodeValue(member)); });
+                return set;
+              }
+              case 'regexp': {
+                var expression = new RegExp(value.source, value.flags);
+                expression.lastIndex = value.lastIndex || 0;
+                return expression;
+              }
+              case 'object': {
+                var object = value.nullPrototype ? Object.create(null) : {};
+                value.v.forEach(function(entry) {
+                  Object.defineProperty(object, entry[0], {
+                    value:decodeValue(entry[1]),enumerable:true,writable:true,configurable:true
+                  });
+                });
+                return object;
+              }
+              default: throw new Error('unknown value encoding');
+            }
+          }
+          function sameKeyPath(left, right) {
+            return JSON.stringify(left) === JSON.stringify(right);
+          }
+          function databaseHasStores(database, stores) {
+            var storeNames = Object.keys(stores);
+            for (var i = 0; i < storeNames.length; i++) {
+              if (!database.objectStoreNames.contains(storeNames[i])) return false;
+            }
+            return true;
+          }
+          function databaseMatchesSchema(database, stores) {
+            var storeNames = Object.keys(stores);
+            var matches = database.objectStoreNames.length === storeNames.length;
+            for (var s = 0; matches && s < storeNames.length; s++) {
+              var storeName = storeNames[s];
+              var expected = stores[storeName];
+              if (!expected || Array.isArray(expected) || !database.objectStoreNames.contains(storeName)) {
+                matches = false;
+                break;
+              }
+              var store = database.transaction(storeName, 'readonly').objectStore(storeName);
+              if (!sameKeyPath(store.keyPath, expected.keyPath) ||
+                  store.autoIncrement !== !!expected.autoIncrement) {
+                matches = false;
+                break;
+              }
+              var expectedIndexes = Array.isArray(expected.indexes) ? expected.indexes : [];
+              if (store.indexNames.length !== expectedIndexes.length) {
+                matches = false;
+                break;
+              }
+              for (var i = 0; matches && i < expectedIndexes.length; i++) {
+                var expectedIndex = expectedIndexes[i];
+                if (!store.indexNames.contains(expectedIndex.name)) {
+                  matches = false;
+                  break;
+                }
+                var actualIndex = store.index(expectedIndex.name);
+                if (!sameKeyPath(actualIndex.keyPath, expectedIndex.keyPath) ||
+                    actualIndex.unique !== !!expectedIndex.unique ||
+                    actualIndex.multiEntry !== !!expectedIndex.multiEntry) matches = false;
+              }
+            }
+            return matches;
+          }
+          function openDatabase(name, spec, version, replaceSchema, stateKey) {
+            return new Promise(function(resolve, reject) {
+              var request = typeof version === 'number' ? indexedDB.open(name, version) : indexedDB.open(name);
+              request.onupgradeneeded = function() {
+                try {
+                  if (window[stateKey] === 'cancelled') {
+                    request.transaction.abort();
+                    return;
+                  }
+                  var database = request.result;
+                  var transaction = request.transaction;
+                  if (replaceSchema) {
+                    while (database.objectStoreNames.length) {
+                      database.deleteObjectStore(database.objectStoreNames.item(0));
+                    }
+                  }
+                  Object.keys(spec.stores || {}).forEach(function(storeName) {
+                    var storeInfo = spec.stores[storeName];
+                    var legacy = Array.isArray(storeInfo);
+                    var schema = legacy ? null : storeInfo;
+                    var store;
+                    if (!database.objectStoreNames.contains(storeName)) {
+                      var options = {};
+                      if (schema && schema.keyPath !== null && schema.keyPath !== undefined) options.keyPath = schema.keyPath;
+                      if (schema && schema.autoIncrement) options.autoIncrement = true;
+                      store = database.createObjectStore(storeName, options);
+                    } else {
+                      store = transaction.objectStore(storeName);
+                    }
+                    if (schema && Array.isArray(schema.indexes)) {
+                      schema.indexes.forEach(function(index) {
+                        if (!store.indexNames.contains(index.name)) {
+                          store.createIndex(index.name, index.keyPath, {
+                            unique:!!index.unique,multiEntry:!!index.multiEntry
+                          });
+                        }
+                      });
+                    }
+                  });
+                } catch (error) {
+                  try { request.transaction.abort(); } catch (_) {}
+                }
+              };
+              request.onsuccess = function() {
+                if (window[stateKey] === 'cancelled') {
+                  request.result.close();
+                  reject(new Error('cancelled'));
+                } else {
+                  resolve(request.result);
+                }
+              };
+              request.onerror = function() { reject(request.error || new Error('IDB open')); };
+              // The open request cannot be canceled when blocked. Leave it pending;
+              // if the bridge times out, onupgradeneeded will abort after unblocking.
+              request.onblocked = function() {};
+            });
+          }
+          ensureActive();
+          var parsed = JSON.parse(decodeBase64Utf8(encoded));
+          var isV2 = !!(parsed && parsed.format === 'animehub-idb' && parsed.version === 2 && parsed.databases);
+          var databases = isV2 ? parsed.databases : parsed;
+          if (!databases || typeof databases !== 'object') throw new Error('bad snapshot');
+          var databaseNames = Object.keys(databases);
+          for (var d = 0; d < databaseNames.length; d++) {
+            ensureActive();
+            var name = databaseNames[d];
+            var spec = databases[name];
+            if (!spec || !spec.stores || typeof spec.stores !== 'object') throw new Error('bad database');
+            var savedVersion = Number(spec.version);
+            if (!Number.isSafeInteger(savedVersion) || savedVersion < 1) savedVersion = 1;
+            var database = await openDatabase(name, spec, undefined, isV2, stateKey);
+            try {
+              ensureActive();
+              var compatibleSchema = isV2
+                ? databaseMatchesSchema(database, spec.stores)
+                : databaseHasStores(database, spec.stores);
+              if (database.version < savedVersion || !compatibleSchema) {
+                var version = Math.max(
+                  savedVersion,
+                  !compatibleSchema ? database.version + 1 : database.version
+                );
+                database.close();
+                database = await openDatabase(name, spec, version, isV2, stateKey);
+                ensureActive();
+              }
+              var storeNames = Object.keys(spec.stores || {});
+              for (var s = 0; s < storeNames.length; s++) {
+                ensureActive();
+                var storeName = storeNames[s];
+                var storeInfo = spec.stores[storeName];
+                var legacy = Array.isArray(storeInfo);
+                var schema = legacy ? null : storeInfo;
+                var rows = legacy ? storeInfo : storeInfo.rows;
+                if (!Array.isArray(rows)) throw new Error('bad rows');
+                ensureActive();
+                await new Promise(function(resolve, reject) {
+                  var transaction = database.transaction(storeName, 'readwrite');
+                  var store = transaction.objectStore(storeName);
+                  transaction.oncomplete = function() { resolve(); };
+                  transaction.onerror = function() { reject(transaction.error || new Error('IDB write')); };
+                  transaction.onabort = function() { reject(transaction.error || new Error('IDB aborted')); };
+                  try {
+                    ensureActive();
+                    store.clear();
+                    rows.forEach(function(row) {
+                      ensureActive();
+                      var value = isV2 ? decodeValue(row.value) : row.value;
+                      var keyPath = schema ? schema.keyPath : store.keyPath;
+                      if (keyPath !== null && keyPath !== undefined) store.put(value);
+                      else store.put(value, isV2 ? decodeValue(row.key) : row.key);
+                    });
+                  } catch (error) {
+                    try { transaction.abort(); } catch (_) {}
+                    reject(error);
+                  }
+                });
+              }
+            } finally {
+              database.close();
+            }
+          }
+          return true;
+        }
+    """.trimIndent()
+
 
     /** Return the existing key for `purpose`, generating one on first use. */
     private fun keyFor(purpose: String): SecretKey {
