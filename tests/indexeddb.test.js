@@ -15,11 +15,19 @@ const KOTLIN_PATH = join(
 const KOTLIN = readFileSync(KOTLIN_PATH, "utf8");
 
 function rawKotlinString(name, source = KOTLIN) {
-  const match = source.match(
-    new RegExp(`private val ${name} = """\\r?\\n([\\s\\S]*?)\\r?\\n    """.trimIndent\\(\\)`),
+  const normalizedSource = source.replace(/\r+\n/g, "\n").replace(/\r/g, "\n");
+  const match = normalizedSource.match(
+    new RegExp(`private val ${name} = """\\n([\\s\\S]*?)\\n    """.trimIndent\\(\\)`),
   );
-  assert.ok(match, `could not find ${name} Kotlin raw string`);
-  const lines = match[1].replace(/\r\n/g, "\n").split("\n");
+  if (!match) {
+    const declaration = normalizedSource
+      .split("\n")
+      .find((line) => line.includes(`private val ${name}`));
+    throw new Error(
+      `could not find ${name} Kotlin raw string; declaration=${JSON.stringify(declaration ?? null)}`,
+    );
+  }
+  const lines = match[1].split("\n");
   const indent = Math.min(
     ...lines.filter((line) => line.trim()).map((line) => line.match(/^ */)[0].length),
   );
@@ -353,10 +361,15 @@ async function importSnapshot(indexedDB, snapshot) {
   return importFunction(jsonPayload(snapshot), "__animehub_test");
 }
 
-test("Kotlin raw-string extraction accepts Windows CRLF checkouts", () => {
-  const crlfSource = KOTLIN.replace(/\n/g, "\r\n");
-  assert.equal(rawKotlinString("EXPORT_IDB_JS", crlfSource), EXPORT_JS);
-  assert.equal(rawKotlinString("IMPORT_IDB_JS", crlfSource), IMPORT_JS);
+test("Kotlin raw-string extraction normalizes platform line endings", () => {
+  for (const source of [
+    KOTLIN.replace(/\n/g, "\r\n"),
+    KOTLIN.replace(/\n/g, "\r"),
+    KOTLIN.replace(/\n/g, "\r\r\n"),
+  ]) {
+    assert.equal(rawKotlinString("EXPORT_IDB_JS", source), EXPORT_JS);
+    assert.equal(rawKotlinString("IMPORT_IDB_JS", source), IMPORT_JS);
+  }
 });
 
 test("Android IndexedDB bridge JS parses and uses a bounded, explicit async bridge", () => {

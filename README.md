@@ -362,22 +362,24 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 | Doğrulama | Sonuç |
 |---|---|
-| `npm test` | **65 test geçti**, 0 hata |
-| `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | GitHub Actions'ta yeşil — Tests işi `ubuntu-24.04`, `macos-latest` ve `windows-latest` üzerinde |
+| `npm test` | **71 test geçti**, 0 hata |
+| `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | CI'da `ubuntu-24.04`, `macos-latest` ve `windows-latest` üzerinde çalışır |
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
 | Android APK derlemesi (aarch64, armv7, x86_64) | yeşil — `release-android.yml` ve CI'daki Android compile işi; `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla |
-| **v0.3.0 yayın paketleri** | doğrulandı: 3 **imzalı** APK + `AnimeHub_0.3.0_x64-setup.exe` + `.deb`/`.rpm`/AppImage (7/7 asset); `main` CI'sı tam yeşil |
+| **v0.3.1 yayın paketleri** | doğrulandı: 3 **imzalı** APK + Windows NSIS kurulum dosyası + Linux `.deb`/`.rpm`/AppImage (7/7 asset) |
 | Windows kurulumu | Windows üzerinde elle doğrulandı (DPAPI + WebView2 profili) |
 | Bağımlılık güvenliği | `npm audit` → 0 açık; `cargo audit` CI'da her koşuda; Dependabot (cargo/npm/actions) haftalık güncelleme açar; açık bildirimi için [SECURITY.md](./SECURITY.md) |
 | Frontend derlemesi | CI'da `npm run build` (Vite 8 + rolldown) her PR'da koşar; sürüm yayınında `tauri build` aynı adımı kullanır |
 
 **Hâlâ doğrulanmayanlar:**
 
-- **Android cihaz testi.** APK derlenip imzalanıyor; elle cihaz doğrulaması
-  yapılmadı (PiP, çerez takası, localStorage/IndexedDB şifreli aktarımı ve
-  geri katmanı dahil). IndexedDB aktarımının kayıpsız olmadığı bilinir:
-  ikincil indeksler ve Blob değerleri taşınmaz.
+- **Android cihaz testi.** APK derlenip imzalanıyor; PiP, çerez takası,
+  localStorage/IndexedDB şifreli aktarımı ve geri yükleme akışı henüz fiziksel
+  cihazda elle doğrulanmadı. IndexedDB v2 aktarım kodu şemayı, ikincil
+  indeksleri, satır anahtarlarını ve desteklenen structured-clone değerlerini
+  korur; v1 anlık görüntülerini içe aktarma uyumluluğu da vardır. Gerçek
+  WebView/AndroidKeyStore uçtan uca davranışı cihaz testi bekliyor.
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.
