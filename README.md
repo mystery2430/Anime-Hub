@@ -123,8 +123,10 @@ ulaşamaz.
 > şifreli blob'lara aktarır: çerez kavanozuna ek olarak `localStorage` ve
 > IndexedDB de AndroidKeyStore ile mühürlenir, hedef sitenin sayfası
 > yüklendiğinde geri yüklenir ve oturum açıkken 30 saniyede bir (depo
-> blob'ları daha seyrek) tazelenir. IndexedDB aktarımı **en iyi çaba**
-> ilkesiyle çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler,
+> blob'ları daha seyrek) tazelenir. Depo geri yükleme/eşitlemesi host adıyla
+> yetinmez; **şema + host + etkin port** eşleşmelidir. Aynı alan adındaki
+> başka port veya şemaya başka sitenin verisi yazılmaz. IndexedDB aktarımı
+> **en iyi çaba** ilkesiyle çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler,
 > key path ve Blob türü değerler korunmaz). Bu mekanizma henüz bir cihazda
 > doğrulanmadı; doğrulama tamamlanana kadar ayrıştırma eksik kalırsa ekranda
 > uyarı gösterilir.
@@ -162,9 +164,10 @@ bir sitenin verisini asla başka bir sitenin blob'una yazamaz.
   `https://192.168.1.1/` adresine yönlendirmeye çalışırsa kesilir; bu kural
   `tests/audit.rs` içinde regresyon testiyle kilitlidir.
 - **DNS rebinding.** Herkese açık görünen bir ad, gezinti veya site açılışı
-  anında özel bir adrese çözülüyorsa kesilir. Çözümleme eşzamanlı kalır
-  (kısa zaman aşımı, `web/dns.rs`); zaman aşımında metin politikası geçerli
-  kalır, DNS kesintisi siteleri kapatmaz. Sayfa yüklendikten sonra WebView'ın
+  anında özel bir adrese çözülüyorsa kesilir. Çözümleme kısa zaman aşımıyla
+  çalışır (`web/dns.rs`); aynı host için eşzamanlı gezinmeler tek DNS
+  sorgusunun sonucunu paylaşır. Zaman aşımında metin politikası geçerli kalır,
+  DNS kesintisi siteleri kapatmaz. Sayfa yüklendikten sonra WebView'ın
   kendi çözümleyicisiyle yapılan alt istekler (XHR/`fetch`) bu kontrolden
   geçmez — onu kapatmak bir filtreleyen vekil ister ve v1'de yok.
 - **Alan adı engel listesi** reklam ve izleyici alanlarını istek düzeyinde

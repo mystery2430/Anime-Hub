@@ -45,6 +45,9 @@ pub struct AppState {
 pub struct CurrentSite {
     pub site_id: String,
     pub host: String,
+    /// Canonical origin that owns the Android localStorage/IndexedDB blob.
+    /// Host-only matching would cross scheme or port boundaries.
+    pub origin: String,
     pub window_label: String,
     /// Desktop: `true` when opening the site is what put the window into
     /// fullscreen, so closing it may restore the windowed state. Kept

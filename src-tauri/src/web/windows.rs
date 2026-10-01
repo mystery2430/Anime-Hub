@@ -34,7 +34,9 @@ use crate::web::dns::{classify_host, DnsClass};
 // desktop child-webview snapshot); `restore` only serves the mobile import.
 #[cfg(mobile)]
 use crate::web::session::restore;
-use crate::web::session::{capture, profile_dir_name, CookieJar};
+use crate::web::session::{capture, origin_key, profile_dir_name, CookieJar};
+#[cfg(mobile)]
+use crate::web::session::url_has_origin;
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
 use tauri::{AppHandle, Emitter, Manager};
@@ -277,6 +279,7 @@ fn open_in_main_window(
         let value = CurrentSite {
             site_id: site.id.clone(),
             host,
+            origin: origin_key(url),
             window_label: label.clone(),
             entered_fullscreen,
         };
@@ -355,9 +358,20 @@ pub fn install_main_window_handlers(app: &AppHandle) {
 /// write into a site's blob must re-derive ownership from the *current* state
 /// rather than trust a value captured when the thread was spawned, so a stale
 /// thread can never write one site's session data into another site's blob.
+#[cfg(any(desktop, test))]
 fn session_is_current(state: &AppState, site_id: &str) -> bool {
     let current = state.current_site.lock().expect("current_site lock");
     current.as_ref().is_some_and(|c| c.site_id == site_id)
+}
+
+/// Mobile storage belongs to a specific site *and* origin, not just a host.
+/// A different scheme/port on the same hostname must not receive the blob.
+#[cfg(any(mobile, test))]
+fn session_is_current_origin(state: &AppState, site_id: &str, expected_origin: &str) -> bool {
+    let current = state.current_site.lock().expect("current_site lock");
+    current
+        .as_ref()
+        .is_some_and(|c| c.site_id == site_id && c.origin == expected_origin)
 }
 
 /// Snapshot the live session into the encrypted store on a fixed interval.
@@ -401,7 +415,13 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
 /// sense while the site's own page is the loaded document, and skipping the
 /// tick otherwise costs nothing.
 #[cfg(mobile)]
-fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: String) {
+fn spawn_session_sync(
+    app: AppHandle,
+    _label: String,
+    site_id: String,
+    host: String,
+    expected_origin: String,
+) {
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
@@ -416,13 +436,13 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
             }
             {
                 let state = app.state::<AppState>();
-                if !session_is_current(&state, &site_id) {
+                if !session_is_current_origin(&state, &site_id, &expected_origin) {
                     return;
                 }
             }
-            let loaded = window
-                .url()
-                .ok()
+            let current_url = window.url().ok();
+            let loaded = current_url
+                .as_ref()
                 .is_some_and(|u| u.host_str() == Some(host.as_str()));
             if !loaded {
                 continue;
@@ -431,8 +451,12 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
             if let Err(e) = export_cookies(&window, &site_id) {
                 log::warn!("dönemsel çerez eşitlemesi başarısız ({site_id}): {e}");
             }
-            if tick % STORAGE_SYNC_EVERY_N_TICKS == 0 {
-                export_site_storage(&app, &site_id);
+            if tick % STORAGE_SYNC_EVERY_N_TICKS == 0
+                && current_url
+                    .as_ref()
+                    .is_some_and(|u| url_has_origin(u, &expected_origin))
+            {
+                export_site_storage(&app, &site_id, &expected_origin);
             }
         }
     });
@@ -450,11 +474,12 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
 
     let state = app.state::<AppState>();
+    let expected_origin = origin_key(url);
 
-    // 1. Export the outgoing site's cookies and web storage while its page is
-    //    still the loaded origin — `localStorage`/IndexedDB reads must happen
-    //    before anything is cleared or navigated. The storage export is
-    //    best-effort and never blocks the switch.
+    // 1. Export the outgoing site's cookies and origin-scoped storage while
+    //    its page is still loaded. Cookie snapshots remain site-scoped; the
+    //    localStorage/IndexedDB blob is stricter and is written only if the
+    //    exact scheme/host/port still matches the registered origin.
     if let Some(current) = state
         .current_site
         .lock()
@@ -462,7 +487,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         .clone()
     {
         export_cookies(&window, &current.site_id)?;
-        export_site_storage(app, &current.site_id);
+        export_site_storage(app, &current.site_id, &current.origin);
     }
 
     // 2. Clear the shared jar, then load the target site's cookies.
@@ -486,6 +511,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
         site_id: site.id.clone(),
         host: site.host(),
+        origin: expected_origin.clone(),
         window_label: LAUNCHER_LABEL.into(),
         entered_fullscreen: false,
     });
@@ -497,6 +523,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         LAUNCHER_LABEL.to_string(),
         site.id.clone(),
         site.host(),
+        expected_origin.clone(),
     );
 
     // 4. Restore the target site's web storage once its page is loaded.
@@ -510,7 +537,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     let watcher_app = app.clone();
     let watcher_window = window;
     let watcher_site_id = site.id.clone();
-    let watcher_host = site.host();
+    let watcher_origin = expected_origin.clone();
     std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
@@ -522,12 +549,12 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
             let loaded = watcher_window
                 .url()
                 .ok()
-                .is_some_and(|u| u.host_str() == Some(watcher_host.as_str()));
+                .is_some_and(|u| url_has_origin(&u, &watcher_origin));
             if loaded {
                 break;
             }
         }
-        import_site_storage(&watcher_app, &watcher_site_id);
+        import_site_storage(&watcher_app, &watcher_site_id, &watcher_origin);
     });
 
     Ok(LAUNCHER_LABEL.to_string())
@@ -540,19 +567,28 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 /// stored state on the next visit, but never blocks closing or switching.
 /// Must run while the site page is still the loaded origin.
 #[cfg(mobile)]
-fn export_site_storage(app: &AppHandle, site_id: &str) {
-    let state = app.state::<AppState>();
+fn export_site_storage(app: &AppHandle, site_id: &str, expected_origin: &str) {
+    let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
+        return;
+    };
     let purpose = format!("site-{site_id}");
-    for (kind, result) in [
-        (
-            "localstorage",
-            crate::android_bridge::localstorage_export(&purpose),
-        ),
-        (
-            "indexeddb",
-            crate::android_bridge::indexeddb_export(&purpose),
-        ),
-    ] {
+    for kind in ["localstorage", "indexeddb"] {
+        // Re-check ownership and the actual page before each bridge call: a
+        // redirect or a rapid site switch must not snapshot another origin.
+        let state = app.state::<AppState>();
+        if !session_is_current_origin(&state, site_id, expected_origin)
+            || !window
+                .url()
+                .ok()
+                .is_some_and(|u| url_has_origin(&u, expected_origin))
+        {
+            return;
+        }
+        let result = if kind == "localstorage" {
+            crate::android_bridge::localstorage_export(&purpose)
+        } else {
+            crate::android_bridge::indexeddb_export(&purpose)
+        };
         match result {
             // An empty export means the page had no storage yet — storing an
             // empty blob would only add noise, skip it.
@@ -571,19 +607,25 @@ fn export_site_storage(app: &AppHandle, site_id: &str) {
 /// Restore a site's `localStorage` and IndexedDB into the currently loaded
 /// page.
 ///
-/// Refuses to run unless `site_id` is still the current session, so a stale
-/// watcher can never write one site's state into another site's origin.
+/// Refuses to run unless both the site and its exact scheme/host/port origin
+/// still own the live WebView, so a stale watcher cannot restore a blob into a
+/// sibling origin on the same hostname.
 #[cfg(mobile)]
-fn import_site_storage(app: &AppHandle, site_id: &str) {
-    {
-        let state = app.state::<AppState>();
-        if !session_is_current(&state, site_id) {
-            return;
-        }
-    }
-    let state = app.state::<AppState>();
+fn import_site_storage(app: &AppHandle, site_id: &str, expected_origin: &str) {
+    let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
+        return;
+    };
     let purpose = format!("site-{site_id}");
     for kind in ["localstorage", "indexeddb"] {
+        let state = app.state::<AppState>();
+        if !session_is_current_origin(&state, site_id, expected_origin)
+            || !window
+                .url()
+                .ok()
+                .is_some_and(|u| url_has_origin(&u, expected_origin))
+        {
+            return;
+        }
         let sealed = match state.provider.get_secret(&format!("{kind}-{site_id}")) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => continue,
@@ -700,7 +742,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
         export_cookies(&window, &current.site_id)?;
         // The live page is still this site's origin; after the navigate below
         // the storage would be unreachable until the next visit.
-        export_site_storage(app, &current.site_id);
+        export_site_storage(app, &current.site_id, &current.origin);
     }
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         let state = app.state::<AppState>();
@@ -855,6 +897,7 @@ mod tests {
         let current = site_id.map(|id| CurrentSite {
             site_id: id.to_string(),
             host: "a.example".into(),
+            origin: "https://a.example".into(),
             window_label: LAUNCHER_LABEL.into(),
             entered_fullscreen: false,
         });
@@ -881,6 +924,31 @@ mod tests {
         let state = state_with_current_site(Some("s1"));
         assert!(session_is_current(&state, "s1"));
         assert!(!session_is_current(&state, "s2"));
+    }
+
+    #[test]
+    fn storage_writes_are_bound_to_the_current_site_origin() {
+        let state = state_with_current_site(Some("s1"));
+        assert!(session_is_current_origin(
+            &state,
+            "s1",
+            "https://a.example"
+        ));
+        assert!(!session_is_current_origin(
+            &state,
+            "s1",
+            "https://a.example:8443"
+        ));
+        assert!(!session_is_current_origin(
+            &state,
+            "s1",
+            "http://a.example"
+        ));
+        assert!(!session_is_current_origin(
+            &state,
+            "s2",
+            "https://a.example"
+        ));
     }
 
     #[test]
