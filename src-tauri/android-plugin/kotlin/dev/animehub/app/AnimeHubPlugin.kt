@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// Android half of AnimeHub's Keystore + Picture-in-Picture + web-storage
-// bridge.
+// Android half of AnimeHub's Keystore + Picture-in-Picture + cookie +
+// web-storage bridge.
 //
 // INSTALLATION
 // ------------
@@ -24,8 +24,9 @@
 // Written against the Tauri 2.11.6 plugin API
 // (`@TauriPlugin`, `Plugin`, `@Command`, `Invoke`, `JSObject`) and the
 // standard Android APIs listed in the imports. The Keystore and PiP halves
-// predate this note; the localStorage/IndexedDB half has NOT been compiled or
-// run on a device yet (the build environment has no Android SDK/NDK). Treat
+// predate this note; the CookieManager and localStorage/IndexedDB bridges have
+// NOT been compiled or run on a device yet (the build environment has no
+// Android SDK/NDK). Treat
 // it as unverified until `npm run tauri android dev` passes on real hardware.
 //
 // STORAGE ISOLATION CONTRACT (localStorage/IndexedDB commands)
@@ -48,7 +49,9 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.Log
 import android.util.Rational
+import android.webkit.CookieManager
 import android.webkit.WebView
 import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
@@ -121,6 +124,105 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       // Never leak the plaintext or the key; a decrypt failure is reported
       // as a generic error.
       invoke.reject("Keystore çözülemedi", e)
+    }
+  }
+
+  // ------------------------------------------------------- Android cookies
+
+  /** Read the current cookie header. Android returns null when there are no cookies. */
+  @Command
+  fun webview_cookies_get(invoke: Invoke) {
+    val url = invoke.getArgs().getString("url") ?: run {
+      invoke.reject("url gerekli"); return
+    }
+    val parsed = android.net.Uri.parse(url)
+    if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
+      invoke.reject("HTTP(S) URL gerekli"); return
+    }
+    try {
+      activity.runOnUiThread {
+        try {
+          // CookieManager.getCookie legitimately returns null for an empty jar.
+          val header = CookieManager.getInstance().getCookie(url) ?: ""
+          invoke.resolve(JSObject().put("value", header))
+        } catch (_: Exception) {
+          invoke.reject("Android çerezleri okunamadı")
+        }
+      }
+    } catch (_: Exception) {
+      invoke.reject("Android çerezleri okunamadı")
+    }
+  }
+
+  /** Replace the shared CookieManager jar, resolving only after all callbacks. */
+  @Command
+  fun webview_cookies_replace(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val url = args.getString("url") ?: run {
+      invoke.reject("url gerekli"); return
+    }
+    val cookieHeaders = try {
+      val array = args.getJSONArray("cookies")
+      ArrayList<String>(array.length()).apply {
+        for (index in 0 until array.length()) add(array.getString(index))
+      }
+    } catch (_: Exception) {
+      invoke.reject("çerez listesi geçersiz"); return
+    }
+    if (cookieHeaders.isNotEmpty()) {
+      val parsed = android.net.Uri.parse(url)
+      if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
+        invoke.reject("HTTP(S) URL gerekli"); return
+      }
+    }
+
+    try {
+      activity.runOnUiThread {
+        try {
+          val manager = CookieManager.getInstance()
+          // removeAllCookies is asynchronous; restoring/navigating before its
+          // callback would let the outgoing provider's cookies leak forward.
+          manager.removeAllCookies {
+            var rejected = 0
+            fun setNext(index: Int) {
+              if (index >= cookieHeaders.size) {
+                try {
+                  manager.flush()
+                  if (rejected > 0) {
+                    Log.w(LOG_TAG, "CookieManager rejected $rejected restored cookie(s)")
+                  }
+                  invoke.resolve(JSObject().put("ok", true))
+                } catch (_: Exception) {
+                  invoke.reject("Android çerezleri kaydedilemedi")
+                }
+                return
+              }
+              try {
+                manager.setCookie(url, cookieHeaders[index]) { accepted ->
+                  if (accepted != true) rejected += 1
+                  setNext(index + 1)
+                }
+              } catch (_: Exception) {
+                // Avoid leaving a partial target jar available to the page
+                // that was active before the provider switch.
+                try {
+                  manager.removeAllCookies {
+                    try { manager.flush() } catch (_: Exception) { }
+                    invoke.reject("Android çerezleri geri yüklenemedi")
+                  }
+                } catch (_: Exception) {
+                  invoke.reject("Android çerezleri geri yüklenemedi")
+                }
+              }
+            }
+            setNext(0)
+          }
+        } catch (_: Exception) {
+          invoke.reject("Android çerezleri temizlenemedi")
+        }
+      }
+    } catch (_: Exception) {
+      invoke.reject("Android çerezleri güncellenemedi")
     }
   }
 
@@ -327,6 +429,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   companion object {
+    private const val LOG_TAG = "AnimeHubPlugin"
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val KEY_ALIAS_PREFIX = "animehub_"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"

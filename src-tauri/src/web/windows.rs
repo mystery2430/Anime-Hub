@@ -56,6 +56,20 @@ pub const LAUNCHER_TITLE: &str = "AnimeHub";
 const CLOSE_SCHEME: &str = "animehub";
 const CLOSE_HOST: &str = "close-site";
 
+/// Android shares one CookieManager and one WebView across all providers.
+/// Serialize site swaps, close-time snapshots, and background syncs so a sync
+/// cannot store the next provider's cookies under the previous provider id.
+#[cfg(target_os = "android")]
+static ANDROID_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock Android's shared provider session while reading/swapping its state.
+#[cfg(target_os = "android")]
+pub fn lock_android_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
+    ANDROID_SESSION_LOCK
+        .lock()
+        .map_err(|_| AppError::Storage("Android oturum kilidi alınamadı".into()))
+}
+
 /// How often a live site session is snapshotted into the encrypted store.
 ///
 /// The close-time export remains the authoritative final write; this interval
@@ -414,6 +428,14 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
                 log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
                 return;
             }
+            #[cfg(target_os = "android")]
+            let _session_guard = match lock_android_session() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    log::error!("Android oturum eşitlemesi kilitlenemedi: {e}");
+                    return;
+                }
+            };
             {
                 let state = app.state::<AppState>();
                 if !session_is_current(&state, &site_id) {
@@ -428,7 +450,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
                 continue;
             }
             tick = tick.wrapping_add(1);
-            if let Err(e) = export_cookies(&window, &site_id) {
+            if let Err(e) = export_cookies(&window, &site_id, &host) {
                 log::warn!("dönemsel çerez eşitlemesi başarısız ({site_id}): {e}");
             }
             if tick % STORAGE_SYNC_EVERY_N_TICKS == 0 {
@@ -443,45 +465,104 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
 // IndexedDB (the platform has no per-profile data directory).
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "android")]
+fn provider_cookie_url(host: &str) -> AppResult<Url> {
+    Url::parse(&format!("https://{host}/"))
+        .map_err(|_| AppError::Other("aktif provider adresi oluşturulamadı".into()))
+}
+
 #[cfg(mobile)]
 fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
     let window = app
         .get_webview_window(LAUNCHER_LABEL)
         .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
 
+    #[cfg(target_os = "android")]
+    let _session_guard = lock_android_session()?;
     let state = app.state::<AppState>();
 
     // 1. Export the outgoing site's cookies and web storage while its page is
     //    still the loaded origin — `localStorage`/IndexedDB reads must happen
     //    before anything is cleared or navigated. The storage export is
     //    best-effort and never blocks the switch.
-    if let Some(current) = state
+    let previous_site = state
         .current_site
         .lock()
         .expect("current_site lock")
-        .clone()
-    {
-        export_cookies(&window, &current.site_id)?;
+        .clone();
+    #[cfg(target_os = "android")]
+    let previous_url = if let Some(current) = previous_site.as_ref() {
+        match window.url() {
+            Ok(active_url) if active_url.host_str() == Some(current.host.as_str()) => {
+                export_cookies(&window, &current.site_id, &current.host)?;
+                export_site_storage(app, &current.site_id);
+                Some(active_url)
+            }
+            Ok(_) => {
+                // `navigate()` is queued before the page finishes loading. A
+                // quick second provider click can still see the launcher URL;
+                // keep the last saved snapshot rather than exporting launcher
+                // state into this provider's jar.
+                log::debug!(
+                    "Android outgoing session snapshot skipped before provider load ({})",
+                    current.site_id
+                );
+                Some(provider_cookie_url(&current.host)?)
+            }
+            Err(e) => {
+                log::debug!(
+                    "Android outgoing session URL unavailable; keeping saved snapshot ({}, {e})",
+                    current.site_id
+                );
+                Some(provider_cookie_url(&current.host)?)
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "android"))]
+    if let Some(current) = previous_site.as_ref() {
+        export_cookies(&window, &current.site_id, &current.host)?;
         export_site_storage(app, &current.site_id);
     }
 
-    // 2. Clear the shared jar, then load the target site's cookies.
+    // 2. Keep the existing Wry cleanup: in the locked Android Wry 0.55.1
+    //    implementation this deletes webviewCache.db/webview.db and clears
+    //    cache, history, and form data, but does not call CookieManager.
+    //    Replace the shared cookie jar explicitly below, and wait for that
+    //    callback chain before navigating.
     window.clear_all_browsing_data().map_err(|e| {
-        log::error!("çerezler temizlenemedi: {e}");
-        AppError::Other("çerezler temizlenemedi".into())
+        #[cfg(target_os = "android")]
+        {
+            log::error!("WebView gezinme verileri temizlenemedi: {e}");
+            AppError::Other("WebView gezinme verileri temizlenemedi".into())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            log::error!("çerezler temizlenemedi: {e}");
+            AppError::Other("çerezler temizlenemedi".into())
+        }
     })?;
-    import_cookies(&window, &site.id)?;
+    if let Err(e) = import_cookies(&window, &site.id, url) {
+        #[cfg(target_os = "android")]
+        rollback_android_cookie_swap(&window, previous_site.as_ref(), previous_url.as_ref());
+        return Err(e);
+    }
 
     // 3. Install the cosmetic/anti-popup script and navigate.
-    window.eval(init_script).map_err(|e| {
+    if let Err(e) = window.eval(init_script) {
         log::error!("script yüklenemedi: {e}");
-        AppError::Other("script yüklenemedi".into())
-    })?;
+        #[cfg(target_os = "android")]
+        rollback_android_cookie_swap(&window, previous_site.as_ref(), previous_url.as_ref());
+        return Err(AppError::Other("script yüklenemedi".into()));
+    }
 
-    window.navigate(url.clone()).map_err(|e| {
+    if let Err(e) = window.navigate(url.clone()) {
         log::error!("sayfa açılamadı: {e}");
-        AppError::Other("sayfa açılamadı".into())
-    })?;
+        #[cfg(target_os = "android")]
+        rollback_android_cookie_swap(&window, previous_site.as_ref(), previous_url.as_ref());
+        return Err(AppError::Other("sayfa açılamadı".into()));
+    }
 
     *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
         site_id: site.id.clone(),
@@ -575,6 +656,14 @@ fn export_site_storage(app: &AppHandle, site_id: &str) {
 /// watcher can never write one site's state into another site's origin.
 #[cfg(mobile)]
 fn import_site_storage(app: &AppHandle, site_id: &str) {
+    #[cfg(target_os = "android")]
+    let _session_guard = match lock_android_session() {
+        Ok(guard) => guard,
+        Err(e) => {
+            log::error!("Android site storage restore kilitlenemedi: {e}");
+            return;
+        }
+    };
     {
         let state = app.state::<AppState>();
         if !session_is_current(&state, site_id) {
@@ -612,12 +701,62 @@ fn import_site_storage(app: &AppHandle, site_id: &str) {
 
 /// Save the WebView's current cookie jar into the named site's encrypted blob.
 #[cfg(mobile)]
-fn export_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()> {
-    let live = window.cookies().map_err(|e| {
-        log::error!("çerezler okunamadı: {e}");
-        AppError::Other("çerezler okunamadı".into())
-    })?;
-    export_cookies_from(live, window.app_handle(), site_id)
+fn export_cookies(
+    window: &tauri::WebviewWindow,
+    site_id: &str,
+    expected_host: &str,
+) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        // Wry's Android `cookies()` API is unsupported (it always returns an
+        // empty Vec). Read the shared CookieManager directly, but only when
+        // the tracked provider is actually loaded; a fast provider switch can
+        // otherwise snapshot the launcher URL as an empty provider jar.
+        let url = match window.url() {
+            Ok(url) if url.host_str() == Some(expected_host) => url,
+            Ok(_) => {
+                log::debug!("Android cookie snapshot skipped before provider load ({site_id})");
+                return Ok(());
+            }
+            Err(e) => {
+                log::debug!("Android cookie snapshot skipped; URL unavailable ({site_id}): {e}");
+                return Ok(());
+            }
+        };
+        let header = crate::android_bridge::webview_cookies_get(url.as_str())?;
+        if header.is_empty() {
+            log::debug!("Android cookie result is empty ({site_id})");
+        }
+        return export_cookies_from(
+            parse_android_cookie_header(&header),
+            window.app_handle(),
+            site_id,
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = expected_host;
+        let live = window.cookies().map_err(|e| {
+            log::error!("çerezler okunamadı: {e}");
+            AppError::Other("çerezler okunamadı".into())
+        })?;
+        export_cookies_from(live, window.app_handle(), site_id)
+    }
+}
+
+/// Parse the request-cookie header returned by Android's CookieManager.
+///
+/// The API exposes name/value pairs, not Set-Cookie attributes; this matches
+/// Wry's existing `cookies_for_url` parsing behavior and keeps CookieJar's
+/// serialized format unchanged.
+#[cfg(any(target_os = "android", test))]
+fn parse_android_cookie_header(header: &str) -> Vec<cookie::Cookie<'static>> {
+    header
+        .split("; ")
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| cookie::Cookie::parse(part.to_string()).ok())
+        .collect()
 }
 
 /// Same as [`export_cookies`] but for a bare child `Webview` (desktop).
@@ -653,25 +792,69 @@ fn export_cookies_from(
 
 /// Load a site's encrypted cookie jar into the WebView.
 #[cfg(mobile)]
-fn import_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()> {
+fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> AppResult<()> {
     let app = window.app_handle().clone();
     let state = app.state::<AppState>();
+    let stored = state.provider.get_secret(&format!("cookies-{site_id}"))?;
+    #[cfg(not(target_os = "android"))]
+    let _ = url;
 
-    let Some(bytes) = state.provider.get_secret(&format!("cookies-{site_id}"))? else {
-        return Ok(());
+    // Android's shared CookieManager must be cleared even when this provider
+    // has no saved jar; otherwise cookies from the previous provider survive.
+    #[cfg(target_os = "android")]
+    let jar: CookieJar = match stored {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => CookieJar::default(),
     };
-    let jar: CookieJar = serde_json::from_slice(&bytes)?;
+    #[cfg(not(target_os = "android"))]
+    let jar: CookieJar = match stored {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => return Ok(()),
+    };
+
     let now = crate::anilist::now_unix();
+    #[cfg(target_os = "android")]
+    let mut cookie_headers = Vec::new();
 
     for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
         if let Some(cookie) = restore(stored) {
-            // A single failed cookie must not abort the whole restore.
-            if let Err(e) = window.set_cookie(cookie) {
-                log::debug!("cookie restore failed for {site_id}: {e}");
+            #[cfg(target_os = "android")]
+            cookie_headers.push(cookie.to_string());
+
+            #[cfg(not(target_os = "android"))]
+            {
+                // Preserve the existing non-Android mobile path.
+                if let Err(e) = window.set_cookie(cookie) {
+                    log::debug!("cookie restore failed for {site_id}: {e}");
+                }
             }
         }
     }
+
+    #[cfg(target_os = "android")]
+    crate::android_bridge::webview_cookies_replace(url.as_str(), &cookie_headers)?;
+
     Ok(())
+}
+
+/// Roll back a failed Android site open without leaving the attempted
+/// provider's cookies in the still-active WebView.
+#[cfg(target_os = "android")]
+fn rollback_android_cookie_swap(
+    window: &tauri::WebviewWindow,
+    previous_site: Option<&CurrentSite>,
+    previous_url: Option<&Url>,
+) {
+    let rollback = match (previous_site, previous_url) {
+        (Some(site), Some(url)) => import_cookies(window, &site.site_id, url),
+        _ => crate::android_bridge::webview_cookies_clear(),
+    };
+    if let Err(e) = rollback {
+        log::error!("Android cookie session rollback failed: {e}");
+        if let Err(clear_error) = crate::android_bridge::webview_cookies_clear() {
+            log::error!("Android cookie cleanup after rollback failure failed: {clear_error}");
+        }
+    }
 }
 
 /// Close a site session, persisting its cookies and web storage first.
@@ -681,6 +864,9 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str) -> AppResult<()>
 /// then send the single WebView back to the launcher.
 #[cfg(mobile)]
 pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    let _session_guard = lock_android_session()?;
+
     let current = {
         let state = app.state::<AppState>();
         // Bind first: the `MutexGuard` temporary must be dropped before
@@ -697,9 +883,25 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
         let window = app
             .get_webview_window(LAUNCHER_LABEL)
             .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
-        export_cookies(&window, &current.site_id)?;
+        export_cookies(&window, &current.site_id, &current.host)?;
         // The live page is still this site's origin; after the navigate below
-        // the storage would be unreachable until the next visit.
+        // the storage would be unreachable until the next visit. If close was
+        // tapped during startup, keep the last stored snapshot rather than
+        // exporting the launcher's origin into this provider's storage blob.
+        #[cfg(target_os = "android")]
+        if window
+            .url()
+            .ok()
+            .is_some_and(|url| url.host_str() == Some(current.host.as_str()))
+        {
+            export_site_storage(app, &current.site_id);
+        } else {
+            log::debug!(
+                "Android storage snapshot skipped before provider load ({})",
+                current.site_id
+            );
+        }
+        #[cfg(not(target_os = "android"))]
         export_site_storage(app, &current.site_id);
     }
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
@@ -715,6 +917,13 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
                 AppError::Other("başlatıcıya dönülemedi".into())
             })?;
         }
+    }
+    #[cfg(target_os = "android")]
+    if current.is_some() {
+        // After navigation is accepted, remove the shared jar before releasing
+        // the session lock; a failed navigation must leave the old page's jar
+        // intact for the still-active provider.
+        crate::android_bridge::webview_cookies_clear()?;
     }
     let closed_site = current.as_ref().map(|c| c.site_id.clone());
     let state = app.state::<AppState>();
@@ -895,5 +1104,16 @@ mod tests {
         {
             assert!(STORAGE_SYNC_EVERY_N_TICKS >= 2, "storage dumps are heavy");
         }
+    }
+
+    #[test]
+    fn android_cookie_header_parses_empty_and_multiple_cookies() {
+        assert!(parse_android_cookie_header("").is_empty());
+        let cookies = parse_android_cookie_header("sid=abc=123; theme=dark");
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0].name(), "sid");
+        assert_eq!(cookies[0].value(), "abc=123");
+        assert_eq!(cookies[1].name(), "theme");
+        assert_eq!(cookies[1].value(), "dark");
     }
 }
