@@ -1,12 +1,14 @@
 //! Android-side bridges for AnimeHub.
 //!
-//! Three platform features have no Rust API and must go through the JVM:
+//! Four Android platform features need the JVM bridge:
 //!
 //! * **AndroidKeyStore** — an AES/GCM key that never leaves the secure
 //!   hardware. Rust hands over plaintext and gets ciphertext back, so the raw
 //!   key is never present in this process.
 //! * **Picture-in-Picture** — `PictureInPictureParams` /
 //!   `enterPictureInPictureMode()` live on the host `Activity`.
+//! * **Per-site cookies** — Android's shared `CookieManager` is read and
+//!   replaced through a null-safe, callback-aware Kotlin API.
 //! * **Per-site WebView storage** — on Android the system WebView has no
 //!   per-profile data directory, so `localStorage` / IndexedDB are
 //!   exported/imported (and Keystore-sealed) from Kotlin via
@@ -43,7 +45,13 @@ pub struct KeystoreResult {
     pub value: String,
 }
 
-/// Shape returned by the Kotlin storage-import and PiP functions.
+/// Shape returned by Kotlin commands that provide a plain string value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StringResult {
+    pub value: String,
+}
+
+/// Shape returned by the Kotlin storage-import, cookie-replace and PiP functions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OkResult {
     pub ok: bool,
@@ -61,6 +69,8 @@ pub const CMD_LOCALSTORAGE_EXPORT: &str = "localstorage_export";
 pub const CMD_LOCALSTORAGE_IMPORT: &str = "localstorage_import";
 pub const CMD_INDEXEDDB_EXPORT: &str = "indexeddb_export";
 pub const CMD_INDEXEDDB_IMPORT: &str = "indexeddb_import";
+pub const CMD_WEBVIEW_COOKIES_GET: &str = "webview_cookies_get";
+pub const CMD_WEBVIEW_COOKIES_REPLACE: &str = "webview_cookies_replace";
 
 /// Alias under which the Kotlin side is registered.
 pub const PLUGIN_ALIAS: &str = "animehub-android";
@@ -176,6 +186,40 @@ pub fn indexeddb_import(purpose: String, sealed: String) -> Result<OkResult> {
     }
 }
 
+/// Read the live Android WebView's cookie header for `url`.
+///
+/// Unlike Wry's Android `cookies()` API (which is unsupported), this uses
+/// Android's shared CookieManager through the Kotlin plugin. Kotlin maps the
+/// normal no-cookies `null` result to an empty string.
+pub fn webview_cookies_get(url: String) -> Result<StringResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(CMD_WEBVIEW_COOKIES_GET, CookieUrlPayload { url })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = url;
+        Err(Error::Unsupported)
+    }
+}
+
+/// Replace Android's shared CookieManager contents and wait until each
+/// accepted cookie has been set before the caller navigates the WebView.
+pub fn webview_cookies_replace(url: String, cookies: Vec<String>) -> Result<OkResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(
+            CMD_WEBVIEW_COOKIES_REPLACE,
+            CookieReplacePayload { url, cookies },
+        )
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (url, cookies);
+        Err(Error::Unsupported)
+    }
+}
+
 /// Enter Picture-in-Picture with the given aspect ratio.
 pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     #[cfg(target_os = "android")]
@@ -244,6 +288,25 @@ struct PurposeValuePayload {
 #[serde(rename_all = "camelCase")]
 struct PurposePayload {
     purpose: String,
+}
+
+/// Wire format for reading cookies for one WebView URL.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CookieUrlPayload {
+    url: String,
+}
+
+/// Wire format for an ordered Android CookieManager replacement.
+///
+/// Intentionally not `Debug`: this payload contains authentication cookies.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CookieReplacePayload {
+    url: String,
+    cookies: Vec<String>,
 }
 
 /// Wire format for `enter_pip`.
@@ -395,6 +458,8 @@ mod tests {
         assert_eq!(CMD_LOCALSTORAGE_IMPORT, "localstorage_import");
         assert_eq!(CMD_INDEXEDDB_EXPORT, "indexeddb_export");
         assert_eq!(CMD_INDEXEDDB_IMPORT, "indexeddb_import");
+        assert_eq!(CMD_WEBVIEW_COOKIES_GET, "webview_cookies_get");
+        assert_eq!(CMD_WEBVIEW_COOKIES_REPLACE, "webview_cookies_replace");
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
     }
 
@@ -424,9 +489,20 @@ mod tests {
             CMD_LOCALSTORAGE_IMPORT,
             CMD_INDEXEDDB_EXPORT,
             CMD_INDEXEDDB_IMPORT,
+            CMD_WEBVIEW_COOKIES_GET,
+            CMD_WEBVIEW_COOKIES_REPLACE,
         ] {
             let marker = format!("fun {cmd}(");
             assert!(kt.contains(&marker), "Kotlin side is missing `fun {cmd}(`");
         }
+        assert!(
+            kt.contains("CookieManager.getInstance().getCookie(url) ?: \"\""),
+            "an empty Android cookie jar must not return null across Kotlin"
+        );
+        assert!(
+            kt.contains("manager.removeAllCookies")
+                && kt.contains("manager.setCookie(url, cookieHeaders[index])"),
+            "Android cookies must be cleared and restored sequentially before navigation"
+        );
     }
 }
