@@ -57,12 +57,15 @@ test("android release workflow prepares the project before signing", () => {
   assert.equal(yml.includes("setup-ndk"), false);
 });
 
-test("CI android job installs the Tauri NDK instead of a mismatched one", () => {
+test("CI android job builds and uploads an installable debug APK", () => {
   const yml = read(join(ROOT, ".github/workflows/ci.yml"));
   assert.match(yml, /platforms;android-36/);
   assert.match(yml, /ndk;29\.0\.13846066/);
   assert.equal(yml.includes("setup-ndk"), false);
-  assert.match(yml, /CARGO_PROFILE_RELEASE_LTO/);
+  assert.match(yml, /--debug --apk --target aarch64/);
+  assert.match(yml, /CARGO_PROFILE_DEV_DEBUG/);
+  assert.match(yml, /animehub-android-aarch64-debug/);
+  assert.match(yml, /actions\/upload-artifact@v7/);
 });
 
 function fakeGen(packageName) {

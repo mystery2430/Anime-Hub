@@ -90,7 +90,9 @@ pub fn webview_cookies_replace(url: &str, cookies: &[String]) -> AppResult<()> {
     let r = animehub_android::webview_cookies_replace(url.to_string(), cookies.to_vec())
         .map_err(|e| AppError::Other(e.to_string()))?;
     if !r.ok {
-        return Err(AppError::Storage("Android çerezleri geri yüklenemedi".into()));
+        return Err(AppError::Storage(
+            "Android çerezleri geri yüklenemedi".into(),
+        ));
     }
     Ok(())
 }
