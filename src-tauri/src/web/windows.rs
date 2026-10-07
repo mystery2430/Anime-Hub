@@ -518,6 +518,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
             }
         }
     } else {
+        // First Android site open: there is no outgoing provider session to snapshot.
         None
     };
     #[cfg(not(target_os = "android"))]
@@ -526,23 +527,19 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         export_site_storage(app, &current.site_id);
     }
 
-    // 2. Keep the existing Wry cleanup: in the locked Android Wry 0.55.1
-    //    implementation this deletes webviewCache.db/webview.db and clears
-    //    cache, history, and form data, but does not call CookieManager.
-    //    Replace the shared cookie jar explicitly below, and wait for that
-    //    callback chain before navigating.
+    // 2. Preserve the existing Wry cleanup on non-Android mobile platforms.
+    // Android must not run clear_all_browsing_data here: on first open there
+    // is no outgoing session, and on provider switches the saved cookie jar
+    // is replaced below without a global WebView data wipe. Storage remains
+    // origin-scoped and the target site's storage is restored after loading.
+    #[cfg(not(target_os = "android"))]
     window.clear_all_browsing_data().map_err(|e| {
-        #[cfg(target_os = "android")]
-        {
-            log::error!("WebView gezinme verileri temizlenemedi: {e}");
-            AppError::Other("WebView gezinme verileri temizlenemedi".into())
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            log::error!("çerezler temizlenemedi: {e}");
-            AppError::Other("çerezler temizlenemedi".into())
-        }
+        log::error!("çerezler temizlenemedi: {e}");
+        AppError::Other("çerezler temizlenemedi".into())
     })?;
+
+    // On Android this replaces only CookieManager's shared cookie jar with
+    // the target provider's saved cookies; it does not clear WebView storage.
     if let Err(e) = import_cookies(&window, &site.id, url) {
         #[cfg(target_os = "android")]
         rollback_android_cookie_swap(&window, previous_site.as_ref(), previous_url.as_ref());
