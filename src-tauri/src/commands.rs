@@ -940,7 +940,8 @@ pub struct AppInfo {
     pub key_backend_os_backed: bool,
     pub webview: String,
     pub anilist_configured: bool,
-    /// `true` on Android, where storage isolation is cookie-level only.
+    /// `true` on Android, where cookie jars are swapped but same-origin
+    /// localStorage/IndexedDB provider isolation remains unresolved.
     pub android_isolation_note: bool,
 }
 

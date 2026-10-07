@@ -68,6 +68,17 @@ test("CI android job builds and uploads an installable debug APK", () => {
   assert.match(yml, /actions\/upload-artifact@v7/);
 });
 
+test("opening an Android site no longer shows the storage-isolation toast", () => {
+  const ui = read(join(ROOT, "src/main.js"));
+  const start = ui.indexOf("async function openSite(tile)");
+  const end = ui.indexOf("/** Ask the backend to close", start);
+  assert.ok(start >= 0 && end > start, "openSite function should be present");
+  const openSite = ui.slice(start, end);
+  assert.equal(openSite.includes("opened.isolated"), false);
+  assert.equal(openSite.includes("şifreli blob'lara aktarılır"), false);
+  assert.match(ui, /aynı kaynaklı localStorage\/IndexedDB yalıtımı henüz çözülmedi/);
+});
+
 function fakeGen(packageName) {
   const gen = mkdtempSync(join(tmpdir(), "animehub-android-"));
   const javaDir = join(gen, "app/src/main/java", ...packageName.split("."));

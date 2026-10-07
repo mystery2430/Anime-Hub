@@ -293,12 +293,6 @@ async function openSite(tile) {
   try {
     const opened = await call("open_site", { id: tile.id });
     openSiteLabel = opened.label;
-    if (!opened.isolated) {
-      showNotice(
-        "Android'de oturum verileri (çerez + localStorage/IndexedDB) site geçişlerinde şifreli blob'lara aktarılır; IndexedDB en iyi çaba ilkesiyle taşınır.",
-        "info",
-      );
-    }
   } catch (e) {
     showNotice(errMessage(e));
   }
@@ -759,7 +753,7 @@ async function openAbout() {
     if (info.androidIsolationNote) {
       appendAboutRow(
         "Oturum izolasyonu",
-        "Android: çerez + localStorage/IndexedDB şifreli aktarımı (IndexedDB en iyi çaba)",
+        "Android: çerez kavanozu site geçişlerinde değiştirilir; aynı kaynaklı localStorage/IndexedDB yalıtımı henüz çözülmedi.",
         true,
       );
     }

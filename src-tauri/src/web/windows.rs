@@ -19,11 +19,11 @@
 //! that scheme is intercepted natively below and turned into a close action.
 //!
 //! ## Android
-//! The system WebView has no per-profile data-directory API, so the main
-//! WebView is navigated with a full state swap: cookies are exported/imported
-//! as before, and `localStorage` / IndexedDB are additionally exported into
-//! Keystore-sealed blobs on leave and restored after the target page loads
-//! (storage is origin-scoped, so the restore must wait for the page).
+//! The system WebView has no per-profile data-directory API. The app swaps
+//! provider cookie jars through Android's shared `CookieManager`; per-provider
+//! same-origin `localStorage` / IndexedDB isolation is not yet guaranteed.
+//! Best-effort encrypted export/import hooks exist for those stores, but they
+//! are not a security boundary and IndexedDB fidelity is incomplete.
 
 use crate::commands::{AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
@@ -461,8 +461,8 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
 }
 
 // ---------------------------------------------------------------------------
-// Mobile: a single WebView, isolated by swapping cookies + localStorage +
-// IndexedDB (the platform has no per-profile data directory).
+// Mobile: a single shared WebView. Android swaps provider cookie jars; true
+// same-origin localStorage/IndexedDB provider isolation remains unresolved.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "android")]
