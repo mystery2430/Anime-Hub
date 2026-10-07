@@ -109,14 +109,14 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 
 | Konu | Neden yapılamadı |
 |---|---|
-| **Android APK / v0.3.2 adayı** | PR #16'nın önceki CI debug APK'sı bir cihazda denendi: siteler artık çökmedi, ancak yavaş yüklendi. v0.3.2 adayındaki asenkron `CookieManager.flush()` değişikliği henüz Android CI'da veya cihazda doğrulanmadı; performans kazancı varsayılmamalı. Release workflow tag ile 3 ABI üretir |
+| **Android APK / v0.3.2 runtime** | Herkese açık v0.3.2 release'i yayımlandı; Android release workflow'u aarch64, armv7 ve x86_64 için imzalı APK'ları başarıyla üretti. Önceki CI APK'sını bir cihazda açarken çökme görülmedi, ancak yükleme yavaştı. Bu sürümdeki asenkron `CookieManager.flush()` değişikliğinin performansı fiziksel cihazda henüz ölçülmedi |
 | **Android localStorage/IndexedDB** | Dışa/içe aktarma köprüleri ve şifreli anlık görüntüler bulunur; bunlar gerçek sağlayıcı yalıtımı sağlamaz. Android tek WebView'ı yeniden kullandığı için aynı kaynaklı `localStorage`/IndexedDB izolasyonu çözülmemiştir ve güvenlik sınırı olarak sunulmamalıdır. IndexedDB aktarımı en iyi çabadır (ikincil indeks/key path/Blob kaybı mümkündür) |
-| **Kotlin köprüsü** | PR #16'nın önceki Kotlin sürümü aarch64 Android CI'da derlendi. v0.3.2 adayı Activity/WebView yaşam döngüsü kontrolleri ve asenkron cookie kalıcılaştırması ekliyor; bu değişiklikler yeni Android CI derlemesini bekliyor. Yerelde Android SDK/Gradle yok |
+| **Kotlin köprüsü** | v0.3.2 release workflow'u Activity/WebView yaşam döngüsü kontrolleri ve asenkron cookie kalıcılaştırması içeren köprüyü üç Android ABI'sinde derleyip imzaladı. Yerelde Android SDK/Gradle yok; asenkron kalıcılaştırmanın gerçek cihaz performansı doğrulanmadı |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
-| **Windows NSIS** | CI Windows'ta test eder, paket üretmez. `77f5e7c` clippy kırmızıydı; DPAPI çağrıları `windows-sys` 0.61 imzasına çekildi, sonuç henüz yok |
+| **Windows NSIS** | v0.3.2 Release Desktop workflow'u Windows üzerinde geçti ve `AnimeHub_0.3.2_x64-setup.exe` üretti. Windows imzalama sırrı tanımlı olmadığı için paket imzasız; README'de uyarısı var |
 | **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
 | **İmzalı yayın APK** | ✅ Keystore secret'ları (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) repository secrets'a eklendi; workflow imzalı üretiyor |
-| **`.deb` / AppImage / rpm** | LTO'lu `cargo build --release --locked` ubuntu-24.04'te geçti. Paket adımı yok |
+| **`.deb` / AppImage / rpm** | v0.3.2 Release Desktop Ubuntu işi geçti ve üç Linux paketini yayımladı (`.deb`, `.rpm`, AppImage) |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
 | **Gerçek sitelerin yüklenmesi** | Uygulama GUI'si başsız ortamda açılmıyor; WebView'da `openani.me`'nin gerçekten render olduğu görülmedi |
 | **Site logoları** | OpenAnime ve Animecix karoları yerel dosya kullanır (`public/logos/`). İkisi de sitelerin kendi işaretleri; uydurma oynat simgesi kaldırıldı. Fotoğraf ekleme arayüzü yazıldı |
