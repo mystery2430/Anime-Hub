@@ -2,7 +2,8 @@
 //!
 //! All are implemented in Kotlin (see `src-tauri/android-plugin/`) because the
 //! platform APIs involved — `AndroidKeyStore`, `PictureInPictureParams`,
-//! `evaluateJavascript` — are only reachable from the JVM side.
+//! `CookieManager`, and `evaluateJavascript` — are only reachable from the JVM
+//! side.
 
 use crate::error::{AppError, AppResult};
 
@@ -73,6 +74,35 @@ pub fn indexeddb_import(purpose: &str, sealed: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Read the live Android CookieManager header for a validated HTTP(S) URL.
+/// The Kotlin side normalizes Android's expected `null` (no cookies) to `""`.
+#[cfg(target_os = "android")]
+pub fn webview_cookies_get(url: &str) -> AppResult<String> {
+    let r = animehub_android::webview_cookies_get(url.to_string())
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    Ok(r.value)
+}
+
+/// Clear the shared Android CookieManager and restore the supplied provider
+/// jar. Kotlin resolves after the asynchronous CookieManager callbacks finish.
+#[cfg(target_os = "android")]
+pub fn webview_cookies_replace(url: &str, cookies: &[String]) -> AppResult<()> {
+    let r = animehub_android::webview_cookies_replace(url.to_string(), cookies.to_vec())
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    if !r.ok {
+        return Err(AppError::Storage(
+            "Android çerezleri geri yüklenemedi".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Clear Android's live shared cookie jar without changing provider snapshots.
+#[cfg(target_os = "android")]
+pub fn webview_cookies_clear() -> AppResult<()> {
+    webview_cookies_replace("", &[])
+}
+
 // ---------------------------------------------------------------------------
 // Desktop stubs: same signatures, honest failures, so call sites compile and
 // stay uniform on every platform.
@@ -117,6 +147,27 @@ pub fn indexeddb_export(_purpose: &str) -> AppResult<String> {
 pub fn indexeddb_import(_purpose: &str, _sealed: &str) -> AppResult<()> {
     Err(AppError::Keyring(
         "Depolama aktarımı yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn webview_cookies_get(_url: &str) -> AppResult<String> {
+    Err(AppError::Other(
+        "CookieManager yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn webview_cookies_replace(_url: &str, _cookies: &[String]) -> AppResult<()> {
+    Err(AppError::Other(
+        "CookieManager yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn webview_cookies_clear() -> AppResult<()> {
+    Err(AppError::Other(
+        "CookieManager yalnızca Android'de kullanılabilir".into(),
     ))
 }
 
@@ -203,5 +254,18 @@ mod tests {
         assert_eq!(localstorage_import("p", "x").unwrap_err().code(), "keyring");
         assert_eq!(indexeddb_export("p").unwrap_err().code(), "keyring");
         assert_eq!(indexeddb_import("p", "x").unwrap_err().code(), "keyring");
+        assert_eq!(
+            webview_cookies_get("https://example.com")
+                .unwrap_err()
+                .code(),
+            "other"
+        );
+        assert_eq!(
+            webview_cookies_replace("https://example.com", &[])
+                .unwrap_err()
+                .code(),
+            "other"
+        );
+        assert_eq!(webview_cookies_clear().unwrap_err().code(), "other");
     }
 }

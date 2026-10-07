@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// Android half of AnimeHub's Keystore + Picture-in-Picture + web-storage
-// bridge.
+// Android half of AnimeHub's Keystore + Picture-in-Picture + cookie +
+// web-storage bridge.
 //
 // INSTALLATION
 // ------------
@@ -24,20 +24,18 @@
 // Written against the Tauri 2.11.6 plugin API
 // (`@TauriPlugin`, `Plugin`, `@Command`, `Invoke`, `JSObject`) and the
 // standard Android APIs listed in the imports. The Keystore and PiP halves
-// predate this note; the localStorage/IndexedDB half has NOT been compiled or
-// run on a device yet (the build environment has no Android SDK/NDK). Treat
+// predate this note; the CookieManager and localStorage/IndexedDB bridges have
+// NOT been compiled or run on a device yet (the build environment has no
+// Android SDK/NDK). Treat
 // it as unverified until `npm run tauri android dev` passes on real hardware.
 //
 // STORAGE ISOLATION CONTRACT (localStorage/IndexedDB commands)
 // ------------------------------------------------------------
-// The Rust side calls `*_export` only while the site page is still the loaded
-// document and `*_import` only after the target page has loaded (it polls the
-// WebView URL first). `run_mobile_plugin` blocks until the invoke resolves,
-// and `evaluateJavascript` delivers its callback on the UI thread — so an
-// export really has captured the page's storage when Rust regains control.
-// The injected scripts are constants with no string interpolation of page
-// data; restored state enters the page as a parsed JSON literal, never as
-// concatenated source text.
+// The Rust side starts exports only while the site page is loaded and imports
+// after the target page's URL is observed. WebView operations run on Android's
+// UI thread. IndexedDB export/import remains best-effort: the scripts use
+// asynchronous IndexedDB APIs and do not provide full database fidelity.
+// Keep restored payloads JSON-encoded; never interpolate raw page/user strings.
 
 package dev.animehub.app
 
@@ -48,14 +46,18 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.Log
 import android.util.Rational
+import android.webkit.CookieManager
 import android.webkit.WebView
+import androidx.appcompat.app.AppCompatActivity
 import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.security.KeyStore
+import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -65,12 +67,78 @@ import javax.crypto.spec.GCMParameterSpec
 class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
   /** The shared WebView, handed to the plugin by Tauri at startup. */
+  @Volatile
   private var sharedWebView: WebView? = null
 
   override fun load(webView: WebView) {
     // On Android the launcher and the sites share this single WebView, so
     // keeping the reference is all the storage commands need.
     sharedWebView = webView
+  }
+
+  override fun onDestroy(activity: AppCompatActivity) {
+    // Plugin instances can outlive their Activity. Reject later WebView work
+    // rather than keep a reference to the destroyed native View.
+    if (activity === this.activity) sharedWebView = null
+  }
+
+  /** Reject an async reply if its Android host was destroyed while work was pending. */
+  private fun rejectIfActivityUnavailable(invoke: Invoke): Boolean {
+    if (activity.isFinishing || activity.isDestroyed) {
+      invoke.reject("Android Activity artık kullanılamıyor")
+      return true
+    }
+    return false
+  }
+
+  /** Run Activity-bound Android APIs on the UI thread and reject a destroyed host. */
+  private fun withLiveActivity(invoke: Invoke, action: () -> Unit) {
+    try {
+      activity.runOnUiThread {
+        if (rejectIfActivityUnavailable(invoke)) return@runOnUiThread
+        try {
+          action()
+        } catch (e: Exception) {
+          invoke.reject("Android işlemi başarısız", e)
+        }
+      }
+    } catch (e: Exception) {
+      invoke.reject("Android Activity artık kullanılamıyor", e)
+    }
+  }
+
+  /** Persist CookieManager state away from Android's UI thread. */
+  private fun flushCookieStoreAsync(manager: CookieManager) {
+    try {
+      COOKIE_FLUSH_EXECUTOR.execute {
+        try {
+          manager.flush()
+        } catch (_: Exception) {
+          Log.w(LOG_TAG, "CookieManager persistence sync failed")
+        }
+      }
+    } catch (_: Exception) {
+      Log.w(LOG_TAG, "CookieManager persistence sync could not be queued")
+    }
+  }
+
+  /** Run WebView work on Android's UI thread and reject stale Activity/View handles. */
+  private fun withLiveWebView(invoke: Invoke, action: (WebView) -> Unit) {
+    val webView = sharedWebView ?: run {
+      invoke.reject("WebView hazır değil")
+      return
+    }
+    withLiveActivity(invoke) {
+      if (sharedWebView !== webView) {
+        invoke.reject("WebView artık kullanılamıyor")
+        return@withLiveActivity
+      }
+      try {
+        action(webView)
+      } catch (e: Exception) {
+        invoke.reject("WebView işlemi başarısız", e)
+      }
+    }
   }
 
   // ------------------------------------------------------------------ Keystore
@@ -124,6 +192,106 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  // ------------------------------------------------------- Android cookies
+
+  /** Read the current cookie header. Android returns null when there are no cookies. */
+  @Command
+  fun webview_cookies_get(invoke: Invoke) {
+    val url = invoke.getArgs().getString("url") ?: run {
+      invoke.reject("url gerekli"); return
+    }
+    val parsed = android.net.Uri.parse(url)
+    if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
+      invoke.reject("HTTP(S) URL gerekli"); return
+    }
+    withLiveActivity(invoke) {
+      try {
+        // CookieManager.getCookie legitimately returns null for an empty jar.
+        val header = CookieManager.getInstance().getCookie(url) ?: ""
+        invoke.resolve(JSObject().put("value", header))
+      } catch (_: Exception) {
+        invoke.reject("Android çerezleri okunamadı")
+      }
+    }
+  }
+
+  /** Replace the shared CookieManager jar; disk persistence is queued off the UI thread. */
+  @Command
+  fun webview_cookies_replace(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val url = args.getString("url") ?: run {
+      invoke.reject("url gerekli"); return
+    }
+    val cookieHeaders = try {
+      val array = args.getJSONArray("cookies")
+      ArrayList<String>(array.length()).apply {
+        for (index in 0 until array.length()) add(array.getString(index))
+      }
+    } catch (_: Exception) {
+      invoke.reject("çerez listesi geçersiz"); return
+    }
+    if (cookieHeaders.isNotEmpty()) {
+      val parsed = android.net.Uri.parse(url)
+      if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
+        invoke.reject("HTTP(S) URL gerekli"); return
+      }
+    }
+
+    withLiveActivity(invoke) {
+      try {
+        val manager = CookieManager.getInstance()
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        // removeAllCookies is asynchronous; restoring/navigating before its
+        // callback would let the outgoing provider's cookies leak forward.
+        manager.removeAllCookies {
+          if (rejectIfActivityUnavailable(invoke)) return@removeAllCookies
+          var rejected = 0
+          fun setNext(index: Int) {
+            if (index >= cookieHeaders.size) {
+              if (rejected > 0) {
+                Log.w(LOG_TAG, "CookieManager rejected $rejected restored cookie(s)")
+              }
+              val elapsedMs = android.os.SystemClock.elapsedRealtime() - startedAt
+              Log.d(
+                LOG_TAG,
+                "Cookie jar ready: ${cookieHeaders.size} cookie(s), ${elapsedMs}ms"
+              )
+              // flush() blocks until disk I/O is complete. CookieManager's
+              // in-memory jar is already ready for the upcoming navigation;
+              // persist non-empty restored jars asynchronously. An empty jar
+              // needs no disk flush; every later site open replaces it again.
+              invoke.resolve(JSObject().put("ok", true))
+              if (cookieHeaders.isNotEmpty()) flushCookieStoreAsync(manager)
+              return
+            }
+            try {
+              manager.setCookie(url, cookieHeaders[index]) { accepted ->
+                if (rejectIfActivityUnavailable(invoke)) return@setCookie
+                if (accepted != true) rejected += 1
+                setNext(index + 1)
+              }
+            } catch (_: Exception) {
+              // Avoid leaving a partial target jar available to the page
+              // that was active before the provider switch.
+              try {
+                manager.removeAllCookies {
+                  if (!rejectIfActivityUnavailable(invoke)) {
+                    invoke.reject("Android çerezleri geri yüklenemedi")
+                  }
+                }
+              } catch (_: Exception) {
+                invoke.reject("Android çerezleri geri yüklenemedi")
+              }
+            }
+          }
+          setNext(0)
+        }
+      } catch (_: Exception) {
+        invoke.reject("Android çerezleri temizlenemedi")
+      }
+    }
+  }
+
   // ------------------------------------------------- localStorage / IndexedDB
 
   /**
@@ -139,23 +307,23 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val purpose = invoke.getArgs().getString("purpose") ?: run {
       invoke.reject("purpose gerekli"); return
     }
-    val webView = sharedWebView ?: run {
-      invoke.reject("WebView hazır değil"); return
-    }
-    webView.evaluateJavascript(
-      "(function(){var o={};for(var i=0;i<localStorage.length;i++){" +
-        "var k=localStorage.key(i);o[k]=localStorage.getItem(k);}return o;})()"
-    ) { result ->
-      if (result == null || result == "null") {
-        // Context torn down mid-evaluation (navigation won the race): report
-        // an empty payload rather than half a jar.
-        invoke.resolve(JSObject().put("value", ""))
-        return@evaluateJavascript
-      }
-      try {
-        invoke.resolve(JSObject().put("value", seal(purpose, result)))
-      } catch (e: Exception) {
-        invoke.reject("localStorage şifrelemesi başarısız: ${e.message}", e)
+    withLiveWebView(invoke) { webView ->
+      webView.evaluateJavascript(
+        "(function(){var o={};for(var i=0;i<localStorage.length;i++){" +
+          "var k=localStorage.key(i);o[k]=localStorage.getItem(k);}return o;})()"
+      ) { result ->
+        if (rejectIfActivityUnavailable(invoke)) return@evaluateJavascript
+        if (result == null || result == "null") {
+          // Context torn down mid-evaluation (navigation won the race): report
+          // an empty payload rather than half a jar.
+          invoke.resolve(JSObject().put("value", ""))
+          return@evaluateJavascript
+        }
+        try {
+          invoke.resolve(JSObject().put("value", seal(purpose, result)))
+        } catch (e: Exception) {
+          invoke.reject("localStorage şifrelemesi başarısız: ${e.message}", e)
+        }
       }
     }
   }
@@ -175,15 +343,14 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       if (json.isEmpty()) {
         invoke.resolve(JSObject().put("ok", true)); return
       }
-      val webView = sharedWebView ?: run {
-        invoke.reject("WebView hazır değil"); return
-      }
       // Valid JSON is a valid JS object literal, so the payload is embedded
       // directly — never interpolated as source text.
       val js = "(function(){try{var d=$json;localStorage.clear();" +
         "for(var k in d){localStorage.setItem(k,d[k]);}}catch(e){}})();"
-      webView.evaluateJavascript(js, null)
-      invoke.resolve(JSObject().put("ok", true))
+      withLiveWebView(invoke) { webView ->
+        webView.evaluateJavascript(js, null)
+        invoke.resolve(JSObject().put("ok", true))
+      }
     } catch (e: Exception) {
       invoke.reject("localStorage çözülemedi", e)
     }
@@ -205,20 +372,20 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val purpose = invoke.getArgs().getString("purpose") ?: run {
       invoke.reject("purpose gerekli"); return
     }
-    val webView = sharedWebView ?: run {
-      invoke.reject("WebView hazır değil"); return
-    }
-    // `evaluateJavascript` awaits a returned Promise (API 21+), so the async
-    // IIFE below resolves the callback with the finished dump.
-    webView.evaluateJavascript(EXPORT_IDB_JS) { result ->
-      if (result == null || result == "null") {
-        invoke.resolve(JSObject().put("value", ""))
-        return@evaluateJavascript
-      }
-      try {
-        invoke.resolve(JSObject().put("value", seal(purpose, result)))
-      } catch (e: Exception) {
-        invoke.reject("IndexedDB şifrelemesi başarısız: ${e.message}", e)
+    // Keep the existing export script and callback contract, but run the
+    // WebView call on Android's required UI thread.
+    withLiveWebView(invoke) { webView ->
+      webView.evaluateJavascript(EXPORT_IDB_JS) { result ->
+        if (rejectIfActivityUnavailable(invoke)) return@evaluateJavascript
+        if (result == null || result == "null") {
+          invoke.resolve(JSObject().put("value", ""))
+          return@evaluateJavascript
+        }
+        try {
+          invoke.resolve(JSObject().put("value", seal(purpose, result)))
+        } catch (e: Exception) {
+          invoke.reject("IndexedDB şifrelemesi başarısız: ${e.message}", e)
+        }
       }
     }
   }
@@ -238,9 +405,6 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       if (json.isEmpty()) {
         invoke.resolve(JSObject().put("ok", true)); return
       }
-      val webView = sharedWebView ?: run {
-        invoke.reject("WebView hazır değil"); return
-      }
       // Same no-interpolation rule: the payload becomes a parsed literal.
       val js = "(async function(){try{var d=$json;" +
         "for(var name in d){var spec=d[name];" +
@@ -253,8 +417,10 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         "spec.stores[sn].forEach(function(row){st.put(row.value,row.key);});" +
         "tx.oncomplete=function(){res()};tx.onerror=function(){rej(tx.error)}});}" +
         "db.close();}}catch(e){}})();"
-      webView.evaluateJavascript(js, null)
-      invoke.resolve(JSObject().put("ok", true))
+      withLiveWebView(invoke) { webView ->
+        webView.evaluateJavascript(js, null)
+        invoke.resolve(JSObject().put("ok", true))
+      }
     } catch (e: Exception) {
       invoke.reject("IndexedDB çözülemedi", e)
     }
@@ -327,6 +493,10 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   companion object {
+    private const val LOG_TAG = "AnimeHubPlugin"
+    private val COOKIE_FLUSH_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "AnimeHubCookieFlush").apply { isDaemon = true }
+    }
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val KEY_ALIAS_PREFIX = "animehub_"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"

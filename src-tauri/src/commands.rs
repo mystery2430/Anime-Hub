@@ -369,7 +369,12 @@ pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
 /// Wipe stored cookies for one site, or for all sites when `id` is `None`.
 #[tauri::command]
 pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u32> {
+    #[cfg(target_os = "android")]
+    let all_sites = id.is_none();
     let state = app.state::<AppState>();
+    #[cfg(target_os = "android")]
+    let _session_guard = windows::lock_android_session()?;
+
     let ids: Vec<String> = match id {
         Some(id) => vec![id],
         None => {
@@ -380,6 +385,24 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
             reg.sites.iter().map(|s| s.id.clone()).collect()
         }
     };
+    #[cfg(target_os = "android")]
+    {
+        let current = state
+            .current_site
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        let clear_live_jar = all_sites
+            || current
+                .as_ref()
+                .is_some_and(|site| ids.iter().any(|id| id == &site.site_id));
+        drop(current);
+        if clear_live_jar {
+            // On Android the CookieManager is shared by every provider; when
+            // clearing the active provider (or all providers), clear that live
+            // jar as well as the encrypted snapshots below.
+            crate::android_bridge::webview_cookies_clear()?;
+        }
+    }
     let mut n = 0;
     for id in &ids {
         state.provider.delete_secret(&format!("cookies-{id}"))?;
@@ -917,7 +940,8 @@ pub struct AppInfo {
     pub key_backend_os_backed: bool,
     pub webview: String,
     pub anilist_configured: bool,
-    /// `true` on Android, where storage isolation is cookie-level only.
+    /// `true` on Android, where cookie jars are swapped but same-origin
+    /// localStorage/IndexedDB provider isolation remains unresolved.
     pub android_isolation_note: bool,
 }
 

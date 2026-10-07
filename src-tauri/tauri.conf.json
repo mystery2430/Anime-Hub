@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AnimeHub",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "identifier": "dev.animehub.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -50,7 +50,7 @@
     "active": true,
     "category": "Video",
     "shortDescription": "Anime takip ve izleme sitelerini tek yerde toplayan başlatıcı",
-    "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve Animecix gibi siteleri tek bir uygulama altında toplar. Her site kendi izole ve şifreli WebView oturumunda açılır; oturum verileri diskte şifreli saklanır ve yalnızca HTTPS adreslere izin verilir.",
+    "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve Animecix gibi siteleri tek bir uygulama altında toplar. Masaüstünde her site ayrı WebView profilinde açılır; Android'de CookieManager çerez kavanozu site geçişlerinde değiştirilir. Aynı kaynaklı localStorage/IndexedDB için sağlayıcılar arası yalıtım henüz çözülmemiştir. Uygulama şifreli deposuna yazılan oturum anlık görüntüleri şifrelenir; Android'in etkin CookieManager kavanozu WebView tarafından ayrı yönetilir. Yalnızca HTTPS adreslere izin verilir.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

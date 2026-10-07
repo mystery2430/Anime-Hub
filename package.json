@@ -1,8 +1,8 @@
 {
   "name": "animehub",
   "private": true,
-  "version": "0.3.1",
-  "description": "AnimeHub — anime tracking and streaming sites in one isolated, encrypted launcher.",
+  "version": "0.3.2",
+  "description": "AnimeHub — a launcher for anime sites with encrypted session storage and platform-specific session handling.",
   "license": "MIT",
   "repository": {
     "type": "git",

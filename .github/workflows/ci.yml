@@ -160,18 +160,17 @@ jobs:
       - name: Install the Kotlin bridge and PiP manifest
         run: python3 scripts/android_prepare.py
 
-      - name: Build APK
-        # Desktop release uses LTO. On the 7 GB Android runner that link OOMs
-        # after a long compile, so this job overrides the profile for the
-        # invocation only. The committed Cargo.toml profile is unchanged.
+      - name: Build installable debug APK
+        # A debug variant is signed with Android's generated debug key, so the
+        # CI artifact can be installed for testing without release keystore
+        # secrets. Disable Rust debug symbols to keep the artifact manageable.
         shell: bash
         env:
           CARGO_BUILD_JOBS: "1"
-          CARGO_PROFILE_RELEASE_LTO: "off"
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           set +e
-          npm run tauri android build -- --apk --target aarch64 > /tmp/android-build.log 2>&1
+          npm run tauri android build -- --debug --apk --target aarch64 > /tmp/android-build.log 2>&1
           status=$?
           set -e
           tail -n 60 /tmp/android-build.log
@@ -179,6 +178,22 @@ jobs:
             node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" /tmp/android-build.log "android build" || true
             exit "$status"
           fi
+
+      - name: Collect debug APK
+        run: |
+          set -euo pipefail
+          mkdir -p dist-apk
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -path '*/debug/*.apk' -print -quit)
+          test -n "$apk"
+          cp "$apk" dist-apk/animehub-aarch64-debug.apk
+          ls -lh dist-apk
+
+      - name: Upload installable Android APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: animehub-android-aarch64-debug
+          path: dist-apk/*.apk
+          if-no-files-found: error
 
       - name: Upload Android build log
         if: always()

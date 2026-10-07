@@ -57,12 +57,26 @@ test("android release workflow prepares the project before signing", () => {
   assert.equal(yml.includes("setup-ndk"), false);
 });
 
-test("CI android job installs the Tauri NDK instead of a mismatched one", () => {
+test("CI android job builds and uploads an installable debug APK", () => {
   const yml = read(join(ROOT, ".github/workflows/ci.yml"));
   assert.match(yml, /platforms;android-36/);
   assert.match(yml, /ndk;29\.0\.13846066/);
   assert.equal(yml.includes("setup-ndk"), false);
-  assert.match(yml, /CARGO_PROFILE_RELEASE_LTO/);
+  assert.match(yml, /--debug --apk --target aarch64/);
+  assert.match(yml, /CARGO_PROFILE_DEV_DEBUG/);
+  assert.match(yml, /animehub-android-aarch64-debug/);
+  assert.match(yml, /actions\/upload-artifact@v7/);
+});
+
+test("opening an Android site no longer shows the storage-isolation toast", () => {
+  const ui = read(join(ROOT, "src/main.js"));
+  const start = ui.indexOf("async function openSite(tile)");
+  const end = ui.indexOf("/** Ask the backend to close", start);
+  assert.ok(start >= 0 && end > start, "openSite function should be present");
+  const openSite = ui.slice(start, end);
+  assert.equal(openSite.includes("opened.isolated"), false);
+  assert.equal(openSite.includes("şifreli blob'lara aktarılır"), false);
+  assert.match(ui, /aynı kaynaklı localStorage\/IndexedDB yalıtımı henüz çözülmedi/);
 });
 
 function fakeGen(packageName) {

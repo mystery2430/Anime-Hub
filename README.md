@@ -5,7 +5,7 @@
 
 # AnimeHub
 
-**Anime takip ve izleme sitelerini tek yerde toplayan; her siteyi kendi izole ve şifreli oturumunda açan Tauri 2 başlatıcısı.**
+**Anime takip ve izleme sitelerini tek yerde toplayan; masaüstünde profilleri ayıran, Android'de çerez kavanozlarını site geçişlerinde değiştiren Tauri 2 başlatıcısı.**
 
 <br/>
 
@@ -29,12 +29,13 @@
 ## ℹ️&nbsp; Proje Hakkında
 
 AnimeHub bir **başlatıcı**dır: tek bir siteye bağlanan bir istemci değil. Ekranda
-gruplanmış bir ikon ızgarası görürsünüz, birine dokunursunuz, o site ana
-pencerenin içinde kendi **izole** WebView'ında açılır (yeni pencere/sekme
-yok; üstteki geri düğmesi veya `Esc` ile starters ekranına dönersiniz).
-Siteler arasında çerez, localStorage veya oturum sızıntısı olmaz — MAL'da
-giriş yapmanız AniList'i, AniList'te giriş yapmanız bir izleme sitesini
-etkilemez.
+gruplanmış bir ikon ızgarası görürsünüz, birine dokunursunuz ve site uygulama
+WebView'ında açılır (yeni pencere/sekme yok; üstteki geri düğmesi veya `Esc` ile
+başlatıcıya dönersiniz). Masaüstünde her site ayrı profil kullanır. Android,
+tek bir sistem WebView'ı kullandığından site geçişlerinde çerez kavanozları
+uygulama tarafından değiştirilir; aynı kaynaklı `localStorage`/IndexedDB için
+sağlayıcılar arası yalıtım henüz çözülmemiştir. Bu nedenle Android'de tam site
+verisi yalıtımı garantisi verilmez.
 
 İki grup vardır:
 
@@ -49,6 +50,8 @@ motorunda açar. Sitelerin kullanım koşullarına uymak size aittir.
 
 > [!NOTE]
 > Bu proje bir topluluk çalışmasıdır; hiçbir sitenin resmî istemcisi değildir.
+>
+> Sürüm notları: [`CHANGELOG.md`](./CHANGELOG.md) · Güncel paketler: [Releases](https://github.com/mystery2430/Anime-Hub/releases/latest)
 
 ---
 
@@ -95,7 +98,7 @@ flowchart TB
 | **Rust çekirdeği** | `src-tauri/src/*.rs` | Komutlar, site kaydı, URL politikası, şifreli depo, AniList OAuth, site görünümünü barındırma |
 | **Güvenlik katmanı** | `secure/`, `sites/`, `web/` | AES-256-GCM depo, HTTPS zorunluluğu, alan adı engelleme, gezinti/yeni pencere reddi |
 | **Başlatıcı arayüzü** | `src/` | Izgara, site ekleme/düzenleme, Ayarlar ve Hakkında ekranları — `innerHTML` kullanmadan |
-| **Android köprüsü** | `src-tauri/android-plugin/` | AndroidKeyStore (şifreleme) + Picture-in-Picture |
+| **Android köprüsü** | `src-tauri/android-plugin/` | CookieManager çerez takası + AndroidKeyStore (şifreleme) + Picture-in-Picture |
 | **CI/CD** | `.github/workflows/` | Test matrisi, Android APK ve masaüstü paketlerinin otomatik derlenmesi |
 
 ---
@@ -104,10 +107,10 @@ flowchart TB
 
 ### 🪟&nbsp; Site başına izole oturum — tek pencerede
 
-Her site kendi WebView profil dizinini alır:
+Masaüstünde her site kendi WebView profil dizinini alır:
 `<uygulama verisi>/profiles/<site>`. Linux'ta WebKitGTK `data_directory`,
-Windows'ta WebView2 profili kullanılır; çerezler, localStorage, IndexedDB ve
-önbellek siteler arasında **hiç** kesişmez.
+Windows'ta WebView2 profili kullanılır; çerezler, `localStorage`, IndexedDB
+ve önbellek bu **masaüstü profilleri** arasında kesişmez.
 
 Masaüstünde site, uygulamanın **tek penceresi içinde** siteden-siteye
 değişen bir alt WebView olarak barındırılır — tarayıcı sekmesi veya OS
@@ -118,22 +121,29 @@ başlatıcı WebView'ına kapsüllüdür, şüpheli bir site Rust komutlarına
 ulaşamaz.
 
 > [!IMPORTANT]
-> Android'de sistem WebView'ının site başına profil API'si **yoktur**.
-> Bunun yerine uygulama, site açılırken/kapanırken **tüm oturum verisini**
-> şifreli blob'lara aktarır: çerez kavanozuna ek olarak `localStorage` ve
-> IndexedDB de AndroidKeyStore ile mühürlenir, hedef sitenin sayfası
-> yüklendiğinde geri yüklenir ve oturum açıkken 30 saniyede bir (depo
-> blob'ları daha seyrek) tazelenir. IndexedDB aktarımı **en iyi çaba**
-> ilkesiyle çalışır (belgeler ve anahtarlar taşınır; ikincil indeksler,
-> key path ve Blob türü değerler korunmaz). Bu mekanizma henüz bir cihazda
-> doğrulanmadı; doğrulama tamamlanana kadar ayrıştırma eksik kalırsa ekranda
-> uyarı gösterilir.
+> Android'de sistem WebView'ının site başına profil API'si **yoktur**; tüm
+> sağlayıcılar aynı WebView ve `CookieManager` kavanozunu paylaşır. Uygulama,
+> geçişte eski sağlayıcının çerezlerini şifreli depoya kaydeder, ortak kavanozu
+> temizler ve hedef sağlayıcının çerezlerini geri yükledikten sonra gezinir.
+> Bu, çerez oturumlarını ayırır; ilk açılışta tüm WebView verisini silen genel
+> temizleme yapılmaz.
+>
+> Çerez anlık görüntüleri AnimeHub'ın şifreli deposuna kaydedilir; Android'in
+> etkin `CookieManager` kavanozu ise WebView tarafından ayrıca yönetilir.
+> `localStorage` ve IndexedDB için şifreli dışa/içe aktarma köprüleri vardır,
+> ancak aynı kaynakta yeniden kullanılan WebView'da **sağlayıcılar arası
+> yalıtımı garanti etmez**. Özellikle aynı-origin `localStorage`/IndexedDB
+> izolasyonu henüz çözülmemiştir; güvenlik sınırı olarak kabul etmeyin.
+> IndexedDB aktarımı en iyi çabadır ve indeks/key path/Blob gibi tüm özellikleri
+> korumaz.
 
 ### 🔒&nbsp; Diskte şifreli duran veriler
 
-Oturum verileri ve API anahtarları AES-256-GCM ile şifrelenir (`AHB1` zarf
-biçimi). Anahtar hiçbir zaman düz metin saklanmaz, platformun kendi anahtar
-kaynağından gelir:
+AnimeHub'ın şifreli deposuna yazılan oturum anlık görüntüleri ve API anahtarları
+AES-256-GCM ile şifrelenir (`AHB1` zarf biçimi). Android'in etkin ortak
+`CookieManager` kavanozu WebView tarafından ayrı yönetilir ve bu uygulama
+şifreli depo sarmalayıcısına dahil değildir. Anahtar hiçbir zaman düz metin
+saklanmaz, platformun kendi anahtar kaynağından gelir:
 
 | Platform | Anahtar kaynağı |
 |---|---|
@@ -142,12 +152,12 @@ kaynağından gelir:
 | Android | AndroidKeyStore (donanım destekli) |
 | Hiçbiri yoksa | `0600` izinli dosya — **ve Hakkında ekranında bu açıkça yazar** |
 
-**Canlı oturum eşitlemesi:** site açıkken çerezler (Android'de ayrıca
-localStorage/IndexedDB, daha seyrek aralıkla) 30 saniyede bir şifreli depoya
-eşitlenir; kapanış anındaki export son ve yetkili yazım olarak kalır. Böylece
-bir çökme ya da Android'in süreci öldürmesi en fazla bir aralıklik oturum
-değişikliğini kaybettirir. Her arka plan yazımı, oturum sahipliği kontrolüyle
-bir sitenin verisini asla başka bir sitenin blob'una yazamaz.
+**Oturum anlık görüntüleri:** açık oturumların çerezleri 30 saniyede bir
+şifreli depoya eşitlenir; Android'de `localStorage`/IndexedDB anlık görüntüleri
+5 dakikada bir denenir ve en iyi çaba niteliğindedir. Kapanış anında son bir
+kayıt alınır. Android depolama köprüsü, aynı-origin `localStorage`/IndexedDB
+verisini sağlayıcı bazında güvenilir biçimde ayırmaz; bu anlık görüntüler tam
+izolasyon garantisi değildir.
 
 ### 🛡️&nbsp; Sıkı gezinti politikası
 
@@ -224,8 +234,8 @@ Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
 
 | Yöntem | Boyut | Komut |
 |---|---|---|
-| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.1_amd64.deb` |
-| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.3.1-1.x86_64.rpm` |
+| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.2_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.3.2-1.x86_64.rpm` |
 | **AppImage** | ~75 MB | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
 
 ```bash
@@ -239,7 +249,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
-> **Windows paketleri henüz kod imzalı değildir (0.3.1 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
+> **Windows paketleri henüz kod imzalı değildir (v0.3.2 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
@@ -248,8 +258,11 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **İmzalı APK** | ~7–11 MB | Releases sayfasından ABI'nize uygun `.apk` (`animehub-aarch64-release.apk` çoğu modern telefon; `animehub-armv7-release.apk` eski 32-bit; `animehub-x86_64-release.apk` emülatör) |
 
 > [!NOTE]
-> APK'lar tüm CI işlerinde derleniyor ve yayın anahtarıyla imzalanıyor.
-> Henüz bir cihazda elle doğrulanmadı — sorun yaşarsanız Issue açın.
+> Yayın APK'ları CI'da ABI başına derlenir ve yayın anahtarıyla imzalanır.
+> Önceki (asenkron kalıcılaştırma değişikliğinden önceki) Android CI debug APK'sı
+> bir cihazda denendi: siteler artık çökmedi, ancak yavaş açıldı. v0.3.2'deki
+> değişiklik henüz fiziksel cihazda ölçülmedi; performans iyileşmesi olduğu
+> doğrulanmış sayılmamalıdır.
 
 ---
 
@@ -259,7 +272,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 |---|---|---|---|
 | 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Releases sayfasındaki paketler CI sürümünde üretildi |
 | 🪟 **Windows** | ✅ Doğrulandı | `.exe` (NSIS) | DPAPI + WebView2 profili; kurulum Windows üzerinde elle doğrulandı |
-| 🤖 **Android** | ✅ Derleniyor | 3 ABI için imzalı `.apk` | Çerez + localStorage/IndexedDB şifreli blob aktarımıyla oturum ayrımı; cihaz testi bekleniyor |
+| 🤖 **Android** | ✅ Derleniyor | 3 ABI için imzalı `.apk` | CookieManager çerez kavanozu takası; aynı-origin localStorage/IndexedDB sağlayıcı yalıtımı çözülmedi |
 | 🍎 **macOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 | 🍏 **iOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 
@@ -358,17 +371,19 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
 | Android APK derlemesi (aarch64, armv7, x86_64) | yeşil — `release-android.yml` ve CI'daki Android compile işi; `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla |
-| **v0.3.0 yayın paketleri** | doğrulandı: 3 **imzalı** APK + `AnimeHub_0.3.0_x64-setup.exe` + `.deb`/`.rpm`/AppImage (7/7 asset); `main` CI'sı tam yeşil |
+| **v0.3.1 yayın paketleri** | GitHub Release'te doğrulandı: 3 **imzalı** APK + Windows NSIS + Linux `.deb`/`.rpm`/AppImage (7/7 asset) |
 | Windows kurulumu | Windows üzerinde elle doğrulandı (DPAPI + WebView2 profili) |
 | Bağımlılık güvenliği | `npm audit` → 0 açık; `cargo audit` CI'da her koşuda; Dependabot (cargo/npm/actions) haftalık güncelleme açar; açık bildirimi için [SECURITY.md](./SECURITY.md) |
 | Frontend derlemesi | CI'da `npm run build` (Vite 8 + rolldown) her PR'da koşar; sürüm yayınında `tauri build` aynı adımı kullanır |
 
 **Hâlâ doğrulanmayanlar:**
 
-- **Android cihaz testi.** APK derlenip imzalanıyor; elle cihaz doğrulaması
-  yapılmadı (PiP, çerez takası, localStorage/IndexedDB şifreli aktarımı ve
-  geri katmanı dahil). IndexedDB aktarımının kayıpsız olmadığı bilinir:
-  ikincil indeksler ve Blob değerleri taşınmaz.
+- **Android cihaz doğrulaması.** Önceki CI adayı bir cihazda site açarken
+  çökmedi, ancak yavaş yüklendi. v0.3.2'deki asenkron CookieManager
+  kalıcılaştırması yeni bir fiziksel cihaz ölçümü bekliyor; performans kazancı
+  doğrulanmış değildir. PiP ve gerçek sağlayıcılar arası same-origin
+  localStorage/IndexedDB yalıtımı da doğrulanmadı; IndexedDB aktarımı
+  kayıpsız değildir (ikincil indeksler ve Blob değerleri taşınmaz).
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.

@@ -10,7 +10,9 @@ bir komutun çıktısı ya da açıkça "yapılamadı" olarak işaretli.
 ## 1. Proje bir cümlede
 
 Tauri 2 (Rust + native WebView) ile yazılmış bir **başlatıcı**: ikon ızgarası,
-seçilen site kendi izole ve şifreli WebView oturumunda tam ekran açılır.
+site masaüstünde kendi WebView profiliyle açılır; Android tek WebView kullanır
+ve sağlayıcı çerez kavanozlarını değiştirir. Android'de aynı kaynaklı
+`localStorage`/IndexedDB için gerçek sağlayıcı yalıtımı henüz çözülmedi.
 Android birincil, Windows/Linux ikincil hedef; macOS/iOS kapsam dışı.
 
 Paket kimliği `dev.animehub.app`. GPLv3 lisanslı Dantotsu'dan **hiç kod
@@ -107,9 +109,9 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 
 | Konu | Neden yapılamadı |
 |---|---|
-| **Android APK** | ✅ v0.2.0 ile yeşil: Init ve prepare geçiyor; derleme hataları `cfg!()` (çalışma-zamanı) yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` (derleme-zamanı) sınırlarıyla giderildi; `release-android.yml` 3 ABI'de üretiyor. Cihaz testi hâlâ yok |
-| **Android localStorage/IndexedDB izolasyonu** | Yazıldı, cihazda doğrulanmadı: Kotlin tarafında `localstorage_export/import` + `indexeddb_export/import` komutları (`evaluateJavascript` ile sayfa deposunu okur/yazar, AndroidKeyStore ile mühürler); Rust tarafında `open_on_mobile`/`close_site_window` çıkışta mühürlü blob'u kaydeder, açılışta sayfa yüklendikten sonra (URL yoklayan watcher + oturum sahipliği kontrolü) geri yükler. **Canlı sync:** `spawn_session_sync` (her platform) oturum açıkken 30 sn'de bir çerezleri, Android'de 10 tick'te bir (5 dk) depo blob'larını şifreli depoya eşitler — sahiplik + origin kontrolüyle. IndexedDB **en iyi çaba**: ikincil indeks/key path/Blob taşınmaz. Sandbox'ta Rust toolchain yok — derleme doğrulaması CI'a kaldı |
-| **Kotlin köprüsü** | `android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`. Paket yolu doğrulandı; Gradle derlemesi yeşil. Depolama komutları bu doğrulamanın öncesinde yazıldı, yeniden derleme gerektirir |
+| **Android APK / v0.3.2 adayı** | PR #16'nın önceki CI debug APK'sı bir cihazda denendi: siteler artık çökmedi, ancak yavaş yüklendi. v0.3.2 adayındaki asenkron `CookieManager.flush()` değişikliği henüz Android CI'da veya cihazda doğrulanmadı; performans kazancı varsayılmamalı. Release workflow tag ile 3 ABI üretir |
+| **Android localStorage/IndexedDB** | Dışa/içe aktarma köprüleri ve şifreli anlık görüntüler bulunur; bunlar gerçek sağlayıcı yalıtımı sağlamaz. Android tek WebView'ı yeniden kullandığı için aynı kaynaklı `localStorage`/IndexedDB izolasyonu çözülmemiştir ve güvenlik sınırı olarak sunulmamalıdır. IndexedDB aktarımı en iyi çabadır (ikincil indeks/key path/Blob kaybı mümkündür) |
+| **Kotlin köprüsü** | PR #16'nın önceki Kotlin sürümü aarch64 Android CI'da derlendi. v0.3.2 adayı Activity/WebView yaşam döngüsü kontrolleri ve asenkron cookie kalıcılaştırması ekliyor; bu değişiklikler yeni Android CI derlemesini bekliyor. Yerelde Android SDK/Gradle yok |
 | **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
 | **Windows NSIS** | CI Windows'ta test eder, paket üretmez. `77f5e7c` clippy kırmızıydı; DPAPI çağrıları `windows-sys` 0.61 imzasına çekildi, sonuç henüz yok |
 | **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
