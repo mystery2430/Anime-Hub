@@ -401,8 +401,9 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
   doğrulanmış değildir. PiP ve gerçek sağlayıcılar arası same-origin
   localStorage/IndexedDB yalıtımı da doğrulanmadı; IndexedDB aktarımı
   kayıpsız değildir (ikincil indeksler ve Blob değerleri taşınmaz).
-  Kontrollü PiP zinciri (hazırlık → PiP → geri yükleme) yalnızca birim
-  testleriyle doğrulandı; fiziksel cihazda **denenmedi**.
+  Kontrollü PiP zinciri (hazırlık → PiP → geri yükleme) birim testleriyle
+  doğrulandı ve Android hâli CI'da derlenip kurulabilir bir debug APK olarak
+  paketlendi; ancak çalışma zamanı fiziksel cihazda **denenmedi**.
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.

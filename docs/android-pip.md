@@ -1,8 +1,9 @@
 # Android Picture-in-Picture — implementation and verification report
 
-Status: **implemented, unit-tested on the WebView side, not compiled and not
-device-tested in the authoring workspace.** See [Verification](#verification)
-for exactly what was and was not run.
+Status: **implemented; the WebView side is unit-tested; the Android half
+compiles and packages into a debug APK in CI (PR #19, all jobs green); not
+device-tested.** See [Verification](#verification) for exactly what was and was
+not run.
 
 AnimeHub opens every site in one shared Android WebView. Android PiP shrinks
 the **whole Activity**, so the PiP window would show the entire site — header,
@@ -386,6 +387,31 @@ before `tauri android build`.
 | `python3 scripts/android_prepare.py --gen <fake gen tree>` | Renders the controller, injects the lifecycle block + imports, is idempotent on a second run, and refuses a `MainActivity` that is not a `TauriActivity` |
 | `node --check src-tauri/src/web/pip_controller.js` | Syntax OK |
 | tree-sitter grammars (`tree-sitter-rust` 0.24, `tree-sitter-kotlin` 1.1, via pip) over every changed `.rs` file and the three generated Kotlin files (controller, plugin, `MainActivity`) | No `ERROR`/missing nodes — a full parse of each file, not just a brace count |
+
+### CI
+
+`ci.yml` runs on pull requests, so opening PR #19 from this branch ran the whole
+pipeline — **run [37792307795](https://github.com/mystery2430/Anime-Hub/actions/runs/37792307795)
+on commit `c82456d`: every job green**:
+
+| Job | Result |
+|---|---|
+| **Android compile (aarch64)** — `tauri android init` → `python3 scripts/android_prepare.py` → `tauri android build -- --debug --apk --target aarch64` | **success.** The generated `MainActivity` with the injected lifecycle block, `AnimeHubPipController.kt` and the reworked `AnimeHubPlugin.kt` all compile and package. Artifact `animehub-android-aarch64-debug` (14.7 MB) is a real, installable debug APK. |
+| Tests (ubuntu-24.04, macos-latest, windows-latest) — `npm test`, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --all` | success on all three |
+| Dependency and secret audit | success |
+| Release profile (LTO) | success |
+
+The first run (commit `cc3ec52`) failed **only the three test jobs** and its
+Android job already passed: two new Rust assertions matched text the shipped
+files do not contain (the controller installs its API through computed keys,
+`window[PREPARE_FN] = prepare`, and `AnimeHubPlugin.kt` mentions
+`enterPictureInPictureMode()` in the doc comment that explains the delegation).
+Both assertions were corrected in `c82456d` to test the real source lines and
+the call form — that is the commit CI is green on.
+
+The APK artifact could not be downloaded into the authoring sandbox (the
+artifact blob host is outside its network allowlist); get it from the run page
+above or from the PR's *Checks* tab.
 | Brace/paren balance of the rendered `AnimeHubPipController.kt`, `AnimeHubPlugin.kt` and generated `MainActivity.kt` after rendering (script in the session, not committed) | Balanced; no placeholder left behind |
 
 The `gaps` tests additionally pin: the embedded controller text in the
@@ -397,22 +423,16 @@ a non-Tauri Activity.
 
 ### What was **not** run — do not read this as "it works on a device"
 
-* **The Kotlin was never compiled.** This workspace has no Android SDK, no
-  NDK, no Gradle and no JDK, and `src-tauri/gen/android` does not exist here, so
-  neither `gradle`/`tauri android build` nor a real `android_prepare.py` run
-  against the generated project was possible. The Kotlin in
-  `AnimeHubPipController.kt` and the generated `MainActivity` is written against
-  the Tauri 2.11 / wry 0.55.1 APIs read from source, but the first real compile
-  will be CI's `android` job (`tauri android build -- --debug --apk --target
-  aarch64`). A red CI run means a signature to fix there — the logic has been
-  reviewed line by line, and this is the honest status.
-* **CI was not started for this branch.** `ci.yml` triggers on `push` to `main`
-  and on `pull_request`, so pushing the working branch does not start it, and
-  `gh workflow run ci.yml --ref <branch>` is refused for this token
-  (`HTTP 403: Resource not accessible by integration`). To get the compile and
-  the debug APK, either open a pull request from the branch (the `pull_request`
-  trigger runs the whole pipeline) or start the workflow manually from the
-  Actions tab. Nothing in this change has been through CI yet.
+* **Nothing was compiled or run in the authoring sandbox.** It has no Android
+  SDK, NDK, Gradle or JDK and no `src-tauri/gen/android`, and no Rust toolchain.
+  Everything in the CI table above ran on GitHub's runners, not here: the
+  `android_prepare.py` run against a *real* generated project, the Kotlin
+  compile, the APK link, `cargo test`, `cargo clippy`. Locally the script was
+  only exercised against a hand-built fake gen tree.
+* **No device or emulator run.** The APK exists and installs, but nothing in
+  this change has been observed running: the PiP transition, the player
+  selection on a real site, the restore, or the API-level differences. The
+  checklist below is what still has to be done on hardware.
 * **Nothing was tested on a device.** No APK was produced in this workspace
   (see above), so there is no emulator or hardware run behind this document.
 * **`cargo test` was not re-run** (no Rust toolchain here). The Rust changes are

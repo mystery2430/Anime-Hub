@@ -14,7 +14,7 @@ Notable user-facing changes are recorded here. Release assets are published from
 
 ### Validation note
 
-The WebView-side controller is covered by `node --test tests/pip_controller.test.js`; the prepare script by `tests/gaps.test.js`, both run in CI. The controlled PiP chain has **not** been device-tested, and the Kotlin has not been compiled in this workspace (no Android SDK/Gradle/JDK) — only CI can do that. Details: [`docs/android-pip.md`](./docs/android-pip.md).
+The WebView-side controller is covered by `node --test tests/pip_controller.test.js`, the prepare script by `tests/gaps.test.js`, and the Kotlin/plugin invariants by unit tests in `src-tauri` — all green in CI (PR #19, run 37792307795: Android aarch64 compile, three-platform tests, audit and LTO jobs all pass; artifact `animehub-android-aarch64-debug`). The APK builds and installs, but the PiP behaviour itself has **not** been device-tested. Details: [`docs/android-pip.md`](./docs/android-pip.md).
 
 ## [0.3.2] — 2026-10-07
 
