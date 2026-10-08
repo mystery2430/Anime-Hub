@@ -401,7 +401,7 @@ on commit `c82456d`: every job green**:
 | Dependency and secret audit | success |
 | Release profile (LTO) | success |
 
-The first run (commit `cc3ec52`) failed **only the three test jobs** and its
+The first run (commit `9393b35`) failed **only the three test jobs** and its
 Android job already passed: two new Rust assertions matched text the shipped
 files do not contain (the controller installs its API through computed keys,
 `window[PREPARE_FN] = prepare`, and `AnimeHubPlugin.kt` mentions
