@@ -385,6 +385,7 @@ before `tauri android build`.
 | `node --test tests/gaps.test.js` | **7/7 pass** — includes the prepare-script tests below |
 | `python3 scripts/android_prepare.py --gen <fake gen tree>` | Renders the controller, injects the lifecycle block + imports, is idempotent on a second run, and refuses a `MainActivity` that is not a `TauriActivity` |
 | `node --check src-tauri/src/web/pip_controller.js` | Syntax OK |
+| tree-sitter grammars (`tree-sitter-rust` 0.24, `tree-sitter-kotlin` 1.1, via pip) over every changed `.rs` file and the three generated Kotlin files (controller, plugin, `MainActivity`) | No `ERROR`/missing nodes — a full parse of each file, not just a brace count |
 | Brace/paren balance of the rendered `AnimeHubPipController.kt`, `AnimeHubPlugin.kt` and generated `MainActivity.kt` after rendering (script in the session, not committed) | Balanced; no placeholder left behind |
 
 The `gaps` tests additionally pin: the embedded controller text in the
@@ -405,6 +406,13 @@ a non-Tauri Activity.
   will be CI's `android` job (`tauri android build -- --debug --apk --target
   aarch64`). A red CI run means a signature to fix there — the logic has been
   reviewed line by line, and this is the honest status.
+* **CI was not started for this branch.** `ci.yml` triggers on `push` to `main`
+  and on `pull_request`, so pushing the working branch does not start it, and
+  `gh workflow run ci.yml --ref <branch>` is refused for this token
+  (`HTTP 403: Resource not accessible by integration`). To get the compile and
+  the debug APK, either open a pull request from the branch (the `pull_request`
+  trigger runs the whole pipeline) or start the workflow manually from the
+  Actions tab. Nothing in this change has been through CI yet.
 * **Nothing was tested on a device.** No APK was produced in this workspace
   (see above), so there is no emulator or hardware run behind this document.
 * **`cargo test` was not re-run** (no Rust toolchain here). The Rust changes are
