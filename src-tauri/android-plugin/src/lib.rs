@@ -515,8 +515,10 @@ mod tests {
             kt.contains("AnimeHubPipController.applyAutoEnter("),
             "set_pip_auto_enter must go through the controller"
         );
+        // The call form, not the word: the doc comment above the command
+        // explains the chain it hands over to.
         assert!(
-            !kt.contains("enterPictureInPictureMode("),
+            !kt.contains(".enterPictureInPictureMode("),
             "the plugin must not enter PiP on its own"
         );
         assert!(

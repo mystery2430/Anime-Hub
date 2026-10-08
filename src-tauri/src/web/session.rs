@@ -858,17 +858,21 @@ mod tests {
             pip_controller: true,
             ..Default::default()
         });
+        // The controller installs through computed keys, so the exact source
+        // lines are what has to be present, not a literal `window.<name> =`.
         assert!(
-            with_pip.contains("window.__animehubPreparePip = prepare"),
+            with_pip.contains("var PREPARE_FN = \"__animehubPreparePip\";"),
             "the Android init script must install the prepare entry point"
         );
-        assert!(with_pip.contains("window.__animehubPip = toggle"));
-        assert!(with_pip.contains("__animehubPipVersion"));
+        assert!(with_pip.contains("window[PREPARE_FN] = prepare;"));
+        assert!(with_pip.contains("window[TOGGLE_FN] = toggle;"));
+        assert!(with_pip.contains("var VERSION_KEY = \"__animehubPipVersion\";"));
 
         // Desktop keeps the smaller script: nothing there calls the controller.
         let without = build_init_script(&InjectedConfig::default());
         assert!(!without.contains("__animehubPreparePip"));
         assert!(!without.contains("__animehubPipVersion"));
+        assert!(!without.contains("window[TOGGLE_FN] = toggle;"));
     }
 
     #[test]
