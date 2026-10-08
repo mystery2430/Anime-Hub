@@ -332,6 +332,10 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         } else {
             vec![]
         },
+        // Android: site pages get the PiP controller, which the native side
+        // drives with `evaluateJavascript` right before entering PiP. Desktop
+        // has no PiP window for a site WebView, so it stays out.
+        pip_controller: cfg!(target_os = "android"),
     };
     let init_script = build_init_script(&injected);
 
@@ -900,12 +904,31 @@ pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppRe
     })
 }
 
+/// Manual Picture-in-Picture entry.
+///
+/// The native side runs the *same* controlled chain the Activity callbacks use
+/// — prepare the WebView (`window.__animehubPreparePip()`), wait for its
+/// answer, then `enterPictureInPictureMode()` with the detected aspect ratio —
+/// so the PiP window only ever shows the active player, and the preparation
+/// exists once instead of once per entry point.
+///
+/// `num`/`den` are clamped here and passed on as a fallback for the case where
+/// no player ratio can be measured. Resolves `false` when PiP is unavailable,
+/// nothing playable was found, or the Activity could not enter PiP.
 #[tauri::command]
 pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
     let (n, d) = crate::android_bridge::clamp_aspect(num.unwrap_or(16), den.unwrap_or(9));
     crate::android_bridge::enter_pip(n, d)
 }
 
+/// Store the "enter PiP automatically" preference.
+///
+/// On Android this only *allows* the controlled paths — API 30+
+/// `onPictureInPictureRequested()` and API 26-29 `onUserLeaveHint()` — which
+/// prepare the WebView before PiP starts. The platform's own auto-enter
+/// (`setAutoEnterEnabled`) is deliberately never turned on: Android documents
+/// that it suppresses `onPictureInPictureRequested()`, so the system would put
+/// the unprepared site into the PiP window.
 #[tauri::command]
 pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
     crate::android_bridge::set_pip_auto_enter(enabled)

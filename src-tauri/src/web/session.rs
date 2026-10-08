@@ -278,6 +278,15 @@ pub fn decide_navigation_dns(
 pub fn build_init_script(cfg: &InjectedConfig) -> String {
     let payload = embed_json(cfg);
 
+    // The PiP controller installs `window.__animehubPreparePip` and
+    // `window.__animehubPip`. Only Android asks for it: desktop has no PiP
+    // window for a site WebView.
+    let pip_controller = if cfg.pip_controller {
+        format!("\n{PIP_CONTROLLER_JS}")
+    } else {
+        String::new()
+    };
+
     // The popup guard is *omitted* rather than disabled when off, so the
     // shipped script never contains the `window.open` override at all.
     let popup_guard = if cfg.block_popups {
@@ -317,7 +326,7 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
   if (window.__animehubInstalled) return;
   window.__animehubInstalled = true;
   var CFG = {payload};
-{popup_guard}{cosmetic}}})();"#
+{popup_guard}{cosmetic}{pip_controller}}})();"#
     )
 }
 
@@ -344,6 +353,14 @@ pub fn embed_json<T: serde::Serialize>(value: &T) -> String {
 pub struct InjectedConfig {
     pub block_popups: bool,
     pub hide_selectors: Vec<String>,
+    /// Android only: append [`PIP_CONTROLLER_JS`] to the injected script.
+    ///
+    /// The controller is *also* installed by the native side on demand
+    /// (`evaluateJavascript` before entering PiP), because navigating the
+    /// shared Android WebView to a site replaces the document and with it
+    /// anything the launcher's eval installed. Keeping it in the init script
+    /// as well means the site page has it from the first paint on.
+    pub pip_controller: bool,
 }
 
 impl Default for InjectedConfig {
@@ -354,6 +371,8 @@ impl Default for InjectedConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            // Off by default: only the Android caller turns it on.
+            pip_controller: false,
         }
     }
 }
@@ -437,6 +456,18 @@ fn assert_app_error_is_send() {
     fn check<T: Send>() {}
     check::<AppError>();
 }
+
+/// WebView-side Picture-in-Picture controller.
+///
+/// The same file is embedded into the Android PiP controller
+/// (`AnimeHubPipController.kt`, via `scripts/android_prepare.py`), so the
+/// WebView-side view and the native entry path can never drift apart. It is
+/// only appended to the init script when [`InjectedConfig::pip_controller`] is
+/// set — desktop never enters PiP and should keep the smaller script.
+///
+/// The text must stay free of dollar signs and triple quotes: it is embedded
+/// inside a Kotlin raw string on the Android side (see the module tests).
+pub const PIP_CONTROLLER_JS: &str = include_str!("pip_controller.js");
 
 /// Standalone overlay snippet: floating "back to launcher" button plus an
 /// `Esc` route home. Installed by Rust on every finished page load via
@@ -772,6 +803,7 @@ mod tests {
         let cfg = InjectedConfig {
             block_popups: true,
             hide_selectors: vec!["</script><script>alert(1)</script>".into()],
+            pip_controller: false,
         };
         let js = build_init_script(&cfg);
         assert!(
@@ -798,6 +830,7 @@ mod tests {
         let js = build_init_script(&InjectedConfig {
             block_popups: false,
             hide_selectors: vec![],
+            pip_controller: false,
         });
         assert!(!js.contains("window.open = function"));
     }
@@ -817,6 +850,43 @@ mod tests {
         // And the init script must not shadow-install a second overlay.
         let init = build_init_script(&InjectedConfig::default());
         assert!(!init.contains("__animehub-back"));
+    }
+
+    #[test]
+    fn init_script_carries_the_pip_controller_only_when_asked() {
+        let with_pip = build_init_script(&InjectedConfig {
+            pip_controller: true,
+            ..Default::default()
+        });
+        assert!(
+            with_pip.contains("window.__animehubPreparePip = prepare"),
+            "the Android init script must install the prepare entry point"
+        );
+        assert!(with_pip.contains("window.__animehubPip = toggle"));
+        assert!(with_pip.contains("__animehubPipVersion"));
+
+        // Desktop keeps the smaller script: nothing there calls the controller.
+        let without = build_init_script(&InjectedConfig::default());
+        assert!(!without.contains("__animehubPreparePip"));
+        assert!(!without.contains("__animehubPipVersion"));
+    }
+
+    #[test]
+    fn pip_controller_stays_embeddable_in_a_kotlin_raw_string() {
+        // scripts/android_prepare.py embeds this text in
+        // AnimeHubPipController.kt; a dollar sign would interpolate and triple
+        // quotes would end the literal.
+        assert!(PIP_CONTROLLER_JS.contains("__animehubPreparePip"));
+        assert!(PIP_CONTROLLER_JS.contains("__animehubPip"));
+        assert!(!PIP_CONTROLLER_JS.contains('$'));
+        assert!(!PIP_CONTROLLER_JS.contains("\"\"\""));
+        // No DOM moves and no iframe internals: the promise the Android side
+        // relies on for a lossless restore. (The file's own comments mention
+        // these APIs when stating the rule, so the scan looks for the call
+        // form, and tests/pip_controller.test.js does the same over code only.)
+        assert!(!PIP_CONTROLLER_JS.contains(".contentDocument"));
+        assert!(!PIP_CONTROLLER_JS.contains(".contentWindow"));
+        assert!(!PIP_CONTROLLER_JS.contains("appendChild(video)"));
     }
 
     #[test]

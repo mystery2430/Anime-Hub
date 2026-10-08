@@ -112,7 +112,7 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **Android APK / v0.3.2 runtime** | Herkese açık v0.3.2 release'i yayımlandı; Android release workflow'u aarch64, armv7 ve x86_64 için imzalı APK'ları başarıyla üretti. Önceki CI APK'sını bir cihazda açarken çökme görülmedi, ancak yükleme yavaştı. Bu sürümdeki asenkron `CookieManager.flush()` değişikliğinin performansı fiziksel cihazda henüz ölçülmedi |
 | **Android localStorage/IndexedDB** | Dışa/içe aktarma köprüleri ve şifreli anlık görüntüler bulunur; bunlar gerçek sağlayıcı yalıtımı sağlamaz. Android tek WebView'ı yeniden kullandığı için aynı kaynaklı `localStorage`/IndexedDB izolasyonu çözülmemiştir ve güvenlik sınırı olarak sunulmamalıdır. IndexedDB aktarımı en iyi çabadır (ikincil indeks/key path/Blob kaybı mümkündür) |
 | **Kotlin köprüsü** | v0.3.2 release workflow'u Activity/WebView yaşam döngüsü kontrolleri ve asenkron cookie kalıcılaştırması içeren köprüyü üç Android ABI'sinde derleyip imzaladı. Yerelde Android SDK/Gradle yok; asenkron kalıcılaştırmanın gerçek cihaz performansı doğrulanmadı |
-| **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
+| **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok. Kontrollü zincir (JS hazırlığı → `enterPictureInPictureMode` → çıkışta geri yükleme) yalnızca `node --test tests/pip_controller.test.js` birim testleriyle doğrulandı; `AnimeHubPipController.kt` ve üretilen `MainActivity` bu ortamda **derlenmedi** (Android SDK/Gradle/JDK yok) |
 | **Windows NSIS** | v0.3.2 Release Desktop workflow'u Windows üzerinde geçti ve `AnimeHub_0.3.2_x64-setup.exe` üretti. Windows imzalama sırrı tanımlı olmadığı için paket imzasız; README'de uyarısı var |
 | **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
 | **İmzalı yayın APK** | ✅ Keystore secret'ları (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) repository secrets'a eklendi; workflow imzalı üretiyor |
@@ -138,6 +138,15 @@ Script üç dizeyi karşılaştırır ve uyuşmazsa durur: Kotlin `package` sat�
 kimliği `dev.animehub.app` noktalı paket olarak üretir; eski
 `dev_animehub_app` tahmini yanlıştı ve düzeltildi. Script ayrıca PiP
 özniteliğini, eksikse OAuth intent-filter'ını ve R8 keep kuralını yazar.
+
+PiP tarafında script üç şey daha yapar: `AnimeHubPlugin.kt`'yi kopyalar,
+`AnimeHubPipController.kt`'yi şablondan üretir (şablondaki
+`__ANIMEHUB_PIP_CONTROLLER_JS__` yer tutucusu, Rust'ın da enjekte ettiği
+`src-tauri/src/web/pip_controller.js` ile doldurulur) ve üretilen
+`MainActivity.kt`'ye `// >>> AnimeHub PiP lifecycle ... >>>` işaretleri
+arasına PiP yaşam döngüsü bloğunu yazar. Blok her koşuda yenilenir, bu yüzden
+`onDestroy` gibi üyeler iki kez oluşmaz. `MainActivity` `TauriActivity`'den
+türemiyorsa (üretilen proje şekli değişmişse) script açıkça durur.
 `./scripts/build.sh android` ve `release-android.yml` bunu kendisi çağırır.
 
 `release-android.yml` içindeki iki gerçek hata da düzeltildi: keystore

@@ -2,6 +2,20 @@
 
 Notable user-facing changes are recorded here. Release assets are published from the matching `v*` tag.
 
+## [Unreleased]
+
+### Android
+
+- Picture-in-Picture now shows the active player instead of the whole site WebView. A new controlled chain finds the playing video (or, when the player lives in a cross-origin frame, uses that frame as the surface), applies a temporary player-only view of the page, and only then calls `enterPictureInPictureMode()` with the measured aspect ratio and the player's bounds as `sourceRectHint`.
+- PiP entry is claimed on API 30+ via `onPictureInPictureRequested()` and on API 26-29 via `onUserLeaveHint()`; both go through the same preparation. Leaving PiP restores the page from byte-exact saved styles, classes and attributes — no DOM move, no reload, playback and scroll position untouched.
+- The platform auto-enter flag (`setAutoEnterEnabled(true)`) is deliberately never set: Android documents that it suppresses `onPictureInPictureRequested()`, so the system could enter PiP before the WebView was prepared. The "auto PiP" setting now arms the controlled paths and is re-applied to the native controller on startup.
+- If no suitable player is found, if the preparation fails, or if the Activity is not resumed, PiP is not entered and the page is left exactly as it was.
+- The generated Android project still carries no permanent PiP code: `scripts/android_prepare.py` installs the configuration and lifecycle after `tauri android init`, and the script now also renders `AnimeHubPipController.kt` from a template and injects the lifecycle block into the generated `MainActivity.kt` idempotently.
+
+### Validation note
+
+The WebView-side controller is covered by `node --test tests/pip_controller.test.js`; the prepare script by `tests/gaps.test.js`, both run in CI. The controlled PiP chain has **not** been device-tested, and the Kotlin has not been compiled in this workspace (no Android SDK/Gradle/JDK) — only CI can do that. Details: [`docs/android-pip.md`](./docs/android-pip.md).
+
 ## [0.3.2] — 2026-10-07
 
 ### Android

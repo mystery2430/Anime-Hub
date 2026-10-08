@@ -3,6 +3,11 @@
 // Android half of AnimeHub's Keystore + Picture-in-Picture + cookie +
 // web-storage bridge.
 //
+// The PiP commands below delegate to `AnimeHubPipController`, which owns the
+// PiP lifecycle and the WebView preparation handshake; the file next to this
+// one is generated from a template by `scripts/android_prepare.py` (see the
+// PLACEHOLDER note in that script).
+//
 // INSTALLATION
 // ------------
 // `npm run tauri android init` generates the Gradle project under
@@ -23,11 +28,15 @@
 // -------------------
 // Written against the Tauri 2.11.6 plugin API
 // (`@TauriPlugin`, `Plugin`, `@Command`, `Invoke`, `JSObject`) and the
-// standard Android APIs listed in the imports. The Keystore and PiP halves
-// predate this note; the CookieManager and localStorage/IndexedDB bridges have
-// NOT been compiled or run on a device yet (the build environment has no
-// Android SDK/NDK). Treat
-// it as unverified until `npm run tauri android dev` passes on real hardware.
+// standard Android APIs listed in the imports. The Keystore half predates this
+// note. The controlled PiP chain (this file + `AnimeHubPipController.kt`) was
+// written from the AOSP sources of `Activity`/`PictureInPictureParams` and has
+// NOT been run on a device yet; the CookieManager and localStorage/IndexedDB
+// bridges have not been compiled or run on a device either (the build
+// environment has no Android SDK/NDK). Treat it as unverified until a real
+// `./scripts/build.sh android` / `tauri android build` has been installed on
+// hardware. Only the JS half of PiP has automated tests
+// (`tests/pip_controller.test.js`).
 //
 // STORAGE ISOLATION CONTRACT (localStorage/IndexedDB commands)
 // ------------------------------------------------------------
@@ -40,14 +49,10 @@
 package dev.animehub.app
 
 import android.app.Activity
-import android.app.PictureInPictureParams
-import android.content.pm.PackageManager
-import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
-import android.util.Rational
 import android.webkit.CookieManager
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
@@ -448,45 +453,66 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
   // ------------------------------------------------------------------- PiP
 
+  /**
+   * Manual PiP entry (`enter_pip`).
+   *
+   * Runs the exact same controlled chain as the Activity callbacks — prepare
+   * the WebView through `window.__animehubPreparePip()`, wait for its answer,
+   * then `enterPictureInPictureMode()` — so this command can never put the
+   * whole site into the PiP window, and the preparation logic exists once
+   * (in `AnimeHubPipController`) instead of twice.
+   *
+   * `num`/`den` are only a fallback: the ratio of the player the JS actually
+   * selected wins when it can be measured.
+   *
+   * Resolves with `{ ok: true }` only when the Activity really entered PiP.
+   */
   @Command
   fun enter_pip(invoke: Invoke) {
     val args = invoke.getArgs()
     val num = args.getInteger("num", 16)
     val den = args.getInteger("den", 9)
     try {
-      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-        invoke.resolve(JSObject().put("ok", false)); return
+      var answered = false
+      fun answer(ok: Boolean) {
+        if (answered) return
+        answered = true
+        try {
+          invoke.resolve(JSObject().put("ok", ok))
+        } catch (_: Exception) {
+          // The host went away between the request and its answer; the
+          // preparation path already restored the page.
+        }
       }
-      if (!activity.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-        invoke.resolve(JSObject().put("ok", false)); return
-      }
-      val params = PictureInPictureParams.Builder()
-        .setAspectRatio(safeAspectRatio(num, den))
-        .build()
-      val ok = activity.enterPictureInPictureMode(params)
-      invoke.resolve(JSObject().put("ok", ok))
+      val claimed = AnimeHubPipController.requestEnter(
+        activity,
+        "command",
+        onResult = { entered -> answer(entered) },
+        fallbackNum = num,
+        fallbackDen = den,
+      )
+      // Unsupported device: no callback will ever fire.
+      if (!claimed) answer(false)
     } catch (e: Exception) {
       invoke.reject("PiP başlatılamadı: ${e.message}", e)
     }
   }
 
+  /**
+   * Store the user's "enter PiP automatically" preference.
+   *
+   * The platform auto-enter flag is deliberately never enabled: Android
+   * documents that it suppresses `onPictureInPictureRequested()`, so the
+   * system would enter PiP before the WebView could be prepared. The
+   * preference is handed to `AnimeHubPipController`, which owns the controlled
+   * paths (API 30+ `onPictureInPictureRequested`, API 26-29 `onUserLeaveHint`).
+   */
   @Command
   fun set_pip_auto_enter(invoke: Invoke) {
     val enabled = invoke.getArgs().getBoolean("enabled", false)
     try {
-      // setAutoEnterEnabled is API 31+.
-      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-        invoke.resolve(JSObject().put("ok", false)); return
-      }
-      if (!activity.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-        invoke.resolve(JSObject().put("ok", false)); return
-      }
-      val params = PictureInPictureParams.Builder()
-        .setAspectRatio(Rational(16, 9))
-        .setAutoEnterEnabled(enabled)
-        .build()
-      activity.setPictureInPictureParams(params)
-      invoke.resolve(JSObject().put("ok", true))
+      val applied = AnimeHubPipController.applyAutoEnter(activity, enabled)
+      invoke.resolve(JSObject().put("ok", applied))
     } catch (e: Exception) {
       invoke.reject("PiP ayarlanamadı: ${e.message}", e)
     }
@@ -571,22 +597,5 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       return if (cleaned.isEmpty()) "default" else cleaned
     }
 
-    /**
-     * Android rejects PiP ratios outside about 1:2.39 .. 2.39:1.
-     * Clamping each side on its own still allows 239:1, which
-     * `setAspectRatio` refuses.
-     */
-    private const val MAX_RATIO = 2.39
-    private const val MIN_RATIO = 0.41841 // 1 / 2.39
-
-    private fun safeAspectRatio(num: Int, den: Int): Rational {
-      val n = num.coerceAtLeast(1)
-      val d = den.coerceAtLeast(1)
-      return when {
-        n.toDouble() / d.toDouble() > MAX_RATIO -> Rational(2390, 1000)
-        n.toDouble() / d.toDouble() < MIN_RATIO -> Rational(1000, 2390)
-        else -> Rational(n, d)
-      }
-    }
   }
 }

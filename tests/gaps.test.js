@@ -79,14 +79,29 @@ test("opening an Android site no longer shows the storage-isolation toast", () =
   assert.match(ui, /aynı kaynaklı localStorage\/IndexedDB yalıtımı henüz çözülmedi/);
 });
 
-function fakeGen(packageName) {
+// The file `tauri android init` writes (crates/tauri-cli/templates/mobile/
+// android/app/src/main/MainActivity.kt); android_prepare.py injects code into
+// its body, so the real shape matters here.
+function mainActivitySource(packageName, baseClass = "TauriActivity()") {
+  return `package ${packageName}
+
+import android.os.Bundle
+import androidx.activity.enableEdgeToEdge
+
+class MainActivity : ${baseClass} {
+  override fun onCreate(savedInstanceState: Bundle?) {
+    enableEdgeToEdge()
+    super.onCreate(savedInstanceState)
+  }
+}
+`;
+}
+
+function fakeGen(packageName, baseClass) {
   const gen = mkdtempSync(join(tmpdir(), "animehub-android-"));
   const javaDir = join(gen, "app/src/main/java", ...packageName.split("."));
   mkdirSync(javaDir, { recursive: true });
-  writeFileSync(
-    join(javaDir, "MainActivity.kt"),
-    `package ${packageName}\n\nclass MainActivity\n`,
-  );
+  writeFileSync(join(javaDir, "MainActivity.kt"), mainActivitySource(packageName, baseClass));
   writeFileSync(
     join(gen, "app/src/main/AndroidManifest.xml"),
     `<?xml version="1.0" encoding="utf-8"?>
@@ -135,14 +150,70 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(gradle, /signingConfigs\.maybeCreate\("release"\)/);
     assert.match(gradle, /keystore\.properties/);
 
+    // The PiP controller is generated from its template with the *same* WebView
+    // JS that Rust injects, so both halves cannot drift apart.
+    const controller = read(
+      join(gen, "app/src/main/java/dev/animehub/app/AnimeHubPipController.kt"),
+    );
+    assert.match(controller, /object AnimeHubPipController/);
+    assert.match(controller, /fun requestEnter\(/);
+    assert.equal(
+      controller.includes("__ANIMEHUB_PIP_CONTROLLER_JS__"),
+      false,
+      "the JS placeholder must be filled in",
+    );
+    const pipJs = read(join(ROOT, "src-tauri/src/web/pip_controller.js"));
+    assert.equal(
+      controller.includes(pipJs.trim()),
+      true,
+      "the embedded controller must be byte-identical to the shipped JS",
+    );
+    assert.match(controller, /setSourceRectHint/);
+
+    // MainActivity: overrides + imports, and the block is marker-delimited.
+    const activity = read(join(gen, "app/src/main/java/dev/animehub/app/MainActivity.kt"));
+    assert.match(activity, /AnimeHubPipController\.attach\(this, webView\)/);
+    assert.match(activity, /override fun onPictureInPictureRequested\(\): Boolean/);
+    assert.match(activity, /override fun onUserLeaveHint\(\)/);
+    assert.match(activity, /onPictureInPictureModeChanged\(/);
+    assert.match(activity, /import android\.content\.res\.Configuration/);
+    assert.match(activity, /import android\.webkit\.WebView/);
+    assert.match(activity, /class MainActivity : TauriActivity\(\) \{/);
+
     const second = run();
     assert.equal(second.status, 0, second.stderr || second.stdout);
+    const activity2 = read(join(gen, "app/src/main/java/dev/animehub/app/MainActivity.kt"));
+    assert.equal(
+      activity2.split("override fun onDestroy").length - 1,
+      1,
+      "a second run must refresh the block, not append a duplicate override",
+    );
+    assert.equal(activity2.split("AnimeHub PiP lifecycle (injected").length - 1, 1);
+    assert.equal(
+      activity2.split("onPictureInPictureRequested").length - 1,
+      activity.split("onPictureInPictureRequested").length - 1,
+    );
     const xml2 = read(join(gen, "app/src/main/AndroidManifest.xml"));
     assert.equal(xml2.split("supportsPictureInPicture").length - 1, 1);
     assert.equal(xml2.split('android:scheme="animehub"').length - 1, 1);
     // signing block injected exactly once (marker pair, not duplicated)
     const gradle2 = read(join(gen, "app/build.gradle.kts"));
     assert.equal(gradle2.split("AnimeHub release signing").length - 1, 2);
+  } finally {
+    rmSync(gen, { recursive: true, force: true });
+  }
+});
+
+test("android_prepare refuses a MainActivity the PiP lifecycle cannot hook into", () => {
+  const gen = fakeGen("dev.animehub.app", "AppCompatActivity()");
+  try {
+    const result = spawnSync(
+      pythonBin(),
+      ["scripts/android_prepare.py", "--root", ROOT, "--gen", gen],
+      { cwd: ROOT, encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /TauriActivity/);
   } finally {
     rmSync(gen, { recursive: true, force: true });
   }

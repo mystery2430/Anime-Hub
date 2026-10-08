@@ -219,10 +219,26 @@ native pencere kromunu kaplar ve şifreli ayarlara kaydedilir.
 
 ### 📱&nbsp; Android Picture-in-Picture
 
-Android 12+ (API 31) için Ayarlar'da **"PiP'e otomatik geç"** anahtarı vardır;
-sistem PiP API'si (`PictureInPictureParams` + `setAutoEnterEnabled`)
-kullanılır. Oran 16:9 varsayılandır ve Android'in kabul ettiği sınırlara
-kırpılır.
+Ayarlar'daki **"PiP'e otomatik geç"** anahtarı, video oynatılırken ana ekrana
+dönünce piP penceresinin açılmasını sağlar. PiP'e girmeden **önce** WebView
+hazırlanır: sayfadaki gerçek oynatıcı bulunur, ekranda yalnızca o oynatıcı
+kalır ve ancak JavaScript "hazır" dedikten sonra
+`enterPictureInPictureMode()` çağrılır. Böylece PiP penceresinde sitenin
+tamamı değil, yalnızca o an oynayan video görünür; PiP kapandığında sayfa
+kaldığı yerden, kaydırma konumu ve oynatma durumu korunarak geri gelir.
+
+- API 30+ (`Android 11`): `onPictureInPictureRequested()`; uygulama `true`
+  döndüğü için sistem kendi (hazırlıksız) akışına karışmaz.
+- API 26-29 (`Android 8.0-10`): `onUserLeaveHint()` geri dönüş yolu.
+- Sistemin kendi otomatik girişi (`setAutoEnterEnabled(true)`) **bilinçli
+  olarak** kullanılmaz: Android belgelerine göre bu ayar açıkken
+  `onPictureInPictureRequested()` hiç çağrılmaz, yani PiP hazırlıksız açılırdı.
+- Oynatıcı yoksa ya da hazırlık başarısızsa PiP **hiç** açılmaz ve sayfaya
+  dokunulmaz; oran olarak oynatıcının kendi en-boy oranı, ölçülemezse 16:9
+  kullanılır (Android'in kabul ettiği sınırlara kırpılır).
+
+Ayrıntılı akış, oynatıcı seçim kuralları ve doğrulama durumu:
+[`docs/android-pip.md`](./docs/android-pip.md).
 
 ---
 
@@ -385,6 +401,8 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
   doğrulanmış değildir. PiP ve gerçek sağlayıcılar arası same-origin
   localStorage/IndexedDB yalıtımı da doğrulanmadı; IndexedDB aktarımı
   kayıpsız değildir (ikincil indeksler ve Blob değerleri taşınmaz).
+  Kontrollü PiP zinciri (hazırlık → PiP → geri yükleme) yalnızca birim
+  testleriyle doğrulandı; fiziksel cihazda **denenmedi**.
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.

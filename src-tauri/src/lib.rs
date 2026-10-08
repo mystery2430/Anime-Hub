@@ -97,6 +97,34 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // the native window below.
     let theme_pref = settings.theme;
 
+    // Android: the controlled PiP paths read this before they may enter PiP,
+    // and the native controller starts out "off" in a fresh process. The
+    // setting otherwise only reaches it when the user toggles the switch, so a
+    // restart would silently disable auto-PiP.
+    //
+    // Throwaway thread, not the async runtime: the call blocks on the Kotlin
+    // side and the plugin bridge may not answer in the first moments of the
+    // process, so this retries a few times instead of blocking startup. A
+    // failure here is only a warning — the toggle keeps working.
+    #[cfg(target_os = "android")]
+    {
+        let pip_auto_enter = settings.pip_auto_enter;
+        std::thread::spawn(move || {
+            for attempt in 0..4 {
+                match crate::android_bridge::set_pip_auto_enter(pip_auto_enter) {
+                    Ok(applied) => {
+                        log::debug!("PiP auto-enter ayarı uygulandı: {applied}");
+                        return;
+                    }
+                    Err(e) if attempt == 3 => {
+                        log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(400)),
+                }
+            }
+        });
+    }
+
     if let Some(w) = &warning {
         log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü: {w}");
     }
