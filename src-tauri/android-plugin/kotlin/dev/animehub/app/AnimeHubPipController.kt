@@ -53,6 +53,7 @@ package dev.animehub.app
 
 import android.app.Activity
 import android.app.PictureInPictureParams
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.os.Build
@@ -60,7 +61,9 @@ import android.os.Looper
 import android.util.Log
 import android.util.Rational
 import android.webkit.WebView
+import android.widget.Toast
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
 
@@ -196,6 +199,22 @@ object AnimeHubPipController {
       }
     }
     return true
+  }
+
+  /**
+   * DIAGNOSTIC (debuggable builds only, no behaviour change): read the page's
+   * PiP report and show it as a Toast and in logcat under tag "AnimeHubPip".
+   * The script runs on the WebView, so the page gets no new interface.
+   */
+  fun showDebugReport(activity: Activity, webView: WebView?) {
+    if ((activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
+    webView?.evaluateJavascript(
+      "(window.__animehubPipReport ? window.__animehubPipReport() : 'no-report')",
+    ) { raw ->
+      val text = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: raw
+      Log.d("AnimeHubPip", "report: $text")
+      Toast.makeText(activity, "AnimeHubPip: $text", Toast.LENGTH_LONG).show()
+    }
   }
 
   /**

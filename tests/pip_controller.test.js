@@ -351,6 +351,82 @@ test("a player that was already paused is not started by PiP", () => {
   dom.pip(false);
 });
 
+// Diagnostics -------------------------------------------------------------
+
+test("the report describes the chosen player and the page state", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  assert.equal(dom.window.__animehubPipReport(), "no-report", "nothing before the first PiP");
+  assert.equal(dom.prepare().ok, true);
+  const report = dom.window.__animehubPipReport();
+  assert.match(report, /kind=video/);
+  assert.match(report, /paused=0/);
+  assert.match(report, /resume=none/);
+  assert.match(report, /events=none/);
+  assert.equal(report.includes("\n"), false, "one line");
+  assert.equal(video.listenerCount("pause"), 1, "the probe listens while PiP is up");
+});
+
+test("playback events during PiP are recorded, then the listeners are removed on exit", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  dom.prepare();
+  video.paused = true;
+  video.dispatch("pause");
+  video.paused = false;
+  video.dispatch("play");
+  dom.document.dispatch("visibilitychange");
+  dom.window.dispatch("blur");
+
+  const live = dom.window.__animehubPipReport();
+  assert.match(live, /events=pause@\d+,play@\d+/);
+  assert.match(live, /blur@\d+/);
+  assert.match(live, /visibility=/);
+
+  dom.pip(false);
+  assert.equal(video.listenerCount("pause"), 0);
+  assert.equal(video.listenerCount("play"), 0);
+  assert.equal(dom.document.listenerCount("visibilitychange"), 0);
+  assert.equal(dom.window.listenerCount("blur"), 0);
+  assert.equal(dom.window.listenerCount("focus"), 0);
+
+  // The last report survives the exit, and later events are no longer seen.
+  video.dispatch("pause");
+  const after = dom.window.__animehubPipReport();
+  assert.match(after, /events=pause@\d+,play@\d+/);
+  assert.doesNotMatch(after, /events=[^;]*pause@\d+,play@\d+,pause/);
+});
+
+test("a rejected play() is recorded by name, not swallowed silently", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  video.play = () => ({
+    catch(handler) {
+      handler({ name: "NotAllowedError" });
+    },
+  });
+  assert.equal(dom.prepare().ok, true);
+  video.paused = true;
+  dom.pip(true);
+  assert.match(dom.window.__animehubPipReport(), /resume=rejected:NotAllowedError/);
+  dom.pip(false);
+});
+
+test("a play() that throws is recorded as threw:<name>", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  video.play = () => {
+    const err = new Error("blocked");
+    err.name = "NotSupportedError";
+    throw err;
+  };
+  assert.equal(dom.prepare().ok, true);
+  video.paused = true;
+  dom.pip(true);
+  assert.match(dom.window.__animehubPipReport(), /resume=threw:NotSupportedError/);
+  dom.pip(false);
+});
+
 // 11 -----------------------------------------------------------------------
 test("restore puts every inline style and class back, exactly", () => {
   const dom = phone();

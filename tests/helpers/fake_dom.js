@@ -63,8 +63,26 @@ class FakeStyle {
   }
 }
 
+/** Minimal event targets: add/remove/dispatch, enough for the probe tests. */
+function installListeners(obj) {
+  const map = new Map();
+  obj.addEventListener = (name, handler) => {
+    if (!map.has(name)) map.set(name, new Set());
+    map.get(name).add(handler);
+  };
+  obj.removeEventListener = (name, handler) => {
+    if (map.has(name)) map.get(name).delete(handler);
+  };
+  obj.dispatch = (name) => {
+    for (const handler of [...(map.has(name) ? map.get(name) : [])]) handler({ type: name });
+  };
+  obj.listenerCount = (name) => (map.has(name) ? map.get(name).size : 0);
+  return obj;
+}
+
 class FakeElement {
   constructor(tagName, doc) {
+    installListeners(this);
     this.tagName = String(tagName).toUpperCase();
     this.ownerDocument = doc;
     this.parentNode = null;
@@ -247,13 +265,13 @@ class FakeDocument {
  * @param {{width?: number, height?: number, devicePixelRatio?: number}} options
  */
 export function createFakeDom(options = {}) {
-  const doc = new FakeDocument();
-  const win = {
+  const doc = installListeners(new FakeDocument());
+  const win = installListeners({
     innerWidth: options.width === undefined ? 1080 : options.width,
     innerHeight: options.height === undefined ? 2400 : options.height,
     devicePixelRatio: options.devicePixelRatio === undefined ? 3 : options.devicePixelRatio,
     getComputedStyle: (el) => doc.getComputedStyle(el),
-  };
+  });
   return { window: win, document: doc };
 }
 

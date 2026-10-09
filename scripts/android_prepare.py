@@ -247,6 +247,8 @@ def pip_lifecycle_block() -> str:
     if (isInPictureInPictureMode) {{
       AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
     }} else {{
+      // Diagnostic: the report is read before restore() releases the view.
+      AnimeHubPipController.showDebugReport(this, AnimeHubPipController.webView())
       AnimeHubPipController.restore(AnimeHubPipController.webView())
     }}
   }}

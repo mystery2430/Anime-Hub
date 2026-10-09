@@ -52,6 +52,7 @@
   // ------------------------------------------------------------------ names
   var PREPARE_FN = "__animehubPreparePip";
   var TOGGLE_FN = "__animehubPip";
+  var REPORT_FN = "__animehubPipReport";
   var VERSION_KEY = "__animehubPipVersion";
 
   // --------------------------------------------------------------- tuning
@@ -744,6 +745,7 @@
     try {
       // Re-entrant by design: a second request (or a retry after a size
       // change) starts from the page's real state, never from a stacked one.
+      finishProbe();
       release();
       if (!document.body || !document.documentElement) return fail("no-body");
 
@@ -756,6 +758,8 @@
 
       var ratio = ratioForCandidate(candidate);
       state = { applied: applied, candidate: candidate, wasPlaying: wasPlaying(candidate) };
+      lastResume = "none";
+      probe = startProbe(candidate);
       return {
         ok: true,
         kind: candidate.kind,
@@ -785,14 +789,98 @@
   }
 
   function resumePlayback(el, shouldPlay) {
-    if (!shouldPlay || !el || el.tagName !== "VIDEO" || el.paused !== true) return;
-    if (typeof el.play !== "function") return;
+    if (!shouldPlay || !el || el.tagName !== "VIDEO" || el.paused !== true || typeof el.play !== "function") {
+      lastResume = "skipped";
+      return lastResume;
+    }
     try {
       var started = el.play();
-      if (started && typeof started.catch === "function") started.catch(function () {});
+      // Set before the handler is attached: a rejection, asynchronous in a
+      // browser, always overwrites this value.
+      lastResume = "called";
+      if (started && typeof started.catch === "function") {
+        started.catch(function (err) {
+          lastResume = "rejected:" + errorName(err);
+        });
+      }
     } catch (e) {
-      // Playback policy refused: the page keeps its own state, nothing else changes.
+      lastResume = "threw:" + errorName(e);
     }
+    return lastResume;
+  }
+
+  // ------------------------------------------------------ diagnostics probe
+  // Read-only observation of the chosen player while PiP is up. It only adds
+  // event listeners and reads state; it never changes the page. Listeners are
+  // attached when the view is applied and removed when PiP is left.
+
+  var probe = null;      // the live probe while a view is applied
+  var lastReport = "no-report";
+  var lastResume = "none";
+
+  function errorName(err) {
+    return err && typeof err.name === "string" ? err.name.slice(0, 40) : "unknown";
+  }
+
+  function startProbe(candidate) {
+    var el = candidate.el;
+    var p = {
+      el: el,
+      isVideo: el.tagName === "VIDEO",
+      t0: Date.now(),
+      events: [],
+      handlers: [],
+    };
+    function note(name) {
+      if (p.events.length < 40) p.events.push(name + "@" + (Date.now() - p.t0));
+    }
+    function listen(target, name) {
+      if (!target || typeof target.addEventListener !== "function") return;
+      var handler = function () {
+        note(name);
+      };
+      target.addEventListener(name, handler);
+      p.handlers.push([target, name, handler]);
+    }
+    if (p.isVideo) {
+      listen(el, "pause");
+      listen(el, "play");
+      listen(el, "ended");
+      listen(el, "waiting");
+      listen(el, "stalled");
+    }
+    listen(document, "visibilitychange");
+    listen(window, "blur");
+    listen(window, "focus");
+    return p;
+  }
+
+  function buildReport(p) {
+    var el = p.el;
+    var parts = [];
+    parts.push("kind=" + (p.isVideo ? "video" : "iframe"));
+    parts.push("ms=" + (Date.now() - p.t0));
+    if (p.isVideo) {
+      parts.push("paused=" + (el.paused === true ? 1 : 0));
+      parts.push("ended=" + (el.ended === true ? 1 : 0));
+      parts.push("readyState=" + numberOrZero(el.readyState));
+    }
+    parts.push("visibility=" + String(document.visibilityState || "na"));
+    var focused = typeof document.hasFocus === "function" ? document.hasFocus() : null;
+    parts.push("focus=" + (focused === null ? "na" : focused ? 1 : 0));
+    parts.push("resume=" + lastResume);
+    parts.push("events=" + (p.events.length ? p.events.join(",") : "none"));
+    return parts.join(";");
+  }
+
+  function finishProbe() {
+    if (!probe) return;
+    lastReport = buildReport(probe);
+    for (var i = 0; i < probe.handlers.length; i++) {
+      var h = probe.handlers[i];
+      h[0].removeEventListener(h[1], h[2]);
+    }
+    probe = null;
   }
 
   function reapply() {
@@ -815,8 +903,15 @@
    * `__animehubPip(false)` restores, `__animehubPip(true)` re-asserts, and a
    * bare call reports whether a PiP view is currently applied.
    */
+  function report() {
+    return probe ? buildReport(probe) : lastReport;
+  }
+
   function toggle(active) {
-    if (active === false) return release();
+    if (active === false) {
+      finishProbe();
+      return release();
+    }
     if (active === true) return reapply();
     return state ? true : false;
   }
@@ -830,4 +925,5 @@
   window[VERSION_KEY] = VERSION;
   window[PREPARE_FN] = prepare;
   window[TOGGLE_FN] = toggle;
+  window[REPORT_FN] = report;
 })();
