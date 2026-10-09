@@ -287,6 +287,28 @@ test("the rest of the page stops painting while the player chain stays visible",
   assert.match(styleOf(dom.document.body), /background-color: #000 !important/);
 });
 
+test("a site header inside the player wrapper is hidden, overlay controls stay", () => {
+  // Device report: the PiP window showed the site's dark top bar (back arrow)
+  // above the video, because the header lives in the same wrapper as the
+  // video and is in flow, so it pushed the video down.
+  const dom = phone();
+  const wrapper = addDiv(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 260 },
+  });
+  const header = addDiv(dom.document, wrapper, { rect: { x: 0, y: 0, width: 360, height: 56 } });
+  const video = addVideo(dom.document, wrapper, { rect: { x: 0, y: 56, width: 360, height: 203 } });
+  const overlay = addDiv(dom.document, wrapper, { rect: { x: 0, y: 200, width: 360, height: 59 } });
+
+  const result = dom.prepare();
+  assert.equal(result.ok, true);
+  assert.equal(video.classList.contains("animehub-pip-target"), true);
+  assert.match(styleOf(header), /visibility: hidden !important/, "the in-flow header must not paint");
+  assert.equal(hasInline(overlay, "visibility"), false, "controls over the video stay visible");
+
+  dom.pip(false);
+  assert.equal(styleOf(header), "", "restore clears the header change");
+});
+
 // 11 -----------------------------------------------------------------------
 test("restore puts every inline style and class back, exactly", () => {
   const dom = phone();

@@ -212,6 +212,14 @@
     };
   }
 
+  // True when a sibling's box overlaps the video box. A sibling with no
+  // measurable box is treated as overlapping, so it is left alone.
+  function overlapsRect(a, b) {
+    if (!a || !b) return true;
+    if (a.width <= 0 || a.height <= 0) return true;
+    return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+  }
+
   function areaOf(rect) {
     if (!rect) return 0;
     if (!(rect.width > 0) || !(rect.height > 0)) return 0;
@@ -674,6 +682,23 @@
       for (var j = 0; j < siblings.length; j++) {
         applyInline(acc, siblings[j], SIBLING_STYLE);
       }
+    }
+    // 4. Inside the stage, an in-flow sibling ABOVE the video (a site header)
+    //    would push the video down, since the video is sized to the stage.
+    //    Siblings below it are clipped by the stage's overflow instead, and
+    //    overlay controls overlap the video, so both stay. Only siblings that
+    //    end above the video's top edge and do not overlap it are hidden.
+    var targetRect = candidate.rect;
+    var node = target;
+    while (node && node !== stage && node !== body && node !== root) {
+      var beside = siblingsOf(node);
+      for (var k = 0; k < beside.length; k++) {
+        var sib = rectOf(beside[k]);
+        if (sib && sib.height > 0 && sib.bottom <= targetRect.top + 1 && !overlapsRect(sib, targetRect)) {
+          applyInline(acc, beside[k], SIBLING_STYLE);
+        }
+      }
+      node = node.parentNode;
     }
     return { touched: acc.styles, classes: acc.classes };
   }
