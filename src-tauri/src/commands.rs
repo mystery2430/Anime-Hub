@@ -1097,7 +1097,7 @@ mod tests {
             fullscreen_sites: s.fullscreen_sites,
             theme: s.theme,
             pip_auto_enter: s.pip_auto_enter,
-        developer_options: s.developer_options,
+            developer_options: s.developer_options,
             anilist: AniListConfigView {
                 configured: s.anilist.is_configured(),
                 client_id: s.anilist.client_id.clone(),
