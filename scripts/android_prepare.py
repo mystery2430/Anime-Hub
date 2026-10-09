@@ -244,8 +244,18 @@ def pip_lifecycle_block() -> str:
     newConfig: Configuration,
   ) {{
     super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
-    if (!isInPictureInPictureMode) {{
+    if (isInPictureInPictureMode) {{
+      AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
+    }} else {{
       AnimeHubPipController.restore(AnimeHubPipController.webView())
+    }}
+  }}
+
+  override fun onPause() {{
+    // WryActivity.onPause() pauses the WebView; in PiP it must keep rendering.
+    super.onPause()
+    if (isInPictureInPictureMode) {{
+      AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
     }}
   }}
 

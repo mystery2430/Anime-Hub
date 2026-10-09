@@ -199,6 +199,20 @@ object AnimeHubPipController {
   }
 
   /**
+   * Keep the WebView rendering while the Activity is in PiP.
+   *
+   * Entering PiP pauses the Activity, and Wry's `WryActivity.onPause()` calls
+   * `WebView.onPause()`. That stops the WebView's rendering and media
+   * processing: the PiP window freezes on the last frame and the WebView's
+   * media session drops its play/pause actions, while the audio keeps going.
+   * Resuming the WebView while in PiP keeps the player live; the normal
+   * `onResume()` on return is a no-op on top of it.
+   */
+  fun keepRenderingInPip(webView: WebView?) {
+    webView?.onResume()
+  }
+
+  /**
    * Undo the PiP-only view. Called from
    * `onPictureInPictureModeChanged(isInPictureInPictureMode = false, ...)`.
    *

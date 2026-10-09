@@ -176,6 +176,9 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(activity, /override fun onPictureInPictureRequested\(\): Boolean/);
     assert.match(activity, /override fun onUserLeaveHint\(\)/);
     assert.match(activity, /onPictureInPictureModeChanged\(/);
+    // WryActivity.onPause() pauses the WebView; PiP must keep it rendering.
+    assert.match(activity, /override fun onPause\(\)/);
+    assert.match(activity, /keepRenderingInPip\(/);
     assert.match(activity, /import android\.content\.res\.Configuration/);
     assert.match(activity, /import android\.webkit\.WebView/);
     assert.match(activity, /class MainActivity : TauriActivity\(\) \{/);
