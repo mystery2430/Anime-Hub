@@ -755,7 +755,7 @@
       if (!applied) return fail("apply-failed");
 
       var ratio = ratioForCandidate(candidate);
-      state = { applied: applied, candidate: candidate };
+      state = { applied: applied, candidate: candidate, wasPlaying: wasPlaying(candidate) };
       return {
         ok: true,
         kind: candidate.kind,
@@ -776,6 +776,25 @@
     }
   }
 
+  // A video that was playing before PiP is paused by the WebView when the
+  // Activity pauses (WebView.onPause stops media); it is started again once
+  // the WebView is resumed in PiP. Only a real <video> is touched.
+  function wasPlaying(candidate) {
+    var el = candidate && candidate.el;
+    return !!el && el.tagName === "VIDEO" && el.paused === false && el.ended !== true;
+  }
+
+  function resumePlayback(el, shouldPlay) {
+    if (!shouldPlay || !el || el.tagName !== "VIDEO" || el.paused !== true) return;
+    if (typeof el.play !== "function") return;
+    try {
+      var started = el.play();
+      if (started && typeof started.catch === "function") started.catch(function () {});
+    } catch (e) {
+      // Playback policy refused: the page keeps its own state, nothing else changes.
+    }
+  }
+
   function reapply() {
     if (!state) return false;
     var candidate = state.candidate;
@@ -783,10 +802,12 @@
       release();
       return false;
     }
+    var shouldPlay = state.wasPlaying;
     release();
     var applied = applyView(candidate);
     if (!applied) return false;
-    state = { applied: applied, candidate: candidate };
+    state = { applied: applied, candidate: candidate, wasPlaying: shouldPlay };
+    resumePlayback(candidate.el, shouldPlay);
     return true;
   }
 

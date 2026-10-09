@@ -205,11 +205,15 @@ object AnimeHubPipController {
    * `WebView.onPause()`. That stops the WebView's rendering and media
    * processing: the PiP window freezes on the last frame and the WebView's
    * media session drops its play/pause actions, while the audio keeps going.
-   * Resuming the WebView while in PiP keeps the player live; the normal
-   * `onResume()` on return is a no-op on top of it.
+   * Resuming the WebView while in PiP keeps the player live. The media that
+   * the pause stopped is started again by the page side: `__animehubPip(true)`
+   * restarts the player if it was playing before PiP. The normal `onResume()`
+   * on return is a no-op on top of it.
    */
   fun keepRenderingInPip(webView: WebView?) {
-    webView?.onResume()
+    if (webView == null) return
+    webView.onResume()
+    webView.evaluateJavascript("if (window.__animehubPip) { window.__animehubPip(true); }", null)
   }
 
   /**

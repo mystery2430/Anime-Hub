@@ -309,6 +309,48 @@ test("a site header inside the player wrapper is hidden, overlay controls stay",
   assert.equal(styleOf(header), "", "restore clears the header change");
 });
 
+test("a player that was playing is started again when PiP resumes the WebView", () => {
+  // Device report: the WebView pauses on Activity onPause, which stops the
+  // video and the audio in PiP. The controller restarts the video it chose,
+  // and only that one, when the WebView is resumed.
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  let plays = 0;
+  video.play = () => {
+    plays += 1;
+    video.paused = false;
+    return { catch() {} };
+  };
+
+  assert.equal(dom.prepare().ok, true);
+  video.paused = true; // what WebView.onPause does to the media
+  dom.pip(true);
+  assert.equal(plays, 1, "the paused player is started again");
+  assert.equal(video.paused, false);
+
+  dom.pip(false);
+  video.paused = true;
+  dom.pip(true);
+  assert.equal(plays, 1, "after restore nothing is started any more");
+});
+
+test("a player that was already paused is not started by PiP", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 203 },
+    paused: true,
+  });
+  let plays = 0;
+  video.play = () => {
+    plays += 1;
+    return { catch() {} };
+  };
+  assert.equal(dom.prepare().ok, true);
+  dom.pip(true);
+  assert.equal(plays, 0);
+  dom.pip(false);
+});
+
 // 11 -----------------------------------------------------------------------
 test("restore puts every inline style and class back, exactly", () => {
   const dom = phone();
