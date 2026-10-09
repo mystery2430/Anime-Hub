@@ -67,6 +67,7 @@ pub fn run() {
             commands::anilist_delete,
             commands::enter_pip,
             commands::set_pip_auto_enter,
+            commands::pip_debug_log,
             commands::set_window_theme,
             commands::app_info,
         ])

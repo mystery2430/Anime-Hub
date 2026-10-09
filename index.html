@@ -194,6 +194,21 @@
           </section>
 
           <section>
+            <h3>Geliştirici seçenekleri</h3>
+            <label class="switch">
+              <input type="checkbox" id="set-developer" />
+              <span>Geliştirici seçeneklerini göster</span>
+            </label>
+            <div id="dev-panel" hidden>
+              <p class="hint">
+                Android PiP kayıtları, uygulama içinde. Logcat gerekmez. Kayıtta site adresi yoktur: yalnızca PiP durumu, oynatıcı türü ve olaylar yazılır.
+              </p>
+              <button type="button" id="dev-refresh">Yenile</button>
+              <pre id="dev-log" class="dev-log"></pre>
+            </div>
+          </section>
+
+          <section>
             <h3>AniList</h3>
             <p class="hint">
               Client ID'nizi <a href="#" id="link-anilist-dev">anilist.co/settings/developer</a>

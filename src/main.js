@@ -48,6 +48,11 @@ const el = {
   btnPickPhoto: document.getElementById("btn-pick-photo"),
   btnClearPhoto: document.getElementById("btn-clear-photo"),
   sitePhoto: document.getElementById("site-photo"),
+  dev: {
+    panel: document.getElementById("dev-panel"),
+    refresh: document.getElementById("dev-refresh"),
+    log: document.getElementById("dev-log"),
+  },
   settings: {
     blockPopups: document.getElementById("set-block-popups"),
     cosmetic: document.getElementById("set-cosmetic"),
@@ -55,6 +60,7 @@ const el = {
     blocklist: document.getElementById("set-blocklist"),
     fullscreen: document.getElementById("set-fullscreen"),
     pip: document.getElementById("set-pip"),
+    developer: document.getElementById("set-developer"),
     anilistId: document.getElementById("set-anilist-id"),
     anilistSecret: document.getElementById("set-anilist-secret"),
     anilistRedirect: document.getElementById("set-anilist-redirect"),
@@ -587,6 +593,8 @@ async function openSettings() {
     el.settings.blocklist.value = s.blocklist.rules || "";
     el.settings.fullscreen.checked = Boolean(s.fullscreenSites);
     el.settings.pip.checked = Boolean(s.pipAutoEnter);
+    el.settings.developer.checked = Boolean(s.developerOptions);
+    el.dev.panel.hidden = !s.developerOptions;
     applyTheme(s.theme);
     el.settings.anilistId.value = s.anilist.clientId || "";
     el.settings.anilistSecret.value = "";
@@ -605,6 +613,19 @@ async function openSettings() {
     await refreshAniListStatus();
   } catch (e) {
     showNotice(errMessage(e));
+  }
+}
+
+/** Developer panel: fill the log box with the native PiP lines (textContent only). */
+async function refreshDevLog() {
+  try {
+    const lines = await call("pip_debug_log");
+    const list = Array.isArray(lines) ? lines : [];
+    el.dev.log.textContent = list.length
+      ? list.join("\n")
+      : "Henüz PiP kaydı yok (kayıtlar yalnızca Android'de tutulur).";
+  } catch (err) {
+    el.dev.log.textContent = "Kayıt okunamadı: " + (err && err.message ? err.message : String(err));
   }
 }
 
@@ -636,6 +657,12 @@ function wireSettings() {
       /* desktop: unsupported, nothing to do */
     }
   });
+  el.settings.developer.addEventListener("change", async (e) => {
+    await saveSettings({ developerOptions: e.target.checked });
+    el.dev.panel.hidden = !e.target.checked;
+    if (e.target.checked) await refreshDevLog();
+  });
+  el.dev.refresh.addEventListener("click", () => refreshDevLog());
   el.settings.blocklistEnabled.addEventListener("change", (e) =>
     saveSettings({
       blocklist: { rules: el.settings.blocklist.value, enabled: e.target.checked },

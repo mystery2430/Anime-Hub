@@ -959,3 +959,17 @@ textarea:focus-visible {
     animation: none !important;
   }
 }
+
+/* Developer panel: the PiP log is plain text, never HTML. */
+.dev-log {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  line-height: 1.4;
+  max-height: 260px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.35);
+}

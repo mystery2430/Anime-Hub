@@ -65,6 +65,7 @@ pub const CMD_KEYSTORE_SEAL: &str = "keystore_seal";
 pub const CMD_KEYSTORE_OPEN: &str = "keystore_open";
 pub const CMD_ENTER_PIP: &str = "enter_pip";
 pub const CMD_SET_PIP_AUTO_ENTER: &str = "set_pip_auto_enter";
+pub const CMD_PIP_DEBUG_LOG: &str = "pip_debug_log";
 pub const CMD_LOCALSTORAGE_EXPORT: &str = "localstorage_export";
 pub const CMD_LOCALSTORAGE_IMPORT: &str = "localstorage_import";
 pub const CMD_INDEXEDDB_EXPORT: &str = "indexeddb_export";
@@ -241,6 +242,30 @@ pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     #[cfg(not(target_os = "android"))]
     {
         let _ = (aspect_num, aspect_den);
+        Err(Error::Unsupported)
+    }
+}
+
+/// Empty argument object for commands that take none.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+struct NoArgs {}
+
+#[cfg(target_os = "android")]
+#[derive(Deserialize)]
+struct DebugLogResponse {
+    lines: Vec<String>,
+}
+
+/// The last PiP diagnostic lines kept by the Kotlin side (in-app log; no
+/// logcat needed). Read-only: it never changes PiP state.
+pub fn pip_debug_log() -> Result<Vec<String>> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin::<_, DebugLogResponse>(CMD_PIP_DEBUG_LOG, NoArgs {}).map(|r| r.lines)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
         Err(Error::Unsupported)
     }
 }
@@ -463,6 +488,7 @@ mod tests {
         assert_eq!(CMD_KEYSTORE_OPEN, "keystore_open");
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
+        assert_eq!(CMD_PIP_DEBUG_LOG, "pip_debug_log");
         assert_eq!(CMD_LOCALSTORAGE_EXPORT, "localstorage_export");
         assert_eq!(CMD_LOCALSTORAGE_IMPORT, "localstorage_import");
         assert_eq!(CMD_INDEXEDDB_EXPORT, "indexeddb_export");
@@ -549,6 +575,7 @@ mod tests {
             CMD_KEYSTORE_OPEN,
             CMD_ENTER_PIP,
             CMD_SET_PIP_AUTO_ENTER,
+            CMD_PIP_DEBUG_LOG,
             CMD_LOCALSTORAGE_EXPORT,
             CMD_LOCALSTORAGE_IMPORT,
             CMD_INDEXEDDB_EXPORT,

@@ -64,8 +64,31 @@ import android.webkit.WebView
 import android.widget.Toast
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
+
+/**
+ * In-app diagnostics: the last PiP lines, read by the launcher's developer
+ * panel through the `pip_debug_log` plugin command. Holds only status text
+ * (trigger names, outcomes, the page's PiP report); never site URLs.
+ */
+object AnimeHubPipLog {
+  private const val MAX_LINES = 200
+  private val lines = ArrayDeque<String>()
+  private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
+
+  @Synchronized
+  fun add(message: String) {
+    if (lines.size >= MAX_LINES) lines.removeFirst()
+    lines.addLast(stamp.format(Date()) + " " + message)
+  }
+
+  @Synchronized
+  fun snapshot(): List<String> = lines.toList()
+}
 
 object AnimeHubPipController {
 
@@ -111,6 +134,12 @@ object AnimeHubPipController {
 
   /** The WebView currently hosting the launcher or a site page, if any. */
   fun webView(): WebView? = webViewRef?.get()
+
+  /** Logcat (tag AnimeHubPip) and the in-app developer panel, both. */
+  private fun note(message: String) {
+    Log.d(LOG_TAG, message)
+    AnimeHubPipLog.add(message)
+  }
 
   /** PiP is API 26+ and needs the hardware feature; both are checked. */
   fun isSupported(activity: Activity): Boolean =
@@ -168,15 +197,16 @@ object AnimeHubPipController {
       return true
     }
     val webView = webViewRef?.get()
+    note("request trigger=$trigger webView=${webView != null}")
     if (webView == null) {
       // Claimed (nothing else may enter PiP either) but answered, so a caller
       // that awaits a result — the `enter_pip` command — never waits forever.
-      Log.w(LOG_TAG, "PiP isteği WebView hazır değilken geldi ($trigger)")
+      note("PiP isteği WebView hazır değilken geldi ($trigger)")
       onResult?.invoke(false)
       return true
     }
     if (requestInFlight) {
-      Log.d(LOG_TAG, "PiP hazırlığı hâlâ sürüyor, istek yok sayıldı ($trigger)")
+      note("PiP hazırlığı hâlâ sürüyor, istek yok sayıldı ($trigger)")
       onResult?.invoke(false)
       return true
     }
@@ -194,7 +224,7 @@ object AnimeHubPipController {
         }
       } catch (e: Exception) {
         requestInFlight = false
-        Log.w(LOG_TAG, "PiP hazırlık betiği çalıştırılamadı", e)
+        note("PiP hazırlık betiği çalıştırılamadı: ${e.javaClass.simpleName}")
         onResult?.invoke(false)
       }
     }
@@ -207,13 +237,15 @@ object AnimeHubPipController {
    * The script runs on the WebView, so the page gets no new interface.
    */
   fun showDebugReport(activity: Activity, webView: WebView?) {
-    if ((activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
+    val debuggable = (activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
     webView?.evaluateJavascript(
       "(window.__animehubPipReport ? window.__animehubPipReport() : 'no-report')",
     ) { raw ->
       val text = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: raw
-      Log.d("AnimeHubPip", "report: $text")
-      Toast.makeText(activity, "AnimeHubPip: $text", Toast.LENGTH_LONG).show()
+      note("report: $text")
+      if (debuggable) {
+        Toast.makeText(activity, "AnimeHubPip: $text", Toast.LENGTH_LONG).show()
+      }
     }
   }
 
@@ -258,7 +290,7 @@ object AnimeHubPipController {
           onDone?.invoke(raw == "true")
         }
       } catch (e: Exception) {
-        Log.w(LOG_TAG, "PiP görünümü geri alınamadı", e)
+        note("PiP görünümü geri alınamadı: ${e.javaClass.simpleName}")
         onDone?.invoke(false)
       }
     }
@@ -282,21 +314,21 @@ object AnimeHubPipController {
     }
     if (raw == null || raw == "null") {
       // The document was torn down mid-evaluation (navigation won the race).
-      Log.w(LOG_TAG, "PiP hazırlığı yanıtsız kaldı ($trigger)")
+      note("PiP hazırlığı yanıtsız kaldı ($trigger)")
       onResult?.invoke(false)
       return
     }
     val answer = try {
       JSONObject(raw)
     } catch (e: Exception) {
-      Log.w(LOG_TAG, "PiP hazırlık yanıtı okunamadı", e)
+      note("PiP hazırlık yanıtı okunamadı: ${e.javaClass.simpleName}")
       null
     }
     if (answer == null || !answer.optBoolean("ok", false)) {
       val reason = answer?.optString("reason") ?: "unreadable"
       // Nothing was entered and the JS already restored what it touched; the
       // extra restore only covers a partial failure inside the page.
-      Log.d(LOG_TAG, "PiP hazırlığı uygun oyuncu bulamadı ($trigger, $reason)")
+      note("PiP hazırlığı uygun oyuncu bulamadı ($trigger, $reason)")
       restore(webView, null)
       onResult?.invoke(false)
       return
@@ -310,10 +342,10 @@ object AnimeHubPipController {
     } catch (e: IllegalStateException) {
       // "Activity must be resumed to enter picture-in-picture": the app was
       // already stopped, so there is nothing to enter. Never crash for this.
-      Log.w(LOG_TAG, "PiP'ye girilemedi: Activity hazır değil ($trigger)")
+      note("PiP'ye girilemedi: Activity hazır değil ($trigger)")
       false
     } catch (e: Exception) {
-      Log.w(LOG_TAG, "PiP'ye girilemedi ($trigger)", e)
+      note("PiP'ye girilemedi ($trigger): ${e.javaClass.simpleName}")
       false
     }
     if (!entered) {
@@ -321,10 +353,7 @@ object AnimeHubPipController {
       // the user on a stripped-down page, so undo it.
       restore(webView, null)
     } else {
-      Log.d(
-        LOG_TAG,
-        "PiP'ye girildi ($trigger, ${answer.optString("kind")}, ${num}x$den)",
-      )
+      note("PiP'ye girildi ($trigger, ${answer.optString("kind")}, ${num}x$den)")
     }
     onResult?.invoke(entered)
   }

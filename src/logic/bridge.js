@@ -124,6 +124,7 @@ const stubState = {
     injectCosmeticRules: true,
     fullscreenSites: true,
     pipAutoEnter: false,
+    developerOptions: false,
     anilist: {
       configured: false,
       clientId: "",

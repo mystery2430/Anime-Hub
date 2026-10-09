@@ -87,6 +87,8 @@ pub struct Settings {
     #[serde(default)]
     pub pip_auto_enter: bool,
     #[serde(default)]
+    pub developer_options: bool,
+    #[serde(default)]
     pub anilist: AniListConfig,
 }
 
@@ -103,6 +105,7 @@ impl Default for Settings {
             fullscreen_sites: false,
             theme: ThemePref::System,
             pip_auto_enter: false,
+            developer_options: false,
             anilist: AniListConfig::default(),
         }
     }
@@ -119,6 +122,7 @@ pub struct SettingsView {
     pub fullscreen_sites: bool,
     pub theme: ThemePref,
     pub pip_auto_enter: bool,
+    pub developer_options: bool,
     pub anilist: AniListConfigView,
     pub key_backend: String,
     pub key_backend_os_backed: bool,
@@ -483,6 +487,7 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsView> {
         fullscreen_sites: s.fullscreen_sites,
         theme: s.theme,
         pip_auto_enter: s.pip_auto_enter,
+        developer_options: s.developer_options,
         anilist: AniListConfigView {
             configured: s.anilist.is_configured(),
             client_id: s.anilist.client_id.clone(),
@@ -523,6 +528,9 @@ pub fn update_settings(
         if let Some(v) = patch.pip_auto_enter {
             s.pip_auto_enter = v;
         }
+        if let Some(v) = patch.developer_options {
+            s.developer_options = v;
+        }
         if let Some(a) = patch.anilist {
             s.anilist = a;
         }
@@ -547,6 +555,8 @@ pub struct SettingsPatch {
     pub theme: Option<ThemePref>,
     #[serde(default)]
     pub pip_auto_enter: Option<bool>,
+    #[serde(default)]
+    pub developer_options: Option<bool>,
     #[serde(default)]
     pub anilist: Option<AniListConfig>,
 }
@@ -934,6 +944,12 @@ pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
     crate::android_bridge::set_pip_auto_enter(enabled)
 }
 
+/// Developer panel: the last PiP diagnostic lines (empty off Android).
+#[tauri::command]
+pub fn pip_debug_log() -> AppResult<Vec<String>> {
+    crate::android_bridge::pip_debug_log()
+}
+
 #[tauri::command]
 pub fn app_info(app: AppHandle) -> AppResult<AppInfo> {
     let state = app.state::<AppState>();
@@ -1029,6 +1045,7 @@ mod tests {
         assert_eq!(s.theme, ThemePref::System, "theme follows the OS");
         assert!(s.blocklist.enabled);
         assert!(!s.pip_auto_enter, "PiP auto-enter is opt-in");
+        assert!(!s.developer_options, "the developer panel is opt-in");
         assert!(!s.anilist.is_configured());
     }
 
@@ -1080,6 +1097,7 @@ mod tests {
             fullscreen_sites: s.fullscreen_sites,
             theme: s.theme,
             pip_auto_enter: s.pip_auto_enter,
+        developer_options: s.developer_options,
             anilist: AniListConfigView {
                 configured: s.anilist.is_configured(),
                 client_id: s.anilist.client_id.clone(),

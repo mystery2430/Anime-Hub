@@ -211,6 +211,17 @@ pub fn set_pip_auto_enter(_enabled: bool) -> AppResult<bool> {
     Ok(false)
 }
 
+/// The PiP diagnostic lines for the developer panel. Empty off Android.
+#[cfg(target_os = "android")]
+pub fn pip_debug_log() -> AppResult<Vec<String>> {
+    animehub_android::pip_debug_log().map_err(|e| AppError::Other(e.to_string()))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn pip_debug_log() -> AppResult<Vec<String>> {
+    Ok(Vec::new())
+}
+
 /// Clamp a video aspect ratio into the range Android accepts for PiP.
 ///
 /// The platform rejects ratios outside roughly 1:2.39 .. 2.39:1, and a

@@ -518,6 +518,14 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  /** Developer panel: the last PiP lines, so no logcat is needed on a device. */
+  @Command
+  fun pip_debug_log(invoke: Invoke) {
+    val lines = org.json.JSONArray()
+    AnimeHubPipLog.snapshot().forEach { lines.put(it) }
+    invoke.resolve(JSObject().put("lines", lines))
+  }
+
   companion object {
     private const val LOG_TAG = "AnimeHubPlugin"
     private val COOKIE_FLUSH_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
