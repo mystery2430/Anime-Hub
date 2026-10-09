@@ -759,7 +759,7 @@
       var ratio = ratioForCandidate(candidate);
       state = { applied: applied, candidate: candidate, wasPlaying: wasPlaying(candidate) };
       lastResume = "none";
-      probe = startProbe(candidate);
+      probe = startProbe(candidate, state.wasPlaying);
       return {
         ok: true,
         kind: candidate.kind,
@@ -822,7 +822,16 @@
     return err && typeof err.name === "string" ? err.name.slice(0, 40) : "unknown";
   }
 
-  function startProbe(candidate) {
+  // A player that was playing when PiP started and is paused again within a
+  // short window is resumed a few times. The device log showed the WebView
+  // pausing it while the Activity paused, each time together with a
+  // visibilitychange. After the window, or after the retries, nothing is
+  // overridden.
+  var EARLY_WINDOW_MS = 2000;
+  var RETRY_DELAY_MS = 250;
+  var MAX_RETRIES = 3;
+
+  function startProbe(candidate, wasPlayingAtStart) {
     var el = candidate.el;
     var p = {
       el: el,
@@ -830,29 +839,56 @@
       t0: Date.now(),
       events: [],
       handlers: [],
+      wasPlaying: !!wasPlayingAtStart,
+      retriesLeft: MAX_RETRIES,
     };
-    function note(name) {
-      if (p.events.length < 40) p.events.push(name + "@" + (Date.now() - p.t0));
+    function note(label) {
+      if (p.events.length < 40) p.events.push(label + "@" + (Date.now() - p.t0));
     }
-    function listen(target, name) {
+    function listen(target, name, onEvent) {
       if (!target || typeof target.addEventListener !== "function") return;
       var handler = function () {
         note(name);
+        if (onEvent) onEvent();
       };
       target.addEventListener(name, handler);
       p.handlers.push([target, name, handler]);
     }
     if (p.isVideo) {
-      listen(el, "pause");
+      listen(el, "pause", function () {
+        retryEarlyPause(p);
+      });
       listen(el, "play");
       listen(el, "ended");
       listen(el, "waiting");
       listen(el, "stalled");
     }
-    listen(document, "visibilitychange");
+    // The visibility state is recorded with the event: "visibilitychange=hidden".
+    if (typeof document.addEventListener === "function") {
+      var visHandler = function () {
+        note("visibilitychange=" + String(document.visibilityState || "na"));
+      };
+      document.addEventListener("visibilitychange", visHandler);
+      p.handlers.push([document, "visibilitychange", visHandler]);
+    }
     listen(window, "blur");
     listen(window, "focus");
     return p;
+  }
+
+  function retryEarlyPause(p) {
+    if (!p.wasPlaying || p.retriesLeft <= 0) return;
+    if (Date.now() - p.t0 > EARLY_WINDOW_MS) return;
+    p.retriesLeft -= 1;
+    var attempt = function () {
+      // Only if the page still has it paused; resumePlayback re-checks that.
+      resumePlayback(p.el, true);
+    };
+    if (typeof window.setTimeout === "function") {
+      window.setTimeout(attempt, RETRY_DELAY_MS);
+    } else {
+      attempt();
+    }
   }
 
   function buildReport(p) {

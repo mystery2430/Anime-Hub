@@ -372,6 +372,70 @@ test("the resume is one-shot: a user pause in PiP survives a later re-assert", (
   dom.pip(false);
 });
 
+// Early pause retry ------------------------------------------------------
+
+// The sandbox's window has no timers; a manual queue makes the retry testable.
+function withTimerQueue(dom) {
+  const queue = [];
+  dom.window.setTimeout = (fn) => {
+    queue.push(fn);
+    return queue.length;
+  };
+  dom.flushTimers = () => {
+    while (queue.length) queue.shift()();
+  };
+  return dom;
+}
+
+test("a player paused right after PiP starts is resumed (early pause, within the window)", () => {
+  const dom = withTimerQueue(phone());
+  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  let plays = 0;
+  video.play = () => {
+    plays += 1;
+    video.paused = false;
+    return { catch() {} };
+  };
+  assert.equal(dom.prepare().ok, true);
+  video.paused = true;
+  video.dispatch("pause"); // the WebView paused it while the Activity paused
+  dom.flushTimers();
+  assert.equal(plays, 1, "the early pause is undone once");
+  assert.equal(video.paused, false);
+  assert.match(dom.window.__animehubPipReport(), /pause@\d+/);
+  dom.pip(false);
+});
+
+test("a player that was already paused before PiP is never started by a pause retry", () => {
+  const dom = withTimerQueue(phone());
+  const video = addVideo(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 203 },
+    paused: true,
+  });
+  let plays = 0;
+  video.play = () => {
+    plays += 1;
+    return { catch() {} };
+  };
+  assert.equal(dom.prepare().ok, true);
+  video.dispatch("pause");
+  dom.flushTimers();
+  assert.equal(plays, 0);
+  dom.pip(false);
+});
+
+test("the visibility state is recorded with the visibilitychange event", () => {
+  const dom = phone();
+  addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  dom.prepare();
+  dom.document.visibilityState = "hidden";
+  dom.document.dispatch("visibilitychange");
+  dom.document.visibilityState = "visible";
+  dom.document.dispatch("visibilitychange");
+  assert.match(dom.window.__animehubPipReport(), /visibilitychange=hidden@\d+,visibilitychange=visible@\d+/);
+  dom.pip(false);
+});
+
 // Diagnostics -------------------------------------------------------------
 
 test("the report describes the chosen player and the page state", () => {
