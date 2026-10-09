@@ -894,7 +894,9 @@
     release();
     var applied = applyView(candidate);
     if (!applied) return false;
-    state = { applied: applied, candidate: candidate, wasPlaying: shouldPlay };
+    // The resume is one-shot: a later re-assert (the Activity pausing again,
+    // or the PiP mode change) must never start a player the user paused.
+    state = { applied: applied, candidate: candidate, wasPlaying: false };
     resumePlayback(candidate.el, shouldPlay);
     return true;
   }

@@ -179,6 +179,9 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     // WryActivity.onPause() pauses the WebView; PiP must keep it rendering.
     assert.match(activity, /override fun onPause\(\)/);
     assert.match(activity, /keepRenderingInPip\(/);
+    // A finished Activity leaves Tauri's per-process state stale: end the process.
+    assert.match(activity, /if \(isFinishing\) \{/);
+    assert.match(activity, /android\.os\.Process\.killProcess\(android\.os\.Process\.myPid\(\)\)/);
     assert.match(activity, /import android\.content\.res\.Configuration/);
     assert.match(activity, /import android\.webkit\.WebView/);
     assert.match(activity, /class MainActivity : TauriActivity\(\) \{/);

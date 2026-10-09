@@ -264,6 +264,16 @@ def pip_lifecycle_block() -> str:
   override fun onDestroy() {{
     AnimeHubPipController.detach(this)
     super.onDestroy()
+    if (isFinishing) {{
+      // Tauri sets up Rust and the AnimeHubPlugin instance once per process,
+      // against the first Activity. When the system finishes this Activity
+      // (for example the PiP window's X), that state keeps pointing at a dead
+      // Activity and every site open fails. Ending the process lets the next
+      // launch set everything up again. Cookies are flushed first: flush()
+      // blocks until the cookies are written, so the kill comes after them.
+      android.webkit.CookieManager.getInstance().flush()
+      android.os.Process.killProcess(android.os.Process.myPid())
+    }}
   }}
   {PIP_BLOCK_END}"""
 

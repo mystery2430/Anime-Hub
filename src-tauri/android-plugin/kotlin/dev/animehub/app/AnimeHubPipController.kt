@@ -232,16 +232,20 @@ object AnimeHubPipController {
   }
 
   /**
-   * DIAGNOSTIC (debuggable builds only, no behaviour change): read the page's
-   * PiP report and show it as a Toast and in logcat under tag "AnimeHubPip".
-   * The script runs on the WebView, so the page gets no new interface.
+   * DIAGNOSTIC (no behaviour change): read the page's PiP report on PiP exit
+   * and keep it in the in-app log (developer panel) and logcat. The Toast is
+   * shown only in debuggable builds. The script runs on the WebView, so the
+   * page gets no new interface.
    */
   fun showDebugReport(activity: Activity, webView: WebView?) {
     val debuggable = (activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
     webView?.evaluateJavascript(
       "(window.__animehubPipReport ? window.__animehubPipReport() : 'no-report')",
     ) { raw ->
-      val text = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: raw
+      // The page can replace __animehubPipReport, so its text is capped before
+      // it reaches the in-app buffer or the Toast.
+      val text = (runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: raw ?: "")
+        .take(MAX_REPORT_CHARS)
       note("report: $text")
       if (debuggable) {
         Toast.makeText(activity, "AnimeHubPip: $text", Toast.LENGTH_LONG).show()
@@ -441,6 +445,7 @@ object AnimeHubPipController {
   // --------------------------------------------------------------- constants
 
   private const val LOG_TAG = "AnimeHubPip"
+  private const val MAX_REPORT_CHARS = 400
   private const val PREPARE_FN = "__animehubPreparePip"
   private const val TOGGLE_FN = "__animehubPip"
   private const val DEFAULT_NUM = 16

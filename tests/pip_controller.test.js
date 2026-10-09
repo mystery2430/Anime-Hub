@@ -351,6 +351,27 @@ test("a player that was already paused is not started by PiP", () => {
   dom.pip(false);
 });
 
+test("the resume is one-shot: a user pause in PiP survives a later re-assert", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  let plays = 0;
+  video.play = () => {
+    plays += 1;
+    video.paused = false;
+    return { catch() {} };
+  };
+  assert.equal(dom.prepare().ok, true);
+  video.paused = true; // the Activity pause stopped it
+  dom.pip(true); // WebView resumed: started once
+  assert.equal(plays, 1);
+
+  video.paused = true; // the user pauses inside PiP
+  dom.pip(true); // a second re-assert (onPause then the PiP mode change)
+  assert.equal(plays, 1, "the user's pause is not undone");
+  assert.equal(video.paused, true);
+  dom.pip(false);
+});
+
 // Diagnostics -------------------------------------------------------------
 
 test("the report describes the chosen player and the page state", () => {
