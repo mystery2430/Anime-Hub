@@ -139,16 +139,30 @@ mod unix_file {
     }
 
     fn file_fallback(dir: &Path) -> AppResult<Zeroizing<[u8; 32]>> {
-        let path = dir.join(KEY_FILE_NAME);
-        if path.exists() {
-            let raw = std::fs::read(&path)?;
-            return decode_hex_key(&String::from_utf8_lossy(&raw));
+        match existing_key(dir)? {
+            Some(k) => Ok(k),
+            None => create_key(dir),
         }
+    }
+
+    /// The key in the key file, if there is one. Never creates the file.
+    pub(super) fn existing_key(dir: &Path) -> AppResult<Option<Zeroizing<[u8; 32]>>> {
+        let path = dir.join(KEY_FILE_NAME);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read(&path)?;
+        decode_hex_key(&String::from_utf8_lossy(&raw)).map(Some)
+    }
+
+    /// Create a new key file and return the key stored in it. If another
+    /// process created the file first, the key already on disk is returned.
+    pub(super) fn create_key(dir: &Path) -> AppResult<Zeroizing<[u8; 32]>> {
         std::fs::create_dir_all(dir)?;
-        let key = generate_key();
-        let hex = hex::encode(key);
-        write_private(&path, hex.as_bytes())?;
-        Ok(Zeroizing::new(key))
+        let path = dir.join(KEY_FILE_NAME);
+        let key = Zeroizing::new(generate_key());
+        write_private(&path, hex::encode(*key).as_bytes())?;
+        existing_key(dir)?.ok_or_else(|| AppError::Crypto("anahtar dosyası yazılamadı".into()))
     }
 
     /// Write with `0600`, creating the file exclusively so a pre-existing
