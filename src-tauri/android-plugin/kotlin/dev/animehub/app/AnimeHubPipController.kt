@@ -60,7 +60,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.drawable.Icon
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.os.Build
@@ -68,7 +67,6 @@ import android.os.Looper
 import android.util.Log
 import android.util.Rational
 import android.webkit.WebView
-import android.widget.Toast
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.text.SimpleDateFormat
@@ -258,23 +256,19 @@ object AnimeHubPipController {
 
   /**
    * DIAGNOSTIC (no behaviour change): read the page's PiP report on PiP exit
-   * and keep it in the in-app log (developer panel) and logcat. The Toast is
-   * shown only in debuggable builds. The script runs on the WebView, so the
-   * page gets no new interface.
+   * and keep it in the in-app log (developer panel) and logcat. No Toast: a
+   * Toast over the site after leaving PiP covers the page. The script runs on
+   * the WebView, so the page gets no new interface.
    */
-  fun showDebugReport(activity: Activity, webView: WebView?) {
-    val debuggable = (activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+  fun showDebugReport(webView: WebView?) {
     webView?.evaluateJavascript(
       "(window.__animehubPipReport ? window.__animehubPipReport() : 'no-report')",
     ) { raw ->
       // The page can replace __animehubPipReport, so its text is capped before
-      // it reaches the in-app buffer or the Toast.
+      // it reaches the in-app buffer.
       val text = (runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: raw ?: "")
         .take(MAX_REPORT_CHARS)
       note("report: $text")
-      if (debuggable) {
-        Toast.makeText(activity, "AnimeHubPip: $text", Toast.LENGTH_LONG).show()
-      }
     }
   }
 

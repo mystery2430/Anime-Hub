@@ -485,3 +485,14 @@ test("the back overlay is installed only on desktop; Android never produces clos
   const mobileBody = win.slice(mobileStart, win.indexOf("\n}\n", mobileStart));
   assert.doesNotMatch(mobileBody, /OVERLAY_SNIPPET/);
 });
+
+test("the PiP diagnostic report goes to the in-app log only, never a Toast over the site", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  const start = kt.indexOf("fun showDebugReport(");
+  assert.ok(start > 0, "showDebugReport found");
+  const body = kt.slice(start, kt.indexOf("\n  }\n", start));
+  assert.doesNotMatch(body, /Toast/);
+  assert.match(body, /note\("report: /);
+  const prepare = read(join(ROOT, "scripts/android_prepare.py"));
+  assert.match(prepare, /AnimeHubPipController\.showDebugReport\(AnimeHubPipController\.webView\(\)\)/);
+});

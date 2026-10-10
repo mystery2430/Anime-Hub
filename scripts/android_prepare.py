@@ -248,7 +248,7 @@ def pip_lifecycle_block() -> str:
       AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
     }} else {{
       // Diagnostic: the report is read before restore() releases the view.
-      AnimeHubPipController.showDebugReport(this, AnimeHubPipController.webView())
+      AnimeHubPipController.showDebugReport(AnimeHubPipController.webView())
       AnimeHubPipController.restore(AnimeHubPipController.webView())
     }}
   }}
