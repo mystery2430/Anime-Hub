@@ -70,26 +70,6 @@ import java.util.Locale
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
 
-/**
- * In-app diagnostics: the last PiP lines, read by the launcher's developer
- * panel through the `pip_debug_log` plugin command. Holds only status text
- * (trigger names, outcomes, the page's PiP report); never site URLs.
- */
-object AnimeHubPipLog {
-  private const val MAX_LINES = 200
-  private val lines = ArrayDeque<String>()
-  private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
-
-  @Synchronized
-  fun add(message: String) {
-    if (lines.size >= MAX_LINES) lines.removeFirst()
-    lines.addLast(stamp.format(Date()) + " " + message)
-  }
-
-  @Synchronized
-  fun snapshot(): List<String> = lines.toList()
-}
-
 object AnimeHubPipController {
 
   // ------------------------------------------------------------- references
@@ -138,7 +118,7 @@ object AnimeHubPipController {
   /** Logcat (tag AnimeHubPip) and the in-app developer panel, both. */
   private fun note(message: String) {
     Log.d(LOG_TAG, message)
-    AnimeHubPipLog.add(message)
+    AnimeHubDebugLog.add("pip", message)
   }
 
   /** PiP is API 26+ and needs the hardware feature; both are checked. */

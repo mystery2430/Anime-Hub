@@ -49,6 +49,7 @@
 package dev.animehub.app
 
 import android.app.Activity
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -72,6 +73,9 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.security.KeyStore
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -91,6 +95,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     sharedWebView = webView
     installNavigationGuard(webView)
     restrictIpcToLauncher(webView)
+    AnimeHubDebugLog.add("app", "WebView ready, api ${Build.VERSION.SDK_INT}")
   }
 
   /**
@@ -105,10 +110,12 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val id = (webView as? RustWebView)?.id
     if (id == null) {
       Log.w(LOG_TAG, "IPC not restricted: WebView is not a RustWebView")
+      AnimeHubDebugLog.add("ipc", "not restricted: WebView is not a RustWebView")
       return
     }
     if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
       Log.w(LOG_TAG, "IPC not restricted: WebMessageListener unsupported, wry interface kept")
+      AnimeHubDebugLog.add("ipc", "WebMessageListener unsupported; wry object kept")
       return
     }
     webView.removeJavascriptInterface(LauncherIpc.OBJECT_NAME)
@@ -119,7 +126,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         LauncherIpc.ORIGINS,
         LauncherIpc(id),
       )
+      AnimeHubDebugLog.add("ipc", "launcher listener installed")
     } catch (e: Exception) {
+      AnimeHubDebugLog.add("ipc", "listener failed (${e.javaClass.simpleName}); launcher IPC is off")
       // Fail closed: the wry object is already gone, so the launcher loses IPC,
       // but no site page gets an `ipc` object. Logged as an error, not a warning.
       Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off", e)
@@ -180,6 +189,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
           manager.flush()
         } catch (_: Exception) {
           Log.w(LOG_TAG, "CookieManager persistence sync failed")
+          AnimeHubDebugLog.add("cookie", "persistence sync failed")
         }
       }
     } catch (_: Exception) {
@@ -315,6 +325,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
             if (index >= cookieHeaders.size) {
               if (rejected > 0) {
                 Log.w(LOG_TAG, "CookieManager rejected $rejected restored cookie(s)")
+                AnimeHubDebugLog.add("cookie", "rejected $rejected restored cookie(s)")
               }
               val elapsedMs = android.os.SystemClock.elapsedRealtime() - startedAt
               Log.d(
@@ -578,11 +589,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  /** Developer panel: the last PiP lines, so no logcat is needed on a device. */
+  /** Developer panel: the last Android lines, so no logcat is needed on a device. */
   @Command
-  fun pip_debug_log(invoke: Invoke) {
+  fun debug_log(invoke: Invoke) {
     val lines = org.json.JSONArray()
-    AnimeHubPipLog.snapshot().forEach { lines.put(it) }
+    AnimeHubDebugLog.snapshot().forEach { lines.put(it) }
     invoke.resolve(JSObject().put("lines", lines))
   }
 
@@ -698,6 +709,8 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
     if (!SiteNavigationPolicy.allows(uri)) {
       // Host and scheme only: paths and queries can carry tokens.
       Log.w(LOG_TAG, "navigation blocked: ${uri.scheme}://${uri.host}")
+      // Scheme only in the in-app log: the host can identify the site.
+      AnimeHubDebugLog.add("nav", "blocked scheme=${uri.scheme}")
       return true
     }
     return inner.shouldOverrideUrlLoading(view, request)
@@ -712,8 +725,13 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
   override fun onPageFinished(view: WebView, url: String) =
     inner.onPageFinished(view, url)
 
-  override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) =
+  override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+    // Error code and frame only: the description and URL are left out.
+    if (request.isForMainFrame) {
+      AnimeHubDebugLog.add("web", "main frame error code=${error.errorCode}")
+    }
     inner.onReceivedError(view, request, error)
+  }
 
   companion object {
     private const val LOG_TAG = "AnimeHubNavGuard"
@@ -824,4 +842,25 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     const val OBJECT_NAME = "ipc"
     val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
   }
+}
+
+/**
+ * In-app diagnostics for the launcher's developer panel, read through the
+ * `debug_log` plugin command. Holds the last 200 lines of status text only:
+ * a short area tag, the outcome, and error codes. Never site URLs or hosts,
+ * and never message bodies or cookie values.
+ */
+object AnimeHubDebugLog {
+  private const val MAX_LINES = 200
+  private val lines = ArrayDeque<String>()
+  private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
+
+  @Synchronized
+  fun add(area: String, message: String) {
+    if (lines.size >= MAX_LINES) lines.removeFirst()
+    lines.addLast(stamp.format(Date()) + " [" + area + "] " + message)
+  }
+
+  @Synchronized
+  fun snapshot(): List<String> = lines.toList()
 }

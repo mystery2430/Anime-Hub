@@ -363,3 +363,20 @@ test("Android IPC is limited to the launcher origins and main frame, never a sit
   const restrict = kt.indexOf("restrictIpcToLauncher(webView)");
   assert.ok(guard > 0 && restrict > guard, "restrictIpcToLauncher must run after installNavigationGuard");
 });
+
+test("Android in-app log: one shared buffer, no site URLs or hosts in any line", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const pip = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  // The buffer lives in the copied plugin file, not in a new file android_prepare.py would skip.
+  assert.match(kt, /^object AnimeHubDebugLog \{/m);
+  assert.doesNotMatch(pip, /object AnimeHubPipLog/);
+  assert.match(kt, /@Command\s+fun debug_log\(/);
+  const rs = read(join(ROOT, "src-tauri/android-plugin/src/lib.rs"));
+  assert.match(rs, /CMD_DEBUG_LOG: &str = "debug_log"/);
+  // Every add() call: no URL, host, path or uri object in the message.
+  const calls = [...(kt + pip).matchAll(/AnimeHubDebugLog\.add\(([^\n]*)\)/g)].map((m) => m[1]);
+  assert.ok(calls.length >= 8, `expected the log calls, found ${calls.length}`);
+  for (const args of calls) {
+    assert.doesNotMatch(args, /\.host\b|\burl\b|\.path\b|\bhost\b|\buri\b(?!\.scheme\b)|\bbody\b/i, args);
+  }
+});

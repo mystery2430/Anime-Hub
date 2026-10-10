@@ -693,11 +693,11 @@ async function openSettings() {
 /** Developer panel: fill the log box with the native PiP lines (textContent only). */
 async function refreshDevLog() {
   try {
-    const lines = await call("pip_debug_log");
+    const lines = await call("debug_log");
     const list = Array.isArray(lines) ? lines : [];
     el.dev.log.textContent = list.length
       ? list.join("\n")
-      : "Henüz PiP kaydı yok (kayıtlar yalnızca Android'de tutulur).";
+      : "Henüz Android kaydı yok (kayıtlar yalnızca Android'de tutulur).";
   } catch (err) {
     el.dev.log.textContent = "Kayıt okunamadı: " + (err && err.message ? err.message : String(err));
   }

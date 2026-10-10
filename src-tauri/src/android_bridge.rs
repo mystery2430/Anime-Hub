@@ -213,12 +213,12 @@ pub fn set_pip_auto_enter(_enabled: bool) -> AppResult<bool> {
 
 /// The PiP diagnostic lines for the developer panel. Empty off Android.
 #[cfg(target_os = "android")]
-pub fn pip_debug_log() -> AppResult<Vec<String>> {
-    animehub_android::pip_debug_log().map_err(|e| AppError::Other(e.to_string()))
+pub fn debug_log() -> AppResult<Vec<String>> {
+    animehub_android::debug_log().map_err(|e| AppError::Other(e.to_string()))
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn pip_debug_log() -> AppResult<Vec<String>> {
+pub fn debug_log() -> AppResult<Vec<String>> {
     Ok(Vec::new())
 }
 

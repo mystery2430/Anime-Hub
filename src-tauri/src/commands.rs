@@ -946,8 +946,8 @@ pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
 
 /// Developer panel: the last PiP diagnostic lines (empty off Android).
 #[tauri::command]
-pub fn pip_debug_log() -> AppResult<Vec<String>> {
-    crate::android_bridge::pip_debug_log()
+pub fn debug_log() -> AppResult<Vec<String>> {
+    crate::android_bridge::debug_log()
 }
 
 #[tauri::command]
