@@ -52,7 +52,15 @@
 package dev.animehub.app
 
 import android.app.Activity
+import android.app.PendingIntent
 import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.drawable.Icon
+import androidx.core.content.ContextCompat
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Rect
@@ -71,6 +79,15 @@ import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
 
 object AnimeHubPipController {
+
+  /** Broadcast sent by the PiP window's play/pause button. App-private: no export. */
+  const val ACTION_PIP_TOGGLE = "dev.animehub.app.PIP_TOGGLE"
+
+  /** Receives the button press; registered in attach(), removed in detach(). */
+  private var toggleReceiver: BroadcastReceiver? = null
+
+  /** Aspect ratio of the last PiP entry, reused when the button changes. */
+  private var pipRatio: Pair<Int, Int> = Pair(DEFAULT_NUM, DEFAULT_DEN)
 
   // ------------------------------------------------------------- references
 
@@ -101,10 +118,38 @@ object AnimeHubPipController {
     activityRef = WeakReference(activity)
     webViewRef = WeakReference(webView)
     requestInFlight = false
+    registerToggle(activity)
+  }
+
+  private fun registerToggle(activity: Activity) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || toggleReceiver != null) return
+    val receiver = object : BroadcastReceiver() {
+      override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == ACTION_PIP_TOGGLE) togglePlayback()
+      }
+    }
+    ContextCompat.registerReceiver(
+      activity,
+      receiver,
+      IntentFilter(ACTION_PIP_TOGGLE),
+      ContextCompat.RECEIVER_NOT_EXPORTED,
+    )
+    toggleReceiver = receiver
+  }
+
+  private fun unregisterToggle(activity: Activity) {
+    val receiver = toggleReceiver ?: return
+    toggleReceiver = null
+    try {
+      activity.unregisterReceiver(receiver)
+    } catch (_: IllegalArgumentException) {
+      // Already gone with the Activity; nothing else to release.
+    }
   }
 
   /** Called from `MainActivity.onDestroy()`: drop handles to the dead view. */
   fun detach(activity: Activity) {
+    unregisterToggle(activity)
     if (activityRef?.get() === activity) {
       activityRef = null
       webViewRef = null
@@ -338,15 +383,68 @@ object AnimeHubPipController {
       restore(webView, null)
     } else {
       note("PiP'ye girildi ($trigger, ${answer.optString("kind")}, ${num}x$den)")
+      syncPlaybackAction(activity)
     }
     onResult?.invoke(entered)
+  }
+
+  /** The PiP window's play/pause button: pause icon while playing, play icon while paused. */
+  private fun playbackActions(activity: Activity, playing: Boolean): List<RemoteAction> {
+    val title = if (playing) "Duraklat" else "Oynat"
+    val iconRes = if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+    val intent = Intent(ACTION_PIP_TOGGLE).setPackage(activity.packageName)
+    val pending = PendingIntent.getBroadcast(activity, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+    return listOf(RemoteAction(Icon.createWithResource(activity, iconRes), title, title, pending))
+  }
+
+  /** Read the page's playing state and show the matching button. Never plays or pauses. */
+  private fun syncPlaybackAction(activity: Activity) {
+    val webView = webView() ?: return
+    webView.evaluateJavascript(playbackScript("state")) { raw -> applyPlaybackState(activity, raw) }
+  }
+
+  /** A button press: play or pause the PiP player, then show the new state. */
+  private fun togglePlayback() {
+    val activity = activityRef?.get() ?: return
+    val webView = webView() ?: return
+    webView.evaluateJavascript(playbackScript("toggle")) { raw ->
+      if (raw == "true") note("PiP düğmesi: oynatıldı")
+      if (raw == "false") note("PiP düğmesi: duraklatıldı")
+      applyPlaybackState(activity, raw)
+    }
+  }
+
+  private fun playbackScript(cmd: String): String =
+    "window.__animehubPipPlayback ? window.__animehubPipPlayback('$cmd') : null"
+
+  private fun applyPlaybackState(activity: Activity, raw: String?) {
+    when (raw) {
+      "true", "false" -> updatePlaybackAction(activity, raw == "true")
+      else -> note("PiP düğmesi: oynatıcı denetlenemiyor")
+    }
+  }
+
+  private fun updatePlaybackAction(activity: Activity, playing: Boolean) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+    val (num, den) = pipRatio
+    runOnMain(activity) {
+      if (!activity.isInPictureInPictureMode) return@runOnMain
+      activity.setPictureInPictureParams(
+        PictureInPictureParams.Builder()
+          .setAspectRatio(safeAspectRatio(num, den))
+          .setActions(playbackActions(activity, playing))
+          .build(),
+      )
+    }
   }
 
   /** Build and enter PiP with the detected ratio and the player's bounds. */
   private fun enter(activity: Activity, num: Int, den: Int, rect: Rect?): Boolean {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+    pipRatio = Pair(num, den)
     val builder = PictureInPictureParams.Builder()
       .setAspectRatio(safeAspectRatio(num, den))
+      .setActions(playbackActions(activity, playing = true))
     // sourceRectHint is only a transition hint: it tells the system which part
     // of the window is worth animating from. It does not crop anything, so the
     // player-only look still comes from the JS view.

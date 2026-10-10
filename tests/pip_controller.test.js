@@ -43,7 +43,7 @@ test("installs the documented window API", () => {
   const dom = phone();
   assert.equal(typeof dom.window.__animehubPreparePip, "function");
   assert.equal(typeof dom.window.__animehubPip, "function");
-  assert.equal(dom.window.__animehubPipVersion, 1);
+  assert.equal(dom.window.__animehubPipVersion, 2);
   assert.equal(dom.pip(), false, "no PiP view before prepare()");
 });
 
@@ -748,4 +748,58 @@ test("a re-assert that throws mid-apply also leaves no half-styled page", () => 
   assert.equal(dom.pip(true), false);
   assert.equal(dom.document.body.getAttribute("style"), "color: red");
   assert.equal(wrapper.getAttribute("style"), "padding: 4px");
+});
+
+// PiP action button ------------------------------------------------------
+test("the PiP button toggles the prepared video and reports the real state", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 203 },
+    paused: false,
+  });
+  // The fake element has no media API; this stands in for the browser's one.
+  video.play = () => {
+    video.paused = false;
+    return Promise.resolve();
+  };
+  video.pause = () => {
+    video.paused = true;
+  };
+
+  dom.prepare();
+  const playing = dom.window.__animehubPipPlayback;
+  assert.equal(typeof playing, "function");
+  assert.equal(playing("state"), true, "playing when prepared");
+  assert.equal(playing("toggle"), false, "toggle pauses a playing video");
+  assert.equal(video.paused, true);
+  assert.equal(playing("state"), false, "state does not change the video");
+  assert.equal(playing("toggle"), true, "toggle plays a paused video");
+  assert.equal(video.paused, false);
+});
+
+test("the PiP button does nothing when no same-document video is applied", () => {
+  const dom = phone();
+  // A player-shaped cross-origin iframe is the only candidate: no <video> to control.
+  addIframe(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 203 },
+    src: "https://player.example/embed",
+  });
+  dom.prepare();
+  assert.equal(dom.window.__animehubPipPlayback("toggle"), null);
+  assert.equal(dom.window.__animehubPipPlayback("state"), null);
+});
+
+test("the PiP button has no effect after PiP is released", () => {
+  const dom = phone();
+  const video = addVideo(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 203 },
+    paused: false,
+  });
+  video.pause = () => {
+    video.paused = true;
+  };
+  dom.prepare();
+  assert.equal(dom.pip(false), true);
+  assert.equal(dom.window.__animehubPipPlayback("toggle"), null);
+  assert.equal(video.paused, false, "a released page is not touched by the button");
 });

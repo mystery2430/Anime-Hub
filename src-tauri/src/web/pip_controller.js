@@ -47,12 +47,13 @@
 
   // Bump when the applied view changes shape: a document that already has a
   // newer copy refuses to be re-installed with an older one.
-  var VERSION = 1;
+  var VERSION = 2;
 
   // ------------------------------------------------------------------ names
   var PREPARE_FN = "__animehubPreparePip";
   var TOGGLE_FN = "__animehubPip";
   var REPORT_FN = "__animehubPipReport";
+  var PLAYBACK_FN = "__animehubPipPlayback";
   var VERSION_KEY = "__animehubPipVersion";
 
   // --------------------------------------------------------------- tuning
@@ -946,6 +947,28 @@
     return probe ? buildReport(probe) : lastReport;
   }
 
+  /**
+   * PiP action button. "state" reports whether the PiP player is playing;
+   * "toggle" plays or pauses it. Both answer true (playing), false (paused), or
+   * null when no same-document <video> is applied (for example, a cross-origin
+   * frame). Only a press on the PiP button calls this, so it never overrides a
+   * pause the user made on the page.
+   */
+  function playback(cmd) {
+    var el = state && state.candidate ? state.candidate.el : null;
+    if (!el || el.tagName !== "VIDEO") return null;
+    if (typeof el.play !== "function" || typeof el.pause !== "function") return null;
+    if (cmd === "toggle") {
+      if (el.paused === true) {
+        var started = el.play();
+        if (started && typeof started.catch === "function") started.catch(function () {});
+      } else {
+        el.pause();
+      }
+    }
+    return el.paused === false;
+  }
+
   function toggle(active) {
     if (active === false) {
       finishProbe();
@@ -965,4 +988,5 @@
   window[PREPARE_FN] = prepare;
   window[TOGGLE_FN] = toggle;
   window[REPORT_FN] = report;
+  window[PLAYBACK_FN] = playback;
 })();

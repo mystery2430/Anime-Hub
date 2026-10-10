@@ -380,3 +380,28 @@ test("Android in-app log: one shared buffer, no site URLs or hosts in any line",
     assert.doesNotMatch(args, /\.host\b|\burl\b|\.path\b|\bhost\b|\buri\b(?!\.scheme\b)|\bbody\b/i, args);
   }
 });
+
+test("PiP play/pause button: only a user press toggles playback, and the receiver stays app-private", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  assert.match(kt, /const val ACTION_PIP_TOGGLE = "dev\.animehub\.app\.PIP_TOGGLE"/);
+  assert.match(kt, /\.setActions\(playbackActions\(activity, playing = true\)\)/);
+  assert.match(kt, /ContextCompat\.RECEIVER_NOT_EXPORTED/);
+  assert.match(kt, /PendingIntent\.FLAG_IMMUTABLE/);
+  assert.match(kt, /\.setPackage\(activity\.packageName\)/);
+  // The "toggle" command is sent from exactly one place: the press handler.
+  const toggleSends = kt.match(/playbackScript\("toggle"\)/g) || [];
+  assert.equal(toggleSends.length, 1, "toggle must have a single call site");
+  const handler = kt.slice(kt.indexOf("private fun togglePlayback()"));
+  assert.ok(
+    handler.indexOf('playbackScript("toggle")') < handler.indexOf("applyPlaybackState"),
+    "toggle sits in the press handler",
+  );
+  // Only the receiver calls the press handler (one definition, one call).
+  assert.equal((kt.match(/togglePlayback\(\)/g) || []).length, 2, "one definition and one receiver call");
+  // The state read never changes playback.
+  assert.match(kt, /playbackScript\("state"\)/);
+  // The JS side exposes the function this Kotlin expects, with no $ in it.
+  const js = read(join(ROOT, "src-tauri/src/web/pip_controller.js"));
+  assert.match(js, /window\[PLAYBACK_FN\] = playback;/);
+  assert.doesNotMatch(js, /\$/);
+});
