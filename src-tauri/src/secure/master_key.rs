@@ -130,6 +130,8 @@ mod unix_file {
 
     pub(super) const KEY_FILE_NAME: &str = "animehub.key";
 
+    // Linux uses `linux::load`; only macOS (and the tests below) need the plain file key.
+    #[cfg(target_os = "macos")]
     pub fn load(dir: &Path) -> AppResult<MasterKey> {
         let k = file_fallback(dir)?;
         Ok(MasterKey {
@@ -138,6 +140,7 @@ mod unix_file {
         })
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn file_fallback(dir: &Path) -> AppResult<Zeroizing<[u8; 32]>> {
         match existing_key(dir)? {
             Some(k) => Ok(k),
@@ -508,11 +511,11 @@ mod linux {
         }
 
         fn open(store: &dyn SecretStore, dir: &Path) -> MasterKey {
-            resolve(store, dir).ok().expect("key should resolve")
+            resolve(store, dir).expect("key should resolve")
         }
 
         fn key_bytes(m: &MasterKey) -> [u8; 32] {
-            *m.raw().ok().expect("key bytes")
+            *m.raw().expect("key bytes")
         }
 
         fn source_of(dir: &Path) -> String {
