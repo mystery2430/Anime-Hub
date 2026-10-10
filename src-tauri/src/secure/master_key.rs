@@ -554,9 +554,16 @@ mod linux {
             let store = FakeStore::with(None);
             open(&store, dir.path());
 
-            for e in [StoreError::Locked, StoreError::Unavailable, StoreError::Other] {
+            for e in [
+                StoreError::Locked,
+                StoreError::Unavailable,
+                StoreError::Other,
+            ] {
                 store.down(Some(e));
-                assert!(resolve(&store, dir.path()).is_err(), "{e:?} must fail closed");
+                assert!(
+                    resolve(&store, dir.path()).is_err(),
+                    "{e:?} must fail closed"
+                );
                 assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
                 assert_eq!(source_of(dir.path()), "secret-service", "record unchanged");
             }
@@ -587,7 +594,11 @@ mod linux {
             let m = open(&back, dir.path());
             assert_eq!(m.backend(), Backend::EncryptedFile);
             assert_eq!(key_bytes(&m), file_key);
-            assert_eq!(back.sets.get(), 0, "the recovered keyring must not be written");
+            assert_eq!(
+                back.sets.get(),
+                0,
+                "the recovered keyring must not be written"
+            );
         }
 
         #[test]
@@ -605,9 +616,15 @@ mod linux {
                 assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
             }
             let empty = FakeStore::with(None);
-            assert!(resolve(&empty, dir.path()).is_err(), "no keyring key for existing data");
+            assert!(
+                resolve(&empty, dir.path()).is_err(),
+                "no keyring key for existing data"
+            );
             assert_eq!(empty.sets.get(), 0);
-            assert_eq!(std::fs::read(dir.path().join("registry.bin")).unwrap(), sealed);
+            assert_eq!(
+                std::fs::read(dir.path().join("registry.bin")).unwrap(),
+                sealed
+            );
         }
 
         #[test]
@@ -630,7 +647,11 @@ mod linux {
             let store = FakeStore::with(None);
 
             assert!(resolve(&store, dir.path()).is_err());
-            assert_eq!(store.sets.get(), 0, "a missing entry must not be re-created");
+            assert_eq!(
+                store.sets.get(),
+                0,
+                "a missing entry must not be re-created"
+            );
             assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
         }
 
