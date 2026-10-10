@@ -8,6 +8,7 @@
  */
 
 import { call, on, ApiError, isTauri } from "./logic/bridge.js";
+import { wrapFocusIndex } from "./logic/focus.js";
 import {
   groupTiles,
   validateDraft,
@@ -434,13 +435,16 @@ function siteMenu(tile) {
 function showActionSheet(title, actions) {
   const backdrop = document.createElement("div");
   backdrop.className = "modal";
+  backdrop.dataset.transient = "true";
 
   const card = document.createElement("div");
   card.className = "modal-card";
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-modal", "true");
+  card.setAttribute("aria-labelledby", "action-sheet-title");
 
   const heading = document.createElement("h2");
+  heading.id = "action-sheet-title";
   heading.textContent = title;
   card.appendChild(heading);
 
@@ -455,7 +459,9 @@ function showActionSheet(title, actions) {
     btn.style.textAlign = "left";
     btn.textContent = action.label;
     btn.addEventListener("click", () => {
-      backdrop.remove();
+      // Close first so focus returns to the menu button, then run the action
+      // (which may open another modal and must see a clean stack).
+      closeModal(backdrop);
       action.run();
     });
     list.appendChild(btn);
@@ -468,15 +474,17 @@ function showActionSheet(title, actions) {
   cancel.type = "button";
   cancel.className = "btn ghost";
   cancel.textContent = "Vazgeç";
-  cancel.addEventListener("click", () => backdrop.remove());
+  cancel.addEventListener("click", () => closeModal(backdrop));
   footer.appendChild(cancel);
   card.appendChild(footer);
 
   backdrop.appendChild(card);
   backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) backdrop.remove();
+    if (e.target === backdrop) closeModal(backdrop);
   });
   document.body.appendChild(backdrop);
+  showOverlay(backdrop);
+  // Start on "Vazgeç": destructive actions must not be one Enter away.
   cancel.focus();
 }
 
@@ -504,14 +512,72 @@ async function removeSite(tile) {
 // Modals
 // ---------------------------------------------------------------------------
 
+/**
+ * Open overlays, top of stack last. Only the top overlay is interactive: the
+ * rest of the document, including lower overlays, is made `inert`, so Tab,
+ * clicks and screen readers cannot reach background controls.
+ */
+const overlayStack = [];
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
+  'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function syncInert() {
+  const top = overlayStack.length ? overlayStack[overlayStack.length - 1].el : null;
+  for (const child of document.body.children) {
+    child.inert = top !== null && child !== top;
+  }
+}
+
+/** Show an overlay element and make it the only interactive one. */
+function showOverlay(el) {
+  // Remember where focus came from so closing can return it there.
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const existing = overlayStack.findIndex((o) => o.el === el);
+  if (existing >= 0) overlayStack.splice(existing, 1);
+  overlayStack.push({ el, opener });
+  el.hidden = false;
+  syncInert();
+  const first = el.querySelector("input, textarea, button");
+  if (first) first.focus();
+}
+
+/**
+ * Hide an overlay, pop it from the stack and restore focus to its opener.
+ * Transient overlays (action sheets) are removed from the DOM instead.
+ */
+function hideOverlay(el) {
+  const index = overlayStack.findIndex((o) => o.el === el);
+  const entry = index >= 0 ? overlayStack.splice(index, 1)[0] : null;
+  if (el.dataset.transient === "true") el.remove();
+  else el.hidden = true;
+  syncInert();
+  if (entry && entry.opener && entry.opener.isConnected) entry.opener.focus();
+}
+
 function openModal(modal) {
-  modal.hidden = false;
-  const focusable = modal.querySelector("input, textarea, button");
-  if (focusable) focusable.focus();
+  showOverlay(modal);
 }
 
 function closeModal(modal) {
-  modal.hidden = true;
+  hideOverlay(modal);
+}
+
+/** Keep Tab and Shift+Tab inside the top overlay. */
+function trapFocus(event) {
+  if (event.key !== "Tab" || overlayStack.length === 0) return;
+  const top = overlayStack[overlayStack.length - 1].el;
+  const items = [...top.querySelectorAll(FOCUSABLE)].filter((n) => !n.disabled && n.offsetParent !== null);
+  if (items.length === 0) {
+    event.preventDefault();
+    return;
+  }
+  const target = wrapFocusIndex(items.length, items.indexOf(document.activeElement), event.shiftKey);
+  if (target !== null) {
+    event.preventDefault();
+    items[target].focus();
+  }
 }
 
 function wireModalClose(modal) {
@@ -900,12 +966,13 @@ function wireGlobal() {
   });
 
   document.addEventListener("keydown", (event) => {
+    trapFocus(event);
     if (event.key !== "Escape") return;
-    for (const m of [el.modalSite, el.modalSettings, el.modalAbout]) {
-      if (!m.hidden) {
-        closeModal(m);
-        return;
-      }
+    // Escape during IME composition belongs to the input method, not to us.
+    if (event.isComposing) return;
+    if (overlayStack.length > 0) {
+      closeModal(overlayStack[overlayStack.length - 1].el);
+      return;
     }
     // No modal open: treat Escape as "back to launcher" (Android back maps
     // here through the WebView).

@@ -297,3 +297,22 @@ test("browser-mode settings stub matches the Rust Settings defaults", () => {
   assert.match(stub, /theme: "system"/);
   assert.match(real, /theme: ThemePref::System/);
 });
+
+test("every overlay goes through the shared stack: focus return, inert background, Escape", () => {
+  const ui = read(join(ROOT, "src/main.js"));
+  // One stack for modals and action sheets.
+  assert.match(ui, /const overlayStack = \[\];/);
+  assert.match(ui, /function showOverlay\(el\)/);
+  assert.match(ui, /function hideOverlay\(el\)/);
+  assert.match(ui, /entry\.opener\.focus\(\)/);
+  assert.match(ui, /child\.inert = top !== null && child !== top;/);
+  // The action sheet uses the shared helpers and is labelled.
+  const sheet = ui.slice(ui.indexOf("function showActionSheet"), ui.indexOf("async function clearSiteData"));
+  assert.match(sheet, /showOverlay\(backdrop\)/);
+  assert.match(sheet, /aria-labelledby", "action-sheet-title"/);
+  assert.equal(/backdrop\.remove\(\)/.test(sheet), false);
+  // Escape closes the top overlay first, and never during IME composition.
+  assert.match(ui, /if \(event\.isComposing\) return;/);
+  assert.match(ui, /if \(overlayStack\.length > 0\)/);
+  assert.match(ui, /trapFocus\(event\);/);
+});
