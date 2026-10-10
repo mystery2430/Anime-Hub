@@ -60,7 +60,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.drawable.Icon
-import androidx.core.content.ContextCompat
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Rect
@@ -128,12 +127,13 @@ object AnimeHubPipController {
         if (intent.action == ACTION_PIP_TOGGLE) togglePlayback()
       }
     }
-    ContextCompat.registerReceiver(
-      activity,
-      receiver,
-      IntentFilter(ACTION_PIP_TOGGLE),
-      ContextCompat.RECEIVER_NOT_EXPORTED,
-    )
+    val filter = IntentFilter(ACTION_PIP_TOGGLE)
+    // Android 13+ wants an explicit export flag; the button is app-private.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      activity.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    } else {
+      activity.registerReceiver(receiver, filter)
+    }
     toggleReceiver = receiver
   }
 
