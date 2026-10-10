@@ -843,6 +843,10 @@
       handlers: [],
       wasPlaying: !!wasPlayingAtStart,
       pausedSinceStart: false,
+      // Geometry at the moment the view was applied, for the report.
+      rect: candidate.rect,
+      coverage: candidate.coverage,
+      vp: viewportSize(),
     };
     function note(label) {
       if (p.events.length < 40) p.events.push(label + "@" + (Date.now() - p.t0));
@@ -883,6 +887,14 @@
     var parts = [];
     parts.push("kind=" + (p.isVideo ? "video" : "iframe"));
     parts.push("ms=" + (Date.now() - p.t0));
+    if (p.rect) {
+      parts.push(
+        "rect=" + Math.round(p.rect.left) + "," + Math.round(p.rect.top) + "," +
+          Math.round(p.rect.width) + "x" + Math.round(p.rect.height),
+      );
+    }
+    if (p.vp) parts.push("vp=" + Math.round(p.vp.width) + "x" + Math.round(p.vp.height));
+    if (typeof p.coverage === "number") parts.push("cov=" + Math.round(p.coverage * 100) / 100);
     if (p.isVideo) {
       parts.push("paused=" + (el.paused === true ? 1 : 0));
       parts.push("ended=" + (el.ended === true ? 1 : 0));

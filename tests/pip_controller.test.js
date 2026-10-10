@@ -803,3 +803,13 @@ test("the PiP button has no effect after PiP is released", () => {
   assert.equal(dom.window.__animehubPipPlayback("toggle"), null);
   assert.equal(video.paused, false, "a released page is not touched by the button");
 });
+
+test("the report carries the applied rect, viewport and coverage", () => {
+  const dom = phone();
+  addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  assert.equal(dom.prepare().ok, true);
+  const report = dom.window.__animehubPipReport();
+  assert.match(report, /rect=0,0,360x203/);
+  assert.match(report, /vp=\d+x\d+/);
+  assert.match(report, /cov=[\d.]+/);
+});
