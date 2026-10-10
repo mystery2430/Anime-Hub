@@ -764,6 +764,10 @@ internal object SiteNavigationPolicy {
   private val BLOCKED_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home")
 
   private val IPV4 = Regex("""\d{1,3}(\.\d{1,3}){3}""")
+  // The last label of a host that WHATWG URL parsing reads as an IPv4 number:
+  // 2130706433, 0x7f000001, 0177.0.0.1, 127.1. Chromium normalises these to
+  // a dotted address, so they must go through the IP rules, not the name rules.
+  private val NUMERIC_LABEL = Regex("""(0x[0-9a-f]*|[0-9]+)""", RegexOption.IGNORE_CASE)
 
   fun allows(uri: Uri): Boolean {
     val scheme = uri.scheme?.lowercase() ?: return false
@@ -780,7 +784,12 @@ internal object SiteNavigationPolicy {
     val host = rawHost?.lowercase()?.trimEnd('.')
     if (host.isNullOrEmpty()) return false
     val bare = host.removePrefix("[").removeSuffix("]")
-    if (bare.contains(':') || IPV4.matches(bare)) return isPublicIp(bare)
+    if (bare.contains(':')) return isPublicIpv6(bare)
+    if (NUMERIC_LABEL.matches(bare.substringAfterLast('.'))) {
+      // Only a canonical dotted-decimal public address passes. Other forms are refused.
+      return IPV4.matches(bare) && isPublicIpv4(bare)
+    }
+    if (IPV4.matches(bare)) return isPublicIpv4(bare)
     if (host in BLOCKED_HOSTS) return false
     return BLOCKED_SUFFIXES.none { host.endsWith(it) }
   }
@@ -793,6 +802,7 @@ internal object SiteNavigationPolicy {
     if (octets.size != 4 || octets.any { it !in 0..255 }) return false
     val a = octets[0]
     val b = octets[1]
+    val c = octets[2]
     return !(
       a == 0 ||                         // 0.0.0.0/8
       a == 10 ||                        // private
@@ -800,8 +810,10 @@ internal object SiteNavigationPolicy {
       (a == 100 && b in 64..127) ||     // CGNAT
       (a == 169 && b == 254) ||         // link-local
       (a == 172 && b in 16..31) ||      // private
-      (a == 192 && b == 0) ||           // IETF protocol assignments, documentation
+      (a == 192 && b == 0) ||           // IETF protocol assignments, documentation 192.0.0.0/24, 192.0.2.0/24
       (a == 192 && b == 168) ||         // private
+      (a == 198 && b == 51 && c == 100) || // documentation 198.51.100.0/24 (as Rust is_documentation)
+      (a == 203 && b == 0 && c == 113) ||  // documentation 203.0.113.0/24 (as Rust is_documentation)
       (a == 198 && (b == 18 || b == 19)) || // benchmarking
       a >= 224                          // multicast, reserved, broadcast
     )

@@ -82,7 +82,10 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 
 | Gap | Why |
 | --- | --- |
-| Blocklist | Lives in Rust. Running it needs a Rust round-trip inside a UI-thread callback. Not done. |
+| Blocklist | Lives in Rust. Running it needs a Rust round-trip inside a UI-thread callback. Not done. Android navigations are checked for scheme, host shape and IP rules only. |
+| Numeric IPv4 spellings | Fixed in the Kotlin policy: `2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1` are refused (previously allowed). Relies on WHATWG parsing; not tested in a WebView. |
+| Documentation IPv4 ranges | Fixed: `198.51.100.0/24` and `203.0.113.0/24` are refused, as in Rust. |
+| Multicast IPv4 (`224.0.0.0/4`) | Kotlin refuses it; Rust `is_public_ip` does not check it. Kotlin is stricter; not changed. |
 | DNS rebinding | DNS on the UI thread would stall the WebView. Not done. |
 | Subframes and sub-resources | The guard only sees top-level navigations. |
 | App-initiated `loadUrl` | Not routed through `shouldOverrideUrlLoading`; `open_on_mobile` checks the first URL with `validate_site_url`. |

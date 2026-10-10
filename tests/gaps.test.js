@@ -339,6 +339,18 @@ test("the Android navigation guard keeps the desktop host rules in step", () => 
   assert.equal(/tauri\.localhost"\s*->\s*return true/.test(kt), false);
 });
 
+test("Android navigation policy: numeric IPv4 spellings and documentation ranges are refused like Rust", () => {
+  // Static check only. The same rules were also run on the real Kotlin object with a
+  // stub android.net.Uri (outside the repo, not a CI test). Chromium's URL parsing of
+  // these spellings is per the WHATWG spec and was not tested in a WebView.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  assert.match(kt, /NUMERIC_LABEL = Regex\("""\(0x\[0-9a-f\]\*\|\[0-9\]\+\)""", RegexOption\.IGNORE_CASE\)/);
+  assert.match(kt, /if \(NUMERIC_LABEL\.matches\(bare\.substringAfterLast\('\.'\)\)\) \{/);
+  // Documentation ranges, as Rust url_policy::is_public_ip rejects them.
+  assert.match(kt, /\(a == 198 && b == 51 && c == 100\)/);
+  assert.match(kt, /\(a == 203 && b == 0 && c == 113\)/);
+});
+
 test("Android IPC is limited to the launcher origins and main frame, never a site-facing JavascriptInterface", () => {
   const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
   // Removes wry's `ipc` object before the listener is registered under the same name.

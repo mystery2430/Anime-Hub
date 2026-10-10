@@ -4,6 +4,7 @@ Notable user-facing changes are recorded here. Release assets are published from
 
 ## [Unreleased]
 
+- Security (Android navigation): numeric IPv4 spellings (`2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1`) and the documentation ranges `198.51.100.0/24` and `203.0.113.0/24` are now refused, as the Rust policy refuses them. Blocklist and DNS rebinding are still not applied on Android (documented).
 - PiP: the play/pause button is offered only when the player is a `<video>`. For a cross-origin iframe candidate the button is not shown, because the page script cannot control it. Device check pending.
 - Security: the launcher's `ipc` object is removed on every path, so a site page never gets it, even when the launcher listener cannot be installed. In that case launcher IPC is off on the device, and the developer log says so (fail closed). Device check pending.
 - Settings are applied only after the store accepts them. A failed save no longer leaves the live setting changed, and the switches are redrawn from the saved state. The "auto PiP" switch rolls its saved value back when the native controller fails or refuses (PiP unsupported), and says so. Desktop behaviour is unchanged.
