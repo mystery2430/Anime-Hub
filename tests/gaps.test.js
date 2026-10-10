@@ -13,7 +13,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const read = (p) => readFileSync(p, "utf8");
+// Normalise line endings: a Windows checkout may hand us CRLF files.
+const read = (p) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 
 // GitHub's Windows runners expose `python`, not `python3`.
 function pythonBin() {
