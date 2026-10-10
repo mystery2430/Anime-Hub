@@ -178,12 +178,10 @@ fn persist_registry(state: &AppState) -> AppResult<()> {
     state.provider.save_registry(&reg)
 }
 
-fn persist_settings(state: &AppState) -> AppResult<()> {
-    let s = state
-        .settings
-        .lock()
-        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-    let bytes = serde_json::to_vec(&*s)?;
+/// Write one settings value to the encrypted store. Callers that change the
+/// live settings must do so only after this returns Ok.
+fn write_settings_doc(state: &AppState, value: &Settings) -> AppResult<()> {
+    let bytes = serde_json::to_vec(value)?;
     state
         .provider
         .save_doc_bytes("settings.bin", bytes.as_slice())
@@ -505,37 +503,42 @@ pub fn update_settings(
     state: State<'_, AppState>,
     patch: SettingsPatch,
 ) -> AppResult<SettingsView> {
+    // The patch is applied to a copy. The live settings change only after the
+    // copy is saved, so a failed save leaves memory and disk in agreement. The
+    // lock is held across the save, so two updates cannot interleave.
     {
-        let mut s = state
+        let mut live = state
             .settings
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        let mut next = live.clone();
         if let Some(b) = patch.blocklist {
-            s.blocklist = b;
+            next.blocklist = b;
         }
         if let Some(v) = patch.block_popups {
-            s.block_popups = v;
+            next.block_popups = v;
         }
         if let Some(v) = patch.inject_cosmetic_rules {
-            s.inject_cosmetic_rules = v;
+            next.inject_cosmetic_rules = v;
         }
         if let Some(v) = patch.fullscreen_sites {
-            s.fullscreen_sites = v;
+            next.fullscreen_sites = v;
         }
         if let Some(v) = patch.theme {
-            s.theme = v;
+            next.theme = v;
         }
         if let Some(v) = patch.pip_auto_enter {
-            s.pip_auto_enter = v;
+            next.pip_auto_enter = v;
         }
         if let Some(v) = patch.developer_options {
-            s.developer_options = v;
+            next.developer_options = v;
         }
         if let Some(a) = patch.anilist {
-            s.anilist = a;
+            next.anilist = a;
         }
+        write_settings_doc(&state, &next)?;
+        *live = next;
     }
-    persist_settings(&state)?;
     rebuild_blocklist(&state);
     get_settings(state)
 }
@@ -574,13 +577,15 @@ pub fn take_startup_warning(state: State<'_, AppState>) -> AppResult<Option<Stri
 #[tauri::command]
 pub fn reset_blocklist(state: State<'_, AppState>) -> AppResult<usize> {
     {
-        let mut s = state
+        let mut live = state
             .settings
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        s.blocklist = BlocklistState::default_state();
+        let mut next = live.clone();
+        next.blocklist = BlocklistState::default_state();
+        write_settings_doc(&state, &next)?;
+        *live = next;
     }
-    persist_settings(&state)?;
     rebuild_blocklist(&state);
     let bl = state
         .blocklist

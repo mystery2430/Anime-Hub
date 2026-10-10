@@ -29,6 +29,7 @@ import {
   bannerStyle,
   bannerRgb,
 } from "./logic/hero.js";
+import { createSettingsFlow } from "./logic/settings_flow.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -703,14 +704,29 @@ async function refreshDevLog() {
   }
 }
 
-async function saveSettings(patch, okMessage) {
-  try {
-    currentSettings = await call("update_settings", { patch });
-    if (okMessage) showNotice(okMessage, "info");
-    await refreshLauncher();
-  } catch (e) {
-    showNotice(errMessage(e));
-  }
+/** Draw the switches from the saved settings (used after a failed change). */
+function syncSettingSwitches() {
+  el.settings.pip.checked = Boolean(currentSettings.pipAutoEnter);
+  el.settings.blockPopups.checked = Boolean(currentSettings.blockPopups);
+  el.settings.cosmetic.checked = Boolean(currentSettings.injectCosmeticRules);
+  el.settings.fullscreen.checked = Boolean(currentSettings.fullscreenSites);
+}
+
+// Save logic and the PiP switch rules live in logic/settings_flow.js.
+const settingsFlow = createSettingsFlow({
+  call,
+  notify: (message, kind) => showNotice(message, kind),
+  errorText: errMessage,
+  refresh: refreshLauncher,
+  drawSwitches: syncSettingSwitches,
+  getCurrent: () => currentSettings,
+  setCurrent: (value) => {
+    currentSettings = value;
+  },
+});
+
+function saveSettings(patch, okMessage) {
+  return settingsFlow.save(patch, okMessage);
 }
 
 function wireSettings() {
@@ -723,14 +739,9 @@ function wireSettings() {
   el.settings.fullscreen.addEventListener("change", (e) =>
     saveSettings({ fullscreenSites: e.target.checked }),
   );
-  el.settings.pip.addEventListener("change", async (e) => {
-    await saveSettings({ pipAutoEnter: e.target.checked });
-    try {
-      await call("set_pip_auto_enter", { enabled: e.target.checked });
-    } catch {
-      /* desktop: unsupported, nothing to do */
-    }
-  });
+  el.settings.pip.addEventListener("change", (e) =>
+    settingsFlow.changePipAutoEnter(e.target.checked),
+  );
   el.settings.developer.addEventListener("change", async (e) => {
     await saveSettings({ developerOptions: e.target.checked });
     el.dev.panel.hidden = !e.target.checked;

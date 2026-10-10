@@ -4,6 +4,7 @@ Notable user-facing changes are recorded here. Release assets are published from
 
 ## [Unreleased]
 
+- Settings are applied only after the store accepts them. A failed save no longer leaves the live setting changed, and the switches are redrawn from the saved state. The "auto PiP" switch rolls its saved value back when the native controller fails or refuses (PiP unsupported), and says so. Desktop behaviour is unchanged.
 ### Android
 
 - Fixed a freeze (ANR) when the launcher's first native call ran on the UI thread: the `ipc` message listener now hands messages to a worker thread, so a plugin call such as the "auto PiP" setting no longer waits on a blocked UI thread. Found by reading the sources (wry, Tauri, androidx); not reproduced on a device yet.
