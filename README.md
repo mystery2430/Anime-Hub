@@ -312,7 +312,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 - [Rust](https://www.rust-lang.org/tools/install) — güncel stable önerilir
   (MSRV `1.77`, bkz. `src-tauri/Cargo.toml`)
-- [Node.js](https://nodejs.org/) 20+
+- [Node.js](https://nodejs.org/) 20.19+ (`package.json` `engines`; CI Node 22 kullanır)
 - Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`
 - Android: SDK platform 36, NDK `29.0.13846066`, `ANDROID_HOME` ve `NDK_HOME` tanımlı
 - Tümü için: [Tauri ön gereksinimleri](https://v2.tauri.app/start/prerequisites/)
@@ -382,7 +382,7 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 | Doğrulama | Sonuç |
 |---|---|
-| `npm test` | **65 test geçti**, 0 hata |
+| `npm test` | **114 test geçti**, 0 hata (yerel, 2026-10-10) |
 | `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | GitHub Actions'ta yeşil — Tests işi `ubuntu-24.04`, `macos-latest` ve `windows-latest` üzerinde |
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |

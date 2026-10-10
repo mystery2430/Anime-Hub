@@ -12,6 +12,14 @@ Notable user-facing changes are recorded here. Release assets are published from
 - If no suitable player is found, if the preparation fails, or if the Activity is not resumed, PiP is not entered and the page is left exactly as it was.
 - The generated Android project still carries no permanent PiP code: `scripts/android_prepare.py` installs the configuration and lifecycle after `tauri android init`, and the script now also renders `AnimeHubPipController.kt` from a template and injects the lifecycle block into the generated `MainActivity.kt` idempotently.
 
+### Fixed
+
+- Site cards: the options menu is now a sibling of the card button instead of a button nested inside it (invalid HTML that broke keyboard and screen reader use). Layout and hover behaviour are unchanged.
+- Browser-mode settings stub now matches the Rust defaults: `fullscreenSites` is `false` and `theme` is `system`. A test keeps the two in sync.
+- Modals and the site action sheet share one overlay stack: Tab stays inside the open dialog, focus returns to the element that opened it, the background is inert while a dialog is open, and Escape closes the top dialog (it previously fell through to "back to launcher" for the action sheet). Escape is ignored during IME composition.
+- PiP: a page that throws while the PiP view is applied (in preparation or in a re-assert) is restored instead of being left half-styled.
+- Android web storage isolation between providers is documented as a known limitation with architecture options in `docs/android-storage-isolation.md`.
+
 ### Validation note
 
 The WebView-side controller is covered by `node --test tests/pip_controller.test.js`, the prepare script by `tests/gaps.test.js`, and the Kotlin/plugin invariants by unit tests in `src-tauri` — all green in CI (PR #19, run 37792307795: Android aarch64 compile, three-platform tests, audit and LTO jobs all pass; artifact `animehub-android-aarch64-debug`). The APK builds and installs, but the PiP behaviour itself has **not** been device-tested. Details: [`docs/android-pip.md`](./docs/android-pip.md).
