@@ -406,3 +406,19 @@ test("PiP play/pause button: only a user press toggles playback, and the receive
   assert.match(js, /window\[PLAYBACK_FN\] = playback;/);
   assert.doesNotMatch(js, /\$/);
 });
+
+test("launcher IPC: the UI-thread listener never calls Rust directly (no main-thread deadlock)", () => {
+  // onPostMessage is @UiThread. Rust runs blocking commands inline, and a plugin
+  // command waits for the UI thread, so a direct Rust.ipc call there can deadlock.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const start = kt.indexOf("class LauncherIpc(");
+  assert.ok(start >= 0, "LauncherIpc must exist");
+  const end = kt.indexOf("\n}\n", start);
+  const body = kt.slice(start, end);
+  assert.match(body, /IPC_EXECUTOR\.execute \{/);
+  assert.match(body, /Rust\.ipc\(webViewId, url, body\)/);
+  // The only direct Rust.ipc call is the one inside the executor.
+  const rustCalls = body.match(/Rust\.ipc\(/g) || [];
+  assert.equal(rustCalls.length, 1);
+  assert.match(kt, /Executors\.newSingleThreadExecutor/);
+});

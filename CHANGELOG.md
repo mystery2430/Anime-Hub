@@ -6,6 +6,7 @@ Notable user-facing changes are recorded here. Release assets are published from
 
 ### Android
 
+- Fixed a freeze (ANR) when the launcher's first native call ran on the UI thread: the `ipc` message listener now hands messages to a worker thread, so a plugin call such as the "auto PiP" setting no longer waits on a blocked UI thread. Found by reading the sources (wry, Tauri, androidx); not reproduced on a device yet.
 - Picture-in-Picture now shows the active player instead of the whole site WebView. A new controlled chain finds the playing video (or, when the player lives in a cross-origin frame, uses that frame as the surface), applies a temporary player-only view of the page, and only then calls `enterPictureInPictureMode()` with the measured aspect ratio and the player's bounds as `sourceRectHint`.
 - PiP entry is claimed on API 30+ via `onPictureInPictureRequested()` and on API 26-29 via `onUserLeaveHint()`; both go through the same preparation. Leaving PiP restores the page from byte-exact saved styles, classes and attributes — no DOM move, no reload, playback and scroll position untouched.
 - The platform auto-enter flag (`setAutoEnterEnabled(true)`) is deliberately never set: Android documents that it suppresses `onPictureInPictureRequested()`, so the system could enter PiP before the WebView was prepared. The "auto PiP" setting now arms the controlled paths and is re-applied to the native controller on startup.

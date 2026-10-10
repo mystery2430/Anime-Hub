@@ -835,10 +835,28 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
   ) {
     if (!isMainFrame) return
     val body = message.data ?: return
-    Rust.ipc(webViewId, view.url ?: "about:blank", body)
+    val url = view.url ?: "about:blank"
+    // onPostMessage runs on the UI thread. Rust runs blocking commands inline, and
+    // a plugin command waits for Kotlin code that needs the UI thread, so calling
+    // Rust here can deadlock (ANR). Run it on a worker, as wry's JavaScript
+    // interface did before this listener. A single thread keeps message order.
+    try {
+      IPC_EXECUTOR.execute {
+        try {
+          Rust.ipc(webViewId, url, body)
+        } catch (e: Exception) {
+          AnimeHubDebugLog.add("ipc", "dispatch failed (${e.javaClass.simpleName})")
+        }
+      }
+    } catch (e: Exception) {
+      AnimeHubDebugLog.add("ipc", "dispatch could not be queued (${e.javaClass.simpleName})")
+    }
   }
 
   companion object {
+    private val IPC_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "AnimeHubLauncherIpc").apply { isDaemon = true }
+    }
     const val OBJECT_NAME = "ipc"
     val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
   }
