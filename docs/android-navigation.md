@@ -49,14 +49,15 @@ public from API 26, which matches `minSdkVersion` 26.
 - Access decisions are Tauri's, from the capability files (see the comment in
   `src-tauri/capabilities/default.json`). Verified in Tauri 2.11.6 source, not on a device.
 
-## Proposal: restrict the `ipc` object (design only, not implemented)
+## Restricting the `ipc` object (implemented in `a864bad`, not device-tested)
 
-Status: proposal from wry 0.55.1 and Tauri 2.11.6 source. Not reviewed, not built, not device-tested.
+Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compiled locally
+(no Android SDK here), and CI only builds it. The device check below is pending.
 
 - Order (verified in `main_pipe.rs`): the first `loadUrl` (line ~250, for the launcher
   URL) runs before `addJavascriptInterface("ipc")` (~307) and the `on_webview_created`
   hook (~320). Later loads in the same WebView run after the hook.
-- Proposal: in `AnimeHubPlugin.load()`, after `installNavigationGuard`, call
+- Implemented: in `AnimeHubPlugin.load()`, after `installNavigationGuard`, call
   `removeJavascriptInterface("ipc")`, then `WebViewCompat.addWebMessageListener(webView,
   "ipc", setOf("http://tauri.localhost", "https://tauri.localhost"), listener)`.
   The listener accepts only `isMainFrame == true`, takes `message.data`, and calls
@@ -65,6 +66,9 @@ Status: proposal from wry 0.55.1 and Tauri 2.11.6 source. Not reviewed, not buil
   `ipc-protocol.js`), so the replacement must keep that name and the string payload.
 - If `WebViewFeature.WEB_MESSAGE_LISTENER` is unsupported, keep wry's object and log
   a warning. The site exposure then stays and must be reported as a limit.
+- If `addWebMessageListener` throws, the wry object is already removed. The launcher
+  then has no IPC, and the error is logged. No site gets an `ipc` object. This is
+  fail-closed, and it can break the launcher, so the device check matters.
 - Open points, all unverified: whether the initial launcher document (loaded before the
   hook) keeps wry's object until its first navigation; whether Tauri's default scheme
   on Android is `http` or `https` (both origins are listed); whether the
