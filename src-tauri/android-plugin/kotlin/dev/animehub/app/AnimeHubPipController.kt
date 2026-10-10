@@ -85,8 +85,8 @@ object AnimeHubPipController {
   /** Receives the button press; registered in attach(), removed in detach(). */
   private var toggleReceiver: BroadcastReceiver? = null
 
-  /** Aspect ratio of the last PiP entry, reused when the button changes. */
-  private var pipRatio: Pair<Int, Int> = Pair(DEFAULT_NUM, DEFAULT_DEN)
+  /** Aspect ratio of the last PiP entry, set in enter(); null until then. */
+  private var pipRatio: Pair<Int, Int>? = null
 
   // ------------------------------------------------------------- references
 
@@ -426,7 +426,7 @@ object AnimeHubPipController {
 
   private fun updatePlaybackAction(activity: Activity, playing: Boolean) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-    val (num, den) = pipRatio
+    val (num, den) = pipRatio ?: return
     runOnMain(activity) {
       if (!activity.isInPictureInPictureMode) return@runOnMain
       activity.setPictureInPictureParams(
