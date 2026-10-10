@@ -785,9 +785,10 @@
     }
   }
 
-  // A video that was playing before PiP is paused by the WebView when the
-  // Activity pauses (WebView.onPause stops media); it is started again once
-  // the WebView is resumed in PiP. Only a real <video> is touched.
+  // A video that was playing when PiP was prepared. The WebView may pause it
+  // when the Activity pauses, but a pause from the user looks the same, so
+  // `reapply` only restarts it when no pause was observed. Only a real <video>
+  // is touched.
   function wasPlaying(candidate) {
     var el = candidate && candidate.el;
     return !!el && el.tagName === "VIDEO" && el.paused === false && el.ended !== true;
@@ -827,14 +828,9 @@
     return err && typeof err.name === "string" ? err.name.slice(0, 40) : "unknown";
   }
 
-  // A player that was playing when PiP started and is paused again within a
-  // short window is resumed a few times. The device log showed the WebView
-  // pausing it while the Activity paused, each time together with a
-  // visibilitychange. After the window, or after the retries, nothing is
-  // overridden.
-  var EARLY_WINDOW_MS = 2000;
-  var RETRY_DELAY_MS = 250;
-  var MAX_RETRIES = 3;
+  // The probe never changes playback. It records whether the page saw its
+  // player pause after PiP was prepared; `reapply` reads that flag and does not
+  // start a player the page reports as paused.
 
   function startProbe(candidate, wasPlayingAtStart) {
     var el = candidate.el;
@@ -845,7 +841,7 @@
       events: [],
       handlers: [],
       wasPlaying: !!wasPlayingAtStart,
-      retriesLeft: MAX_RETRIES,
+      pausedSinceStart: false,
     };
     function note(label) {
       if (p.events.length < 40) p.events.push(label + "@" + (Date.now() - p.t0));
@@ -861,7 +857,7 @@
     }
     if (p.isVideo) {
       listen(el, "pause", function () {
-        retryEarlyPause(p);
+        p.pausedSinceStart = true;
       });
       listen(el, "play");
       listen(el, "ended");
@@ -879,21 +875,6 @@
     listen(window, "blur");
     listen(window, "focus");
     return p;
-  }
-
-  function retryEarlyPause(p) {
-    if (!p.wasPlaying || p.retriesLeft <= 0) return;
-    if (Date.now() - p.t0 > EARLY_WINDOW_MS) return;
-    p.retriesLeft -= 1;
-    var attempt = function () {
-      // Only if the page still has it paused; resumePlayback re-checks that.
-      resumePlayback(p.el, true);
-    };
-    if (typeof window.setTimeout === "function") {
-      window.setTimeout(attempt, RETRY_DELAY_MS);
-    } else {
-      attempt();
-    }
   }
 
   function buildReport(p) {
@@ -931,7 +912,10 @@
       release();
       return false;
     }
-    var shouldPlay = state.wasPlaying;
+    // Resume only when the page saw no pause since PiP was prepared. A pause
+    // event from the user or from the WebView is indistinguishable here, so a
+    // paused player is left paused. Without a probe nothing is known: leave it.
+    var shouldPlay = !!state.wasPlaying && !!probe && probe.pausedSinceStart === false;
     release();
     var acc = newAccumulator();
     var applied;

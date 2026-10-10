@@ -309,119 +309,111 @@ test("a site header inside the player wrapper is hidden, overlay controls stay",
   assert.equal(styleOf(header), "", "restore clears the header change");
 });
 
-test("a player that was playing is started again when PiP resumes the WebView", () => {
-  // Device report: the WebView pauses on Activity onPause, which stops the
-  // video and the audio in PiP. The controller restarts the video it chose,
-  // and only that one, when the WebView is resumed.
-  const dom = phone();
-  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
-  let plays = 0;
-  video.play = () => {
-    plays += 1;
-    video.paused = false;
-    return { catch() {} };
-  };
+// Playback continuity during PiP ----------------------------------------
+// The rule the tests hold: PiP never starts a player the page has paused, and
+// never restarts one after a pause the page observed. A WebView pause and a
+// user pause emit the same `pause` event, so the controller cannot tell them
+// apart; it leaves the player paused in both cases.
 
-  assert.equal(dom.prepare().ok, true);
-  video.paused = true; // what WebView.onPause does to the media
-  dom.pip(true);
-  assert.equal(plays, 1, "the paused player is started again");
-  assert.equal(video.paused, false);
-
-  dom.pip(false);
-  video.paused = true;
-  dom.pip(true);
-  assert.equal(plays, 1, "after restore nothing is started any more");
-});
-
-test("a player that was already paused is not started by PiP", () => {
-  const dom = phone();
+function countingVideo(dom, opts = {}) {
   const video = addVideo(dom.document, dom.document.body, {
     rect: { x: 0, y: 0, width: 360, height: 203 },
-    paused: true,
+    ...opts,
   });
-  let plays = 0;
+  video.plays = 0;
   video.play = () => {
-    plays += 1;
-    return { catch() {} };
-  };
-  assert.equal(dom.prepare().ok, true);
-  dom.pip(true);
-  assert.equal(plays, 0);
-  dom.pip(false);
-});
-
-test("the resume is one-shot: a user pause in PiP survives a later re-assert", () => {
-  const dom = phone();
-  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
-  let plays = 0;
-  video.play = () => {
-    plays += 1;
+    video.plays += 1;
     video.paused = false;
     return { catch() {} };
   };
-  assert.equal(dom.prepare().ok, true);
-  video.paused = true; // the Activity pause stopped it
-  dom.pip(true); // WebView resumed: started once
-  assert.equal(plays, 1);
+  return video;
+}
 
-  video.paused = true; // the user pauses inside PiP
-  dom.pip(true); // a second re-assert (onPause then the PiP mode change)
-  assert.equal(plays, 1, "the user's pause is not undone");
+test("scenario 1: a video that keeps playing through PiP is left alone", () => {
+  const dom = phone();
+  const video = countingVideo(dom);
+  assert.equal(dom.prepare().ok, true);
+  dom.pip(true);
+  assert.equal(video.plays, 0, "no play() call for a player that is still playing");
+  assert.equal(video.paused, false);
+  dom.pip(false);
+});
+
+test("scenario 2: a user pause just before PiP is not undone", () => {
+  const dom = phone();
+  const video = countingVideo(dom);
+  video.paused = true;
+  video.dispatch("pause");
+  assert.equal(dom.prepare().ok, true);
+  dom.pip(true);
+  assert.equal(video.plays, 0);
   assert.equal(video.paused, true);
   dom.pip(false);
 });
 
-// Early pause retry ------------------------------------------------------
-
-// The sandbox's window has no timers; a manual queue makes the retry testable.
-function withTimerQueue(dom) {
-  const queue = [];
-  dom.window.setTimeout = (fn) => {
-    queue.push(fn);
-    return queue.length;
-  };
-  dom.flushTimers = () => {
-    while (queue.length) queue.shift()();
-  };
-  return dom;
-}
-
-test("a player paused right after PiP starts is resumed (early pause, within the window)", () => {
-  const dom = withTimerQueue(phone());
-  const video = addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
-  let plays = 0;
-  video.play = () => {
-    plays += 1;
-    video.paused = false;
-    return { catch() {} };
-  };
+test("scenario 2b: a pause after prepare and before PiP is observed and not undone", () => {
+  const dom = phone();
+  const video = countingVideo(dom);
   assert.equal(dom.prepare().ok, true);
   video.paused = true;
-  video.dispatch("pause"); // the WebView paused it while the Activity paused
-  dom.flushTimers();
-  assert.equal(plays, 1, "the early pause is undone once");
-  assert.equal(video.paused, false);
+  video.dispatch("pause");
+  dom.pip(true);
+  assert.equal(video.plays, 0, "a pause the page saw is never reversed");
+  assert.equal(video.paused, true);
+  dom.pip(false);
+});
+
+test("scenario 3: a pause right after PiP starts is not undone", () => {
+  const dom = phone();
+  const video = countingVideo(dom);
+  assert.equal(dom.prepare().ok, true);
+  dom.pip(true);
+  video.paused = true;
+  video.dispatch("pause");
+  dom.pip(true); // a later re-assert (Activity onPause, then the mode change)
+  assert.equal(video.plays, 0);
+  assert.equal(video.paused, true);
+  dom.pip(false);
+});
+
+test("scenario 3b: the Activity-pause case is not auto-resumed and is reported", () => {
+  // Known limit: when the WebView pauses the video during PiP entry the page
+  // sees a pause event, so the controller does not restart it. The report
+  // names the event so a device log can show it.
+  const dom = phone();
+  const video = countingVideo(dom);
+  assert.equal(dom.prepare().ok, true);
+  video.paused = true;
+  video.dispatch("pause");
+  dom.pip(true);
+  assert.equal(video.plays, 0);
   assert.match(dom.window.__animehubPipReport(), /pause@\d+/);
   dom.pip(false);
 });
 
-test("a player that was already paused before PiP is never started by a pause retry", () => {
-  const dom = withTimerQueue(phone());
-  const video = addVideo(dom.document, dom.document.body, {
-    rect: { x: 0, y: 0, width: 360, height: 203 },
-    paused: true,
-  });
-  let plays = 0;
-  video.play = () => {
-    plays += 1;
-    return { catch() {} };
-  };
+test("a player that was already paused before PiP is never started", () => {
+  const dom = phone();
+  const video = countingVideo(dom, { paused: true });
   assert.equal(dom.prepare().ok, true);
-  video.dispatch("pause");
-  dom.flushTimers();
-  assert.equal(plays, 0);
+  dom.pip(true);
+  assert.equal(video.plays, 0);
   dom.pip(false);
+});
+
+test("scenario 4: PiP exit restores every inline style and class", () => {
+  const dom = phone();
+  dom.document.body.setAttribute("class", "page site-theme");
+  const before = dom.document.body.getAttribute("class");
+  const video = countingVideo(dom);
+  const wrapBefore = styleOf(video);
+  assert.equal(dom.prepare().ok, true);
+  video.paused = true;
+  video.dispatch("pause");
+  dom.pip(true);
+  dom.pip(false);
+  assert.equal(styleOf(video), wrapBefore, "the video's inline style is back");
+  assert.equal(dom.document.body.getAttribute("class"), before, "page classes are back");
+  assert.equal(dom.window.__animehubPip(), false, "no PiP view is left applied");
 });
 
 test("the visibility state is recorded with the visibilitychange event", () => {
