@@ -22,15 +22,16 @@ taşınmadı** (temiz oda); ayrıntı `NOTICES.md` içinde.
 
 ## 2. Doğrulandı — komut ve sonuç
 
-Geliştirme ortamı: Linux x86_64, Debian 13, **1984 MB RAM**, Node v20.20.2,
+Geliştirme ortamı: Linux x86_64, Debian 13, **1984 MB RAM**, Node v20.20.2 (önceki oturum; 2026-10-10 oturumunda Node v22.22.3 kullanıldı),
 rustup stable (1.98.x).
 
 | Komut | Sonuç |
 |---|---|
-| `cargo test` (src-tauri) | **137 birim + 11 denetim = 148 geçti**, 0 hata |
+| `cargo test` (src-tauri) | Bu oturumda yerelde **çalıştırılmadı** (sandbox'ta Rust araç zinciri yok). Son yeşil sonuç CI'daki Tests işleri (ubuntu-24.04, macos-latest, windows-latest); eski yerel sayı 137 birim + 11 denetimdi |
 | `cargo clippy --all-targets -- -D warnings` | temiz, uyarı yok |
 | `cargo fmt --all -- --check` | temiz |
-| `node --test tests/` | **45 geçti**, 0 hata |
+| `npm test` | **118 geçti**, 0 hata (2026-10-10, yerel; çıktı `# pass 118` / `# fail 0`, çıkış kodu 0) |
+| `node --test tests/` (dizin argümanı) | Yerelde Node 22.22.3 ile çalışmadı: `Cannot find module '…/tests'`, çıkış kodu 1. Proje `npm test` ile dosya listesi kullanır; dizin argümanı kullanılmamalı |
 | `npm run build` | başarılı (vite) |
 | `npm run tauri build -- --bundles deb` | `AnimeHub_0.1.0_amd64.deb` (3.7 MB) üretildi |
 
@@ -112,7 +113,11 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **Android APK / v0.3.2 runtime** | Herkese açık v0.3.2 release'i yayımlandı; Android release workflow'u aarch64, armv7 ve x86_64 için imzalı APK'ları başarıyla üretti. Önceki CI APK'sını bir cihazda açarken çökme görülmedi, ancak yükleme yavaştı. Bu sürümdeki asenkron `CookieManager.flush()` değişikliğinin performansı fiziksel cihazda henüz ölçülmedi |
 | **Android localStorage/IndexedDB** | Dışa/içe aktarma köprüleri ve şifreli anlık görüntüler bulunur; bunlar gerçek sağlayıcı yalıtımı sağlamaz. Android tek WebView'ı yeniden kullandığı için aynı kaynaklı `localStorage`/IndexedDB izolasyonu çözülmemiştir ve güvenlik sınırı olarak sunulmamalıdır. IndexedDB aktarımı en iyi çabadır (ikincil indeks/key path/Blob kaybı mümkündür) |
 | **Kotlin köprüsü** | v0.3.2 release workflow'u Activity/WebView yaşam döngüsü kontrolleri ve asenkron cookie kalıcılaştırması içeren köprüyü üç Android ABI'sinde derleyip imzaladı. Yerelde Android SDK/Gradle yok; asenkron kalıcılaştırmanın gerçek cihaz performansı doğrulanmadı |
-| **PiP gerçek cihazda** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; cihaz yok |
+| **PiP duraklatma** | 6f28b13'teki 2 saniyelik otomatik oynatma yeniden denemesi kaldırıldı (`c4a260b`). Sayfanın gördüğü bir duraklatma geri alınmaz. Kullanıcı ile WebView duraklatması ayırt edilemediğinden, PiP sırasındaki oynatma sürekliliği **cihazda doğrulanmadı** ve bir sınır olarak kalıyor |
+| **Android site gezinme koruması** | `SiteNavigationGuard` (`470e7b8`) yalnızca üst düzey gezinmeleri denetler: düz `http`, https dışı şemalar, yerel/özel hostlar. Blocklist, DNS rebinding, alt çerçeveler ve uygulamanın `loadUrl` çağrıları kapsam dışı. Kotlin derlenmedi, cihazda denenmedi. Ayrıntı: `docs/android-navigation.md` |
+| **Android `ipc` kısıtı** | wry'nin her sayfaya açtığı `ipc` nesnesi kaldırıldı; launcher origin'lerine ana çerçevede yalnızca `WebMessageListener` verildi (`a864bad`). Kurulamazsa hata loglanır ve IPC kapalı kalır (fail closed). CI Android derlemesi (`5ef743f`, run 38047701321) geçti. **Cihazda doğrulanmadı**: launcher IPC'si çalışmalı, bir site sayfasında `typeof window.ipc` `"undefined"` olmalı |
+| **Linux anahtar kaynağı (keyring)** | Anahtar kaynağı `key-source` kaydında tutulur (`e001705`). Kilitli/erişilemeyen keyring'de yeni anahtar oluşturulmaz, kayıtlı keyring anahtarı varken dosya anahtarına geçilmez. CI `cargo test --all` Linux, Windows ve macOS'ta geçti (`a21b0ec`, run 38045901411). Gerçek Secret Service ile test edilmedi |
+| **PiP çalışma zamanı (gerçek cihaz)** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; bu ortamda cihaz yok. Kontrollü zincir testlerden geçti ve PR #19'un CI koşusunda (`6f28b13` için run 37985547812, tüm işler yeşil) Android aarch64 **derlendi, debug APK üretildi** (`animehub-android-aarch64-debug`). Bu tarihten sonraki commit'ler için CI sonucu ayrıca kontrol edilmelidir. Yani "derleniyor" doğrulandı, "cihazda çalışıyor" **doğrulanmadı**: PiP geçişi, oynatıcı seçimi, geri yükleme ve API seviyesi farkları hâlâ cihazda denenmeli (`docs/android-pip.md` §12'deki 15 maddelik liste) |
 | **Windows NSIS** | v0.3.2 Release Desktop workflow'u Windows üzerinde geçti ve `AnimeHub_0.3.2_x64-setup.exe` üretti. Windows imzalama sırrı tanımlı olmadığı için paket imzasız; README'de uyarısı var |
 | **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
 | **İmzalı yayın APK** | ✅ Keystore secret'ları (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) repository secrets'a eklendi; workflow imzalı üretiyor |
@@ -138,6 +143,16 @@ Script üç dizeyi karşılaştırır ve uyuşmazsa durur: Kotlin `package` sat�
 kimliği `dev.animehub.app` noktalı paket olarak üretir; eski
 `dev_animehub_app` tahmini yanlıştı ve düzeltildi. Script ayrıca PiP
 özniteliğini, eksikse OAuth intent-filter'ını ve R8 keep kuralını yazar.
+
+PiP tarafında script üç şey daha yapar (hepsi PR #19'un CI koşusunda gerçek proje
+üzerinde çalıştı ve aarch64 debug APK üretti): `AnimeHubPlugin.kt`'yi kopyalar,
+`AnimeHubPipController.kt`'yi şablondan üretir (şablondaki
+`__ANIMEHUB_PIP_CONTROLLER_JS__` yer tutucusu, Rust'ın da enjekte ettiği
+`src-tauri/src/web/pip_controller.js` ile doldurulur) ve üretilen
+`MainActivity.kt`'ye `// >>> AnimeHub PiP lifecycle ... >>>` işaretleri
+arasına PiP yaşam döngüsü bloğunu yazar. Blok her koşuda yenilenir, bu yüzden
+`onDestroy` gibi üyeler iki kez oluşmaz. `MainActivity` `TauriActivity`'den
+türemiyorsa (üretilen proje şekli değişmişse) script açıkça durur.
 `./scripts/build.sh android` ve `release-android.yml` bunu kendisi çağırır.
 
 `release-android.yml` içindeki iki gerçek hata da düzeltildi: keystore
@@ -212,7 +227,7 @@ cd animehub && npm install
 
 ```bash
 cd src-tauri && cargo test              # birim + denetim
-npm test                                # frontend (dosya listesi; `tests/` dizini Node 22'de kırılıyor)
+npm test                                # frontend (dosya listesi; `node --test tests/` yerelde Node 22.22.3'te çalışmıyor)
 npm run check                           # ikisi birden
 ./scripts/build.sh linux                # paketle
 python3 scripts/android_prepare.py      # `tauri android init` sonrası

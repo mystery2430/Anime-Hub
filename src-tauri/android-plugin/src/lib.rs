@@ -65,6 +65,7 @@ pub const CMD_KEYSTORE_SEAL: &str = "keystore_seal";
 pub const CMD_KEYSTORE_OPEN: &str = "keystore_open";
 pub const CMD_ENTER_PIP: &str = "enter_pip";
 pub const CMD_SET_PIP_AUTO_ENTER: &str = "set_pip_auto_enter";
+pub const CMD_DEBUG_LOG: &str = "debug_log";
 pub const CMD_LOCALSTORAGE_EXPORT: &str = "localstorage_export";
 pub const CMD_LOCALSTORAGE_IMPORT: &str = "localstorage_import";
 pub const CMD_INDEXEDDB_EXPORT: &str = "indexeddb_export";
@@ -220,7 +221,12 @@ pub fn webview_cookies_replace(url: String, cookies: Vec<String>) -> Result<OkRe
     }
 }
 
-/// Enter Picture-in-Picture with the given aspect ratio.
+/// Enter Picture-in-Picture with the given aspect ratio as the fallback.
+///
+/// The Kotlin side prepares the shared WebView first (`AnimeHubPipController`
+/// calls the site's `window.__animehubPreparePip()` and waits for its answer),
+/// so the PiP window shows the active player instead of the whole site. The
+/// ratio here is only used when the page could not report the player's own.
 pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
@@ -240,7 +246,35 @@ pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     }
 }
 
-/// Enable or disable auto-enter PiP (Android 12 / API 31+).
+/// Empty argument object for commands that take none.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+struct NoArgs {}
+
+#[cfg(target_os = "android")]
+#[derive(Deserialize)]
+struct DebugLogResponse {
+    lines: Vec<String>,
+}
+
+/// The last PiP diagnostic lines kept by the Kotlin side (in-app log; no
+/// logcat needed). Read-only: it never changes PiP state.
+pub fn debug_log() -> Result<Vec<String>> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin::<_, DebugLogResponse>(CMD_DEBUG_LOG, NoArgs {}).map(|r| r.lines)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err(Error::Unsupported)
+    }
+}
+
+/// Enable or disable the controlled auto-PiP paths (never platform auto-enter).
+///
+/// See `AnimeHubPipController.applyAutoEnter`: `setAutoEnterEnabled(true)`
+/// would let the system skip the WebView preparation entirely, so the setting
+/// only gates `onPictureInPictureRequested()` / `onUserLeaveHint()`.
 pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
@@ -454,6 +488,7 @@ mod tests {
         assert_eq!(CMD_KEYSTORE_OPEN, "keystore_open");
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
+        assert_eq!(CMD_DEBUG_LOG, "debug_log");
         assert_eq!(CMD_LOCALSTORAGE_EXPORT, "localstorage_export");
         assert_eq!(CMD_LOCALSTORAGE_IMPORT, "localstorage_import");
         assert_eq!(CMD_INDEXEDDB_EXPORT, "indexeddb_export");
@@ -461,6 +496,61 @@ mod tests {
         assert_eq!(CMD_WEBVIEW_COOKIES_GET, "webview_cookies_get");
         assert_eq!(CMD_WEBVIEW_COOKIES_REPLACE, "webview_cookies_replace");
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
+    }
+
+    #[test]
+    fn kotlin_pip_controller_template_is_wired_for_controlled_entry() {
+        // Template, not a generated file: `scripts/android_prepare.py` fills
+        // the JS in and copies it into the Android project.
+        let kt = include_str!("../kotlin/dev/animehub/app/AnimeHubPipController.kt");
+        for marker in [
+            "object AnimeHubPipController",
+            "fun attach(",
+            "fun detach(",
+            "fun requestEnter(",
+            "fun restore(",
+            "fun applyAutoEnter(",
+            "__animehubPreparePip",
+            "__animehubPip",
+            "setSourceRectHint",
+            "enterPictureInPictureMode(",
+        ] {
+            assert!(
+                kt.contains(marker),
+                "AnimeHubPipController.kt is missing `{marker}`"
+            );
+        }
+        assert!(
+            kt.contains("__ANIMEHUB_PIP_CONTROLLER_JS__"),
+            "the JS placeholder must stay for scripts/android_prepare.py"
+        );
+        assert!(
+            !kt.contains("setAutoEnterEnabled(true)"),
+            "platform auto-enter would skip the WebView preparation"
+        );
+    }
+
+    #[test]
+    fn pip_commands_delegate_to_the_controller_instead_of_duplicating_it() {
+        let kt = include_str!("../kotlin/dev/animehub/app/AnimeHubPlugin.kt");
+        assert!(
+            kt.contains("AnimeHubPipController.requestEnter("),
+            "enter_pip must use the shared preparation chain"
+        );
+        assert!(
+            kt.contains("AnimeHubPipController.applyAutoEnter("),
+            "set_pip_auto_enter must go through the controller"
+        );
+        // The call form, not the word: the doc comment above the command
+        // explains the chain it hands over to.
+        assert!(
+            !kt.contains(".enterPictureInPictureMode("),
+            "the plugin must not enter PiP on its own"
+        );
+        assert!(
+            !kt.contains("setAutoEnterEnabled"),
+            "platform auto-enter is disabled for good; the controller owns it"
+        );
     }
 
     #[test]
@@ -485,6 +575,7 @@ mod tests {
             CMD_KEYSTORE_OPEN,
             CMD_ENTER_PIP,
             CMD_SET_PIP_AUTO_ENTER,
+            CMD_DEBUG_LOG,
             CMD_LOCALSTORAGE_EXPORT,
             CMD_LOCALSTORAGE_IMPORT,
             CMD_INDEXEDDB_EXPORT,

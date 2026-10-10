@@ -33,6 +33,9 @@ lines.forEach((line, i) => {
   if (/^(\x1b\[[0-9;]*m)*error(\[|:)/i.test(line) && !/could not compile/i.test(line)) {
     context.push(...lines.slice(i, i + 5));
   }
+  // Kotlin compiler errors: "e: file:///path/File.kt:LINE:COL message".
+  // Gradle prints them before the FAILURE block, which this script did not keep.
+  if (/^e: /.test(line)) context.push(line);
 });
 const contextBlock = [...new Set(context)].slice(0, 40).join("\n");
 

@@ -13,7 +13,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const read = (p) => readFileSync(p, "utf8");
+// Normalise line endings: a Windows checkout may hand us CRLF files.
+const read = (p) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 
 // GitHub's Windows runners expose `python`, not `python3`.
 function pythonBin() {
@@ -79,14 +80,29 @@ test("opening an Android site no longer shows the storage-isolation toast", () =
   assert.match(ui, /aynı kaynaklı localStorage\/IndexedDB yalıtımı henüz çözülmedi/);
 });
 
-function fakeGen(packageName) {
+// The file `tauri android init` writes (crates/tauri-cli/templates/mobile/
+// android/app/src/main/MainActivity.kt); android_prepare.py injects code into
+// its body, so the real shape matters here.
+function mainActivitySource(packageName, baseClass = "TauriActivity()") {
+  return `package ${packageName}
+
+import android.os.Bundle
+import androidx.activity.enableEdgeToEdge
+
+class MainActivity : ${baseClass} {
+  override fun onCreate(savedInstanceState: Bundle?) {
+    enableEdgeToEdge()
+    super.onCreate(savedInstanceState)
+  }
+}
+`;
+}
+
+function fakeGen(packageName, baseClass) {
   const gen = mkdtempSync(join(tmpdir(), "animehub-android-"));
   const javaDir = join(gen, "app/src/main/java", ...packageName.split("."));
   mkdirSync(javaDir, { recursive: true });
-  writeFileSync(
-    join(javaDir, "MainActivity.kt"),
-    `package ${packageName}\n\nclass MainActivity\n`,
-  );
+  writeFileSync(join(javaDir, "MainActivity.kt"), mainActivitySource(packageName, baseClass));
   writeFileSync(
     join(gen, "app/src/main/AndroidManifest.xml"),
     `<?xml version="1.0" encoding="utf-8"?>
@@ -135,14 +151,76 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(gradle, /signingConfigs\.maybeCreate\("release"\)/);
     assert.match(gradle, /keystore\.properties/);
 
+    // The PiP controller is generated from its template with the *same* WebView
+    // JS that Rust injects, so both halves cannot drift apart.
+    const controller = read(
+      join(gen, "app/src/main/java/dev/animehub/app/AnimeHubPipController.kt"),
+    );
+    assert.match(controller, /object AnimeHubPipController/);
+    assert.match(controller, /fun requestEnter\(/);
+    assert.equal(
+      controller.includes("__ANIMEHUB_PIP_CONTROLLER_JS__"),
+      false,
+      "the JS placeholder must be filled in",
+    );
+    const pipJs = read(join(ROOT, "src-tauri/src/web/pip_controller.js"));
+    assert.equal(
+      controller.includes(pipJs.trim()),
+      true,
+      "the embedded controller must be byte-identical to the shipped JS",
+    );
+    assert.match(controller, /setSourceRectHint/);
+
+    // MainActivity: overrides + imports, and the block is marker-delimited.
+    const activity = read(join(gen, "app/src/main/java/dev/animehub/app/MainActivity.kt"));
+    assert.match(activity, /AnimeHubPipController\.attach\(this, webView\)/);
+    assert.match(activity, /override fun onPictureInPictureRequested\(\): Boolean/);
+    assert.match(activity, /override fun onUserLeaveHint\(\)/);
+    assert.match(activity, /onPictureInPictureModeChanged\(/);
+    // WryActivity.onPause() pauses the WebView; PiP must keep it rendering.
+    assert.match(activity, /override fun onPause\(\)/);
+    assert.match(activity, /keepRenderingInPip\(/);
+    // A finished Activity leaves Tauri's per-process state stale: end the process.
+    assert.match(activity, /if \(isFinishing\) \{/);
+    assert.match(activity, /android\.os\.Process\.killProcess\(android\.os\.Process\.myPid\(\)\)/);
+    assert.match(activity, /import android\.content\.res\.Configuration/);
+    assert.match(activity, /import android\.webkit\.WebView/);
+    assert.match(activity, /class MainActivity : TauriActivity\(\) \{/);
+
     const second = run();
     assert.equal(second.status, 0, second.stderr || second.stdout);
+    const activity2 = read(join(gen, "app/src/main/java/dev/animehub/app/MainActivity.kt"));
+    assert.equal(
+      activity2.split("override fun onDestroy").length - 1,
+      1,
+      "a second run must refresh the block, not append a duplicate override",
+    );
+    assert.equal(activity2.split("AnimeHub PiP lifecycle (injected").length - 1, 1);
+    assert.equal(
+      activity2.split("onPictureInPictureRequested").length - 1,
+      activity.split("onPictureInPictureRequested").length - 1,
+    );
     const xml2 = read(join(gen, "app/src/main/AndroidManifest.xml"));
     assert.equal(xml2.split("supportsPictureInPicture").length - 1, 1);
     assert.equal(xml2.split('android:scheme="animehub"').length - 1, 1);
     // signing block injected exactly once (marker pair, not duplicated)
     const gradle2 = read(join(gen, "app/build.gradle.kts"));
     assert.equal(gradle2.split("AnimeHub release signing").length - 1, 2);
+  } finally {
+    rmSync(gen, { recursive: true, force: true });
+  }
+});
+
+test("android_prepare refuses a MainActivity the PiP lifecycle cannot hook into", () => {
+  const gen = fakeGen("dev.animehub.app", "AppCompatActivity()");
+  try {
+    const result = spawnSync(
+      pythonBin(),
+      ["scripts/android_prepare.py", "--root", ROOT, "--gen", gen],
+      { cwd: ROOT, encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /TauriActivity/);
   } finally {
     rmSync(gen, { recursive: true, force: true });
   }
@@ -162,4 +240,269 @@ test("android_prepare refuses a generated package that would not load", () => {
   } finally {
     rmSync(gen, { recursive: true, force: true });
   }
+});
+
+test("site card menu is a sibling of the card button, never nested inside it", () => {
+  const ui = read(join(ROOT, "src/main.js"));
+  const start = ui.indexOf("function renderTile(tile)");
+  const end = ui.indexOf("function renderAddTile()", start);
+  assert.ok(start >= 0 && end > start, "renderTile should be present");
+  const body = ui.slice(start, end);
+
+  // The card button must not receive the menu as a child.
+  assert.equal(/button\.appendChild\(menu\)/.test(body), false);
+  assert.match(body, /wrap\.appendChild\(button\);/);
+  assert.match(body, /wrap\.appendChild\(menu\);/);
+  // The menu must not open the site, and the card must not open the menu.
+  assert.match(body, /menu\.addEventListener\("click", \(\) => siteMenu\(tile\)\);/);
+  assert.equal(/stopPropagation/.test(body), false);
+  // Every control keeps an accessible name.
+  assert.match(body, /menu\.setAttribute\("aria-label"/);
+  // The wrapper is what the grid receives.
+  assert.match(body, /return wrap;/);
+});
+
+test("site card styles target the wrapper for menu visibility", () => {
+  const css = read(join(ROOT, "src/styles.css"));
+  assert.match(css, /\.tile-wrap:hover \.tile-menu,\s*\.tile-wrap:focus-within \.tile-menu/);
+  assert.equal(/\.tile:hover \.tile-menu/.test(css), false);
+});
+
+test("browser-mode settings stub matches the Rust Settings defaults", () => {
+  const bridge = read(join(ROOT, "src/logic/bridge.js"));
+  const rust = read(join(ROOT, "src-tauri/src/commands.rs"));
+
+  const jsStart = bridge.indexOf("settings: {", bridge.indexOf("const stubState"));
+  const jsEnd = bridge.indexOf("keyBackend:", jsStart);
+  assert.ok(jsStart > 0 && jsEnd > jsStart, "stub settings block should be present");
+  const stub = bridge.slice(jsStart, jsEnd);
+
+  const rStart = rust.indexOf("impl Default for Settings");
+  const rEnd = rust.indexOf("\n}\n", rStart);
+  assert.ok(rStart > 0 && rEnd > rStart, "Rust Settings default should be present");
+  const real = rust.slice(rStart, rEnd);
+
+  const pairs = [
+    [/blockPopups: (\w+)/, /block_popups: (\w+)/],
+    [/injectCosmeticRules: (\w+)/, /inject_cosmetic_rules: (\w+)/],
+    [/fullscreenSites: (\w+)/, /fullscreen_sites: (\w+)/],
+    [/pipAutoEnter: (\w+)/, /pip_auto_enter: (\w+)/],
+    [/developerOptions: (\w+)/, /developer_options: (\w+)/],
+  ];
+  for (const [jsRe, rustRe] of pairs) {
+    const jsVal = stub.match(jsRe)?.[1];
+    const rustVal = real.match(rustRe)?.[1];
+    assert.ok(jsVal && rustVal, `both sides should define ${jsRe}`);
+    assert.equal(jsVal, rustVal, `default mismatch for ${jsRe}`);
+  }
+  assert.match(stub, /theme: "system"/);
+  assert.match(real, /theme: ThemePref::System/);
+});
+
+test("every overlay goes through the shared stack: focus return, inert background, Escape", () => {
+  const ui = read(join(ROOT, "src/main.js"));
+  // One stack for modals and action sheets.
+  assert.match(ui, /const overlayStack = \[\];/);
+  assert.match(ui, /function showOverlay\(el\)/);
+  assert.match(ui, /function hideOverlay\(el\)/);
+  assert.match(ui, /entry\.opener\.focus\(\)/);
+  assert.match(ui, /child\.inert = top !== null && child !== top;/);
+  // The action sheet uses the shared helpers and is labelled.
+  const sheet = ui.slice(ui.indexOf("function showActionSheet"), ui.indexOf("async function clearSiteData"));
+  assert.match(sheet, /showOverlay\(backdrop\)/);
+  assert.match(sheet, /aria-labelledby", "action-sheet-title"/);
+  assert.equal(/backdrop\.remove\(\)/.test(sheet), false);
+  // Escape closes the top overlay first, and never during IME composition.
+  assert.match(ui, /if \(event\.isComposing\) return;/);
+  assert.match(ui, /if \(overlayStack\.length > 0\)/);
+  assert.match(ui, /trapFocus\(event\);/);
+});
+
+test("the Android navigation guard keeps the desktop host rules in step", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const rs = read(join(ROOT, "src-tauri/src/sites/url_policy.rs"));
+
+  // Suffixes the Rust policy refuses (`h.ends_with(".x")`).
+  const rustSuffixes = [...rs.matchAll(/h\.ends_with\("(\.[a-z.]+)"\)/g)].map((m) => m[1]);
+  const ktBlock = kt.slice(kt.indexOf("BLOCKED_SUFFIXES = listOf("));
+  const ktSuffixes = [...ktBlock.slice(0, ktBlock.indexOf(")")).matchAll(/"(\.[a-z.]+)"/g)].map((m) => m[1]);
+  assert.ok(rustSuffixes.length >= 5, "Rust suffix list should be found");
+  assert.deepEqual([...ktSuffixes].sort(), [...rustSuffixes].sort());
+
+  // Exact host names refused by Rust must be refused by Kotlin too, except the
+  // launcher origin names, which the Kotlin policy blocks by suffix instead.
+  const rustHosts = [...rs.matchAll(/"(localhost|localhost\.localdomain|ip6-localhost|ip6-loopback|metadata\.google\.internal)"/g)].map((m) => m[1]);
+  const ktHosts = kt.slice(kt.indexOf("BLOCKED_HOSTS = setOf("), kt.indexOf("BLOCKED_SUFFIXES")).match(/"[^"]+"/g).map((s) => s.slice(1, -1));
+  for (const host of new Set(rustHosts)) assert.ok(ktHosts.includes(host), `Kotlin should refuse ${host}`);
+
+  // The launcher origin has no exception: a site must not load it.
+  assert.equal(/tauri\.localhost"\s*->\s*return true/.test(kt), false);
+});
+
+test("Android navigation policy: numeric IPv4 spellings and documentation ranges are refused like Rust", () => {
+  // Static check only. The same rules were also run on the real Kotlin object with a
+  // stub android.net.Uri (outside the repo, not a CI test). Chromium's URL parsing of
+  // these spellings is per the WHATWG spec and was not tested in a WebView.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  assert.match(kt, /NUMERIC_LABEL = Regex\("""\(0x\[0-9a-f\]\*\|\[0-9\]\+\)""", RegexOption\.IGNORE_CASE\)/);
+  assert.match(kt, /if \(NUMERIC_LABEL\.matches\(bare\.substringAfterLast\('\.'\)\)\) \{/);
+  // Documentation ranges, as Rust url_policy::is_public_ip rejects them.
+  assert.match(kt, /\(a == 198 && b == 51 && c == 100\)/);
+  assert.match(kt, /\(a == 203 && b == 0 && c == 113\)/);
+});
+
+test("Android IPC is limited to the launcher origins and main frame, never a site-facing JavascriptInterface", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  // Removes wry's `ipc` object before the listener is registered under the same name.
+  assert.match(kt, /webView\.removeJavascriptInterface\(LauncherIpc\.OBJECT_NAME\)/);
+  const remove = kt.indexOf("removeJavascriptInterface(LauncherIpc");
+  const add = kt.indexOf("WebViewCompat.addWebMessageListener(");
+  assert.ok(remove > 0 && add > remove, "remove must run before addWebMessageListener");
+  // Only the launcher origins may receive the object.
+  assert.match(kt, /setOf\("http:\/\/tauri\.localhost", "https:\/\/tauri\.localhost"\)/);
+  // Main-frame guard on the message path.
+  assert.match(kt, /if \(!isMainFrame\) return/);
+  // The object is removed on every path, before any early return, so an
+  // unsupported or non-Rust WebView still gives sites no `ipc` object.
+  const removeAt = kt.indexOf("removeJavascriptInterface(LauncherIpc.OBJECT_NAME)");
+  const restrictStart = kt.indexOf("private fun restrictIpcToLauncher");
+  const firstReturn = kt.indexOf("return", restrictStart);
+  assert.ok(removeAt > restrictStart && removeAt < firstReturn, "removal must come before any early return");
+  assert.match(kt, /WebViewFeature\.isFeatureSupported\(WebViewFeature\.WEB_MESSAGE_LISTENER\)/);
+  assert.doesNotMatch(kt, /wry interface kept/);
+  // A failed install is logged as an error and never falls back to a site-visible object.
+  assert.match(kt, /try \{\s*WebViewCompat\.addWebMessageListener[\s\S]*?\} catch \(e: Exception\) \{[\s\S]*?Log\.e\(LOG_TAG/);
+  // Nothing in the plugin exposes a JavascriptInterface to pages.
+  assert.doesNotMatch(kt, /@JavascriptInterface/);
+  assert.doesNotMatch(kt, /addJavascriptInterface/);
+  // Restriction runs in load(), after the navigation guard is installed.
+  const guard = kt.indexOf("installNavigationGuard(webView)");
+  const restrict = kt.indexOf("restrictIpcToLauncher(webView)");
+  assert.ok(guard > 0 && restrict > guard, "restrictIpcToLauncher must run after installNavigationGuard");
+});
+
+test("Android in-app log: one shared buffer, no site URLs or hosts in any line", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const pip = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  // The buffer lives in the copied plugin file, not in a new file android_prepare.py would skip.
+  assert.match(kt, /^object AnimeHubDebugLog \{/m);
+  assert.doesNotMatch(pip, /object AnimeHubPipLog/);
+  assert.match(kt, /@Command\s+fun debug_log\(/);
+  const rs = read(join(ROOT, "src-tauri/android-plugin/src/lib.rs"));
+  assert.match(rs, /CMD_DEBUG_LOG: &str = "debug_log"/);
+  // Every add() call: no URL, host, path or uri object in the message.
+  const calls = [...(kt + pip).matchAll(/AnimeHubDebugLog\.add\(([^\n]*)\)/g)].map((m) => m[1]);
+  assert.ok(calls.length >= 8, `expected the log calls, found ${calls.length}`);
+  for (const args of calls) {
+    assert.doesNotMatch(args, /\.host\b|\burl\b|\.path\b|\bhost\b|\buri\b(?!\.scheme\b)|\bbody\b/i, args);
+  }
+});
+
+test("PiP play/pause button: shown only for a <video> candidate, never for an iframe", () => {
+  // Static check: the JS playback() only controls <video>, so the button must
+  // not be offered for an iframe candidate. Not a device test.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  assert.match(kt, /controllable = answer\.optString\("kind"\) == "video"/);
+  assert.match(kt, /if \(controllable\) playbackActions\(activity, playing = true\) else emptyList<RemoteAction>\(\)/);
+});
+
+test("PiP play/pause button: only a user press toggles playback, and the receiver stays app-private", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  assert.match(kt, /const val ACTION_PIP_TOGGLE = "dev\.animehub\.app\.PIP_TOGGLE"/);
+  // The button is offered on entry only for a controllable (video) candidate;
+  // updatePlaybackAction still shows it in the setActions call for both states.
+  assert.match(kt, /if \(controllable\) playbackActions\(activity, playing = true\) else emptyList<RemoteAction>\(\)/);
+  assert.match(kt, /\.setActions\(playbackActions\(activity, playing\)\)/);
+  assert.match(kt, /Context\.RECEIVER_NOT_EXPORTED/);
+  assert.doesNotMatch(kt, /ContextCompat/);
+  assert.match(kt, /PendingIntent\.FLAG_IMMUTABLE/);
+  assert.match(kt, /\.setPackage\(activity\.packageName\)/);
+  // The "toggle" command is sent from exactly one place: the press handler.
+  const toggleSends = kt.match(/playbackScript\("toggle"\)/g) || [];
+  assert.equal(toggleSends.length, 1, "toggle must have a single call site");
+  const handler = kt.slice(kt.indexOf("private fun togglePlayback()"));
+  assert.ok(
+    handler.indexOf('playbackScript("toggle")') < handler.indexOf("applyPlaybackState"),
+    "toggle sits in the press handler",
+  );
+  // Only the receiver calls the press handler (one definition, one call).
+  assert.equal((kt.match(/togglePlayback\(\)/g) || []).length, 2, "one definition and one receiver call");
+  // The state read never changes playback.
+  assert.match(kt, /playbackScript\("state"\)/);
+  // The JS side exposes the function this Kotlin expects, with no $ in it.
+  const js = read(join(ROOT, "src-tauri/src/web/pip_controller.js"));
+  assert.match(js, /window\[PLAYBACK_FN\] = playback;/);
+  assert.doesNotMatch(js, /\$/);
+});
+
+test("launcher IPC: the UI-thread listener never calls Rust directly (no main-thread deadlock)", () => {
+  // onPostMessage is @UiThread. Rust runs blocking commands inline, and a plugin
+  // command waits for the UI thread, so a direct Rust.ipc call there can deadlock.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const start = kt.indexOf("class LauncherIpc(");
+  assert.ok(start >= 0, "LauncherIpc must exist");
+  const end = kt.indexOf("\n}\n", start);
+  const body = kt.slice(start, end);
+  assert.match(body, /IPC_EXECUTOR\.execute \{/);
+  assert.match(body, /Rust\.ipc\(webViewId, url, body\)/);
+  // The only direct Rust.ipc call is the one inside the executor.
+  const rustCalls = body.match(/Rust\.ipc\(/g) || [];
+  assert.equal(rustCalls.length, 1);
+  assert.match(kt, /Executors\.newSingleThreadExecutor/);
+});
+
+test("plugin-calling commands use the async runtime, not the IPC dispatch thread", () => {
+  // Static check. Tauri runs a blocking command inline on the dispatch thread;
+  // these three wait for a Kotlin reply, so they must be marked async.
+  const rs = read(join(ROOT, "src-tauri/src/commands.rs"));
+  for (const name of ["enter_pip", "set_pip_auto_enter", "debug_log"]) {
+    assert.match(rs, new RegExp(`#\\[tauri::command\\(async\\)\\]\\npub fn ${name}\\(`), name);
+  }
+});
+
+test("fail-closed launcher IPC shows a native notice on every failure path", () => {
+  // Static check of AnimeHubPlugin.kt. Each of the three "IPC is off" branches
+  // must call the native Toast, because JS cannot show it in that state.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const calls = kt.match(/showIpcOffNotice\(\)/g) || [];
+  assert.equal(calls.length, 4, "one definition and three calls");
+  assert.match(kt, /import android\.widget\.Toast/);
+  assert.match(kt, /activity\.runOnUiThread \{[\s\S]*?Toast\.makeText\(/);
+  const start = kt.indexOf("private fun showIpcOffNotice");
+  const body = kt.slice(start, kt.indexOf("\n  }\n", start));
+  assert.ok(start > 0 && body.length > 0, "function body found");
+  assert.doesNotMatch(body, /\$\{/, "fixed text only, no template values");
+});
+
+test("the back overlay is installed only on desktop; Android never produces close-site", () => {
+  // Static check. If the overlay is ever added to the Android path, the Android
+  // close-site handling must be built first (see docs/android-navigation.md).
+  const win = read(join(ROOT, "src-tauri/src/web/windows.rs"));
+  const evals = win.match(/webview\.eval\(crate::web::session::OVERLAY_SNIPPET\)/g) || [];
+  assert.equal(evals.length, 1);
+  const mobileStart = win.indexOf("fn open_on_mobile(");
+  assert.ok(mobileStart > 0);
+  const mobileBody = win.slice(mobileStart, win.indexOf("\n}\n", mobileStart));
+  assert.doesNotMatch(mobileBody, /OVERLAY_SNIPPET/);
+});
+
+test("the PiP diagnostic report goes to the in-app log only, never a Toast over the site", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  const start = kt.indexOf("fun showDebugReport(");
+  assert.ok(start > 0, "showDebugReport found");
+  const body = kt.slice(start, kt.indexOf("\n  }\n", start));
+  assert.doesNotMatch(body, /Toast/);
+  assert.match(body, /note\("report: /);
+  const prepare = read(join(ROOT, "scripts/android_prepare.py"));
+  assert.match(prepare, /AnimeHubPipController\.showDebugReport\(AnimeHubPipController\.webView\(\)\)/);
+});
+
+test("Android-only settings are marked and hidden by platform in main.js", () => {
+  const html = read(join(ROOT, "index.html"));
+  assert.match(html, /<label class="switch" data-platform="android">\s*<input type="checkbox" id="set-pip"/);
+  assert.match(html, /<section data-platform="android">\s*<h3>Geliştirici seçenekleri<\/h3>/);
+  const main = read(join(ROOT, "src/main.js"));
+  assert.match(main, /async function applyPlatformVisibility\(\)/);
+  assert.match(main, /node\.dataset\.platform === "android" && isAndroid/);
+  assert.match(main, /await applyPlatformVisibility\(\);\n\s*const s = await call\("get_settings"\)/);
 });

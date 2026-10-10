@@ -173,7 +173,12 @@ pub fn webview_cookies_clear() -> AppResult<()> {
 
 /// Enter Picture-in-Picture mode.
 ///
-/// On Android this calls `enterPictureInPictureMode()` on the host Activity.
+/// On Android the Kotlin side runs the controlled chain: it prepares the
+/// WebView with the site's `window.__animehubPreparePip()` (player-only view,
+/// detected aspect ratio, player rect as `sourceRectHint`), waits for the JS
+/// answer and only then calls `enterPictureInPictureMode()`. The `num`/`den`
+/// passed here are the fallback ratio, already clamped by `clamp_aspect`.
+///
 /// On desktop there is no system PiP for an arbitrary WebView, so the command
 /// reports unsupported rather than faking a floating window.
 #[cfg(target_os = "android")]
@@ -186,9 +191,16 @@ pub fn enter_pip(_aspect_num: u32, _aspect_den: u32) -> AppResult<bool> {
     Ok(false)
 }
 
-/// Ask the Activity to enable auto-enter PiP when the user leaves the app.
+/// Allow or deny the *controlled* PiP paths.
 ///
-/// Requires Android 12 (API 31)+; returns `false` on older devices.
+/// On Android the Kotlin side stores the preference and uses it for
+/// `onPictureInPictureRequested()` (API 30+) and `onUserLeaveHint()`
+/// (API 26-29). The platform's own `setAutoEnterEnabled` stays `false`: AOSP
+/// documents that it suppresses `onPictureInPictureRequested()`, so the system
+/// would enter PiP before the WebView could be prepared for it.
+///
+/// Returns `false` on devices without PiP support (and on desktop, where the
+/// whole idea does not apply).
 #[cfg(target_os = "android")]
 pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
     animehub_android::set_pip_auto_enter(enabled).map_err(|e| AppError::Other(e.to_string()))
@@ -197,6 +209,17 @@ pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
 #[cfg(not(target_os = "android"))]
 pub fn set_pip_auto_enter(_enabled: bool) -> AppResult<bool> {
     Ok(false)
+}
+
+/// The PiP diagnostic lines for the developer panel. Empty off Android.
+#[cfg(target_os = "android")]
+pub fn debug_log() -> AppResult<Vec<String>> {
+    animehub_android::debug_log().map_err(|e| AppError::Other(e.to_string()))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn debug_log() -> AppResult<Vec<String>> {
+    Ok(Vec::new())
 }
 
 /// Clamp a video aspect ratio into the range Android accepts for PiP.

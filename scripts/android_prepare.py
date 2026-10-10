@@ -3,7 +3,21 @@
 
 `tauri android init` rewrites `src-tauri/gen/android/` and does not know about
 this repo's plugin. Running this afterwards is what makes the Keystore / PiP
-class and `android:supportsPictureInPicture` actually part of the build.
+classes, the PiP lifecycle on the generated `MainActivity` and
+`android:supportsPictureInPicture` actually part of the build.
+
+Three things are generated into the app package:
+
+1. `AnimeHubPlugin.kt` — copied verbatim from `android-plugin/kotlin/`.
+2. `AnimeHubPipController.kt` — a template whose
+   `__ANIMEHUB_PIP_CONTROLLER_JS__` placeholder is filled with the *same*
+   `src-tauri/src/web/pip_controller.js` that Rust injects into site pages, so
+   the WebView-side controller cannot drift between the two consumers.
+3. the PiP lifecycle block inside the generated `MainActivity.kt`, delimited by
+   markers and replaced on every run.
+
+`src-tauri/gen/android` is generated: never edit those files by hand, re-run
+this script instead.
 
 The generated package name is checked against the string passed to
 `register_android_plugin` in `android-plugin/src/lib.rs`. Those two drifting
@@ -23,6 +37,21 @@ from pathlib import Path
 
 PIP_ATTR = 'android:supportsPictureInPicture="true"'
 SIGN_MARKER = "AnimeHub release signing"
+# Kotlin template -> generated controller, and the JS that fills its placeholder.
+PIP_CONTROLLER_CLASS = "AnimeHubPipController"
+PIP_CONTROLLER_JS_REL = ("src-tauri", "src", "web", "pip_controller.js")
+PIP_CONTROLLER_KT_REL = ("src-tauri", "android-plugin", "kotlin")
+PIP_JS_PLACEHOLDER = "__ANIMEHUB_PIP_CONTROLLER_JS__"
+# Markers around the block that is injected into the generated MainActivity.
+PIP_BLOCK_BEGIN = "// >>> AnimeHub PiP lifecycle (injected by scripts/android_prepare.py) >>>"
+PIP_BLOCK_END = "// <<< AnimeHub PiP lifecycle <<<"
+MAIN_ACTIVITY_IMPORTS = (
+    "import android.content.res.Configuration",
+    "import android.os.Build",
+    "import android.webkit.WebView",
+)
+MAIN_ACTIVITY_CLASS_RE = re.compile(r"class\s+MainActivity\b[^{]*\{")
+IMPORT_RE = re.compile(r"^import\s+\S+\s*$", re.MULTILINE)
 # Tauri v2's generated Android template has no signing config at all, so a
 # release build is always unsigned unless we inject one. The block is a
 # no-op when keystore.properties is absent (dev builds stay unsigned).
@@ -123,14 +152,190 @@ def ensure_proguard(path: Path, package: str, class_name: str) -> None:
         fh.write(rule)
 
 
+def kotlin_source(root: Path, package: str, class_name: str) -> Path:
+    """Path of a Kotlin source inside `android-plugin/kotlin/`, by package."""
+    base = root.joinpath(*PIP_CONTROLLER_KT_REL)
+    return base / Path(package.replace(".", "/")) / f"{class_name}.kt"
+
+
+def read_pip_controller_js(root: Path) -> str:
+    """The WebView-side PiP controller, checked for the Kotlin embeddings it feeds.
+
+    The file is embedded verbatim inside a Kotlin raw string, where a dollar
+    sign starts an interpolation and three quotes end the literal. Both would
+    turn a compile error into something much harder to read, so fail here with
+    a message that names the file.
+    """
+    js_path = root.joinpath(*PIP_CONTROLLER_JS_REL)
+    if not js_path.is_file():
+        raise SystemExit(f"PiP controller JS not found at {js_path}")
+    js = js_path.read_text(encoding="utf-8")
+    if "$" in js:
+        raise SystemExit(
+            f"{js_path} contains a dollar sign; the file is embedded in a Kotlin "
+            "raw string where that interpolates. Use string concatenation."
+        )
+    if '"""' in js:
+        raise SystemExit(
+            f"{js_path} contains triple quotes; the file is embedded in a Kotlin "
+            "raw string, which they would terminate."
+        )
+    return js
+
+
+def render_pip_controller(template: Path, js: str) -> str:
+    """Fill the JS placeholder of the controller template."""
+    text = template.read_text(encoding="utf-8")
+    if PIP_JS_PLACEHOLDER not in text:
+        raise SystemExit(f"{template} has no {PIP_JS_PLACEHOLDER} placeholder")
+    return text.replace(PIP_JS_PLACEHOLDER, js.strip())
+
+
+def pip_lifecycle_block() -> str:
+    """The Kotlin that MainActivity needs for controlled PiP entry/exit."""
+    return f"""{PIP_BLOCK_BEGIN}
+  // Controlled Picture-in-Picture lifecycle. The logic lives in
+  // AnimeHubPipController; this Activity only decides when a preparation may
+  // start and when the page has to be restored.
+  //
+  // PiP is never entered directly: the WebView is prepared (player-only view)
+  // first, so every path below goes through
+  // AnimeHubPipController.requestEnter() and waits for the JS answer.
+
+  override fun onWebViewCreate(webView: WebView) {{
+    super.onWebViewCreate(webView)
+    // The Tauri/Wry WebView is the one the launcher and every site page share.
+    AnimeHubPipController.attach(this, webView)
+  }}
+
+  /**
+   * Android 11 (API 30)+ asks the Activity whether it wants PiP. Returning
+   * true claims the callback — "the app received it", whether or not it acts
+   * on it — which also stops the framework from falling back to the legacy
+   * pause -> onUserLeaveHint -> resume dance.
+   */
+  override fun onPictureInPictureRequested(): Boolean {{
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+    if (!AnimeHubPipController.autoEnterEnabled) return true
+    AnimeHubPipController.requestEnter(this, "pip-requested")
+    return true
+  }}
+
+  /**
+   * Android 8.0-10 (API 26-29) fallback: there is no
+   * onPictureInPictureRequested below API 30, so the leave hint is the entry
+   * point. From API 30 on the request callback above owns the flow, and this
+   * path stays closed so the two can never both fire.
+   */
+  override fun onUserLeaveHint() {{
+    super.onUserLeaveHint()
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) return
+    if (!AnimeHubPipController.autoEnterEnabled) return
+    AnimeHubPipController.requestEnter(this, "user-leave-hint")
+  }}
+
+  /**
+   * Exit signal only: entering PiP is handled by requestEnter(), so this
+   * callback is where the page is put back exactly as it was (styles,
+   * classes, nothing removed, playback untouched).
+   */
+  override fun onPictureInPictureModeChanged(
+    isInPictureInPictureMode: Boolean,
+    newConfig: Configuration,
+  ) {{
+    super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+    if (isInPictureInPictureMode) {{
+      AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
+    }} else {{
+      // Diagnostic: the report is read before restore() releases the view.
+      AnimeHubPipController.showDebugReport(AnimeHubPipController.webView())
+      AnimeHubPipController.restore(AnimeHubPipController.webView())
+    }}
+  }}
+
+  override fun onPause() {{
+    // WryActivity.onPause() pauses the WebView; in PiP it must keep rendering.
+    super.onPause()
+    if (isInPictureInPictureMode) {{
+      AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
+    }}
+  }}
+
+  override fun onDestroy() {{
+    AnimeHubPipController.detach(this)
+    super.onDestroy()
+    if (isFinishing) {{
+      // Tauri sets up Rust and the AnimeHubPlugin instance once per process,
+      // against the first Activity. When the system finishes this Activity
+      // (for example the PiP window's X), that state keeps pointing at a dead
+      // Activity and every site open fails. Ending the process lets the next
+      // launch set everything up again. Cookies are flushed first: flush()
+      // blocks until the cookies are written, so the kill comes after them.
+      android.webkit.CookieManager.getInstance().flush()
+      android.os.Process.killProcess(android.os.Process.myPid())
+    }}
+  }}
+  {PIP_BLOCK_END}"""
+
+
+def ensure_imports(text: str, imports: tuple[str, ...]) -> str:
+    """Add `import ...` lines that the injected block needs, once each."""
+    missing = [line for line in imports if line not in text]
+    if not missing:
+        return text
+    matches = list(IMPORT_RE.finditer(text))
+    if matches:
+        insert_at = matches[-1].end()
+        return text[:insert_at] + "\n" + "\n".join(missing) + "\n" + text[insert_at:]
+    # No imports at all (a hand-written stub): put them after the package line.
+    package = PACKAGE_RE.search(text)
+    if not package:
+        raise SystemExit("MainActivity.kt has neither a package nor an import line")
+    insert_at = package.end()
+    return text[:insert_at] + "\n\n" + "\n".join(missing) + text[insert_at:]
+
+
+def ensure_pip_lifecycle(activity: Path) -> str:
+    """Install or refresh the PiP lifecycle block in the generated MainActivity.
+
+    Idempotent: the block is delimited by markers, so a second run replaces the
+    block with the current text instead of appending a duplicate override (two
+    `onDestroy` overrides would not compile).
+    """
+    text = activity.read_text(encoding="utf-8")
+    block = pip_lifecycle_block()
+    if PIP_BLOCK_BEGIN in text and PIP_BLOCK_END in text:
+        start = text.index(PIP_BLOCK_BEGIN)
+        end = text.index(PIP_BLOCK_END, start) + len(PIP_BLOCK_END)
+        if text[start:end] == block:
+            return f"PiP lifecycle already current in {activity}"
+        activity.write_text(text[:start] + block + text[end:], encoding="utf-8")
+        return f"refreshed the PiP lifecycle block in {activity}"
+    match = MAIN_ACTIVITY_CLASS_RE.search(text)
+    if not match:
+        raise SystemExit(
+            f"{activity} has no `class MainActivity ... {{` to attach the PiP "
+            "lifecycle to. Re-run `tauri android init`."
+        )
+    if "TauriActivity" not in match.group(0):
+        # onWebViewCreate()/the WebView lifecycle only exist on the Tauri/Wry
+        # activity; a different base class means the generated project changed.
+        raise SystemExit(
+            f"{activity} does not extend TauriActivity ({match.group(0).strip()}); "
+            "the injected PiP lifecycle would not compile"
+        )
+    updated = text[: match.end()] + "\n" + block + text[match.end():]
+    updated = ensure_imports(updated, MAIN_ACTIVITY_IMPORTS)
+    activity.write_text(updated, encoding="utf-8")
+    return f"injected the PiP lifecycle into {activity}"
+
+
 def prepare(root: Path, gen: Path) -> list[str]:
     notes: list[str] = []
     lib_rs = root / "src-tauri" / "android-plugin" / "src" / "lib.rs"
     package, class_name = rust_registration(lib_rs)
 
-    kt_src = root / "src-tauri" / "android-plugin" / "kotlin" / Path(
-        package.replace(".", "/")
-    ) / f"{class_name}.kt"
+    kt_src = kotlin_source(root, package, class_name)
     if not kt_src.is_file():
         raise SystemExit(f"Kotlin bridge not found at {kt_src}")
     kt_pkg = package_of(kt_src)
@@ -156,6 +361,29 @@ def prepare(root: Path, gen: Path) -> list[str]:
     target = dest / f"{class_name}.kt"
     target.write_text(kt_src.read_text(encoding="utf-8"), encoding="utf-8")
     notes.append(f"copied {class_name}.kt -> {target}")
+
+    # The PiP controller: Kotlin half (template) + the shared WebView JS.
+    pip_js = read_pip_controller_js(root)
+    pip_template = kotlin_source(root, package, PIP_CONTROLLER_CLASS)
+    if not pip_template.is_file():
+        raise SystemExit(f"PiP controller template not found at {pip_template}")
+    pip_pkg = package_of(pip_template)
+    if pip_pkg != package:
+        raise SystemExit(
+            f"Kotlin package {pip_pkg!r} != register_android_plugin package {package!r} "
+            f"({pip_template})"
+        )
+    pip_target = dest / f"{PIP_CONTROLLER_CLASS}.kt"
+    pip_target.write_text(render_pip_controller(pip_template, pip_js), encoding="utf-8")
+    notes.append(
+        f"copied {PIP_CONTROLLER_CLASS}.kt -> {pip_target} "
+        f"({len(pip_js)} bytes of pip_controller.js embedded)"
+    )
+
+    notes.append(ensure_pip_lifecycle(activity))
+    dest_controller = dest / f"{PIP_CONTROLLER_CLASS}.kt"
+    if not dest_controller.is_file():
+        raise SystemExit(f"controller was not written to {dest_controller}")
 
     manifests = list(gen.glob("app/src/main/AndroidManifest.xml"))
     if not manifests:

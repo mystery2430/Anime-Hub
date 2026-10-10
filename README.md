@@ -219,10 +219,26 @@ native pencere kromunu kaplar ve şifreli ayarlara kaydedilir.
 
 ### 📱&nbsp; Android Picture-in-Picture
 
-Android 12+ (API 31) için Ayarlar'da **"PiP'e otomatik geç"** anahtarı vardır;
-sistem PiP API'si (`PictureInPictureParams` + `setAutoEnterEnabled`)
-kullanılır. Oran 16:9 varsayılandır ve Android'in kabul ettiği sınırlara
-kırpılır.
+Ayarlar'daki **"PiP'e otomatik geç"** anahtarı, video oynatılırken ana ekrana
+dönünce piP penceresinin açılmasını sağlar. PiP'e girmeden **önce** WebView
+hazırlanır: sayfadaki gerçek oynatıcı bulunur, ekranda yalnızca o oynatıcı
+kalır ve ancak JavaScript "hazır" dedikten sonra
+`enterPictureInPictureMode()` çağrılır. Böylece PiP penceresinde sitenin
+tamamı değil, yalnızca o an oynayan video görünür; PiP kapandığında sayfa
+kaldığı yerden, kaydırma konumu ve oynatma durumu korunarak geri gelir.
+
+- API 30+ (`Android 11`): `onPictureInPictureRequested()`; uygulama `true`
+  döndüğü için sistem kendi (hazırlıksız) akışına karışmaz.
+- API 26-29 (`Android 8.0-10`): `onUserLeaveHint()` geri dönüş yolu.
+- Sistemin kendi otomatik girişi (`setAutoEnterEnabled(true)`) **bilinçli
+  olarak** kullanılmaz: Android belgelerine göre bu ayar açıkken
+  `onPictureInPictureRequested()` hiç çağrılmaz, yani PiP hazırlıksız açılırdı.
+- Oynatıcı yoksa ya da hazırlık başarısızsa PiP **hiç** açılmaz ve sayfaya
+  dokunulmaz; oran olarak oynatıcının kendi en-boy oranı, ölçülemezse 16:9
+  kullanılır (Android'in kabul ettiği sınırlara kırpılır).
+
+Ayrıntılı akış, oynatıcı seçim kuralları ve doğrulama durumu:
+[`docs/android-pip.md`](./docs/android-pip.md).
 
 ---
 
@@ -296,7 +312,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 - [Rust](https://www.rust-lang.org/tools/install) — güncel stable önerilir
   (MSRV `1.77`, bkz. `src-tauri/Cargo.toml`)
-- [Node.js](https://nodejs.org/) 20+
+- [Node.js](https://nodejs.org/) 20.19+ (`package.json` `engines`; CI Node 22 kullanır)
 - Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`
 - Android: SDK platform 36, NDK `29.0.13846066`, `ANDROID_HOME` ve `NDK_HOME` tanımlı
 - Tümü için: [Tauri ön gereksinimleri](https://v2.tauri.app/start/prerequisites/)
@@ -366,11 +382,11 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 | Doğrulama | Sonuç |
 |---|---|
-| `npm test` | **65 test geçti**, 0 hata |
-| `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | GitHub Actions'ta yeşil — Tests işi `ubuntu-24.04`, `macos-latest` ve `windows-latest` üzerinde |
+| `npm test` | **117 test geçti**, 0 hata (yerel, 2026-10-10; çıktı `# pass 117` / `# fail 0`) |
+| `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | Yerelde çalıştırılmadı (Rust araç zinciri yok). Son yeşil CI koşusu daha eski bir commit'te; güncel commit için GitHub Actions'taki Tests işi (`ubuntu-24.04`, `macos-latest`, `windows-latest`) esas alınmalı |
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
-| Android APK derlemesi (aarch64, armv7, x86_64) | yeşil — `release-android.yml` ve CI'daki Android compile işi; `cfg!()` yerine `#[cfg(desktop)]` / `#[cfg(mobile)]` derleme-zamanı sınırlarıyla |
+| Android derleme | CI'daki "Android compile (aarch64)" işi debug APK üretir; `release-android.yml` üç ABI için imzalı APK üretir. Bu yalnızca derlemedir; cihazda çalıştığı doğrulanmadı |
 | **v0.3.1 yayın paketleri** | GitHub Release'te doğrulandı: 3 **imzalı** APK + Windows NSIS + Linux `.deb`/`.rpm`/AppImage (7/7 asset) |
 | **v0.3.2 yayın paketleri** | 2026-10-07'de yayımlandı; 3 **imzalı** APK + Windows NSIS + Linux `.deb`/`.rpm`/AppImage (7/7 asset), release workflow'ları yeşil |
 | Windows kurulumu | Windows üzerinde elle doğrulandı (DPAPI + WebView2 profili) |
@@ -385,6 +401,9 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
   doğrulanmış değildir. PiP ve gerçek sağlayıcılar arası same-origin
   localStorage/IndexedDB yalıtımı da doğrulanmadı; IndexedDB aktarımı
   kayıpsız değildir (ikincil indeksler ve Blob değerleri taşınmaz).
+  Kontrollü PiP zinciri (hazırlık → PiP → geri yükleme) birim testleriyle
+  doğrulandı ve Android hâli CI'da derlenip kurulabilir bir debug APK olarak
+  paketlendi; ancak çalışma zamanı fiziksel cihazda **denenmedi**.
 
 Tüm doğrulama kayıtları ve devralan kişiye düşen işler
 [`HANDOFF.md`](./HANDOFF.md) dosyasında.

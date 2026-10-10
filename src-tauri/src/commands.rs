@@ -87,6 +87,8 @@ pub struct Settings {
     #[serde(default)]
     pub pip_auto_enter: bool,
     #[serde(default)]
+    pub developer_options: bool,
+    #[serde(default)]
     pub anilist: AniListConfig,
 }
 
@@ -103,6 +105,7 @@ impl Default for Settings {
             fullscreen_sites: false,
             theme: ThemePref::System,
             pip_auto_enter: false,
+            developer_options: false,
             anilist: AniListConfig::default(),
         }
     }
@@ -119,6 +122,7 @@ pub struct SettingsView {
     pub fullscreen_sites: bool,
     pub theme: ThemePref,
     pub pip_auto_enter: bool,
+    pub developer_options: bool,
     pub anilist: AniListConfigView,
     pub key_backend: String,
     pub key_backend_os_backed: bool,
@@ -174,12 +178,10 @@ fn persist_registry(state: &AppState) -> AppResult<()> {
     state.provider.save_registry(&reg)
 }
 
-fn persist_settings(state: &AppState) -> AppResult<()> {
-    let s = state
-        .settings
-        .lock()
-        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-    let bytes = serde_json::to_vec(&*s)?;
+/// Write one settings value to the encrypted store. Callers that change the
+/// live settings must do so only after this returns Ok.
+fn write_settings_doc(state: &AppState, value: &Settings) -> AppResult<()> {
+    let bytes = serde_json::to_vec(value)?;
     state
         .provider
         .save_doc_bytes("settings.bin", bytes.as_slice())
@@ -332,6 +334,10 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         } else {
             vec![]
         },
+        // Android: site pages get the PiP controller, which the native side
+        // drives with `evaluateJavascript` right before entering PiP. Desktop
+        // has no PiP window for a site WebView, so it stays out.
+        pip_controller: cfg!(target_os = "android"),
     };
     let init_script = build_init_script(&injected);
 
@@ -479,6 +485,7 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsView> {
         fullscreen_sites: s.fullscreen_sites,
         theme: s.theme,
         pip_auto_enter: s.pip_auto_enter,
+        developer_options: s.developer_options,
         anilist: AniListConfigView {
             configured: s.anilist.is_configured(),
             client_id: s.anilist.client_id.clone(),
@@ -496,34 +503,42 @@ pub fn update_settings(
     state: State<'_, AppState>,
     patch: SettingsPatch,
 ) -> AppResult<SettingsView> {
+    // The patch is applied to a copy. The live settings change only after the
+    // copy is saved, so a failed save leaves memory and disk in agreement. The
+    // lock is held across the save, so two updates cannot interleave.
     {
-        let mut s = state
+        let mut live = state
             .settings
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        let mut next = live.clone();
         if let Some(b) = patch.blocklist {
-            s.blocklist = b;
+            next.blocklist = b;
         }
         if let Some(v) = patch.block_popups {
-            s.block_popups = v;
+            next.block_popups = v;
         }
         if let Some(v) = patch.inject_cosmetic_rules {
-            s.inject_cosmetic_rules = v;
+            next.inject_cosmetic_rules = v;
         }
         if let Some(v) = patch.fullscreen_sites {
-            s.fullscreen_sites = v;
+            next.fullscreen_sites = v;
         }
         if let Some(v) = patch.theme {
-            s.theme = v;
+            next.theme = v;
         }
         if let Some(v) = patch.pip_auto_enter {
-            s.pip_auto_enter = v;
+            next.pip_auto_enter = v;
+        }
+        if let Some(v) = patch.developer_options {
+            next.developer_options = v;
         }
         if let Some(a) = patch.anilist {
-            s.anilist = a;
+            next.anilist = a;
         }
+        write_settings_doc(&state, &next)?;
+        *live = next;
     }
-    persist_settings(&state)?;
     rebuild_blocklist(&state);
     get_settings(state)
 }
@@ -544,6 +559,8 @@ pub struct SettingsPatch {
     #[serde(default)]
     pub pip_auto_enter: Option<bool>,
     #[serde(default)]
+    pub developer_options: Option<bool>,
+    #[serde(default)]
     pub anilist: Option<AniListConfig>,
 }
 
@@ -560,13 +577,15 @@ pub fn take_startup_warning(state: State<'_, AppState>) -> AppResult<Option<Stri
 #[tauri::command]
 pub fn reset_blocklist(state: State<'_, AppState>) -> AppResult<usize> {
     {
-        let mut s = state
+        let mut live = state
             .settings
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        s.blocklist = BlocklistState::default_state();
+        let mut next = live.clone();
+        next.blocklist = BlocklistState::default_state();
+        write_settings_doc(&state, &next)?;
+        *live = next;
     }
-    persist_settings(&state)?;
     rebuild_blocklist(&state);
     let bl = state
         .blocklist
@@ -900,15 +919,46 @@ pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppRe
     })
 }
 
-#[tauri::command]
+/// Manual Picture-in-Picture entry.
+///
+/// The native side runs the *same* controlled chain the Activity callbacks use
+/// — prepare the WebView (`window.__animehubPreparePip()`), wait for its
+/// answer, then `enterPictureInPictureMode()` with the detected aspect ratio —
+/// so the PiP window only ever shows the active player, and the preparation
+/// exists once instead of once per entry point.
+///
+/// `num`/`den` are clamped here and passed on as a fallback for the case where
+/// no player ratio can be measured. Resolves `false` when PiP is unavailable,
+/// nothing playable was found, or the Activity could not enter PiP.
+// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
+// thread. These commands wait for a Kotlin reply through the plugin bridge.
+#[tauri::command(async)]
 pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
     let (n, d) = crate::android_bridge::clamp_aspect(num.unwrap_or(16), den.unwrap_or(9));
     crate::android_bridge::enter_pip(n, d)
 }
 
-#[tauri::command]
+/// Store the "enter PiP automatically" preference.
+///
+/// On Android this only *allows* the controlled paths — API 30+
+/// `onPictureInPictureRequested()` and API 26-29 `onUserLeaveHint()` — which
+/// prepare the WebView before PiP starts. The platform's own auto-enter
+/// (`setAutoEnterEnabled`) is deliberately never turned on: Android documents
+/// that it suppresses `onPictureInPictureRequested()`, so the system would put
+/// the unprepared site into the PiP window.
+// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
+// thread. These commands wait for a Kotlin reply through the plugin bridge.
+#[tauri::command(async)]
 pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
     crate::android_bridge::set_pip_auto_enter(enabled)
+}
+
+/// Developer panel: the last PiP diagnostic lines (empty off Android).
+// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
+// thread. These commands wait for a Kotlin reply through the plugin bridge.
+#[tauri::command(async)]
+pub fn debug_log() -> AppResult<Vec<String>> {
+    crate::android_bridge::debug_log()
 }
 
 #[tauri::command]
@@ -1006,6 +1056,7 @@ mod tests {
         assert_eq!(s.theme, ThemePref::System, "theme follows the OS");
         assert!(s.blocklist.enabled);
         assert!(!s.pip_auto_enter, "PiP auto-enter is opt-in");
+        assert!(!s.developer_options, "the developer panel is opt-in");
         assert!(!s.anilist.is_configured());
     }
 
@@ -1057,6 +1108,7 @@ mod tests {
             fullscreen_sites: s.fullscreen_sites,
             theme: s.theme,
             pip_auto_enter: s.pip_auto_enter,
+            developer_options: s.developer_options,
             anilist: AniListConfigView {
                 configured: s.anilist.is_configured(),
                 client_id: s.anilist.client_id.clone(),

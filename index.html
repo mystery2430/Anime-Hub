@@ -187,10 +187,25 @@
               <input type="checkbox" id="set-fullscreen" />
               <span>Siteleri tam ekran aç</span>
             </label>
-            <label class="switch">
+            <label class="switch" data-platform="android">
               <input type="checkbox" id="set-pip" />
-              <span>Android: ana ekrana dönünce Resim-içinde-resim</span>
+              <span>Android: video oynarken ana ekrana dönünce PiP</span>
             </label>
+          </section>
+
+          <section data-platform="android">
+            <h3>Geliştirici seçenekleri</h3>
+            <label class="switch">
+              <input type="checkbox" id="set-developer" />
+              <span>Geliştirici seçeneklerini göster</span>
+            </label>
+            <div id="dev-panel" hidden>
+              <p class="hint">
+                Android kayıtları (PiP, navigasyon, IPC, çerez ve sayfa hataları), uygulama içinde. Logcat gerekmez. Kayıtta site adresi ve sunucu adı yoktur: yalnızca olay türü, durum ve hata kodu yazılır.
+              </p>
+              <button type="button" id="dev-refresh">Yenile</button>
+              <pre id="dev-log" class="dev-log"></pre>
+            </div>
           </section>
 
           <section>

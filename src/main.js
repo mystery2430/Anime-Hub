@@ -8,6 +8,7 @@
  */
 
 import { call, on, ApiError, isTauri } from "./logic/bridge.js";
+import { wrapFocusIndex } from "./logic/focus.js";
 import {
   groupTiles,
   validateDraft,
@@ -28,6 +29,11 @@ import {
   bannerStyle,
   bannerRgb,
 } from "./logic/hero.js";
+import {
+  bindSwitch,
+  createSettingsFlow,
+  switchStates,
+} from "./logic/settings_flow.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -48,6 +54,11 @@ const el = {
   btnPickPhoto: document.getElementById("btn-pick-photo"),
   btnClearPhoto: document.getElementById("btn-clear-photo"),
   sitePhoto: document.getElementById("site-photo"),
+  dev: {
+    panel: document.getElementById("dev-panel"),
+    refresh: document.getElementById("dev-refresh"),
+    log: document.getElementById("dev-log"),
+  },
   settings: {
     blockPopups: document.getElementById("set-block-popups"),
     cosmetic: document.getElementById("set-cosmetic"),
@@ -55,6 +66,7 @@ const el = {
     blocklist: document.getElementById("set-blocklist"),
     fullscreen: document.getElementById("set-fullscreen"),
     pip: document.getElementById("set-pip"),
+    developer: document.getElementById("set-developer"),
     anilistId: document.getElementById("set-anilist-id"),
     anilistSecret: document.getElementById("set-anilist-secret"),
     anilistRedirect: document.getElementById("set-anilist-redirect"),
@@ -154,7 +166,16 @@ function showFormError(message) {
 /** `undefined` keeps the stored photo, `""` clears it, a data URL replaces it. */
 let pendingImage;
 
+/**
+ * One site card: a wrapper holding two sibling buttons. The card button opens
+ * the site; the menu button is a sibling, not a child, so the two never nest
+ * (nested interactive elements are invalid and confuse keyboard and screen
+ * reader users). Clicking the menu cannot reach the card's handler.
+ */
 function renderTile(tile) {
+  const wrap = document.createElement("div");
+  wrap.className = "tile-wrap";
+
   const button = document.createElement("button");
   button.type = "button";
   button.className = "tile";
@@ -204,19 +225,18 @@ function renderTile(tile) {
   }
 
   button.addEventListener("click", () => openSite(tile));
+  wrap.appendChild(button);
 
   const menu = document.createElement("button");
   menu.type = "button";
   menu.className = "tile-menu";
   menu.setAttribute("aria-label", `${tile.name} seçenekleri`);
+  menu.setAttribute("aria-haspopup", "dialog");
   menu.textContent = "\u22ee";
-  menu.addEventListener("click", (event) => {
-    event.stopPropagation();
-    siteMenu(tile);
-  });
-  button.appendChild(menu);
+  menu.addEventListener("click", () => siteMenu(tile));
+  wrap.appendChild(menu);
 
-  return button;
+  return wrap;
 }
 
 function renderAddTile() {
@@ -420,13 +440,16 @@ function siteMenu(tile) {
 function showActionSheet(title, actions) {
   const backdrop = document.createElement("div");
   backdrop.className = "modal";
+  backdrop.dataset.transient = "true";
 
   const card = document.createElement("div");
   card.className = "modal-card";
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-modal", "true");
+  card.setAttribute("aria-labelledby", "action-sheet-title");
 
   const heading = document.createElement("h2");
+  heading.id = "action-sheet-title";
   heading.textContent = title;
   card.appendChild(heading);
 
@@ -441,7 +464,9 @@ function showActionSheet(title, actions) {
     btn.style.textAlign = "left";
     btn.textContent = action.label;
     btn.addEventListener("click", () => {
-      backdrop.remove();
+      // Close first so focus returns to the menu button, then run the action
+      // (which may open another modal and must see a clean stack).
+      closeModal(backdrop);
       action.run();
     });
     list.appendChild(btn);
@@ -454,15 +479,17 @@ function showActionSheet(title, actions) {
   cancel.type = "button";
   cancel.className = "btn ghost";
   cancel.textContent = "Vazgeç";
-  cancel.addEventListener("click", () => backdrop.remove());
+  cancel.addEventListener("click", () => closeModal(backdrop));
   footer.appendChild(cancel);
   card.appendChild(footer);
 
   backdrop.appendChild(card);
   backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) backdrop.remove();
+    if (e.target === backdrop) closeModal(backdrop);
   });
   document.body.appendChild(backdrop);
+  showOverlay(backdrop);
+  // Start on "Vazgeç": destructive actions must not be one Enter away.
   cancel.focus();
 }
 
@@ -490,14 +517,72 @@ async function removeSite(tile) {
 // Modals
 // ---------------------------------------------------------------------------
 
+/**
+ * Open overlays, top of stack last. Only the top overlay is interactive: the
+ * rest of the document, including lower overlays, is made `inert`, so Tab,
+ * clicks and screen readers cannot reach background controls.
+ */
+const overlayStack = [];
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
+  'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function syncInert() {
+  const top = overlayStack.length ? overlayStack[overlayStack.length - 1].el : null;
+  for (const child of document.body.children) {
+    child.inert = top !== null && child !== top;
+  }
+}
+
+/** Show an overlay element and make it the only interactive one. */
+function showOverlay(el) {
+  // Remember where focus came from so closing can return it there.
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const existing = overlayStack.findIndex((o) => o.el === el);
+  if (existing >= 0) overlayStack.splice(existing, 1);
+  overlayStack.push({ el, opener });
+  el.hidden = false;
+  syncInert();
+  const first = el.querySelector("input, textarea, button");
+  if (first) first.focus();
+}
+
+/**
+ * Hide an overlay, pop it from the stack and restore focus to its opener.
+ * Transient overlays (action sheets) are removed from the DOM instead.
+ */
+function hideOverlay(el) {
+  const index = overlayStack.findIndex((o) => o.el === el);
+  const entry = index >= 0 ? overlayStack.splice(index, 1)[0] : null;
+  if (el.dataset.transient === "true") el.remove();
+  else el.hidden = true;
+  syncInert();
+  if (entry && entry.opener && entry.opener.isConnected) entry.opener.focus();
+}
+
 function openModal(modal) {
-  modal.hidden = false;
-  const focusable = modal.querySelector("input, textarea, button");
-  if (focusable) focusable.focus();
+  showOverlay(modal);
 }
 
 function closeModal(modal) {
-  modal.hidden = true;
+  hideOverlay(modal);
+}
+
+/** Keep Tab and Shift+Tab inside the top overlay. */
+function trapFocus(event) {
+  if (event.key !== "Tab" || overlayStack.length === 0) return;
+  const top = overlayStack[overlayStack.length - 1].el;
+  const items = [...top.querySelectorAll(FOCUSABLE)].filter((n) => !n.disabled && n.offsetParent !== null);
+  if (items.length === 0) {
+    event.preventDefault();
+    return;
+  }
+  const target = wrapFocusIndex(items.length, items.indexOf(document.activeElement), event.shiftKey);
+  if (target !== null) {
+    event.preventDefault();
+    items[target].focus();
+  }
 }
 
 function wireModalClose(modal) {
@@ -577,8 +662,28 @@ applyTheme(themePref);
 
 let currentSettings = null;
 
+/**
+ * Show only the settings that apply to this platform. Rows marked
+ * `data-platform="android"` (PiP, developer log) are hidden elsewhere. If the
+ * platform is unknown, they stay hidden: the safe choice.
+ */
+async function applyPlatformVisibility() {
+  let platform = "";
+  try {
+    const info = await call("app_info");
+    platform = info && typeof info.platform === "string" ? info.platform : "";
+  } catch {
+    platform = "";
+  }
+  const isAndroid = platform === "android";
+  document.querySelectorAll("[data-platform]").forEach((node) => {
+    node.style.display = node.dataset.platform === "android" && isAndroid ? "" : "none";
+  });
+}
+
 async function openSettings() {
   try {
+    await applyPlatformVisibility();
     const s = await call("get_settings");
     currentSettings = s;
     el.settings.blockPopups.checked = Boolean(s.blockPopups);
@@ -587,6 +692,8 @@ async function openSettings() {
     el.settings.blocklist.value = s.blocklist.rules || "";
     el.settings.fullscreen.checked = Boolean(s.fullscreenSites);
     el.settings.pip.checked = Boolean(s.pipAutoEnter);
+    el.settings.developer.checked = Boolean(s.developerOptions);
+    el.dev.panel.hidden = !s.developerOptions;
     applyTheme(s.theme);
     el.settings.anilistId.value = s.anilist.clientId || "";
     el.settings.anilistSecret.value = "";
@@ -608,14 +715,51 @@ async function openSettings() {
   }
 }
 
-async function saveSettings(patch, okMessage) {
+/** Developer panel: fill the log box with the native PiP lines (textContent only). */
+async function refreshDevLog() {
   try {
-    currentSettings = await call("update_settings", { patch });
-    if (okMessage) showNotice(okMessage, "info");
-    await refreshLauncher();
-  } catch (e) {
-    showNotice(errMessage(e));
+    const lines = await call("debug_log");
+    const list = Array.isArray(lines) ? lines : [];
+    el.dev.log.textContent = list.length
+      ? list.join("\n")
+      : "Henüz Android kaydı yok (kayıtlar yalnızca Android'de tutulur).";
+  } catch (err) {
+    el.dev.log.textContent = "Kayıt okunamadı: " + (err && err.message ? err.message : String(err));
   }
+}
+
+/** Draw the switches from the saved settings (used after a failed change). */
+function syncSettingSwitches() {
+  const s = switchStates(currentSettings);
+  if (!s) return;
+  el.settings.pip.checked = s.pip;
+  el.settings.blockPopups.checked = s.blockPopups;
+  el.settings.cosmetic.checked = s.cosmetic;
+  el.settings.fullscreen.checked = s.fullscreen;
+  el.settings.developer.checked = s.developer;
+  el.settings.blocklistEnabled.checked = s.blocklistEnabled;
+  el.dev.panel.hidden = !s.developer;
+}
+
+// Save logic and the PiP switch rules live in logic/settings_flow.js.
+const settingsFlow = createSettingsFlow({
+  call,
+  notify: (message, kind) => showNotice(message, kind),
+  errorText: errMessage,
+  refresh: refreshLauncher,
+  drawSwitches: syncSettingSwitches,
+  getCurrent: () => currentSettings,
+  setCurrent: (value) => {
+    currentSettings = value;
+  },
+  setDevPanel: (open) => {
+    el.dev.panel.hidden = !open;
+  },
+  refreshDevLog: () => refreshDevLog(),
+});
+
+function saveSettings(patch, okMessage) {
+  return settingsFlow.save(patch, okMessage);
 }
 
 function wireSettings() {
@@ -628,18 +772,13 @@ function wireSettings() {
   el.settings.fullscreen.addEventListener("change", (e) =>
     saveSettings({ fullscreenSites: e.target.checked }),
   );
-  el.settings.pip.addEventListener("change", async (e) => {
-    await saveSettings({ pipAutoEnter: e.target.checked });
-    try {
-      await call("set_pip_auto_enter", { enabled: e.target.checked });
-    } catch {
-      /* desktop: unsupported, nothing to do */
-    }
-  });
-  el.settings.blocklistEnabled.addEventListener("change", (e) =>
-    saveSettings({
-      blocklist: { rules: el.settings.blocklist.value, enabled: e.target.checked },
-    }),
+  bindSwitch(el.settings.pip, (checked) => settingsFlow.changePipAutoEnter(checked));
+  bindSwitch(el.settings.developer, (checked) =>
+    settingsFlow.changeDeveloperOptions(checked),
+  );
+  el.dev.refresh.addEventListener("click", () => refreshDevLog());
+  bindSwitch(el.settings.blocklistEnabled, (checked) =>
+    settingsFlow.changeBlocklistEnabled(checked),
   );
 
   el.btnSaveBlocklist.addEventListener("click", () =>
@@ -865,12 +1004,13 @@ function wireGlobal() {
   });
 
   document.addEventListener("keydown", (event) => {
+    trapFocus(event);
     if (event.key !== "Escape") return;
-    for (const m of [el.modalSite, el.modalSettings, el.modalAbout]) {
-      if (!m.hidden) {
-        closeModal(m);
-        return;
-      }
+    // Escape during IME composition belongs to the input method, not to us.
+    if (event.isComposing) return;
+    if (overlayStack.length > 0) {
+      closeModal(overlayStack[overlayStack.length - 1].el);
+      return;
     }
     // No modal open: treat Escape as "back to launcher" (Android back maps
     // here through the WebView).

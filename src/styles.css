@@ -382,6 +382,18 @@ body::before {
     box-shadow 0.16s;
 }
 
+/* Wrapper for a card and its menu button (siblings, never nested). */
+.tile-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.tile-wrap > .tile {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .tile:hover {
   transform: translateY(-4px);
   border-color: rgb(var(--site, 99 102 241) / 0.55);
@@ -498,8 +510,8 @@ body::before {
   backdrop-filter: blur(4px);
 }
 
-.tile:hover .tile-menu,
-.tile:focus-within .tile-menu {
+.tile-wrap:hover .tile-menu,
+.tile-wrap:focus-within .tile-menu {
   opacity: 1;
 }
 
@@ -958,4 +970,18 @@ textarea:focus-visible {
     transition: none !important;
     animation: none !important;
   }
+}
+
+/* Developer panel: the PiP log is plain text, never HTML. */
+.dev-log {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  line-height: 1.4;
+  max-height: 260px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.35);
 }

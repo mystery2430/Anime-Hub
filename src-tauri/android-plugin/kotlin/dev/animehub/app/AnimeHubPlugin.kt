@@ -3,6 +3,11 @@
 // Android half of AnimeHub's Keystore + Picture-in-Picture + cookie +
 // web-storage bridge.
 //
+// The PiP commands below delegate to `AnimeHubPipController`, which owns the
+// PiP lifecycle and the WebView preparation handshake; the file next to this
+// one is generated from a template by `scripts/android_prepare.py` (see the
+// PLACEHOLDER note in that script).
+//
 // INSTALLATION
 // ------------
 // `npm run tauri android init` generates the Gradle project under
@@ -23,11 +28,15 @@
 // -------------------
 // Written against the Tauri 2.11.6 plugin API
 // (`@TauriPlugin`, `Plugin`, `@Command`, `Invoke`, `JSObject`) and the
-// standard Android APIs listed in the imports. The Keystore and PiP halves
-// predate this note; the CookieManager and localStorage/IndexedDB bridges have
-// NOT been compiled or run on a device yet (the build environment has no
-// Android SDK/NDK). Treat
-// it as unverified until `npm run tauri android dev` passes on real hardware.
+// standard Android APIs listed in the imports. The Keystore half predates this
+// note. The controlled PiP chain (this file + `AnimeHubPipController.kt`) was
+// written from the AOSP sources of `Activity`/`PictureInPictureParams` and has
+// NOT been run on a device yet; the CookieManager and localStorage/IndexedDB
+// bridges have not been compiled or run on a device either (the build
+// environment has no Android SDK/NDK). Treat it as unverified until a real
+// `./scripts/build.sh android` / `tauri android build` has been installed on
+// hardware. Only the JS half of PiP has automated tests
+// (`tests/pip_controller.test.js`).
 //
 // STORAGE ISOLATION CONTRACT (localStorage/IndexedDB commands)
 // ------------------------------------------------------------
@@ -40,23 +49,34 @@
 package dev.animehub.app
 
 import android.app.Activity
-import android.app.PictureInPictureParams
-import android.content.pm.PackageManager
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.graphics.Bitmap
+import android.net.Uri
 import android.util.Log
-import android.util.Rational
+import android.widget.Toast
 import android.webkit.CookieManager
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.WebMessageCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.security.KeyStore
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -74,6 +94,88 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     // On Android the launcher and the sites share this single WebView, so
     // keeping the reference is all the storage commands need.
     sharedWebView = webView
+    installNavigationGuard(webView)
+    restrictIpcToLauncher(webView)
+    AnimeHubDebugLog.add("app", "WebView ready, api ${Build.VERSION.SDK_INT}")
+  }
+
+  /**
+   * wry gives every WebView a `ipc` JavaScript interface, so any page loaded in
+   * it, a remote site included, can call `window.ipc.postMessage`. Tauri on
+   * Android has no other IPC path (its custom protocol is off there), so the
+   * launcher still needs the object. This replaces it with a WebMessageListener
+   * that only the launcher origins receive, and only in the main frame.
+   * If the listener cannot be installed, wry's object is still removed and the
+   * launcher's IPC is off (logged). Sites never get an `ipc` object.
+   */
+  private fun restrictIpcToLauncher(webView: WebView) {
+    // Remove wry's object on every path, first. A site page must never get an
+    // `ipc` object, even when the launcher listener cannot be installed. The
+    // cost of failing closed is that launcher IPC is off on that device; it is
+    // logged as an error below, not hidden.
+    webView.removeJavascriptInterface(LauncherIpc.OBJECT_NAME)
+    val id = (webView as? RustWebView)?.id
+    if (id == null) {
+      Log.e(LOG_TAG, "launcher IPC is off: WebView is not a RustWebView")
+      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebView is not a RustWebView")
+      showIpcOffNotice()
+      return
+    }
+    if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+      Log.e(LOG_TAG, "launcher IPC is off: WebMessageListener unsupported")
+      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebMessageListener unsupported")
+      showIpcOffNotice()
+      return
+    }
+    try {
+      WebViewCompat.addWebMessageListener(
+        webView,
+        LauncherIpc.OBJECT_NAME,
+        LauncherIpc.ORIGINS,
+        LauncherIpc(id),
+      )
+      AnimeHubDebugLog.add("ipc", "launcher listener installed")
+    } catch (e: Exception) {
+      AnimeHubDebugLog.add("ipc", "listener failed (${e.javaClass.simpleName}); launcher IPC is off")
+      // Fail closed: the wry object is already gone, so no site page gets an `ipc` object.
+      Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off", e)
+      showIpcOffNotice()
+    }
+  }
+
+  /**
+   * Tell the user, natively, that launcher IPC is off. The launcher cannot
+   * show this itself: its JS never gets a working `ipc` in this state. Only the
+   * fixed Turkish text is shown; no URL, no page data. Posted to the UI thread.
+   */
+  private fun showIpcOffNotice() {
+    activity.runOnUiThread {
+      try {
+        Toast.makeText(
+          activity,
+          "Uygulama içi bağlantı başlatılamadı. Ayarlar ve bazı özellikler çalışmayabilir; uygulamayı yeniden başlatın.",
+          Toast.LENGTH_LONG,
+        ).show()
+      } catch (e: Exception) {
+        // Showing a notice must never break the plugin load.
+        Log.e(LOG_TAG, "could not show the IPC notice", e)
+      }
+    }
+  }
+
+  /**
+   * Wrap the WebView's client so top-level navigations pass the site policy.
+   *
+   * Tauri calls `load` from its `on_webview_created` hook, which runs after
+   * wry has set its own `RustWebViewClient`, so the current client is the one
+   * to wrap. wry's `Ipc` object holds a reference to that original client and
+   * reads its `currentUrl`, which the delegate's `onPageStarted` keeps up to
+   * date. See `SiteNavigationGuard` for the limits.
+   */
+  private fun installNavigationGuard(webView: WebView) {
+    val current = webView.webViewClient
+    if (current is SiteNavigationGuard) return
+    webView.webViewClient = SiteNavigationGuard(current)
   }
 
   override fun onDestroy(activity: AppCompatActivity) {
@@ -115,6 +217,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
           manager.flush()
         } catch (_: Exception) {
           Log.w(LOG_TAG, "CookieManager persistence sync failed")
+          AnimeHubDebugLog.add("cookie", "persistence sync failed")
         }
       }
     } catch (_: Exception) {
@@ -250,6 +353,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
             if (index >= cookieHeaders.size) {
               if (rejected > 0) {
                 Log.w(LOG_TAG, "CookieManager rejected $rejected restored cookie(s)")
+                AnimeHubDebugLog.add("cookie", "rejected $rejected restored cookie(s)")
               }
               val elapsedMs = android.os.SystemClock.elapsedRealtime() - startedAt
               Log.d(
@@ -448,48 +552,77 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
   // ------------------------------------------------------------------- PiP
 
+  /**
+   * Manual PiP entry (`enter_pip`).
+   *
+   * Runs the exact same controlled chain as the Activity callbacks — prepare
+   * the WebView through `window.__animehubPreparePip()`, wait for its answer,
+   * then `enterPictureInPictureMode()` — so this command can never put the
+   * whole site into the PiP window, and the preparation logic exists once
+   * (in `AnimeHubPipController`) instead of twice.
+   *
+   * `num`/`den` are only a fallback: the ratio of the player the JS actually
+   * selected wins when it can be measured.
+   *
+   * Resolves with `{ ok: true }` only when the Activity really entered PiP.
+   */
   @Command
   fun enter_pip(invoke: Invoke) {
     val args = invoke.getArgs()
     val num = args.getInteger("num", 16)
     val den = args.getInteger("den", 9)
     try {
-      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-        invoke.resolve(JSObject().put("ok", false)); return
+      var answered = false
+      fun answer(ok: Boolean) {
+        if (answered) return
+        answered = true
+        try {
+          invoke.resolve(JSObject().put("ok", ok))
+        } catch (_: Exception) {
+          // The host went away between the request and its answer; the
+          // preparation path already restored the page.
+        }
       }
-      if (!activity.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-        invoke.resolve(JSObject().put("ok", false)); return
-      }
-      val params = PictureInPictureParams.Builder()
-        .setAspectRatio(safeAspectRatio(num, den))
-        .build()
-      val ok = activity.enterPictureInPictureMode(params)
-      invoke.resolve(JSObject().put("ok", ok))
+      val claimed = AnimeHubPipController.requestEnter(
+        activity,
+        "command",
+        onResult = { entered -> answer(entered) },
+        fallbackNum = num,
+        fallbackDen = den,
+      )
+      // Unsupported device: no callback will ever fire.
+      if (!claimed) answer(false)
     } catch (e: Exception) {
       invoke.reject("PiP başlatılamadı: ${e.message}", e)
     }
   }
 
+  /**
+   * Store the user's "enter PiP automatically" preference.
+   *
+   * The platform auto-enter flag is deliberately never enabled: Android
+   * documents that it suppresses `onPictureInPictureRequested()`, so the
+   * system would enter PiP before the WebView could be prepared. The
+   * preference is handed to `AnimeHubPipController`, which owns the controlled
+   * paths (API 30+ `onPictureInPictureRequested`, API 26-29 `onUserLeaveHint`).
+   */
   @Command
   fun set_pip_auto_enter(invoke: Invoke) {
     val enabled = invoke.getArgs().getBoolean("enabled", false)
     try {
-      // setAutoEnterEnabled is API 31+.
-      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-        invoke.resolve(JSObject().put("ok", false)); return
-      }
-      if (!activity.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-        invoke.resolve(JSObject().put("ok", false)); return
-      }
-      val params = PictureInPictureParams.Builder()
-        .setAspectRatio(Rational(16, 9))
-        .setAutoEnterEnabled(enabled)
-        .build()
-      activity.setPictureInPictureParams(params)
-      invoke.resolve(JSObject().put("ok", true))
+      val applied = AnimeHubPipController.applyAutoEnter(activity, enabled)
+      invoke.resolve(JSObject().put("ok", applied))
     } catch (e: Exception) {
       invoke.reject("PiP ayarlanamadı: ${e.message}", e)
     }
+  }
+
+  /** Developer panel: the last Android lines, so no logcat is needed on a device. */
+  @Command
+  fun debug_log(invoke: Invoke) {
+    val lines = org.json.JSONArray()
+    AnimeHubDebugLog.snapshot().forEach { lines.put(it) }
+    invoke.resolve(JSObject().put("lines", lines))
   }
 
   companion object {
@@ -571,22 +704,221 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       return if (cleaned.isEmpty()) "default" else cleaned
     }
 
-    /**
-     * Android rejects PiP ratios outside about 1:2.39 .. 2.39:1.
-     * Clamping each side on its own still allows 239:1, which
-     * `setAspectRatio` refuses.
-     */
-    private const val MAX_RATIO = 2.39
-    private const val MIN_RATIO = 0.41841 // 1 / 2.39
+  }
+}
 
-    private fun safeAspectRatio(num: Int, den: Int): Rational {
-      val n = num.coerceAtLeast(1)
-      val d = den.coerceAtLeast(1)
-      return when {
-        n.toDouble() / d.toDouble() > MAX_RATIO -> Rational(2390, 1000)
-        n.toDouble() / d.toDouble() < MIN_RATIO -> Rational(1000, 2390)
-        else -> Rational(n, d)
-      }
+/**
+ * Top-level navigation guard for the shared site WebView (Android only).
+ *
+ * Desktop enforces the site policy in Tauri's `on_navigation` hook. Android has
+ * no equivalent for the single launcher WebView: wry's navigation handler is
+ * fixed when the WebView is created and is not reachable from app code. So this
+ * class wraps wry's `WebViewClient` and cancels the navigations that the desktop
+ * policy would refuse.
+ *
+ * Scope (verified against wry 0.55.1 source and the Android WebView docs, not on
+ * a device):
+ *  - Covered: top-level navigations that the WebView routes through
+ *    `shouldOverrideUrlLoading` (link clicks, `location` changes, main-frame
+ *    redirects as delivered by the WebView).
+ *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
+ *    `open_on_mobile` already validates the first URL), subframes, and
+ *    sub-resources.
+ *  - Not covered: the blocklist and DNS rebinding checks. Those live in Rust;
+ *    running DNS on the UI thread from this callback is not acceptable.
+ *
+ * Every other callback is forwarded unchanged, so wry's custom-protocol
+ * handling, the IPC page-started tracking and the error recovery keep working.
+ */
+class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
+
+  override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+    val uri = request.url
+    if (!SiteNavigationPolicy.allows(uri)) {
+      // Host and scheme only: paths and queries can carry tokens.
+      Log.w(LOG_TAG, "navigation blocked: ${uri.scheme}://${uri.host}")
+      // Scheme only in the in-app log: the host can identify the site.
+      AnimeHubDebugLog.add("nav", "blocked scheme=${uri.scheme}")
+      return true
+    }
+    return inner.shouldOverrideUrlLoading(view, request)
+  }
+
+  override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+    inner.shouldInterceptRequest(view, request)
+
+  override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) =
+    inner.onPageStarted(view, url, favicon)
+
+  override fun onPageFinished(view: WebView, url: String) =
+    inner.onPageFinished(view, url)
+
+  override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+    // Error code and frame only: the description and URL are left out.
+    if (request.isForMainFrame) {
+      AnimeHubDebugLog.add("web", "main frame error code=${error.errorCode}")
+    }
+    inner.onReceivedError(view, request, error)
+  }
+
+  companion object {
+    private const val LOG_TAG = "AnimeHubNavGuard"
+  }
+}
+
+/**
+ * The desktop site policy, restated for Kotlin. Keep it in step with
+ * `navigation_allowed` and `is_private_host` in `src-tauri/src/sites/url_policy.rs`;
+ * `tests/gaps.test.js` checks the shared host suffixes.
+ *
+ * Deliberately has no exception for the launcher's own origin: a site must not
+ * be able to load `tauri.localhost` into the WebView, because that origin is
+ * the one that receives IPC. The launcher returns through `loadUrl`, which is
+ * not routed through this guard.
+ */
+internal object SiteNavigationPolicy {
+  private val BLOCKED_HOSTS = setOf(
+    "localhost",
+    "localhost.localdomain",
+    "ip6-localhost",
+    "ip6-loopback",
+    "metadata.google.internal",
+  )
+
+  private val BLOCKED_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home")
+
+  private val IPV4 = Regex("""\d{1,3}(\.\d{1,3}){3}""")
+  // The last label of a host that WHATWG URL parsing reads as an IPv4 number:
+  // 2130706433, 0x7f000001, 0177.0.0.1, 127.1. Chromium normalises these to
+  // a dotted address, so they must go through the IP rules, not the name rules.
+  private val NUMERIC_LABEL = Regex("""(0x[0-9a-f]*|[0-9]+)""", RegexOption.IGNORE_CASE)
+
+  fun allows(uri: Uri): Boolean {
+    val scheme = uri.scheme?.lowercase() ?: return false
+    return when (scheme) {
+      "https" -> hostAllowed(uri.host)
+      // Playback and inline-asset schemes, as in Rust's navigation_allowed.
+      "blob", "data", "about" -> true
+      // Plain http is a downgrade, and every other scheme is refused.
+      else -> false
     }
   }
+
+  private fun hostAllowed(rawHost: String?): Boolean {
+    val host = rawHost?.lowercase()?.trimEnd('.')
+    if (host.isNullOrEmpty()) return false
+    val bare = host.removePrefix("[").removeSuffix("]")
+    if (bare.contains(':')) return isPublicIpv6(bare)
+    if (NUMERIC_LABEL.matches(bare.substringAfterLast('.'))) {
+      // Only a canonical dotted-decimal public address passes. Other forms are refused.
+      return IPV4.matches(bare) && isPublicIpv4(bare)
+    }
+    if (IPV4.matches(bare)) return isPublicIpv4(bare)
+    if (host in BLOCKED_HOSTS) return false
+    return BLOCKED_SUFFIXES.none { host.endsWith(it) }
+  }
+
+  private fun isPublicIp(ip: String): Boolean =
+    if (ip.contains(':')) isPublicIpv6(ip) else isPublicIpv4(ip)
+
+  private fun isPublicIpv4(ip: String): Boolean {
+    val octets = ip.split('.').map { it.toIntOrNull() ?: return false }
+    if (octets.size != 4 || octets.any { it !in 0..255 }) return false
+    val a = octets[0]
+    val b = octets[1]
+    val c = octets[2]
+    return !(
+      a == 0 ||                         // 0.0.0.0/8
+      a == 10 ||                        // private
+      a == 127 ||                       // loopback
+      (a == 100 && b in 64..127) ||     // CGNAT
+      (a == 169 && b == 254) ||         // link-local
+      (a == 172 && b in 16..31) ||      // private
+      (a == 192 && b == 0) ||           // IETF protocol assignments, documentation 192.0.0.0/24, 192.0.2.0/24
+      (a == 192 && b == 168) ||         // private
+      (a == 198 && b == 51 && c == 100) || // documentation 198.51.100.0/24 (as Rust is_documentation)
+      (a == 203 && b == 0 && c == 113) ||  // documentation 203.0.113.0/24 (as Rust is_documentation)
+      (a == 198 && (b == 18 || b == 19)) || // benchmarking
+      a >= 224                          // multicast, reserved, broadcast
+    )
+  }
+
+  private fun isPublicIpv6(ip: String): Boolean {
+    val lower = ip.lowercase()
+    if (lower == "::1" || lower == "::") return false
+    if (lower.startsWith("::ffff:")) {
+      val v4 = lower.removePrefix("::ffff:")
+      return IPV4.matches(v4) && isPublicIpv4(v4)
+    }
+    val first = lower.substringBefore(':').ifEmpty { "0" }.toIntOrNull(16) ?: return false
+    return !(
+      (first and 0xffc0) == 0xfe80 ||   // link-local fe80::/10
+      (first and 0xfe00) == 0xfc00 ||   // unique local fc00::/7
+      (first and 0xff00) == 0xff00      // multicast ff00::/8
+    )
+  }
+}
+
+/**
+ * Receives `window.ipc.postMessage` from the launcher only. The origin rules
+ * stop the object being injected into site pages at all; the main-frame check
+ * is a second, cheap guard. `Rust.ipc` gets the same arguments as wry's object:
+ * the WebView id, the page URL and the message text. Message bodies are never logged.
+ */
+class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListener {
+  override fun onPostMessage(
+    view: WebView,
+    message: WebMessageCompat,
+    sourceOrigin: Uri,
+    isMainFrame: Boolean,
+    replyProxy: JavaScriptReplyProxy,
+  ) {
+    if (!isMainFrame) return
+    val body = message.data ?: return
+    val url = view.url ?: "about:blank"
+    // onPostMessage runs on the UI thread. Rust runs blocking commands inline, and
+    // a plugin command waits for Kotlin code that needs the UI thread, so calling
+    // Rust here can deadlock (ANR). Run it on a worker, as wry's JavaScript
+    // interface did before this listener. A single thread keeps message order.
+    try {
+      IPC_EXECUTOR.execute {
+        try {
+          Rust.ipc(webViewId, url, body)
+        } catch (e: Exception) {
+          AnimeHubDebugLog.add("ipc", "dispatch failed (${e.javaClass.simpleName})")
+        }
+      }
+    } catch (e: Exception) {
+      AnimeHubDebugLog.add("ipc", "dispatch could not be queued (${e.javaClass.simpleName})")
+    }
+  }
+
+  companion object {
+    private val IPC_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "AnimeHubLauncherIpc").apply { isDaemon = true }
+    }
+    const val OBJECT_NAME = "ipc"
+    val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
+  }
+}
+
+/**
+ * In-app diagnostics for the launcher's developer panel, read through the
+ * `debug_log` plugin command. Holds the last 200 lines of status text only:
+ * a short area tag, the outcome, and error codes. Never site URLs or hosts,
+ * and never message bodies or cookie values.
+ */
+object AnimeHubDebugLog {
+  private const val MAX_LINES = 200
+  private val lines = ArrayDeque<String>()
+  private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
+
+  @Synchronized
+  fun add(area: String, message: String) {
+    if (lines.size >= MAX_LINES) lines.removeFirst()
+    lines.addLast(stamp.format(Date()) + " [" + area + "] " + message)
+  }
+
+  @Synchronized
+  fun snapshot(): List<String> = lines.toList()
 }

@@ -122,8 +122,13 @@ const stubState = {
     blocklistCount: 0,
     blockPopups: true,
     injectCosmeticRules: true,
-    fullscreenSites: true,
+    // Mirrors the Rust defaults in `commands.rs` (`Settings::default`). The
+    // blocklist above is intentionally empty in browser mode, so its count
+    // stays 0; every other default must match the real app.
+    fullscreenSites: false,
+    theme: "system",
     pipAutoEnter: false,
+    developerOptions: false,
     anilist: {
       configured: false,
       clientId: "",

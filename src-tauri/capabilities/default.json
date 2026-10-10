@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the launcher webview only. Sites are hosted as child WebViews inside the same window, so the grant must be scoped to the `main` webview, not the window: window-scoped grants would cover the site webviews. They load external origins and are deliberately given no capabilities — Tauri withholds IPC from them, so a compromised streaming site cannot reach the Rust core.",
+  "description": "Permissions for the launcher webview (`main`) only. Desktop: each site is a child WebView inside the same window, so the grant is scoped to the `main` webview rather than the window, and site child WebViews get no capability. Android: there is a single WebView, and the site page is loaded into it, so this grant applies to the same WebView that shows sites. Remote origins get no IPC from this file: no `remote` capability is defined, and Tauri 2.11.6 rejects commands from a remote origin unless a remote capability allows them. On Android, wry adds a JavaScript interface named `ipc` to the WebView (wry src/android/main_pipe.rs). Because it is a WebView-wide object, the loaded page, including a remote site, can call `window.ipc.postMessage`. Each message carries the page URL that wry tracked in onPageStarted, and Tauri checks that URL against the capabilities. This is an exposure to review, not one this file removes. See docs/android-navigation.md.",
   "webviews": ["main"],
   "permissions": [
     "core:default",
