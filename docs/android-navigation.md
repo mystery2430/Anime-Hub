@@ -91,7 +91,7 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 | App-initiated `loadUrl` | Not routed through `shouldOverrideUrlLoading`; `open_on_mobile` checks the first URL with `validate_site_url`. |
 | Redirects | Whether the WebView calls `shouldOverrideUrlLoading` for every server redirect is not verified. |
 | `window.open` | Wry does not enable multiple windows, and the init script overrides `window.open` when popup blocking is on. The Android default is that multi-window is off; not device-verified. |
-| The back affordance (`animehub://close-site`) | Desktop handles it in `on_navigation`. On Android it is a non-HTTP scheme, so the guard refuses it. Whether the Android back path works without it is not verified. |
+| The back affordance (`animehub://close-site`) | Verified from source: the overlay snippet (`OVERLAY_SNIPPET`) is installed only by the desktop child-WebView builder (`web/windows.rs`). `open_on_mobile` never installs it, so the app never produces this URL on Android. The guard refuses it there, which blocks no working path. There is no in-site way back on Android. A native return path would need a Kotlin-to-Rust hand-off to `close_site_window` (cookie and storage export first). That is not built and not device-verified. Whether the system back button returns to the launcher is not verified. |
 
 ## Verification status
 

@@ -473,3 +473,15 @@ test("fail-closed launcher IPC shows a native notice on every failure path", () 
   assert.ok(start > 0 && body.length > 0, "function body found");
   assert.doesNotMatch(body, /\$\{/, "fixed text only, no template values");
 });
+
+test("the back overlay is installed only on desktop; Android never produces close-site", () => {
+  // Static check. If the overlay is ever added to the Android path, the Android
+  // close-site handling must be built first (see docs/android-navigation.md).
+  const win = read(join(ROOT, "src-tauri/src/web/windows.rs"));
+  const evals = win.match(/webview\.eval\(crate::web::session::OVERLAY_SNIPPET\)/g) || [];
+  assert.equal(evals.length, 1);
+  const mobileStart = win.indexOf("fn open_on_mobile(");
+  assert.ok(mobileStart > 0);
+  const mobileBody = win.slice(mobileStart, win.indexOf("\n}\n", mobileStart));
+  assert.doesNotMatch(mobileBody, /OVERLAY_SNIPPET/);
+});
