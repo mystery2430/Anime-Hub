@@ -56,6 +56,7 @@ import android.util.Base64
 import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
+import android.widget.Toast
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -117,11 +118,13 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     if (id == null) {
       Log.e(LOG_TAG, "launcher IPC is off: WebView is not a RustWebView")
       AnimeHubDebugLog.add("ipc", "launcher IPC off: WebView is not a RustWebView")
+      showIpcOffNotice()
       return
     }
     if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
       Log.e(LOG_TAG, "launcher IPC is off: WebMessageListener unsupported")
       AnimeHubDebugLog.add("ipc", "launcher IPC off: WebMessageListener unsupported")
+      showIpcOffNotice()
       return
     }
     try {
@@ -136,6 +139,27 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       AnimeHubDebugLog.add("ipc", "listener failed (${e.javaClass.simpleName}); launcher IPC is off")
       // Fail closed: the wry object is already gone, so no site page gets an `ipc` object.
       Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off", e)
+      showIpcOffNotice()
+    }
+  }
+
+  /**
+   * Tell the user, natively, that launcher IPC is off. The launcher cannot
+   * show this itself: its JS never gets a working `ipc` in this state. Only the
+   * fixed Turkish text is shown; no URL, no page data. Posted to the UI thread.
+   */
+  private fun showIpcOffNotice() {
+    activity.runOnUiThread {
+      try {
+        Toast.makeText(
+          activity,
+          "Uygulama içi bağlantı başlatılamadı. Ayarlar ve bazı özellikler çalışmayabilir; uygulamayı yeniden başlatın.",
+          Toast.LENGTH_LONG,
+        ).show()
+      } catch (e: Exception) {
+        // Showing a notice must never break the plugin load.
+        Log.e(LOG_TAG, "could not show the IPC notice", e)
+      }
     }
   }
 

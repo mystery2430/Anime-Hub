@@ -459,3 +459,17 @@ test("plugin-calling commands use the async runtime, not the IPC dispatch thread
     assert.match(rs, new RegExp(`#\\[tauri::command\\(async\\)\\]\\npub fn ${name}\\(`), name);
   }
 });
+
+test("fail-closed launcher IPC shows a native notice on every failure path", () => {
+  // Static check of AnimeHubPlugin.kt. Each of the three "IPC is off" branches
+  // must call the native Toast, because JS cannot show it in that state.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const calls = kt.match(/showIpcOffNotice\(\)/g) || [];
+  assert.equal(calls.length, 4, "one definition and three calls");
+  assert.match(kt, /import android\.widget\.Toast/);
+  assert.match(kt, /activity\.runOnUiThread \{[\s\S]*?Toast\.makeText\(/);
+  const start = kt.indexOf("private fun showIpcOffNotice");
+  const body = kt.slice(start, kt.indexOf("\n  }\n", start));
+  assert.ok(start > 0 && body.length > 0, "function body found");
+  assert.doesNotMatch(body, /\$\{/, "fixed text only, no template values");
+});
