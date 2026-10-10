@@ -1,17 +1,20 @@
-# Produces Android APKs, published as release assets when the run is a tag.
+# Builds signed production APKs for manual publication after all checks pass.
 #
 # Nothing secret lives in this file or in the repo. The keystore arrives as
 # base64 environment secrets (environment `keystore`) and is written to a
 # temporary file that is deleted at the end of the job. If the secret is
-# absent the APK is built unsigned.
+# absent the production build fails closed.
 #
 # `secrets` cannot be referenced from `if:` — GitHub rejects that — so a
 # step exports `enabled=true/false` and later steps branch on that output.
 name: Release Android
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       sign:
@@ -20,7 +23,7 @@ on:
         default: true
 
 permissions:
-  contents: write # needed to attach assets to the release
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +48,8 @@ jobs:
             target: x86_64-linux-android
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - uses: actions/setup-java@v6
         with:
@@ -115,6 +120,12 @@ jobs:
             echo "signing enabled"
           fi
 
+      - name: Require production signing
+        if: steps.signing.outputs.enabled != 'true'
+        run: |
+          echo "::error::Production APKs require the release keystore and sign=true"
+          exit 1
+
       - name: Materialise keystore
         if: steps.signing.outputs.enabled == 'true'
         env:
@@ -166,14 +177,10 @@ jobs:
           # Prefer the signed APK: once a signingConfig is active Gradle
           # names it without `-unsigned`; fall back to unsigned dev builds.
           f=$(find src-tauri/gen/android/app/build/outputs/apk \
-                -name "*.apk" ! -name "*unsigned*" | head -1)
-          if [ -z "$f" ]; then
-            f=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -1)
-          fi
+                -path "*/release/*.apk" ! -name "*unsigned*" | head -1)
           test -n "$f"
-          suffix=""
-          case "$(basename "$f")" in *unsigned*) suffix="-unsigned" ;; esac
-          cp "$f" "dist-apk/animehub-${{ matrix.abi }}-release${suffix}.apk"
+          "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose "$f"
+          cp "$f" "dist-apk/animehub-${{ matrix.abi }}-release.apk"
           ls -la dist-apk
 
       - name: Shred the keystore
@@ -189,20 +196,3 @@ jobs:
           name: animehub-android-${{ matrix.abi }}
           path: dist-apk/*.apk
           if-no-files-found: error
-
-  publish:
-    name: Publish release
-    needs: android
-    runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: animehub-android-*
-          merge-multiple: true
-          path: apks
-
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: apks/**/*.apk
-          generate_release_notes: true

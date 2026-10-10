@@ -1,8 +1,22 @@
 # Changelog
 
-Notable user-facing changes are recorded here. Release assets are published from the matching `v*` tag.
+Notable user-facing changes are recorded here. Production assets are built and checked before the matching tag and public release are created.
 
 ## [Unreleased]
+
+No changes yet.
+
+## [0.3.3] — 2026-10-10
+
+### Release safety and known limitations
+
+- Production workflows support dispatch and reusable calls and stage installers as CI artifacts. The publisher waits for successful main CI and fresh production builds of that exact SHA before creating a tag or public release. Rust tests and dependency audit failures block validation. Android release signing is required and APK signatures are verified. CI debug APKs are never release assets.
+- Local validation: `npm test` **152 passed**, `npm run build` passed, `npm audit` **0 vulnerabilities**. Rust and Android validation runs in GitHub Actions (no local Rust toolchain/Android SDK).
+- **No physical Android test was performed for v0.3.3.** PiP, launcher IPC, navigation, cookie persistence and performance remain device-unverified.
+- **Provider-to-provider isolation of same-origin localStorage/IndexedDB is not guaranteed on Android.** Best-effort storage transfer is not a security boundary and IndexedDB transfer is not lossless.
+- Windows installers are not code-signed unless signing secrets are configured. Android navigation does not cover blocklist, DNS rebinding, subframes or app-initiated loads.
+
+### Changes since v0.3.2
 
 - Security (Android navigation): numeric IPv4 spellings (`2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1`) and the documentation ranges `198.51.100.0/24` and `203.0.113.0/24` are now refused, as the Rust policy refuses them. Blocklist and DNS rebinding are still not applied on Android (documented).
 - PiP: the play/pause button is offered only when the player is a `<video>`. For a cross-origin iframe candidate the button is not shown, because the page script cannot control it. Device check pending.
@@ -43,7 +57,7 @@ Notable user-facing changes are recorded here. Release assets are published from
 
 The WebView-side controller is covered by `node --test tests/pip_controller.test.js`, the prepare script by `tests/gaps.test.js`, and the Kotlin/plugin invariants by unit tests in `src-tauri` — all green in CI (PR #19, run 37792307795: Android aarch64 compile, three-platform tests, audit and LTO jobs all pass; artifact `animehub-android-aarch64-debug`). The APK builds and installs, but the PiP behaviour itself has **not** been device-tested. Details: [`docs/android-pip.md`](./docs/android-pip.md).
 
-Current branch, after `6f28b13`: `npm test` passes locally with 117 tests (`# pass 117`, `# fail 0`). The Rust tests (`cargo test`), the Android build and the Kotlin code were not run locally, because the sandbox has no Rust toolchain or Android SDK. Their results come from GitHub Actions for the pushed commit. Nothing in this section has been tested on a device.
+Historical validation after `6f28b13` (not the v0.3.3 test count): `npm test` passes locally with 117 tests (`# pass 117`, `# fail 0`). The Rust tests (`cargo test`), the Android build and the Kotlin code were not run locally, because the sandbox has no Rust toolchain or Android SDK. Their results come from GitHub Actions for the pushed commit. Nothing in this section has been tested on a device.
 
 ## [0.3.2] — 2026-10-07
 

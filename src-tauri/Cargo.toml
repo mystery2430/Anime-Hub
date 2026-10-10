@@ -1,6 +1,6 @@
 [package]
 name = "animehub"
-version = "0.3.2"
+version = "0.3.3"
 description = "AnimeHub — a launcher for anime sites with encrypted session storage and platform-specific session handling."
 authors = ["AnimeHub contributors"]
 edition = "2021"

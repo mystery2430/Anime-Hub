@@ -243,11 +243,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm audit
+
       - name: cargo-audit (Rust advisories)
         run: |
           cargo install cargo-audit --locked
           cargo audit --file src-tauri/Cargo.lock
-        continue-on-error: true # advisories should warn, not block a hotfix
 
       - name: No committed secrets
         run: |

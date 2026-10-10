@@ -5,12 +5,15 @@
 name: Release Desktop
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,6 +32,8 @@ jobs:
             label: linux
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Linux system dependencies
         if: matrix.label == 'linux'
@@ -54,12 +59,7 @@ jobs:
       - name: Frontend tests
         run: npm test
 
-      # Bu geçit bazı Actions runner imajlarında (ubuntu-24.04) flaky kırmızı
-      # üretiyor — aynı ağaç diag ile tekrar tekrar yeşil geçiyor. Testler
-      # yine koşulsuz çalışır; paketleme artık araya girmesin diye
-      # continue-on-error. Kök sebep ayrıca incelenecek.
       - name: Rust tests
-        continue-on-error: true
         run: cargo test --all
         working-directory: src-tauri
 
@@ -109,14 +109,6 @@ jobs:
           # steps.win-sign appends the signing config overlay on Windows only,
           # and only when signing secrets exist.
           args: ${{ matrix.label == 'windows' && '--bundles nsis' || '--bundles appimage,deb,rpm' }} ${{ steps.win-sign.outputs.args }}
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('AnimeHub {0}', github.ref_name) || '' }}
-          # Must stay false: the Android workflow publishes the tag's release
-          # as non-draft, and GitHub refuses to demote a published release to
-          # draft (422). With false, both workflows merge into one release.
-          releaseDraft: false
-          prerelease: false
-
       # scripts/sign_windows.ps1 already validates every file it signs; this
       # re-checks the shipped artifacts so an unsigned installer can never
       # reach the release silently. target/release holds only the final
@@ -142,3 +134,15 @@ jobs:
             }
           }
           Write-Host 'All Windows artifacts are signed and timestamped'
+
+      - name: Stage production installers
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find src-tauri/target/release/bundle -type f \( -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -exec cp {} release-assets/ \;
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: animehub-desktop-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error
