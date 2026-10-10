@@ -29,7 +29,11 @@ import {
   bannerStyle,
   bannerRgb,
 } from "./logic/hero.js";
-import { createSettingsFlow } from "./logic/settings_flow.js";
+import {
+  bindSwitch,
+  createSettingsFlow,
+  switchStates,
+} from "./logic/settings_flow.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -706,10 +710,15 @@ async function refreshDevLog() {
 
 /** Draw the switches from the saved settings (used after a failed change). */
 function syncSettingSwitches() {
-  el.settings.pip.checked = Boolean(currentSettings.pipAutoEnter);
-  el.settings.blockPopups.checked = Boolean(currentSettings.blockPopups);
-  el.settings.cosmetic.checked = Boolean(currentSettings.injectCosmeticRules);
-  el.settings.fullscreen.checked = Boolean(currentSettings.fullscreenSites);
+  const s = switchStates(currentSettings);
+  if (!s) return;
+  el.settings.pip.checked = s.pip;
+  el.settings.blockPopups.checked = s.blockPopups;
+  el.settings.cosmetic.checked = s.cosmetic;
+  el.settings.fullscreen.checked = s.fullscreen;
+  el.settings.developer.checked = s.developer;
+  el.settings.blocklistEnabled.checked = s.blocklistEnabled;
+  el.dev.panel.hidden = !s.developer;
 }
 
 // Save logic and the PiP switch rules live in logic/settings_flow.js.
@@ -723,6 +732,10 @@ const settingsFlow = createSettingsFlow({
   setCurrent: (value) => {
     currentSettings = value;
   },
+  setDevPanel: (open) => {
+    el.dev.panel.hidden = !open;
+  },
+  refreshDevLog: () => refreshDevLog(),
 });
 
 function saveSettings(patch, okMessage) {
@@ -739,19 +752,13 @@ function wireSettings() {
   el.settings.fullscreen.addEventListener("change", (e) =>
     saveSettings({ fullscreenSites: e.target.checked }),
   );
-  el.settings.pip.addEventListener("change", (e) =>
-    settingsFlow.changePipAutoEnter(e.target.checked),
+  bindSwitch(el.settings.pip, (checked) => settingsFlow.changePipAutoEnter(checked));
+  bindSwitch(el.settings.developer, (checked) =>
+    settingsFlow.changeDeveloperOptions(checked),
   );
-  el.settings.developer.addEventListener("change", async (e) => {
-    await saveSettings({ developerOptions: e.target.checked });
-    el.dev.panel.hidden = !e.target.checked;
-    if (e.target.checked) await refreshDevLog();
-  });
   el.dev.refresh.addEventListener("click", () => refreshDevLog());
-  el.settings.blocklistEnabled.addEventListener("change", (e) =>
-    saveSettings({
-      blocklist: { rules: el.settings.blocklist.value, enabled: e.target.checked },
-    }),
+  bindSwitch(el.settings.blocklistEnabled, (checked) =>
+    settingsFlow.changeBlocklistEnabled(checked),
   );
 
   el.btnSaveBlocklist.addEventListener("click", () =>
