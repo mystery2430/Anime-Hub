@@ -367,7 +367,9 @@ object AnimeHubPipController {
     val den = answer.optInt("den", fallbackDen)
     val rect = sourceRect(answer.optJSONObject("rect"), webView)
     val entered = try {
-      enter(activity, num, den, rect)
+      // Only a <video> candidate can be played or paused from JS. An iframe
+      // candidate gets no play/pause button, so the button never does nothing.
+      enter(activity, num, den, rect, controllable = answer.optString("kind") == "video")
     } catch (e: IllegalStateException) {
       // "Activity must be resumed to enter picture-in-picture": the app was
       // already stopped, so there is nothing to enter. Never crash for this.
@@ -439,12 +441,20 @@ object AnimeHubPipController {
   }
 
   /** Build and enter PiP with the detected ratio and the player's bounds. */
-  private fun enter(activity: Activity, num: Int, den: Int, rect: Rect?): Boolean {
+  private fun enter(
+    activity: Activity,
+    num: Int,
+    den: Int,
+    rect: Rect?,
+    controllable: Boolean,
+  ): Boolean {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
     pipRatio = Pair(num, den)
     val builder = PictureInPictureParams.Builder()
       .setAspectRatio(safeAspectRatio(num, den))
-      .setActions(playbackActions(activity, playing = true))
+      .setActions(
+        if (controllable) playbackActions(activity, playing = true) else emptyList<RemoteAction>(),
+      )
     // sourceRectHint is only a transition hint: it tells the system which part
     // of the window is worth animating from. It does not crop anything, so the
     // player-only look still comes from the JS view.

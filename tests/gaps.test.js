@@ -386,10 +386,21 @@ test("Android in-app log: one shared buffer, no site URLs or hosts in any line",
   }
 });
 
+test("PiP play/pause button: shown only for a <video> candidate, never for an iframe", () => {
+  // Static check: the JS playback() only controls <video>, so the button must
+  // not be offered for an iframe candidate. Not a device test.
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
+  assert.match(kt, /controllable = answer\.optString\("kind"\) == "video"/);
+  assert.match(kt, /if \(controllable\) playbackActions\(activity, playing = true\) else emptyList<RemoteAction>\(\)/);
+});
+
 test("PiP play/pause button: only a user press toggles playback, and the receiver stays app-private", () => {
   const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
   assert.match(kt, /const val ACTION_PIP_TOGGLE = "dev\.animehub\.app\.PIP_TOGGLE"/);
-  assert.match(kt, /\.setActions\(playbackActions\(activity, playing = true\)\)/);
+  // The button is offered on entry only for a controllable (video) candidate;
+  // updatePlaybackAction still shows it in the setActions call for both states.
+  assert.match(kt, /if \(controllable\) playbackActions\(activity, playing = true\) else emptyList<RemoteAction>\(\)/);
+  assert.match(kt, /\.setActions\(playbackActions\(activity, playing\)\)/);
   assert.match(kt, /Context\.RECEIVER_NOT_EXPORTED/);
   assert.doesNotMatch(kt, /ContextCompat/);
   assert.match(kt, /PendingIntent\.FLAG_IMMUTABLE/);
