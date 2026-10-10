@@ -930,7 +930,9 @@ pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppRe
 /// `num`/`den` are clamped here and passed on as a fallback for the case where
 /// no player ratio can be measured. Resolves `false` when PiP is unavailable,
 /// nothing playable was found, or the Activity could not enter PiP.
-#[tauri::command]
+// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
+// thread. These commands wait for a Kotlin reply through the plugin bridge.
+#[tauri::command(async)]
 pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
     let (n, d) = crate::android_bridge::clamp_aspect(num.unwrap_or(16), den.unwrap_or(9));
     crate::android_bridge::enter_pip(n, d)
@@ -944,13 +946,17 @@ pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
 /// (`setAutoEnterEnabled`) is deliberately never turned on: Android documents
 /// that it suppresses `onPictureInPictureRequested()`, so the system would put
 /// the unprepared site into the PiP window.
-#[tauri::command]
+// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
+// thread. These commands wait for a Kotlin reply through the plugin bridge.
+#[tauri::command(async)]
 pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
     crate::android_bridge::set_pip_auto_enter(enabled)
 }
 
 /// Developer panel: the last PiP diagnostic lines (empty off Android).
-#[tauri::command]
+// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
+// thread. These commands wait for a Kotlin reply through the plugin bridge.
+#[tauri::command(async)]
 pub fn debug_log() -> AppResult<Vec<String>> {
     crate::android_bridge::debug_log()
 }
