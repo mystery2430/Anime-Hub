@@ -702,3 +702,58 @@ test("a page with a broken candidate list does not leave a half-styled page", ()
 });
 
 void place;
+
+test("a page that throws mid-preparation is restored, not left half-styled", () => {
+  const dom = phone();
+  const wrapper = addDiv(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 220 },
+    style: "padding: 4px",
+  });
+  addDiv(dom.document, wrapper, {
+    rect: { x: 0, y: 0, width: 360, height: 40 },
+    style: "color: blue",
+  }).getAttribute = () => {
+    throw new Error("site script broke the DOM");
+  };
+  const video = addVideo(dom.document, wrapper, {
+    rect: { x: 0, y: 40, width: 360, height: 180 },
+    style: undefined,
+  });
+  dom.document.body.setAttribute("style", "color: red");
+
+  const result = dom.prepare();
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "exception");
+  assert.equal(dom.document.body.getAttribute("style"), "color: red");
+  assert.equal(dom.document.documentElement.getAttribute("style"), null);
+  assert.equal(wrapper.getAttribute("style"), "padding: 4px");
+  assert.equal(video.getAttribute("style"), null);
+  assert.equal(video.classList.contains("animehub-pip-target"), false);
+  assert.equal(dom.pip(), false, "no view is left applied");
+});
+
+test("a re-assert that throws mid-apply also leaves no half-styled page", () => {
+  const dom = phone();
+  const wrapper = addDiv(dom.document, dom.document.body, {
+    rect: { x: 0, y: 0, width: 360, height: 220 },
+    style: "padding: 4px",
+  });
+  const header = addDiv(dom.document, wrapper, {
+    rect: { x: 0, y: 0, width: 360, height: 40 },
+    style: "color: blue",
+  });
+  addVideo(dom.document, wrapper, {
+    rect: { x: 0, y: 40, width: 360, height: 180 },
+    style: undefined,
+  });
+  dom.document.body.setAttribute("style", "color: red");
+  assert.equal(dom.prepare().ok, true);
+
+  // The page replaces the header while PiP is up; the next re-assert trips on it.
+  header.getAttribute = () => {
+    throw new Error("site script broke the DOM");
+  };
+  assert.equal(dom.pip(true), false);
+  assert.equal(dom.document.body.getAttribute("style"), "color: red");
+  assert.equal(wrapper.getAttribute("style"), "padding: 4px");
+});

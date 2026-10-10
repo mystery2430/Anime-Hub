@@ -649,8 +649,9 @@
     return chain;
   }
 
-  function applyView(candidate) {
-    var acc = newAccumulator();
+  // `acc` is owned by the caller so a throw part-way through leaves a record
+  // of every style already applied, and the caller can undo exactly those.
+  function applyView(candidate, acc) {
     var target = candidate.el;
     var root = document.documentElement;
     var body = document.body;
@@ -742,6 +743,7 @@
   }
 
   function prepare() {
+    var acc = null;
     try {
       // Re-entrant by design: a second request (or a retry after a size
       // change) starts from the page's real state, never from a stacked one.
@@ -753,7 +755,8 @@
       var candidate = chooseCandidate(found.videos, found.frames);
       if (!candidate) return fail("no-candidate");
 
-      var applied = applyView(candidate);
+      acc = newAccumulator();
+      var applied = applyView(candidate, acc);
       if (!applied) return fail("apply-failed");
 
       var ratio = ratioForCandidate(candidate);
@@ -773,8 +776,10 @@
       // A page that throws mid-preparation must not stay half-styled.
       try {
         release();
+        if (acc) restoreState({ touched: acc.styles, classes: acc.classes });
       } catch (inner) {
-        // ignored: the release is best-effort
+        // ignored: the restore is best-effort, and every write above is
+        // guarded individually.
       }
       return fail("exception");
     }
@@ -928,7 +933,19 @@
     }
     var shouldPlay = state.wasPlaying;
     release();
-    var applied = applyView(candidate);
+    var acc = newAccumulator();
+    var applied;
+    try {
+      applied = applyView(candidate, acc);
+    } catch (e) {
+      // Same rule as prepare(): a throw must not leave a half-styled page.
+      try {
+        restoreState({ touched: acc.styles, classes: acc.classes });
+      } catch (inner) {
+        // best-effort; every write is guarded individually
+      }
+      return false;
+    }
     if (!applied) return false;
     // The resume is one-shot: a later re-assert (the Activity pausing again,
     // or the PiP mode change) must never start a player the user paused.
