@@ -662,8 +662,28 @@ applyTheme(themePref);
 
 let currentSettings = null;
 
+/**
+ * Show only the settings that apply to this platform. Rows marked
+ * `data-platform="android"` (PiP, developer log) are hidden elsewhere. If the
+ * platform is unknown, they stay hidden: the safe choice.
+ */
+async function applyPlatformVisibility() {
+  let platform = "";
+  try {
+    const info = await call("app_info");
+    platform = info && typeof info.platform === "string" ? info.platform : "";
+  } catch {
+    platform = "";
+  }
+  const isAndroid = platform === "android";
+  document.querySelectorAll("[data-platform]").forEach((node) => {
+    node.style.display = node.dataset.platform === "android" && isAndroid ? "" : "none";
+  });
+}
+
 async function openSettings() {
   try {
+    await applyPlatformVisibility();
     const s = await call("get_settings");
     currentSettings = s;
     el.settings.blockPopups.checked = Boolean(s.blockPopups);

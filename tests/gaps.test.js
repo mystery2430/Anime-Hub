@@ -496,3 +496,13 @@ test("the PiP diagnostic report goes to the in-app log only, never a Toast over 
   const prepare = read(join(ROOT, "scripts/android_prepare.py"));
   assert.match(prepare, /AnimeHubPipController\.showDebugReport\(AnimeHubPipController\.webView\(\)\)/);
 });
+
+test("Android-only settings are marked and hidden by platform in main.js", () => {
+  const html = read(join(ROOT, "index.html"));
+  assert.match(html, /<label class="switch" data-platform="android">\s*<input type="checkbox" id="set-pip"/);
+  assert.match(html, /<section data-platform="android">\s*<h3>Geliştirici seçenekleri<\/h3>/);
+  const main = read(join(ROOT, "src/main.js"));
+  assert.match(main, /async function applyPlatformVisibility\(\)/);
+  assert.match(main, /node\.dataset\.platform === "android" && isAndroid/);
+  assert.match(main, /await applyPlatformVisibility\(\);\n\s*const s = await call\("get_settings"\)/);
+});
