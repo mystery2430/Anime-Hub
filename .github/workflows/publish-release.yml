@@ -1,0 +1,133 @@
+# Publish only after main CI and fresh production builds of that exact SHA.
+name: Publish production release
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.gate.outputs.sha }}
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Validate release version and immutable target
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, tomllib
+          from pathlib import Path
+          version = '0.3.3'
+          for f in ['package.json', 'package-lock.json', 'src-tauri/tauri.conf.json']:
+              assert json.loads(Path(f).read_text())['version'] == version, f
+          for f in ['src-tauri/Cargo.toml', 'src-tauri/android-plugin/Cargo.toml']:
+              assert tomllib.loads(Path(f).read_text())['package']['version'] == version, f
+          lock = tomllib.loads(Path('src-tauri/Cargo.lock').read_text())
+          for package in lock['package']:
+              if package['name'] in ('animehub', 'animehub-android'):
+                  assert package['version'] == version
+          PY
+          # Fail on API errors, and skip an already tagged release. Never reuse tags.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v0.3.3" > /tmp/tags.json
+          if jq -e '.[] | select(.ref == "refs/tags/v0.3.3")' /tmp/tags.json >/dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  desktop:
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      ref: ${{ needs.gate.outputs.sha }}
+    secrets: inherit
+
+  android:
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
+    uses: ./.github/workflows/release-android.yml
+    with:
+      ref: ${{ needs.gate.outputs.sha }}
+    secrets: inherit
+
+  publish:
+    needs: [gate, desktop, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: animehub-desktop-*
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: animehub-android-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify exact production asset allowlist and checksum
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          root = Path('release-assets')
+          expected = {
+              'AnimeHub-0.3.3-1.x86_64.rpm',
+              'AnimeHub_0.3.3_amd64.deb',
+              'AnimeHub_0.3.3_amd64.AppImage',
+              'AnimeHub_0.3.3_x64-setup.exe',
+              'animehub-aarch64-release.apk',
+              'animehub-armv7-release.apk',
+              'animehub-x86_64-release.apk',
+          }
+          files = {p.name for p in root.iterdir()}
+          assert files == expected, f'Unexpected/missing assets: {files ^ expected}'
+          lines = []
+          for name in sorted(expected):
+              p = root / name
+              assert p.is_file() and p.stat().st_size > 0, name
+              lines.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {name}\n')
+          (root / 'SHA256SUMS').write_text(''.join(lines))
+          PY
+      - name: Publish v0.3.3 only after all gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+          CI_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          cp docs/release-v0.3.3.md /tmp/release-notes.md
+          printf '\n## Validation evidence\n\n- Main CI: %s\n- Production builds and publication: https://github.com/%s/actions/runs/%s\n- Exact source commit: `%s`\n' "$CI_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$RELEASE_SHA" >> /tmp/release-notes.md
+          gh release create v0.3.3 release-assets/* \
+            --target "$RELEASE_SHA" --title 'AnimeHub v0.3.3' \
+            --notes-file /tmp/release-notes.md --draft
+          gh release view v0.3.3 --json assets --jq '.assets | length' | grep -x 8
+          gh release edit v0.3.3 --draft=false --prerelease=false --latest

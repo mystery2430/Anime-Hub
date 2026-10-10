@@ -5,6 +5,11 @@
 name: Release Desktop
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
@@ -27,6 +32,8 @@ jobs:
             label: linux
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Linux system dependencies
         if: matrix.label == 'linux'

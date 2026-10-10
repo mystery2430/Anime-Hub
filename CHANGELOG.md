@@ -10,7 +10,7 @@ No changes yet.
 
 ### Release safety and known limitations
 
-- Production workflows are dispatch-only and stage installers as CI artifacts; publication is manual only after PR CI and both release workflows succeed for the release tree. Rust tests and dependency audit failures block validation. Android release signing is required and APK signatures are verified. CI debug APKs are never release assets.
+- Production workflows support dispatch and reusable calls and stage installers as CI artifacts. The publisher waits for successful main CI and fresh production builds of that exact SHA before creating a tag or public release. Rust tests and dependency audit failures block validation. Android release signing is required and APK signatures are verified. CI debug APKs are never release assets.
 - Local validation: `npm test` **152 passed**, `npm run build` passed, `npm audit` **0 vulnerabilities**. Rust and Android validation runs in GitHub Actions (no local Rust toolchain/Android SDK).
 - **No physical Android test was performed for v0.3.3.** PiP, launcher IPC, navigation, cookie persistence and performance remain device-unverified.
 - **Provider-to-provider isolation of same-origin localStorage/IndexedDB is not guaranteed on Android.** Best-effort storage transfer is not a security boundary and IndexedDB transfer is not lossless.

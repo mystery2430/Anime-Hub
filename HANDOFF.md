@@ -13,7 +13,8 @@ bir komutun çıktısı ya da açıkça "yapılamadı" olarak işaretli.
 - Yerel: `npm test` **152 geçti / 0 hata**; `npm run build` başarılı;
   `npm audit` **0 açık**. Rust/Android araç zinciri yok; bu kontroller CI’da yapılır.
 - PR CI, Release Desktop ve Release Android aynı yayın ağacı için geçmeden
-  tag/release oluşturulmaz. Release workflow’ları yalnızca paket üretir;
+  tag/release oluşturulmaz. Release workflow’ları paket üretir; main CI sonrası yayın geçidi aynı SHA için
+  iki üretim derlemesini tekrar çalıştırır ve başarılıysa yayını açar;
   yayın prosedürü ve kanıt kaydı: [`docs/releasing.md`](docs/releasing.md).
 - **v0.3.3 fiziksel Android testi yapılmadı.** PiP/IPC/gezinti/performans
   doğrulaması ve gerçek Linux Secret Service denemesi bekliyor.

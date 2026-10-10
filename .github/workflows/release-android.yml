@@ -10,6 +10,11 @@
 name: Release Android
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       sign:
@@ -43,6 +48,8 @@ jobs:
             target: x86_64-linux-android
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - uses: actions/setup-java@v6
         with:

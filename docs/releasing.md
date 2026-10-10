@@ -11,15 +11,21 @@
    and verifies APK signatures. Desktop verifies Authenticode if configured.
 5. Merge the explicit PR only after all checks succeed. Confirm the merge tree
    equals the tested tree; if different, rebuild and revalidate before publication.
-6. Download only `animehub-desktop-linux`, `animehub-desktop-windows`, and the
-   three `animehub-android-{aarch64,armv7,x86_64}` artifacts from those successful
-   release runs. Never download CI's debug artifact for publication. Check seven
-   package names, versions and nonempty sizes; record SHA-256 checksums.
-7. Create a draft v0.3.3 release targeting the verified merge commit, upload the
-   seven installers plus SHA256SUMS, then publish as latest, non-prerelease.
-   Use GitHub CLI to create the new tag; do not push tags from the session branch.
-8. Verify public release metadata, assets and tag target. Report PR/run URLs,
-   checksum manifest and remaining risks. Do not modify v0.3.2.
+6. After merge, main CI must pass. `publish-release.yml` then calls both release
+   workflows to rebuild that exact main CI SHA (not a moving branch). Both fresh
+   production build matrices must succeed before its publish job can run.
+7. The publish job downloads only production artifacts from its own run, checks
+   an exact seven-installer allowlist, and generates `SHA256SUMS`. It creates a
+   draft at the verified SHA, checks the eight assets, then publishes latest,
+   non-prerelease. The CI debug APK cannot pass the allowlist. Existing v0.3.3
+   tags are skipped, never overwritten. This pipeline is scoped to v0.3.3.
+8. Verify public metadata, assets and tag target; report CI/build URLs and risks.
+   Preserve v0.3.2. If draft upload fails, inspect manually; do not overwrite tags.
+
+The Actions-based publisher avoids downloading artifacts through this sandbox,
+which cannot reach GitHub's external artifact storage. Workflow dispatch also
+requires Actions write permission; the initial branch builds can be started by
+a maintainer. Publication runs only on successful main CI, never on PR code.
 
 ## Required release disclosures
 

@@ -367,10 +367,10 @@ etmeyin** — `.gitignore` bunu zaten engeller.
 | İş akışı | Tetikleyici | Ne yapar |
 |---|---|---|
 | `ci.yml` | her push / PR | 3 işletim sisteminde test, `fmt`, `clippy -D warnings`, `cargo audit`, gizli anahtar taraması |
-| `release-android.yml` | manuel dispatch | 3 ABI için imzası doğrulanmış release APK; CI varlığı, otomatik yayın yok |
-| `release-desktop.yml` | manuel dispatch | Linux `.deb`/`.rpm`/AppImage + Windows NSIS; CI varlığı, otomatik yayın yok |
+| `release-android.yml` | manuel dispatch / reusable | 3 ABI için imzası doğrulanmış release APK; CI varlığı, otomatik yayın yok |
+| `release-desktop.yml` | manuel dispatch / reusable | Linux `.deb`/`.rpm`/AppImage + Windows NSIS; CI varlığı, otomatik yayın yok |
 
-Tag/release yalnızca tüm kontroller geçtikten sonra oluşturulur; bkz. [yayın prosedürü](docs/releasing.md).
+`publish-release.yml`, başarılı main CI sonrası aynı SHA için iki üretim derlemesini yeniden çalıştırır. Tag/release yalnızca tüm kontroller geçtikten sonra oluşturulur; bkz. [yayın prosedürü](docs/releasing.md).
 
 ---
 
