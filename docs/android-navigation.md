@@ -49,6 +49,31 @@ public from API 26, which matches `minSdkVersion` 26.
 - Access decisions are Tauri's, from the capability files (see the comment in
   `src-tauri/capabilities/default.json`). Verified in Tauri 2.11.6 source, not on a device.
 
+## Proposal: restrict the `ipc` object (design only, not implemented)
+
+Status: proposal from wry 0.55.1 and Tauri 2.11.6 source. Not reviewed, not built, not device-tested.
+
+- Order (verified in `main_pipe.rs`): the first `loadUrl` (line ~250, for the launcher
+  URL) runs before `addJavascriptInterface("ipc")` (~307) and the `on_webview_created`
+  hook (~320). Later loads in the same WebView run after the hook.
+- Proposal: in `AnimeHubPlugin.load()`, after `installNavigationGuard`, call
+  `removeJavascriptInterface("ipc")`, then `WebViewCompat.addWebMessageListener(webView,
+  "ipc", setOf("http://tauri.localhost", "https://tauri.localhost"), listener)`.
+  The listener accepts only `isMainFrame == true`, takes `message.data`, and calls
+  `Rust.ipc(webView.id, view.url, text)`, the same arguments as wry's object.
+- Tauri on Android sends IPC only through `window.ipc.postMessage` (verified in
+  `ipc-protocol.js`), so the replacement must keep that name and the string payload.
+- If `WebViewFeature.WEB_MESSAGE_LISTENER` is unsupported, keep wry's object and log
+  a warning. The site exposure then stays and must be reported as a limit.
+- Open points, all unverified: whether the initial launcher document (loaded before the
+  hook) keeps wry's object until its first navigation; whether Tauri's default scheme
+  on Android is `http` or `https` (both origins are listed); whether the
+  `addJavascriptInterface` removal reaches a document that is already loading.
+- Test plan: a static check in `tests/gaps.test.js` (removal before add, origin set,
+  main-frame guard, no `@JavascriptInterface`), then a device check that a site page
+  gets no `window.ipc` (`typeof window.ipc === "undefined"`) and that the launcher's
+  IPC commands still work. The device check is pending.
+
 ## What is not covered
 
 | Gap | Why |
