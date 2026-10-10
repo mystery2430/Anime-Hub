@@ -160,7 +160,16 @@ function showFormError(message) {
 /** `undefined` keeps the stored photo, `""` clears it, a data URL replaces it. */
 let pendingImage;
 
+/**
+ * One site card: a wrapper holding two sibling buttons. The card button opens
+ * the site; the menu button is a sibling, not a child, so the two never nest
+ * (nested interactive elements are invalid and confuse keyboard and screen
+ * reader users). Clicking the menu cannot reach the card's handler.
+ */
 function renderTile(tile) {
+  const wrap = document.createElement("div");
+  wrap.className = "tile-wrap";
+
   const button = document.createElement("button");
   button.type = "button";
   button.className = "tile";
@@ -210,19 +219,18 @@ function renderTile(tile) {
   }
 
   button.addEventListener("click", () => openSite(tile));
+  wrap.appendChild(button);
 
   const menu = document.createElement("button");
   menu.type = "button";
   menu.className = "tile-menu";
   menu.setAttribute("aria-label", `${tile.name} seçenekleri`);
+  menu.setAttribute("aria-haspopup", "dialog");
   menu.textContent = "\u22ee";
-  menu.addEventListener("click", (event) => {
-    event.stopPropagation();
-    siteMenu(tile);
-  });
-  button.appendChild(menu);
+  menu.addEventListener("click", () => siteMenu(tile));
+  wrap.appendChild(menu);
 
-  return button;
+  return wrap;
 }
 
 function renderAddTile() {

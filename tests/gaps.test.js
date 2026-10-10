@@ -240,3 +240,29 @@ test("android_prepare refuses a generated package that would not load", () => {
     rmSync(gen, { recursive: true, force: true });
   }
 });
+
+test("site card menu is a sibling of the card button, never nested inside it", () => {
+  const ui = read(join(ROOT, "src/main.js"));
+  const start = ui.indexOf("function renderTile(tile)");
+  const end = ui.indexOf("function renderAddTile()", start);
+  assert.ok(start >= 0 && end > start, "renderTile should be present");
+  const body = ui.slice(start, end);
+
+  // The card button must not receive the menu as a child.
+  assert.equal(/button\.appendChild\(menu\)/.test(body), false);
+  assert.match(body, /wrap\.appendChild\(button\);/);
+  assert.match(body, /wrap\.appendChild\(menu\);/);
+  // The menu must not open the site, and the card must not open the menu.
+  assert.match(body, /menu\.addEventListener\("click", \(\) => siteMenu\(tile\)\);/);
+  assert.equal(/stopPropagation/.test(body), false);
+  // Every control keeps an accessible name.
+  assert.match(body, /menu\.setAttribute\("aria-label"/);
+  // The wrapper is what the grid receives.
+  assert.match(body, /return wrap;/);
+});
+
+test("site card styles target the wrapper for menu visibility", () => {
+  const css = read(join(ROOT, "src/styles.css"));
+  assert.match(css, /\.tile-wrap:hover \.tile-menu,\s*\.tile-wrap:focus-within \.tile-menu/);
+  assert.equal(/\.tile:hover \.tile-menu/.test(css), false);
+});
