@@ -36,6 +36,19 @@ Tauri calls `load()` from `on_webview_created`, which runs after wry calls
 guard wraps wry's client, not a default one. `WebView.getWebViewClient()` is
 public from API 26, which matches `minSdkVersion` 26.
 
+## IPC and the site-facing `ipc` object (verified in wry 0.55.1 source)
+
+- wry's `main_pipe.rs` calls `addJavascriptInterface(Ipc, "ipc")` on the WebView.
+  The object is therefore visible to every page loaded in it, including remote sites.
+  This conflicts with the project rule against site-facing `JavascriptInterface`.
+  It comes from wry, not from AnimeHub code. Removing it needs a wry change or a
+  different IPC transport, and is not done here.
+- `Ipc.postMessage` sends `webViewClient.currentUrl` with each message. `Ipc` holds
+  the original `RustWebViewClient`, and the delegate forwards `onPageStarted`, so
+  `currentUrl` keeps updating under the guard.
+- Access decisions are Tauri's, from the capability files (see the comment in
+  `src-tauri/capabilities/default.json`). Verified in Tauri 2.11.6 source, not on a device.
+
 ## What is not covered
 
 | Gap | Why |
