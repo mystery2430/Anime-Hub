@@ -93,8 +93,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    *
    * Tauri calls `load` from its `on_webview_created` hook, which runs after
    * wry has set its own `RustWebViewClient`, so the current client is the one
-   * to wrap. Wry keeps its IPC object bound to that client, so it must stay in
-   * place as the delegate. See `SiteNavigationGuard` for the limits.
+   * to wrap. wry's `Ipc` object holds a reference to that original client and
+   * reads its `currentUrl`, which the delegate's `onPageStarted` keeps up to
+   * date. See `SiteNavigationGuard` for the limits.
    */
   private fun installNavigationGuard(webView: WebView) {
     val current = webView.webViewClient
