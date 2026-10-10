@@ -52,9 +52,15 @@ import android.app.Activity
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.graphics.Bitmap
+import android.net.Uri
 import android.util.Log
 import android.webkit.CookieManager
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
 import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
@@ -79,6 +85,21 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     // On Android the launcher and the sites share this single WebView, so
     // keeping the reference is all the storage commands need.
     sharedWebView = webView
+    installNavigationGuard(webView)
+  }
+
+  /**
+   * Wrap the WebView's client so top-level navigations pass the site policy.
+   *
+   * Tauri calls `load` from its `on_webview_created` hook, which runs after
+   * wry has set its own `RustWebViewClient`, so the current client is the one
+   * to wrap. Wry keeps its IPC object bound to that client, so it must stay in
+   * place as the delegate. See `SiteNavigationGuard` for the limits.
+   */
+  private fun installNavigationGuard(webView: WebView) {
+    val current = webView.webViewClient
+    if (current is SiteNavigationGuard) return
+    webView.webViewClient = SiteNavigationGuard(current)
   }
 
   override fun onDestroy(activity: AppCompatActivity) {
@@ -605,5 +626,138 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       return if (cleaned.isEmpty()) "default" else cleaned
     }
 
+  }
+}
+
+/**
+ * Top-level navigation guard for the shared site WebView (Android only).
+ *
+ * Desktop enforces the site policy in Tauri's `on_navigation` hook. Android has
+ * no equivalent for the single launcher WebView: wry's navigation handler is
+ * fixed when the WebView is created and is not reachable from app code. So this
+ * class wraps wry's `WebViewClient` and cancels the navigations that the desktop
+ * policy would refuse.
+ *
+ * Scope (verified against wry 0.55.1 source and the Android WebView docs, not on
+ * a device):
+ *  - Covered: top-level navigations that the WebView routes through
+ *    `shouldOverrideUrlLoading` (link clicks, `location` changes, main-frame
+ *    redirects as delivered by the WebView).
+ *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
+ *    `open_on_mobile` already validates the first URL), subframes, and
+ *    sub-resources.
+ *  - Not covered: the blocklist and DNS rebinding checks. Those live in Rust;
+ *    running DNS on the UI thread from this callback is not acceptable.
+ *
+ * Every other callback is forwarded unchanged, so wry's custom-protocol
+ * handling, the IPC page-started tracking and the error recovery keep working.
+ */
+class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
+
+  override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+    val uri = request.url
+    if (!SiteNavigationPolicy.allows(uri)) {
+      // Host and scheme only: paths and queries can carry tokens.
+      Log.w(LOG_TAG, "navigation blocked: ${uri.scheme}://${uri.host}")
+      return true
+    }
+    return inner.shouldOverrideUrlLoading(view, request)
+  }
+
+  override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+    inner.shouldInterceptRequest(view, request)
+
+  override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) =
+    inner.onPageStarted(view, url, favicon)
+
+  override fun onPageFinished(view: WebView, url: String) =
+    inner.onPageFinished(view, url)
+
+  override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) =
+    inner.onReceivedError(view, request, error)
+
+  companion object {
+    private const val LOG_TAG = "AnimeHubNavGuard"
+  }
+}
+
+/**
+ * The desktop site policy, restated for Kotlin. Keep it in step with
+ * `navigation_allowed` and `is_private_host` in `src-tauri/src/sites/url_policy.rs`;
+ * `tests/gaps.test.js` checks the shared host suffixes.
+ *
+ * Deliberately has no exception for the launcher's own origin: a site must not
+ * be able to load `tauri.localhost` into the WebView, because that origin is
+ * the one that receives IPC. The launcher returns through `loadUrl`, which is
+ * not routed through this guard.
+ */
+internal object SiteNavigationPolicy {
+  private val BLOCKED_HOSTS = setOf(
+    "localhost",
+    "localhost.localdomain",
+    "ip6-localhost",
+    "ip6-loopback",
+    "metadata.google.internal",
+  )
+
+  private val BLOCKED_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home")
+
+  private val IPV4 = Regex("""\d{1,3}(\.\d{1,3}){3}""")
+
+  fun allows(uri: Uri): Boolean {
+    val scheme = uri.scheme?.lowercase() ?: return false
+    return when (scheme) {
+      "https" -> hostAllowed(uri.host)
+      // Playback and inline-asset schemes, as in Rust's navigation_allowed.
+      "blob", "data", "about" -> true
+      // Plain http is a downgrade, and every other scheme is refused.
+      else -> false
+    }
+  }
+
+  private fun hostAllowed(rawHost: String?): Boolean {
+    val host = rawHost?.lowercase()?.trimEnd('.')
+    if (host.isNullOrEmpty()) return false
+    val bare = host.removePrefix("[").removeSuffix("]")
+    if (bare.contains(':') || IPV4.matches(bare)) return isPublicIp(bare)
+    if (host in BLOCKED_HOSTS) return false
+    return BLOCKED_SUFFIXES.none { host.endsWith(it) }
+  }
+
+  private fun isPublicIp(ip: String): Boolean =
+    if (ip.contains(':')) isPublicIpv6(ip) else isPublicIpv4(ip)
+
+  private fun isPublicIpv4(ip: String): Boolean {
+    val octets = ip.split('.').map { it.toIntOrNull() ?: return false }
+    if (octets.size != 4 || octets.any { it !in 0..255 }) return false
+    val a = octets[0]
+    val b = octets[1]
+    return !(
+      a == 0 ||                         // 0.0.0.0/8
+      a == 10 ||                        // private
+      a == 127 ||                       // loopback
+      (a == 100 && b in 64..127) ||     // CGNAT
+      (a == 169 && b == 254) ||         // link-local
+      (a == 172 && b in 16..31) ||      // private
+      (a == 192 && b == 0) ||           // IETF protocol assignments, documentation
+      (a == 192 && b == 168) ||         // private
+      (a == 198 && (b == 18 || b == 19)) || // benchmarking
+      a >= 224                          // multicast, reserved, broadcast
+    )
+  }
+
+  private fun isPublicIpv6(ip: String): Boolean {
+    val lower = ip.lowercase()
+    if (lower == "::1" || lower == "::") return false
+    if (lower.startsWith("::ffff:")) {
+      val v4 = lower.removePrefix("::ffff:")
+      return IPV4.matches(v4) && isPublicIpv4(v4)
+    }
+    val first = lower.substringBefore(':').ifEmpty { "0" }.toIntOrNull(16) ?: return false
+    return !(
+      (first and 0xffc0) == 0xfe80 ||   // link-local fe80::/10
+      (first and 0xfe00) == 0xfc00 ||   // unique local fc00::/7
+      (first and 0xff00) == 0xff00      // multicast ff00::/8
+    )
   }
 }

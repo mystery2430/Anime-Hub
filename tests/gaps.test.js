@@ -317,3 +317,24 @@ test("every overlay goes through the shared stack: focus return, inert backgroun
   assert.match(ui, /if \(overlayStack\.length > 0\)/);
   assert.match(ui, /trapFocus\(event\);/);
 });
+
+test("the Android navigation guard keeps the desktop host rules in step", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const rs = read(join(ROOT, "src-tauri/src/sites/url_policy.rs"));
+
+  // Suffixes the Rust policy refuses (`h.ends_with(".x")`).
+  const rustSuffixes = [...rs.matchAll(/h\.ends_with\("(\.[a-z.]+)"\)/g)].map((m) => m[1]);
+  const ktBlock = kt.slice(kt.indexOf("BLOCKED_SUFFIXES = listOf("));
+  const ktSuffixes = [...ktBlock.slice(0, ktBlock.indexOf(")")).matchAll(/"(\.[a-z.]+)"/g)].map((m) => m[1]);
+  assert.ok(rustSuffixes.length >= 5, "Rust suffix list should be found");
+  assert.deepEqual([...ktSuffixes].sort(), [...rustSuffixes].sort());
+
+  // Exact host names refused by Rust must be refused by Kotlin too, except the
+  // launcher origin names, which the Kotlin policy blocks by suffix instead.
+  const rustHosts = [...rs.matchAll(/"(localhost|localhost\.localdomain|ip6-localhost|ip6-loopback|metadata\.google\.internal)"/g)].map((m) => m[1]);
+  const ktHosts = kt.slice(kt.indexOf("BLOCKED_HOSTS = setOf("), kt.indexOf("BLOCKED_SUFFIXES")).match(/"[^"]+"/g).map((s) => s.slice(1, -1));
+  for (const host of new Set(rustHosts)) assert.ok(ktHosts.includes(host), `Kotlin should refuse ${host}`);
+
+  // The launcher origin has no exception: a site must not load it.
+  assert.equal(/tauri\.localhost"\s*->\s*return true/.test(kt), false);
+});
