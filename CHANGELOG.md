@@ -8,6 +8,12 @@ Notable user-facing changes are recorded here. Release assets are published from
 - PiP: the play/pause button is offered only when the player is a `<video>`. For a cross-origin iframe candidate the button is not shown, because the page script cannot control it. Device check pending.
 - Security: the launcher's `ipc` object is removed on every path, so a site page never gets it, even when the launcher listener cannot be installed. In that case launcher IPC is off on the device, and the developer log says so (fail closed). Device check pending.
 - Settings are applied only after the store accepts them. A failed save no longer leaves the live setting changed, and the switches are redrawn from the saved state. The "auto PiP" switch rolls its saved value back when the native controller fails or refuses (PiP unsupported), and says so. Desktop behaviour is unchanged.
+- Settings: the developer panel opens and the log refreshes only after the save succeeds. The blocklist switch saves the saved rule text, not an unsaved draft. The switches are redrawn from the saved state, including the developer and blocklist switches. If the platform cannot be identified, the "auto PiP" switch does not save and does not call the native controller; it says so and reverts. Desktop platforms (Windows, Linux, macOS) keep the preference only. Covered by `tests/settings_flow.test.js`. Local `npm test`: 149 pass, 0 fail.
+- Android IPC: `enter_pip`, `set_pip_auto_enter` and `debug_log` run on the async runtime (`#[tauri::command(async)]`), not on the IPC dispatch thread, because they wait for a Kotlin reply. Not device-verified.
+- Android: when launcher IPC cannot be installed (fail closed), a native notice tells the user that the in-app connection did not start. Not device-verified.
+- Android back affordance: verified from source that the app never produces `animehub://close-site` on Android (the overlay is desktop-only). The refusal blocks no working path. A native Android return path is not built. Documented in `docs/android-navigation.md`.
+- Docs: `docs/android-crash-diagnostics.md` gives `adb` steps for a crash or ANR, with redaction rules. Not a verified result.
+
 ### Android
 
 - Fixed a freeze (ANR) when the launcher's first native call ran on the UI thread: the `ipc` message listener now hands messages to a worker thread, so a plugin call such as the "auto PiP" setting no longer waits on a blocked UI thread. Found by reading the sources (wry, Tauri, androidx); not reproduced on a device yet.
