@@ -266,3 +266,34 @@ test("site card styles target the wrapper for menu visibility", () => {
   assert.match(css, /\.tile-wrap:hover \.tile-menu,\s*\.tile-wrap:focus-within \.tile-menu/);
   assert.equal(/\.tile:hover \.tile-menu/.test(css), false);
 });
+
+test("browser-mode settings stub matches the Rust Settings defaults", () => {
+  const bridge = read(join(ROOT, "src/logic/bridge.js"));
+  const rust = read(join(ROOT, "src-tauri/src/commands.rs"));
+
+  const jsStart = bridge.indexOf("settings: {", bridge.indexOf("const stubState"));
+  const jsEnd = bridge.indexOf("keyBackend:", jsStart);
+  assert.ok(jsStart > 0 && jsEnd > jsStart, "stub settings block should be present");
+  const stub = bridge.slice(jsStart, jsEnd);
+
+  const rStart = rust.indexOf("impl Default for Settings");
+  const rEnd = rust.indexOf("\n}\n", rStart);
+  assert.ok(rStart > 0 && rEnd > rStart, "Rust Settings default should be present");
+  const real = rust.slice(rStart, rEnd);
+
+  const pairs = [
+    [/blockPopups: (\w+)/, /block_popups: (\w+)/],
+    [/injectCosmeticRules: (\w+)/, /inject_cosmetic_rules: (\w+)/],
+    [/fullscreenSites: (\w+)/, /fullscreen_sites: (\w+)/],
+    [/pipAutoEnter: (\w+)/, /pip_auto_enter: (\w+)/],
+    [/developerOptions: (\w+)/, /developer_options: (\w+)/],
+  ];
+  for (const [jsRe, rustRe] of pairs) {
+    const jsVal = stub.match(jsRe)?.[1];
+    const rustVal = real.match(rustRe)?.[1];
+    assert.ok(jsVal && rustVal, `both sides should define ${jsRe}`);
+    assert.equal(jsVal, rustVal, `default mismatch for ${jsRe}`);
+  }
+  assert.match(stub, /theme: "system"/);
+  assert.match(real, /theme: ThemePref::System/);
+});
