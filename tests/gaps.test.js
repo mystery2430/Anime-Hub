@@ -350,9 +350,14 @@ test("Android IPC is limited to the launcher origins and main frame, never a sit
   assert.match(kt, /setOf\("http:\/\/tauri\.localhost", "https:\/\/tauri\.localhost"\)/);
   // Main-frame guard on the message path.
   assert.match(kt, /if \(!isMainFrame\) return/);
-  // The feature check keeps the wry object when unsupported, and says so.
+  // The object is removed on every path, before any early return, so an
+  // unsupported or non-Rust WebView still gives sites no `ipc` object.
+  const removeAt = kt.indexOf("removeJavascriptInterface(LauncherIpc.OBJECT_NAME)");
+  const restrictStart = kt.indexOf("private fun restrictIpcToLauncher");
+  const firstReturn = kt.indexOf("return", restrictStart);
+  assert.ok(removeAt > restrictStart && removeAt < firstReturn, "removal must come before any early return");
   assert.match(kt, /WebViewFeature\.isFeatureSupported\(WebViewFeature\.WEB_MESSAGE_LISTENER\)/);
-  assert.match(kt, /wry interface kept/);
+  assert.doesNotMatch(kt, /wry interface kept/);
   // A failed install is logged as an error and never falls back to a site-visible object.
   assert.match(kt, /try \{\s*WebViewCompat\.addWebMessageListener[\s\S]*?\} catch \(e: Exception\) \{[\s\S]*?Log\.e\(LOG_TAG/);
   // Nothing in the plugin exposes a JavascriptInterface to pages.

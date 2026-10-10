@@ -104,21 +104,26 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    * Android has no other IPC path (its custom protocol is off there), so the
    * launcher still needs the object. This replaces it with a WebMessageListener
    * that only the launcher origins receive, and only in the main frame.
-   * If the WebView lacks WEB_MESSAGE_LISTENER, wry's object stays and that is logged.
+   * If the listener cannot be installed, wry's object is still removed and the
+   * launcher's IPC is off (logged). Sites never get an `ipc` object.
    */
   private fun restrictIpcToLauncher(webView: WebView) {
+    // Remove wry's object on every path, first. A site page must never get an
+    // `ipc` object, even when the launcher listener cannot be installed. The
+    // cost of failing closed is that launcher IPC is off on that device; it is
+    // logged as an error below, not hidden.
+    webView.removeJavascriptInterface(LauncherIpc.OBJECT_NAME)
     val id = (webView as? RustWebView)?.id
     if (id == null) {
-      Log.w(LOG_TAG, "IPC not restricted: WebView is not a RustWebView")
-      AnimeHubDebugLog.add("ipc", "not restricted: WebView is not a RustWebView")
+      Log.e(LOG_TAG, "launcher IPC is off: WebView is not a RustWebView")
+      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebView is not a RustWebView")
       return
     }
     if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-      Log.w(LOG_TAG, "IPC not restricted: WebMessageListener unsupported, wry interface kept")
-      AnimeHubDebugLog.add("ipc", "WebMessageListener unsupported; wry object kept")
+      Log.e(LOG_TAG, "launcher IPC is off: WebMessageListener unsupported")
+      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebMessageListener unsupported")
       return
     }
-    webView.removeJavascriptInterface(LauncherIpc.OBJECT_NAME)
     try {
       WebViewCompat.addWebMessageListener(
         webView,
@@ -129,8 +134,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       AnimeHubDebugLog.add("ipc", "launcher listener installed")
     } catch (e: Exception) {
       AnimeHubDebugLog.add("ipc", "listener failed (${e.javaClass.simpleName}); launcher IPC is off")
-      // Fail closed: the wry object is already gone, so the launcher loses IPC,
-      // but no site page gets an `ipc` object. Logged as an error, not a warning.
+      // Fail closed: the wry object is already gone, so no site page gets an `ipc` object.
       Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off", e)
     }
   }
