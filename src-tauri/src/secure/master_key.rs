@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | Android | Android Keystore, used *inside* Kotlin | The raw key never enters the Rust process; [`crate::secure::keystore_android`] delegates seal/open to a `KeyStore`-backed cipher. |
 //! | Windows | DPAPI `CryptProtectData` (user scope) | The random key is stored as a DPAPI blob in the app-data dir. |
-//! | Linux | XDG Secret Service (gnome-keyring / KWallet) | Falls back to a `0600` key file only when no keyring is running. |
+//! | Linux | XDG Secret Service (gnome-keyring / KWallet) | Falls back to a `0600` key file only at first setup when no Secret Service exists. The choice is recorded in `key-source` and kept. A locked or failing keyring blocks opening; it never creates a second key. |
 //!
 //! The Linux fallback is a deliberate, documented degradation: a headless or
 //! minimal session often has no Secret Service, and refusing to start would be
@@ -128,7 +128,7 @@ pub fn load_master_key(dir: &Path) -> AppResult<MasterKey> {
 mod unix_file {
     use super::*;
 
-    const KEY_FILE_NAME: &str = "animehub.key";
+    pub(super) const KEY_FILE_NAME: &str = "animehub.key";
 
     pub fn load(dir: &Path) -> AppResult<MasterKey> {
         let k = file_fallback(dir)?;
@@ -243,40 +243,416 @@ mod unix_file {
 
 // ---------------------------------------------------------------------------
 // Linux: XDG Secret Service, with the encrypted-file fallback above.
+//
+// The key source is recorded in `key-source` in the config dir. The record,
+// not the keyring's current answer, decides which key may open the data:
+//   * `secret-service`: the keyring key sealed the data. If the keyring is
+//     locked, missing or failing, the app refuses to open. It never creates a
+//     second key.
+//   * `file`: the file key sealed the data. The keyring is ignored, even after
+//     it recovers, and is never written to.
 // ---------------------------------------------------------------------------
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
 mod linux {
     use super::*;
 
-    pub fn load(dir: &Path) -> AppResult<MasterKey> {
-        if let Some(k) = try_secret_service()? {
-            return Ok(MasterKey {
-                backend: Backend::SecretService,
-                key: Some(k),
-            });
-        }
-        unix_file::load(dir)
+    const SOURCE_FILE_NAME: &str = "key-source";
+    const SOURCE_KEYRING: &str = "secret-service";
+    const SOURCE_FILE: &str = "file";
+
+    /// What the platform store reported, reduced to what the policy needs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum StoreError {
+        /// No store is registered or reachable (no Secret Service running).
+        Unavailable,
+        /// The store exists but is locked, or the unlock was refused.
+        Locked,
+        /// Anything else: bad encoding, invalid, ambiguous, and so on.
+        Other,
     }
 
-    fn try_secret_service() -> AppResult<Option<Zeroizing<[u8; 32]>>> {
-        let entry = match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            Ok(e) => e,
-            // No Secret Service running (headless, minimal session, …).
-            Err(_) => return Ok(None),
-        };
+    /// The narrow surface the policy needs. `Ok(None)` means the store answered
+    /// and has no entry.
+    pub(super) trait SecretStore {
+        fn get(&self) -> Result<Option<String>, StoreError>;
+        fn set(&self, value: &str) -> Result<(), StoreError>;
+    }
 
-        match entry.get_password() {
-            Ok(hexkey) => Ok(Some(unix_file::decode_hex_key(&hexkey)?)),
-            Err(keyring::Error::NoEntry) => {
-                let key = generate_key();
-                let hex = hex::encode(key);
-                entry
-                    .set_password(&hex)
-                    .map_err(|e| AppError::Keyring(format!("anahtar kaydedilemedi: {e}")))?;
-                Ok(Some(Zeroizing::new(key)))
+    fn classify(e: &keyring::Error) -> StoreError {
+        match e {
+            keyring::Error::NoDefaultStore | keyring::Error::PlatformFailure(_) => {
+                StoreError::Unavailable
             }
-            // Locked keyring, D-Bus failure, etc. — degrade rather than die.
-            Err(_) => Ok(None),
+            keyring::Error::NoStorageAccess(_) => StoreError::Locked,
+            _ => StoreError::Other,
+        }
+    }
+
+    /// The real Secret Service through the `keyring` crate. `Entry::new` is the
+    /// call that connects, so its failure is kept and reported on every use.
+    struct KeyringStore(Result<keyring::Entry, StoreError>);
+
+    impl KeyringStore {
+        fn open() -> Self {
+            Self(keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| classify(&e)))
+        }
+    }
+
+    impl SecretStore for KeyringStore {
+        fn get(&self) -> Result<Option<String>, StoreError> {
+            let entry = self.0.as_ref().map_err(|e| *e)?;
+            match entry.get_password() {
+                Ok(v) => Ok(Some(v)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(classify(&e)),
+            }
+        }
+
+        fn set(&self, value: &str) -> Result<(), StoreError> {
+            let entry = self.0.as_ref().map_err(|e| *e)?;
+            entry.set_password(value).map_err(|e| classify(&e))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Source {
+        Keyring,
+        File,
+    }
+
+    pub fn load(dir: &Path) -> AppResult<MasterKey> {
+        resolve(&KeyringStore::open(), dir)
+    }
+
+    /// Pick the key for `dir`. Pure policy over a store and a directory, so the
+    /// tests can drive it with an in-memory store.
+    pub(super) fn resolve(store: &dyn SecretStore, dir: &Path) -> AppResult<MasterKey> {
+        match read_source(dir)? {
+            Some(Source::File) => {
+                let k = unix_file::existing_key(dir)?.ok_or_else(|| {
+                    AppError::Keyring(
+                        "anahtar dosyası bulunamadı; yeni anahtar oluşturulmadı, veriler açılmadı."
+                            .into(),
+                    )
+                })?;
+                Ok(file_key(k))
+            }
+            Some(Source::Keyring) => match store.get() {
+                Ok(Some(hex)) => Ok(keyring_key(unix_file::decode_hex_key(&hex)?)),
+                Ok(None) => Err(keyring_entry_missing()),
+                Err(_) => Err(keyring_unavailable()),
+            },
+            None => resolve_unrecorded(store, dir),
+        }
+    }
+
+    /// No record yet: a first start, or an install from before the record
+    /// existed.
+    fn resolve_unrecorded(store: &dyn SecretStore, dir: &Path) -> AppResult<MasterKey> {
+        // A key file that predates the record may be the key that sealed the
+        // data. Keep it, even when a keyring key exists as well.
+        if let Some(k) = unix_file::existing_key(dir)? {
+            write_source(dir, Source::File)?;
+            return Ok(file_key(k));
+        }
+
+        // Encrypted documents with no record and no key file were sealed by a
+        // key we cannot name. Only a keyring key can be that key.
+        let has_data = sealed_data_present(dir)?;
+        match store.get() {
+            Ok(Some(hex)) => {
+                let k = unix_file::decode_hex_key(&hex)?;
+                write_source(dir, Source::Keyring)?;
+                Ok(keyring_key(k))
+            }
+            Ok(None) if has_data => Err(keyring_entry_missing()),
+            Ok(None) => {
+                let key = Zeroizing::new(generate_key());
+                match store.set(&hex::encode(*key)) {
+                    Ok(()) => {
+                        write_source(dir, Source::Keyring)?;
+                        Ok(keyring_key(key))
+                    }
+                    // No Secret Service at all: nothing can hold a keyring key.
+                    Err(StoreError::Unavailable) => create_file_key(dir),
+                    Err(_) => Err(keyring_unavailable()),
+                }
+            }
+            // Nothing sealed yet and no Secret Service running: first setup
+            // without a keyring. Record the file key so it is never replaced.
+            Err(StoreError::Unavailable) if !has_data => create_file_key(dir),
+            // Locked or failing keyring, and we cannot tell whether it holds
+            // the key for existing data. Create nothing.
+            Err(_) => Err(keyring_unavailable()),
+        }
+    }
+
+    fn create_file_key(dir: &Path) -> AppResult<MasterKey> {
+        let k = unix_file::create_key(dir)?;
+        write_source(dir, Source::File)?;
+        Ok(file_key(k))
+    }
+
+    fn file_key(k: Zeroizing<[u8; 32]>) -> MasterKey {
+        MasterKey {
+            backend: Backend::EncryptedFile,
+            key: Some(k),
+        }
+    }
+
+    fn keyring_key(k: Zeroizing<[u8; 32]>) -> MasterKey {
+        MasterKey {
+            backend: Backend::SecretService,
+            key: Some(k),
+        }
+    }
+
+    fn keyring_unavailable() -> AppError {
+        AppError::Keyring(
+            "anahtar deposu kilitli veya geçici olarak kullanılamıyor; veriler açılmadı. \
+             Depoyu açıp uygulamayı yeniden başlatın."
+                .into(),
+        )
+    }
+
+    fn keyring_entry_missing() -> AppError {
+        AppError::Keyring(
+            "anahtar deposunda kayıtlı anahtar bulunamadı; yeni anahtar oluşturulmadı, \
+             veriler açılmadı."
+                .into(),
+        )
+    }
+
+    fn read_source(dir: &Path) -> AppResult<Option<Source>> {
+        match std::fs::read_to_string(dir.join(SOURCE_FILE_NAME)) {
+            Ok(s) => match s.trim() {
+                SOURCE_KEYRING => Ok(Some(Source::Keyring)),
+                SOURCE_FILE => Ok(Some(Source::File)),
+                _ => Err(AppError::Keyring(
+                    "anahtar kaynağı kaydı tanınmıyor; veriler açılmadı.".into(),
+                )),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn write_source(dir: &Path, source: Source) -> AppResult<()> {
+        std::fs::create_dir_all(dir)?;
+        let name = match source {
+            Source::Keyring => SOURCE_KEYRING,
+            Source::File => SOURCE_FILE,
+        };
+        let tmp = dir.join(format!("{SOURCE_FILE_NAME}.tmp"));
+        std::fs::write(&tmp, name)?;
+        std::fs::rename(&tmp, dir.join(SOURCE_FILE_NAME))?;
+        Ok(())
+    }
+
+    /// Whether any encrypted document is already on disk (`registry.bin`,
+    /// `secret.*.bin`).
+    fn sealed_data_present(dir: &Path) -> AppResult<bool> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            if entry?.file_name().to_string_lossy().ends_with(".bin") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+
+        /// In-memory store. While `outage` is set, every call fails with it.
+        struct FakeStore {
+            value: RefCell<Option<String>>,
+            outage: Cell<Option<StoreError>>,
+            sets: Cell<u32>,
+        }
+
+        impl FakeStore {
+            fn with(value: Option<&str>) -> Self {
+                Self {
+                    value: RefCell::new(value.map(str::to_string)),
+                    outage: Cell::new(None),
+                    sets: Cell::new(0),
+                }
+            }
+            fn down(&self, e: Option<StoreError>) {
+                self.outage.set(e);
+            }
+        }
+
+        impl SecretStore for FakeStore {
+            fn get(&self) -> Result<Option<String>, StoreError> {
+                if let Some(e) = self.outage.get() {
+                    return Err(e);
+                }
+                Ok(self.value.borrow().clone())
+            }
+            fn set(&self, value: &str) -> Result<(), StoreError> {
+                if let Some(e) = self.outage.get() {
+                    return Err(e);
+                }
+                self.sets.set(self.sets.get() + 1);
+                *self.value.borrow_mut() = Some(value.to_string());
+                Ok(())
+            }
+        }
+
+        fn open(store: &dyn SecretStore, dir: &Path) -> MasterKey {
+            resolve(store, dir).ok().expect("key should resolve")
+        }
+
+        fn key_bytes(m: &MasterKey) -> [u8; 32] {
+            *m.raw().ok().expect("key bytes")
+        }
+
+        fn source_of(dir: &Path) -> String {
+            std::fs::read_to_string(dir.join(SOURCE_FILE_NAME)).unwrap()
+        }
+
+        #[test]
+        fn first_setup_without_secret_service_uses_and_records_a_file_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FakeStore::with(None);
+            store.down(Some(StoreError::Unavailable));
+
+            let m = open(&store, dir.path());
+            assert_eq!(m.backend(), Backend::EncryptedFile);
+            assert!(dir.path().join(unix_file::KEY_FILE_NAME).exists());
+            assert_eq!(source_of(dir.path()), "file");
+            assert_eq!(store.sets.get(), 0, "no keyring entry may be written");
+        }
+
+        #[test]
+        fn keyring_key_survives_a_reopen() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FakeStore::with(None);
+
+            let first = key_bytes(&open(&store, dir.path()));
+            assert_eq!(store.sets.get(), 1);
+            assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
+            assert_eq!(source_of(dir.path()), "secret-service");
+
+            let again = open(&store, dir.path());
+            assert_eq!(again.backend(), Backend::SecretService);
+            assert_eq!(key_bytes(&again), first, "reopen must return the same key");
+            assert_eq!(store.sets.get(), 1, "reopen must not write a new key");
+        }
+
+        #[test]
+        fn temporary_keyring_failure_never_creates_a_second_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FakeStore::with(None);
+            open(&store, dir.path());
+
+            for e in [StoreError::Locked, StoreError::Unavailable, StoreError::Other] {
+                store.down(Some(e));
+                assert!(resolve(&store, dir.path()).is_err(), "{e:?} must fail closed");
+                assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
+                assert_eq!(source_of(dir.path()), "secret-service", "record unchanged");
+            }
+            assert_eq!(store.sets.get(), 1, "a failing keyring must not be written");
+        }
+
+        #[test]
+        fn locked_keyring_on_first_setup_creates_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FakeStore::with(None);
+            store.down(Some(StoreError::Locked));
+
+            assert!(resolve(&store, dir.path()).is_err());
+            assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
+            assert!(!dir.path().join(SOURCE_FILE_NAME).exists());
+            assert_eq!(store.sets.get(), 0);
+        }
+
+        #[test]
+        fn keyring_recovered_later_does_not_replace_the_file_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let offline = FakeStore::with(None);
+            offline.down(Some(StoreError::Unavailable));
+            let file_key = key_bytes(&open(&offline, dir.path()));
+
+            // The keyring is back and holds some other key.
+            let back = FakeStore::with(Some(hex::encode([7u8; 32]).as_str()));
+            let m = open(&back, dir.path());
+            assert_eq!(m.backend(), Backend::EncryptedFile);
+            assert_eq!(key_bytes(&m), file_key);
+            assert_eq!(back.sets.get(), 0, "the recovered keyring must not be written");
+        }
+
+        #[test]
+        fn fallback_never_opens_or_overwrites_data_sealed_under_another_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let sealed = b"sealed under the keyring key".to_vec();
+            std::fs::write(dir.path().join("registry.bin"), &sealed).unwrap();
+
+            // Data exists, no record, no key file: a locked or missing keyring
+            // must not produce a key, and the document must stay byte-identical.
+            for e in [StoreError::Unavailable, StoreError::Locked] {
+                let store = FakeStore::with(None);
+                store.down(Some(e));
+                assert!(resolve(&store, dir.path()).is_err());
+                assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
+            }
+            let empty = FakeStore::with(None);
+            assert!(resolve(&empty, dir.path()).is_err(), "no keyring key for existing data");
+            assert_eq!(empty.sets.get(), 0);
+            assert_eq!(std::fs::read(dir.path().join("registry.bin")).unwrap(), sealed);
+        }
+
+        #[test]
+        fn existing_data_with_a_keyring_key_adopts_that_key() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("registry.bin"), b"x").unwrap();
+            let store = FakeStore::with(Some(hex::encode([9u8; 32]).as_str()));
+
+            let m = open(&store, dir.path());
+            assert_eq!(m.backend(), Backend::SecretService);
+            assert_eq!(key_bytes(&m), [9u8; 32]);
+            assert_eq!(source_of(dir.path()), "secret-service");
+            assert_eq!(store.sets.get(), 0);
+        }
+
+        #[test]
+        fn recorded_keyring_key_missing_from_the_store_fails_closed() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(SOURCE_FILE_NAME), "secret-service").unwrap();
+            let store = FakeStore::with(None);
+
+            assert!(resolve(&store, dir.path()).is_err());
+            assert_eq!(store.sets.get(), 0, "a missing entry must not be re-created");
+            assert!(!dir.path().join(unix_file::KEY_FILE_NAME).exists());
+        }
+
+        #[test]
+        fn existing_key_file_without_a_record_is_kept_over_a_keyring_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let file_key = unix_file::create_key(dir.path()).unwrap();
+            let store = FakeStore::with(Some(hex::encode([5u8; 32]).as_str()));
+
+            let m = open(&store, dir.path());
+            assert_eq!(m.backend(), Backend::EncryptedFile);
+            assert_eq!(key_bytes(&m), *file_key);
+            assert_eq!(source_of(dir.path()), "file");
+            assert_eq!(store.sets.get(), 0);
+        }
+
+        #[test]
+        fn unknown_source_record_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(SOURCE_FILE_NAME), "something-else").unwrap();
+            let store = FakeStore::with(None);
+            assert!(resolve(&store, dir.path()).is_err());
         }
     }
 }
