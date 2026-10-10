@@ -338,3 +338,28 @@ test("the Android navigation guard keeps the desktop host rules in step", () => 
   // The launcher origin has no exception: a site must not load it.
   assert.equal(/tauri\.localhost"\s*->\s*return true/.test(kt), false);
 });
+
+test("Android IPC is limited to the launcher origins and main frame, never a site-facing JavascriptInterface", () => {
+  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  // Removes wry's `ipc` object before the listener is registered under the same name.
+  assert.match(kt, /webView\.removeJavascriptInterface\(LauncherIpc\.OBJECT_NAME\)/);
+  const remove = kt.indexOf("removeJavascriptInterface(LauncherIpc");
+  const add = kt.indexOf("WebViewCompat.addWebMessageListener(");
+  assert.ok(remove > 0 && add > remove, "remove must run before addWebMessageListener");
+  // Only the launcher origins may receive the object.
+  assert.match(kt, /setOf\("http:\/\/tauri\.localhost", "https:\/\/tauri\.localhost"\)/);
+  // Main-frame guard on the message path.
+  assert.match(kt, /if \(!isMainFrame\) return/);
+  // The feature check keeps the wry object when unsupported, and says so.
+  assert.match(kt, /WebViewFeature\.isFeatureSupported\(WebViewFeature\.WEB_MESSAGE_LISTENER\)/);
+  assert.match(kt, /wry interface kept/);
+  // A failed install is logged as an error and never falls back to a site-visible object.
+  assert.match(kt, /try \{\s*WebViewCompat\.addWebMessageListener[\s\S]*?\} catch \(e: Exception\) \{[\s\S]*?Log\.e\(LOG_TAG/);
+  // Nothing in the plugin exposes a JavascriptInterface to pages.
+  assert.doesNotMatch(kt, /@JavascriptInterface/);
+  assert.doesNotMatch(kt, /addJavascriptInterface/);
+  // Restriction runs in load(), after the navigation guard is installed.
+  const guard = kt.indexOf("installNavigationGuard(webView)");
+  const restrict = kt.indexOf("restrictIpcToLauncher(webView)");
+  assert.ok(guard > 0 && restrict > guard, "restrictIpcToLauncher must run after installNavigationGuard");
+});

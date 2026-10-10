@@ -62,6 +62,10 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.WebMessageCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
@@ -86,6 +90,40 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     // keeping the reference is all the storage commands need.
     sharedWebView = webView
     installNavigationGuard(webView)
+    restrictIpcToLauncher(webView)
+  }
+
+  /**
+   * wry gives every WebView a `ipc` JavaScript interface, so any page loaded in
+   * it, a remote site included, can call `window.ipc.postMessage`. Tauri on
+   * Android has no other IPC path (its custom protocol is off there), so the
+   * launcher still needs the object. This replaces it with a WebMessageListener
+   * that only the launcher origins receive, and only in the main frame.
+   * If the WebView lacks WEB_MESSAGE_LISTENER, wry's object stays and that is logged.
+   */
+  private fun restrictIpcToLauncher(webView: WebView) {
+    val id = (webView as? RustWebView)?.id
+    if (id == null) {
+      Log.w(LOG_TAG, "IPC not restricted: WebView is not a RustWebView")
+      return
+    }
+    if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+      Log.w(LOG_TAG, "IPC not restricted: WebMessageListener unsupported, wry interface kept")
+      return
+    }
+    webView.removeJavascriptInterface(LauncherIpc.OBJECT_NAME)
+    try {
+      WebViewCompat.addWebMessageListener(
+        webView,
+        LauncherIpc.OBJECT_NAME,
+        LauncherIpc.ORIGINS,
+        LauncherIpc(id),
+      )
+    } catch (e: Exception) {
+      // Fail closed: the wry object is already gone, so the launcher loses IPC,
+      // but no site page gets an `ipc` object. Logged as an error, not a warning.
+      Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off", e)
+    }
   }
 
   /**
@@ -760,5 +798,30 @@ internal object SiteNavigationPolicy {
       (first and 0xfe00) == 0xfc00 ||   // unique local fc00::/7
       (first and 0xff00) == 0xff00      // multicast ff00::/8
     )
+  }
+}
+
+/**
+ * Receives `window.ipc.postMessage` from the launcher only. The origin rules
+ * stop the object being injected into site pages at all; the main-frame check
+ * is a second, cheap guard. `Rust.ipc` gets the same arguments as wry's object:
+ * the WebView id, the page URL and the message text. Message bodies are never logged.
+ */
+class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListener {
+  override fun onPostMessage(
+    view: WebView,
+    message: WebMessageCompat,
+    sourceOrigin: Uri,
+    isMainFrame: Boolean,
+    replyProxy: JavaScriptReplyProxy,
+  ) {
+    if (!isMainFrame) return
+    val body = message.data ?: return
+    Rust.ipc(webViewId, view.url ?: "about:blank", body)
+  }
+
+  companion object {
+    const val OBJECT_NAME = "ipc"
+    val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
   }
 }
