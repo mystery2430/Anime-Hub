@@ -7,6 +7,26 @@ bir komutun çıktısı ya da açıkça "yapılamadı" olarak işaretli.
 
 ---
 
+## v0.3.3 yayın devri — 2026-10-10
+
+- Güncel sürüm: **0.3.3** (npm, Tauri, iki Rust paketi ve lockfile tutarlı).
+- Yerel: `npm test` **152 geçti / 0 hata**; `npm run build` başarılı;
+  `npm audit` **0 açık**. Rust/Android araç zinciri yok; bu kontroller CI’da yapılır.
+- PR CI, Release Desktop ve Release Android aynı yayın ağacı için geçmeden
+  tag/release oluşturulmaz. Release workflow’ları yalnızca paket üretir;
+  yayın prosedürü ve kanıt kaydı: [`docs/releasing.md`](docs/releasing.md).
+- **v0.3.3 fiziksel Android testi yapılmadı.** PiP/IPC/gezinti/performans
+  doğrulaması ve gerçek Linux Secret Service denemesi bekliyor.
+- **Android sağlayıcıları arasında aynı-origin localStorage/IndexedDB
+  izolasyonu garanti edilmez.** Aktarım güvenlik sınırı değildir, kayıpsız değildir.
+- CI debug APK’sı GitHub Release’e eklenmez. Yalnızca imzası doğrulanmış
+  üç ABI release APK’sı ve dört masaüstü paketi yayımlanır.
+- v0.3.2 tag’i ve release’i tarihsel kayıt olarak korunur.
+
+Aşağıdaki eski oturum kayıtları tarihsel kanıttır; v0.3.3 cihaz testi sonucu değildir.
+
+---
+
 ## 1. Proje bir cümlede
 
 Tauri 2 (Rust + native WebView) ile yazılmış bir **başlatıcı**: ikon ızgarası,

@@ -242,6 +242,17 @@ Ayrıntılı akış, oynatıcı seçim kuralları ve doğrulama durumu:
 
 ---
 
+## v0.3.3 — yayın ve sınırlar
+
+**v0.3.3 için fiziksel Android testi yapılmadı.** CI derlemesi cihaz doğrulaması
+anlamına gelmez; PiP, IPC, gezinti, çerez kalıcılığı ve performans cihaz testi bekliyor.
+**Android’de sağlayıcılar arası aynı-origin localStorage/IndexedDB izolasyonu
+garanti edilmez.** Best-effort aktarım bir güvenlik sınırı değildir.
+
+Üretim paketleri PR CI ve iki release workflow kontrolünden sonra yayımlanır.
+CI’daki `animehub-aarch64-debug.apk` yalnızca test içindir, GitHub Release varlığı değildir.
+Ayrıntılar: [v0.3.3 yayın prosedürü](docs/releasing.md).
+
 ## 📦&nbsp; Kurulum
 
 Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
@@ -250,8 +261,8 @@ Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
 
 | Yöntem | Boyut | Komut |
 |---|---|---|
-| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.2_amd64.deb` |
-| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh animehub-0.3.2-1.x86_64.rpm` |
+| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.3_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh AnimeHub-0.3.3-1.x86_64.rpm` |
 | **AppImage** | ~75 MB | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
 
 ```bash
@@ -265,7 +276,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
-> **Windows paketleri henüz kod imzalı değildir (v0.3.2 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
+> **Windows paketleri henüz kod imzalı değildir (v0.3.3 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
@@ -288,7 +299,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 |---|---|---|---|
 | 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Releases sayfasındaki paketler CI sürümünde üretildi |
 | 🪟 **Windows** | ✅ Doğrulandı | `.exe` (NSIS) | DPAPI + WebView2 profili; kurulum Windows üzerinde elle doğrulandı |
-| 🤖 **Android** | ✅ Doğrulandı | 3 ABI için imzalı `.apk` | CookieManager çerez kavanozu takası; aynı-origin localStorage/IndexedDB sağlayıcı yalıtımı çözülmedi |
+| 🤖 **Android** | ⚠️ CI derlemesi; fiziksel test yok | 3 ABI için imzalı `.apk` | CookieManager çerez kavanozu takası; aynı-origin localStorage/IndexedDB sağlayıcı yalıtımı çözülmedi |
 | 🍎 **macOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 | 🍏 **iOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 
@@ -356,13 +367,10 @@ etmeyin** — `.gitignore` bunu zaten engeller.
 | İş akışı | Tetikleyici | Ne yapar |
 |---|---|---|
 | `ci.yml` | her push / PR | 3 işletim sisteminde test, `fmt`, `clippy -D warnings`, `cargo audit`, gizli anahtar taraması |
-| `release-android.yml` | `v*` etiketi | 3 ABI için imzalı `.apk`, GitHub Release'e ekler |
-| `release-desktop.yml` | `v*` etiketi | Linux `.deb`/`.rpm`/AppImage + Windows NSIS |
+| `release-android.yml` | manuel dispatch | 3 ABI için imzası doğrulanmış release APK; CI varlığı, otomatik yayın yok |
+| `release-desktop.yml` | manuel dispatch | Linux `.deb`/`.rpm`/AppImage + Windows NSIS; CI varlığı, otomatik yayın yok |
 
-```bash
-git tag vX.Y.Z          # sürüm etiketi; iki release iş akışını da tetikler
-git push origin vX.Y.Z
-```
+Tag/release yalnızca tüm kontroller geçtikten sonra oluşturulur; bkz. [yayın prosedürü](docs/releasing.md).
 
 ---
 
@@ -382,7 +390,7 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 | Doğrulama | Sonuç |
 |---|---|
-| `npm test` | **117 test geçti**, 0 hata (yerel, 2026-10-10; çıktı `# pass 117` / `# fail 0`) |
+| `npm test` | **152 test geçti**, 0 hata (v0.3.3, yerel, 2026-10-10) |
 | `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | Yerelde çalıştırılmadı (Rust araç zinciri yok). Son yeşil CI koşusu daha eski bir commit'te; güncel commit için GitHub Actions'taki Tests işi (`ubuntu-24.04`, `macos-latest`, `windows-latest`) esas alınmalı |
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
