@@ -270,7 +270,7 @@ mod unix_file {
     /// Uses `O_NOFOLLOW | O_EXCL | O_CREAT` relative to an opened dir fd
     /// and validates the opened fd. This prevents a concurrent rename of the
     /// directory from bypassing `ensure_dir_safe`.
-    fn write_private(path: &PathBuf, bytes: &[u8]) -> AppResult<()> {
+    fn write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = path
             .parent()

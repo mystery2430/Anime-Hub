@@ -319,17 +319,16 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                 && seg[3] == 0
                 && seg[4] == 0
                 && seg[5] == 0
+                && (seg[6] != 0 || seg[7] != 0)
             {
-                if seg[6] != 0 || seg[7] != 0 {
-                    let v4 = std::net::Ipv4Addr::new(
-                        ((seg[6] >> 8) & 0xff) as u8,
-                        (seg[6] & 0xff) as u8,
-                        ((seg[7] >> 8) & 0xff) as u8,
-                        (seg[7] & 0xff) as u8,
-                    );
-                    if !ip_is_public(&std::net::IpAddr::V4(v4)) {
-                        return false;
-                    }
+                let v4 = std::net::Ipv4Addr::new(
+                    ((seg[6] >> 8) & 0xff) as u8,
+                    (seg[6] & 0xff) as u8,
+                    ((seg[7] >> 8) & 0xff) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+                    return false;
                 }
             }
             // 64:ff9b::/96 translation – globally reachable true per IANA,

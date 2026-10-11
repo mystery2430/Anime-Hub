@@ -948,7 +948,7 @@ internal object SiteNavigationPolicy {
       }
       // 64:ff9b::/96 translation – globally reachable true per IANA,
       // but the embedded IPv4 must itself be globally reachable (RFC 6052).
-      if (bytes[0].toInt() and 0xFF) == 0x00 && (bytes[1].toInt() and 0xFF) == 0x64 &&
+      if ((bytes[0].toInt() and 0xFF) == 0x00 && (bytes[1].toInt() and 0xFF) == 0x64 &&
         (bytes[2].toInt() and 0xFF) == 0xFF && (bytes[3].toInt() and 0xFF) == 0x9B &&
         (bytes[4].toInt() and 0xFF) == 0x00 && (bytes[5].toInt() and 0xFF) == 0x00 &&
         (bytes[6].toInt() and 0xFF) == 0x00 && (bytes[7].toInt() and 0xFF) == 0x00 &&

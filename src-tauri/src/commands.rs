@@ -1033,9 +1033,7 @@ pub fn set_pip_auto_enter(
             Ok(v) => v,
             Err(e) => {
                 // Best-effort revert: native may have toggled before throwing.
-                let reverted = crate::android_bridge::set_pip_auto_enter(previous)
-                    .map(|v| v)
-                    .unwrap_or(false);
+                let reverted = crate::android_bridge::set_pip_auto_enter(previous).unwrap_or(false);
                 if reverted {
                     return Err(e);
                 } else {
@@ -1069,9 +1067,7 @@ pub fn set_pip_auto_enter(
             Err(e) => {
                 // Persist failed – try to revert native on Android.
                 if is_android {
-                    let reverted = crate::android_bridge::set_pip_auto_enter(previous)
-                        .map(|v| v)
-                        .unwrap_or(false);
+                    let reverted = crate::android_bridge::set_pip_auto_enter(previous).unwrap_or(false);
                     if reverted {
                         return Err(e);
                     } else {
