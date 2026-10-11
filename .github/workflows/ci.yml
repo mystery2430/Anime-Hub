@@ -168,13 +168,18 @@ jobs:
           cat /tmp/tauri-exit.log
           echo "=== gen after init (full) ==="
           find src-tauri/gen -type f 2>&1 | head -n 200
+          ls -la src-tauri/gen/android/ 2>&1 | head -n 100
           ls -R src-tauri/gen 2>&1 | head -n 500
           echo "=== settings.gradle ==="
           cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
           echo "=== tauri.settings.gradle ==="
           cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 100 || echo "tauri.settings.gradle MISSING"
+          ls -la src-tauri/gen/android/ 2>&1 | head -n 100
           ls -l src-tauri/gen/android/*.gradle 2>&1 | head -n 50
-          find src-tauri/gen -name "*.gradle" 2>&1 | head -n 50
+          find src-tauri/gen -name "*.gradle" 2>&1 | head -n 100
+          echo "=== check for tauri.settings.gradle in app ==="
+          find src-tauri/gen -name "tauri.settings.gradle" 2>&1 | head -n 20
+          ls -la src-tauri/gen/android/app/ 2>&1 | head -n 50
           echo "=== cargo check ==="
           cargo --version 2>&1 | head || echo "cargo not found"
           rustc --version 2>&1 | head || echo "rustc not found"
