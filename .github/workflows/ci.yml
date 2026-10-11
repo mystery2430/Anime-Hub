@@ -160,7 +160,10 @@ jobs:
           echo "=== tauri version ==="
           npx @tauri-apps/cli --version
           echo "=== running tauri android init (verbose) ==="
-          npm run tauri android init -- --verbose 2>&1 | head -n 300
+          npm run tauri android init -- --verbose > /tmp/tauri-init.log 2>&1 || true
+          cat /tmp/tauri-init.log 2>&1 | head -n 500
+          echo "=== tauri init exit code ==="
+          cat /tmp/tauri-init.log 2>&1 | tail -n 20
           echo "=== gen after init (full) ==="
           find src-tauri/gen -type f 2>&1 | head -n 100
           ls -R src-tauri/gen 2>&1 | head -n 300
@@ -174,6 +177,7 @@ jobs:
           mkdir -p /tmp
           ls -R src-tauri/gen > /tmp/init-ls.log 2>&1 || true
           cat src-tauri/gen/android/settings.gradle > /tmp/settings.log 2>&1 || true
+          cat /tmp/tauri-init.log > /tmp/tauri-init-full.log 2>&1 || true
           if [ ! -f src-tauri/gen/android/tauri.settings.gradle ]; then
             echo "::error::tauri.settings.gradle missing after tauri android init – check tauri-cli version and init output"
             echo "=== ls -R src-tauri/gen ==="
@@ -182,12 +186,11 @@ jobs:
             find src-tauri/gen -name "*.gradle" 2>&1 | head -n 50
             echo "=== cat settings.gradle ==="
             cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
+            echo "=== tauri-init.log tail ==="
+            cat /tmp/tauri-init.log 2>&1 | tail -n 100
             npx @tauri-apps/cli info 2>&1 | head -n 100 || true
             ls -R src-tauri 2>&1 | head -n 100 || true
-            # Also save for next step and comment
-            ls -R src-tauri/gen > /tmp/init-fail.log 2>&1 || true
-            cat src-tauri/gen/android/settings.gradle > /tmp/settings-fail.log 2>&1 || true
-            gh pr comment ${{ github.event.pull_request.number }} --body "init fail: $(cat src-tauri/gen/android/settings.gradle 2>&1 | head -c 1500 | tr '\n' ' ') -- $(ls -R src-tauri/gen 2>&1 | head -c 1500 | tr '\n' ' ')" || true
+            gh pr comment ${{ github.event.pull_request.number }} --body "init fail: tauri.settings.gradle missing, init log: $(cat /tmp/tauri-init.log 2>&1 | tail -c 3000 | tr '\n' ' ' | head -c 3000)" || true
             exit 1
           fi
 
