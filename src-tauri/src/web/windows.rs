@@ -1073,6 +1073,8 @@ mod tests {
             startup_warning: Mutex::new(warning),
             launcher_url: Mutex::new(None),
             current_site: Mutex::new(current),
+            pip_lock: Mutex::new(()),
+            pip_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

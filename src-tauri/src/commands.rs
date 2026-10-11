@@ -1009,6 +1009,7 @@ pub fn set_pip_auto_enter(
 
     if enabled == previous {
         // No change – still return the current view for the UI.
+        drop(_pip_guard);
         return get_settings(state);
     }
 
@@ -1407,7 +1408,7 @@ mod tests {
             0
         );
         // Change pip via update_settings
-        let patch = SettingsPatch {
+        let _patch = SettingsPatch {
             blocklist: None,
             block_popups: None,
             inject_cosmetic_rules: None,
@@ -1432,16 +1433,16 @@ mod tests {
     #[test]
     fn pip_startup_skips_when_lock_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let st = state_in(dir.path());
+        let st = std::sync::Arc::new(state_in(dir.path()));
         // Hold the lock in this thread, then try to acquire it from another
         // thread like startup would with try_lock – it should fail.
         let guard = st.pip_lock.lock().unwrap();
-        let st_ref = &st;
+        let st2 = std::sync::Arc::clone(&st);
         let try_result = std::thread::spawn(move || {
             // This thread tries to acquire the lock while main holds it.
             // In real startup we use try_lock which should fail.
             // Here we test that try_lock indeed fails when held.
-            st_ref.pip_lock.try_lock().is_err()
+            st2.pip_lock.try_lock().is_err()
         })
         .join()
         .unwrap();

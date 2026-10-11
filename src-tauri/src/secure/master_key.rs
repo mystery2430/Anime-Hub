@@ -127,6 +127,7 @@ pub fn load_master_key(dir: &Path) -> AppResult<MasterKey> {
 #[cfg(all(unix, not(target_os = "android")))]
 mod unix_file {
     use super::*;
+    use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::io::FromRawFd as _;
 
     pub(super) const KEY_FILE_NAME: &str = "animehub.key";
@@ -471,6 +472,7 @@ mod unix_file {
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
 mod linux {
     use super::*;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     const SOURCE_FILE_NAME: &str = "key-source";
     const SOURCE_KEYRING: &str = "secret-service";
