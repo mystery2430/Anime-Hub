@@ -156,7 +156,7 @@ jobs:
 
       - name: Initialise the Android project
         run: |
-          rm -rf src-tauri/gen/android
+          rm -rf src-tauri/gen
           echo "=== tauri version ==="
           npx @tauri-apps/cli --version
           echo "=== node_modules/.bin/tauri ==="
