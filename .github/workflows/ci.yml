@@ -180,6 +180,14 @@ jobs:
           fi
           echo "Kotlin policy test passed via Gradle (IpPolicy.kt – same file APK uses)"
 
+      - name: Upload Kotlin test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-test-log
+          path: /tmp/kotlin-test.log
+          if-no-files-found: ignore
+
       - name: Build installable debug APK
         # A debug variant is signed with Android's generated debug key, so the
         # CI artifact can be installed for testing without release keystore
