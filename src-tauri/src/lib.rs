@@ -107,11 +107,28 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // side and the plugin bridge may not answer in the first moments of the
     // process, so this retries a few times instead of blocking startup. A
     // failure here is only a warning — the toggle keeps working.
+    // The thread re-reads the current settings before each attempt; if the
+    // user has toggled the switch in the meantime, the stale startup value is
+    // not allowed to overwrite the newer choice. This provides a tiny, safe
+    // shared ordering without blocking other settings.
     #[cfg(target_os = "android")]
     {
         let pip_auto_enter = settings.pip_auto_enter;
+        let handle = app.handle().clone();
         std::thread::spawn(move || {
             for attempt in 0..4 {
+                // If the live settings now differ from the captured startup value,
+                // the user has toggled – do not overwrite the newer native state.
+                let live_pip = handle
+                    .try_state::<AppState>()
+                    .and_then(|s| s.settings.lock().ok().map(|g| g.pip_auto_enter))
+                    .unwrap_or(pip_auto_enter);
+                if live_pip != pip_auto_enter {
+                    log::debug!(
+                        "PiP startup skipped (live {live_pip} != startup {pip_auto_enter})"
+                    );
+                    return;
+                }
                 match crate::android_bridge::set_pip_auto_enter(pip_auto_enter) {
                     Ok(applied) => {
                         log::debug!("PiP auto-enter ayarı uygulandı: {applied}");

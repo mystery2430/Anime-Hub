@@ -828,12 +828,19 @@ internal object SiteNavigationPolicy {
    * plus multicast/reserved. Keep in step with Rust `ip_is_public` in
    * `src-tauri/src/sites/url_policy.rs`.
    */
+  /**
+   * IANA IPv4 Special-Purpose Registry (2025-10-09) – Globally Reachable == false
+   * plus multicast/reserved. Keep in step with Rust `ip_is_public` in
+   * `src-tauri/src/sites/url_policy.rs`. Precise: 192.0.0.0/24 has exceptions
+   * 192.0.0.9/32 and 192.0.0.10/32 (Globally Reachable true, RFC 7723/8155).
+   */
   private fun isPublicIpv4(ip: String): Boolean {
     val octets = ip.split('.').map { it.toIntOrNull() ?: return false }
     if (octets.size != 4 || octets.any { it !in 0..255 }) return false
     val a = octets[0]
     val b = octets[1]
     val c = octets[2]
+    val d = octets[3]
     return !(
       a == 0 ||                         // 0.0.0.0/8 This network
       a == 10 ||                        // 10.0.0.0/8 private
@@ -841,7 +848,8 @@ internal object SiteNavigationPolicy {
       (a == 100 && b in 64..127) ||     // 100.64.0.0/10 CGNAT
       (a == 169 && b == 254) ||         // 169.254.0.0/16 link-local
       (a == 172 && b in 16..31) ||      // 172.16.0.0/12 private
-      (a == 192 && b == 0) ||           // 192.0.0.0/24 IANA + 192.0.2.0/24 TEST-NET-1 (covers 192.0.0.0/24 broadly)
+      (a == 192 && b == 0 && c == 0 && d != 9 && d != 10) || // 192.0.0.0/24 IANA (except .9/.10 globally reachable)
+      (a == 192 && b == 0 && c == 2) || // 192.0.2.0/24 TEST-NET-1
       (a == 192 && b == 88 && c == 99) || // 192.88.99.0/24 6to4 relay (deprecated)
       (a == 192 && b == 168) ||         // 192.168.0.0/16 private
       (a == 198 && b == 51 && c == 100) || // 198.51.100.0/24 TEST-NET-2
@@ -852,35 +860,77 @@ internal object SiteNavigationPolicy {
   }
 
   /**
-   * IANA IPv6 Special-Purpose Registry (2025-10-09) – Globally Reachable == false
-   * plus multicast, link-local, ULA, documentation. Uses `InetAddress` for
-   * robust :: compression and IPv4-embedded handling, so `::7f00:1` and
-   * `::ffff:192.168.1.1` are correctly recognised via the embedded IPv4.
+   * IANA IPv6 Special-Purpose Registry (2025-10-09) – Globally Reachable == false.
+   * Uses `InetAddress` for :: compression. On parse error safely rejects.
+   * Missing ranges 3fff::/20, 64:ff9b:1::/48, 100:0:0:1::/64, 2001:2::/48, 5f00::/16,
+   * and 2001::/23 with more-specific exceptions are handled. Prefix lengths are
+   * checked exactly; 64:ff9b::/96 vs 64:ff9b:1::/48 are not confused.
    */
   private fun isPublicIpv6(ip: String): Boolean {
-    // Fast path for the two most common special addresses without needing InetAddress.
     val lower = ip.lowercase()
     if (lower == "::1" || lower == "::") return false
-    // Use InetAddress for correct :: expansion and embedded-IPv4 detection.
-    // This never does DNS for literals (host contains ':').
     try {
       val addr = InetAddress.getByName(ip) as? Inet6Address ?: return false
       if (addr.isAnyLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress) return false
       val bytes = addr.address // 16 bytes, network order
-      // fe80::/10 link-local: 1111111010
+
+      // fe80::/10 link-local
       if ((bytes[0].toInt() and 0xFF) == 0xFE && (bytes[1].toInt() and 0xC0) == 0x80) return false
-      // fc00::/7 unique local: 1111110x
+      // fc00::/7 unique local
       if ((bytes[0].toInt() and 0xFE) == 0xFC) return false
+      // ff00::/8 multicast (already via isMulticast but explicit for malformed)
+      if ((bytes[0].toInt() and 0xFF) == 0xFF) return false
       // 2001:db8::/32 documentation
-      if ((bytes[0].toInt() and 0xFF) == 0x20 && (bytes[1].toInt() and 0xFF) == 0x01 &&
-        (bytes[2].toInt() and 0xFF) == 0x0D && (bytes[3].toInt() and 0xFF) == 0xB8
+      if (bytes[0] == 0x20.toByte() && bytes[1] == 0x01.toByte() && bytes[2] == 0x0D.toByte() && bytes[3] == 0xB8.toByte()) return false
+      // 100::/64 discard-only (0100:0000:0000:0000/64) – exact /64
+      if (bytes[0] == 0x01.toByte() && bytes[1] == 0x00.toByte() && bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() &&
+        bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte() && bytes[6] == 0x00.toByte() && bytes[7] == 0x00.toByte()
       ) return false
-      // 100::/64 discard-only
-      if ((bytes[0].toInt() and 0xFF) == 0x01 && (bytes[1].toInt() and 0xFF) == 0x00 &&
-        bytes[2] == 0.toByte() && bytes[3] == 0.toByte() &&
-        bytes[4] == 0.toByte() && bytes[5] == 0.toByte() &&
-        bytes[6] == 0.toByte() && bytes[7] == 0.toByte()
+      // 100:0:0:1::/64 dummy (0100:0000:0000:0001/64) – distinct /64 inside 100::/64 supernet
+      if (bytes[0] == 0x01.toByte() && bytes[1] == 0x00.toByte() && bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() &&
+        bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte() && bytes[6] == 0x00.toByte() && bytes[7] == 0x01.toByte()
       ) return false
+      // 3fff::/20 documentation (RFC 9637) – first 20 bits 0011 1111 1111
+      if ((bytes[0].toInt() and 0xFF) == 0x3F && (bytes[1].toInt() and 0xFF) == 0xFF && (bytes[2].toInt() and 0xF0) == 0x00) return false
+      // 5f00::/16 SRv6 SIDs
+      if ((bytes[0].toInt() and 0xFF) == 0x5F && (bytes[1].toInt() and 0xFF) == 0x00) return false
+      // 64:ff9b:1::/48 translation – false (must be checked before /96)
+      if (bytes[0] == 0x00.toByte() && bytes[1] == 0x64.toByte() && bytes[2] == 0xFF.toByte() && bytes[3] == 0x9B.toByte() &&
+        bytes[4] == 0x00.toByte() && bytes[5] == 0x01.toByte()
+      ) return false
+      // 2001:2::/48 benchmarking – false
+      if (bytes[0] == 0x20.toByte() && bytes[1] == 0x01.toByte() && bytes[2] == 0x00.toByte() && bytes[3] == 0x02.toByte() &&
+        bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte()
+      ) return false
+      // 2001::/23 IETF protocol assignments – false unless more-specific true allocation
+      val in2001_23 = (bytes[0].toInt() and 0xFF) == 0x20 && (bytes[1].toInt() and 0xFF) == 0x01 && (bytes[2].toInt() and 0xFE) == 0x00
+      if (in2001_23) {
+        // Whitelist true allocations inside /23 (TEREDO, PCP, AMT, AS112, ORCHIDv2)
+        val isTeredo = bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() // 2001::/32
+        val isPcp1 = bytes[0]==0x20.toByte() && bytes[1]==0x01.toByte() && bytes[2]==0x00.toByte() && bytes[3]==0x01.toByte() &&
+          bytes[4]==0x00.toByte() && bytes[5]==0x00.toByte() && bytes[6]==0x00.toByte() && bytes[7]==0x00.toByte() &&
+          bytes[8]==0x00.toByte() && bytes[9]==0x00.toByte() && bytes[10]==0x00.toByte() && bytes[11]==0x00.toByte() &&
+          bytes[12]==0x00.toByte() && bytes[13]==0x00.toByte() && bytes[14]==0x00.toByte() && bytes[15]==0x01.toByte()
+        val isPcp2 = bytes[0]==0x20.toByte() && bytes[1]==0x01.toByte() && bytes[2]==0x00.toByte() && bytes[3]==0x01.toByte() &&
+          bytes[4]==0x00.toByte() && bytes[5]==0x00.toByte() && bytes[6]==0x00.toByte() && bytes[7]==0x00.toByte() &&
+          bytes[8]==0x00.toByte() && bytes[9]==0x00.toByte() && bytes[10]==0x00.toByte() && bytes[11]==0x00.toByte() &&
+          bytes[12]==0x00.toByte() && bytes[13]==0x00.toByte() && bytes[14]==0x00.toByte() && bytes[15]==0x02.toByte()
+        // 2001:3::/32 AMT
+        val isAmt = bytes[2] == 0x00.toByte() && bytes[3] == 0x03.toByte()
+        // 2001:4:112::/48 AS112-v6 (approx)
+        val isAs112 = bytes[2] == 0x00.toByte() && bytes[3] == 0x04.toByte() && bytes[4] == 0x01.toByte() && bytes[5] == 0x12.toByte()
+        // 2001:20::/28, 2001:30::/28, 2001:10::/28 (ORCHIDv2 etc) – first 28 bits
+        val b2 = bytes[2].toInt() and 0xFF
+        val b3 = bytes[3].toInt() and 0xFF
+        val isOrchid = b2 == 0x00 && (b3 == 0x10 || b3 == 0x20 || b3 == 0x30)
+        val allowedIn23 = isTeredo || isPcp1 || isPcp2 || isAmt || isAs112 || isOrchid
+        if (!allowedIn23) {
+          // Also allow any /23 address that is explicitly documented as true via more-specific table but not in our small whitelist?
+          // Fail-closed: treat unknown /23 as blocked.
+          return false
+        }
+      }
+
       // Detect IPv4-embedded: ::ffff:0:0/96 (mapped) and ::/96 (compatible, deprecated)
       val isMapped = bytes[0] == 0.toByte() && bytes[1] == 0.toByte() && bytes[2] == 0.toByte() && bytes[3] == 0.toByte() &&
         bytes[4] == 0.toByte() && bytes[5] == 0.toByte() && bytes[6] == 0.toByte() && bytes[7] == 0.toByte() &&
@@ -892,27 +942,12 @@ internal object SiteNavigationPolicy {
         val v4 = "${bytes[12].toInt() and 0xFF}.${bytes[13].toInt() and 0xFF}.${bytes[14].toInt() and 0xFF}.${bytes[15].toInt() and 0xFF}"
         return isPublicIpv4(v4)
       }
-      // 64:ff9b::/96 translation – check inner IPv4 if present
-      if ((bytes[0].toInt() and 0xFF) == 0x00 && (bytes[1].toInt() and 0xFF) == 0x64 &&
-        (bytes[2].toInt() and 0xFF) == 0xFF && (bytes[3].toInt() and 0xFF) == 0x9B
-      ) {
-        val v4 = "${bytes[12].toInt() and 0xFF}.${bytes[13].toInt() and 0xFF}.${bytes[14].toInt() and 0xFF}.${bytes[15].toInt() and 0xFF}"
-        if (!isPublicIpv4(v4)) return false
-      }
+      // 64:ff9b::/96 translation – globally reachable true, do NOT block (inner IPv4 not checked).
+      // The /48 variant already returned false above.
       return true
     } catch (e: Exception) {
-      // Fallback for malformed input – use the previous string checks for
-      // the two fast-path cases, otherwise reject.
-      if (lower.startsWith("::ffff:")) {
-        val v4 = lower.removePrefix("::ffff:")
-        return IPV4.matches(v4) && isPublicIpv4(v4)
-      }
-      val first = lower.substringBefore(':').ifEmpty { "0" }.toIntOrNull(16) ?: return false
-      return !(
-        (first and 0xffc0) == 0xfe80 ||
-        (first and 0xfe00) == 0xfc00 ||
-        (first and 0xff00) == 0xff00
-      )
+      // On parser failure, safely reject (fail-closed). Never accept based on first segment.
+      return false
     }
   }
 }

@@ -648,6 +648,13 @@ function ensureThemeFlow() {
         /* private mode etc. — the backend copy still persists */
       }
     },
+    cacheGet: () => {
+      try {
+        return localStorage.getItem(THEME_CACHE_KEY);
+      } catch {
+        return null;
+      }
+    },
     applyNative: (pref) => call("set_window_theme", { theme: normalizeTheme(pref) }),
   });
   return themeFlow;

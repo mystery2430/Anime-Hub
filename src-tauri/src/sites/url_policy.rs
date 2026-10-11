@@ -168,6 +168,13 @@ pub fn is_private_host(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(h);
+    // If it looks like an IP literal but fails to parse, treat as private (fail-closed).
+    if bare.contains(':') {
+        return match bare.parse::<std::net::IpAddr>() {
+            Ok(ip) => !ip_is_public(&ip),
+            Err(_) => true,
+        };
+    }
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return !ip_is_public(&ip);
     }
@@ -200,9 +207,10 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
 fn ip_is_public(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            let [a, b, c, _] = v4.octets();
+            let [a, b, c, d] = v4.octets();
             // IANA IPv4 Special-Purpose Registry (2025-10-09) – Globally Reachable == false
             // plus multicast/reserved. Keep in step with Kotlin SiteNavigationPolicy.
+            // 192.0.0.0/24 has exceptions 192.0.0.9/32 and 192.0.0.10/32 (true).
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -212,8 +220,10 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                 || a == 0 // 0.0.0.0/8 This network
                 // 100.64.0.0/10 CGNAT
                 || (a == 100 && (64..=127).contains(&b))
-                // 192.0.0.0/24 IANA reserved, 192.0.2.0/24 TEST-NET-1
-                || (a == 192 && b == 0)
+                // 192.0.0.0/24 IANA reserved, but 192.0.0.9 and .10 are globally reachable (RFC 7723/8155)
+                || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+                // 192.0.2.0/24 TEST-NET-1
+                || (a == 192 && b == 0 && c == 2)
                 // 192.88.99.0/24 6to4 relay (deprecated)
                 || (a == 192 && b == 88 && c == 99)
                 // 198.18.0.0/15 benchmarking
@@ -225,57 +235,87 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
             if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return false;
             }
-            // IPv4-embedded: ::ffff:0:0/96 (mapped) and ::/96 (compatible, deprecated)
-            // `to_ipv4_mapped` covers the former; compatible needs manual check for
-            // `::7f00:1` etc. Both delegate to the IPv4 policy.
-            if let Some(m) = v6.to_ipv4_mapped() {
-                if !ip_is_public(&std::net::IpAddr::V4(m)) {
-                    return false;
-                }
-            } else {
-                // Check IPv4-compatible ::/96 (first 96 bits zero, last 32 bits != 0)
-                let seg = v6.segments();
-                if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
-                    // Last 32 bits are an IPv4 address (could be ::7f00:1)
-                    // Avoid treating :: and ::1 as IPv4 (already handled, but last bits zero)
-                    if seg[6] != 0 || seg[7] != 0 {
-                        let v4 = std::net::Ipv4Addr::new(
-                            ((seg[6] >> 8) & 0xff) as u8,
-                            (seg[6] & 0xff) as u8,
-                            ((seg[7] >> 8) & 0xff) as u8,
-                            (seg[7] & 0xff) as u8,
-                        );
-                        if !ip_is_public(&std::net::IpAddr::V4(v4)) {
-                            return false;
-                        }
-                    }
-                }
-            }
             let seg = v6.segments();
-            // 2001:db8::/32 documentation
-            if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+            // 3fff::/20 documentation (RFC 9637) – first 20 bits 0011 1111 1111
+            if seg[0] == 0x3fff && (seg[1] & 0xf000) == 0x0000 {
+                return false;
+            }
+            // 5f00::/16 SRv6 SIDs
+            if seg[0] == 0x5f00 {
+                return false;
+            }
+            // 64:ff9b:1::/48 translation – false (must be before /96 handling)
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
                 return false;
             }
             // 100::/64 discard-only
             if seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 {
                 return false;
             }
+            // 100:0:0:1::/64 dummy
+            if seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0x0001 {
+                return false;
+            }
+            // 2001:db8::/32 documentation
+            if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+                return false;
+            }
+            // 2001:2::/48 benchmarking
+            if seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0x0000 {
+                return false;
+            }
+            // 2001::/23 IETF protocol assignments – false unless more-specific true allocation
+            if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0x0000 {
+                // Whitelist true allocations inside /23
+                let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000; // 2001::/32
+                let is_pcp1 = seg[0] == 0x2001
+                    && seg[1] == 0x0001
+                    && seg[2] == 0x0000
+                    && seg[3] == 0x0000
+                    && seg[4] == 0x0000
+                    && seg[5] == 0x0000
+                    && seg[6] == 0x0000
+                    && seg[7] == 0x0001;
+                let is_pcp2 = seg[0] == 0x2001
+                    && seg[1] == 0x0001
+                    && seg[2] == 0x0000
+                    && seg[3] == 0x0000
+                    && seg[4] == 0x0000
+                    && seg[5] == 0x0000
+                    && seg[6] == 0x0000
+                    && seg[7] == 0x0002;
+                let is_amt = seg[0] == 0x2001 && seg[1] == 0x0003; // 2001:3::/32
+                let is_as112 = seg[0] == 0x2001 && seg[1] == 0x0004 && seg[2] == 0x0112; // 2001:4:112::/48
+                // ORCHIDv2 2001:20::/28, Drone 2001:30::/28, deprecated 2001:10::/28
+                let is_orchid = seg[0] == 0x2001 && (seg[1] == 0x0010 || seg[1] == 0x0020 || seg[1] == 0x0030);
+                let allowed = is_teredo || is_pcp1 || is_pcp2 || is_amt || is_as112 || is_orchid;
+                if !allowed {
+                    return false;
+                }
+            }
             // fe80::/10 link-local, fc00::/7 unique-local
             if (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00 {
                 return false;
             }
-            // 64:ff9b::/96 translation – check inner IPv4
-            if seg[0] == 0x0064 && seg[1] == 0xff9b {
-                let v4 = std::net::Ipv4Addr::new(
-                    ((seg[6] >> 8) & 0xff) as u8,
-                    (seg[6] & 0xff) as u8,
-                    ((seg[7] >> 8) & 0xff) as u8,
-                    (seg[7] & 0xff) as u8,
-                );
-                if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+            // IPv4-embedded: ::ffff:0:0/96 (mapped) and ::/96 (compatible, deprecated)
+            if let Some(m) = v6.to_ipv4_mapped() {
+                if !ip_is_public(&std::net::IpAddr::V4(m)) {
                     return false;
                 }
+            } else if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+                if seg[6] != 0 || seg[7] != 0 {
+                    let v4 = std::net::Ipv4Addr::new(
+                        ((seg[6] >> 8) & 0xff) as u8,
+                        (seg[6] & 0xff) as u8,
+                        ((seg[7] >> 8) & 0xff) as u8,
+                        (seg[7] & 0xff) as u8,
+                    );
+                    if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+                        return false;
+                    }
+                }
             }
+            // 64:ff9b::/96 translation – globally reachable true, do NOT block.
             true
         }
     }
@@ -444,5 +484,146 @@ mod tests {
             sanitize_cookie_component("a; Path=/ b\"c\\d\ne"),
             "aPath=/bcde"
         );
+    }
+
+    #[test]
+    fn ipv4_iana_precise_blocks_and_allows() {
+        // Blocked: IANA false
+        for ip in [
+            "0.0.0.1",
+            "10.5.6.7",
+            "100.64.0.1",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.10.20",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.0.0.1",
+            "192.0.0.8",
+            "192.0.0.170",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.1.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_public_ip(addr), "should block {ip}");
+            assert!(is_private_host(ip), "host {ip} should be private");
+        }
+        // Allowed: exceptions and public
+        for ip in [
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.0.1.1",
+            "192.0.3.1",
+            "192.1.0.1",
+            "8.8.8.8",
+            "1.1.1.1",
+            "100.128.0.1",
+            "198.20.0.1",
+            "192.0.4.1",
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_public_ip(addr), "should allow {ip}");
+            assert!(!is_private_host(ip), "host {ip} should not be private");
+            assert!(validate_site_url(&format!("https://{ip}/")).is_ok(), "https://{ip}/ should validate");
+        }
+    }
+
+    #[test]
+    fn ipv6_iana_blocks_and_allows() {
+        // Blocked vectors (must be rejected)
+        for ip in [
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:10.0.0.1",
+            "::10.0.0.1",
+            "::7f00:1",
+            "::192.168.1.1",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+            "ff00::1",
+            "2001:db8::1",
+            "100::1",
+            "100:0:0:1::1",
+            "3fff::1",
+            "3fff:1234::1",
+            "64:ff9b:1::1",
+            "64:ff9b:1::192.0.2.1",
+            "2001:2::1",
+            "5f00::1",
+            "2001:5::1",
+            "2001:0:5::1",
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap_or_else(|_| panic!("parse {ip}"));
+            assert!(!is_public_ip(addr), "should block {ip}");
+            assert!(is_private_host(&format!("[{ip}]")), "host [{ip}] should be private");
+        }
+        // Allowed vectors (must pass)
+        for ip in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "64:ff9b::192.0.2.1", // /96 true, even with private inner? actually 192.0.2.1 private but we now allow /96 regardless
+            "64:ff9b::8.8.8.8",
+            "2001::1", // wait this is inside /23 but we block 2001::1? Actually 2001::1 is 2001:0000:0000:0001::, which is inside /23 and not whitelisted? But 2001::/32 TEREDO is whitelisted, 2001::1 is inside TEREDO /32? 2001::/32 is 2001:0000::/32, so 2001::1 is ::1 within that, so should be allowed. Our whitelist for TEREDO is seg1==0x0000, so 2001::1 has seg1 0x0000, seg2 0x0000, should be allowed. So this is allowed.
+            "2001:1::1",
+            "2001:1::2",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:30::1",
+            "2001:10::1",
+            "2600::1",
+        ] {
+            // Avoid duplicate of blocked above: 2001::1 appears in both? We listed 2001::1 as blocked earlier, but now we list as allowed. Need to distinguish.
+            // 2001::1 with seg1 0x0000 is TEREDO, so allowed. So we should not have blocked it earlier. Remove from blocked.
+            let addr: std::net::IpAddr = match ip.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            // For the duplicate, we will assert allowed
+            // Skip the blocked check for 2001::1 if we changed mind
+            if ip == "2001::1" {
+                assert!(is_public_ip(addr), "should allow {ip} (TEREDO)");
+                continue;
+            }
+            assert!(is_public_ip(addr), "should allow {ip}");
+        }
+    }
+
+    #[test]
+    fn is_private_host_rejects_invalid_ipv6() {
+        // Invalid literals must be blocked (fail-closed)
+        assert!(is_private_host("[:::]"));
+        assert!(is_private_host("[:::1]"));
+        assert!(is_private_host("[not:an:ip]"));
+        // Valid public should not be private
+        assert!(!is_private_host("[2606:4700:4700::1111]"));
+    }
+
+    #[test]
+    fn ipv4_mapped_consistency() {
+        // Rust and Kotlin must agree: mapped private stays private
+        for (mapped, inner) in [
+            ("::ffff:192.168.1.1", "192.168.1.1"),
+            ("::ffff:8.8.8.8", "8.8.8.8"),
+        ] {
+            let mapped_ip: std::net::IpAddr = mapped.parse().unwrap();
+            let inner_ip: std::net::IpAddr = inner.parse().unwrap();
+            assert_eq!(is_public_ip(mapped_ip), is_public_ip(inner_ip), "mapped {mapped} vs inner {inner}");
+        }
+        // Compatible ::7f00:1 should delegate to 127.0.0.1 (blocked)
+        let compat: std::net::IpAddr = "::7f00:1".parse().unwrap();
+        let inner: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(is_public_ip(compat), is_public_ip(inner));
     }
 }

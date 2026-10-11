@@ -130,6 +130,18 @@ mod unix_file {
 
     pub(super) const KEY_FILE_NAME: &str = "animehub.key";
 
+    fn ensure_dir_safe(dir: &Path) -> AppResult<()> {
+        // Fail closed if dir is a symlink or not a directory.
+        let meta = std::fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() {
+            return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
+        }
+        if !meta.is_dir() {
+            return Err(AppError::Crypto("yapılandırma yolu dizin değil".into()));
+        }
+        Ok(())
+    }
+
     // Linux uses `linux::load`; only macOS (and the tests below) need the plain file key.
     #[cfg(target_os = "macos")]
     pub fn load(dir: &Path) -> AppResult<MasterKey> {
@@ -151,6 +163,9 @@ mod unix_file {
     /// The key in the key file, if there is one. Never creates the file.
     /// Uses `O_NOFOLLOW` and fd metadata to avoid TOCTOU via symlink swap.
     pub(super) fn existing_key(dir: &Path) -> AppResult<Option<Zeroizing<[u8; 32]>>> {
+        if dir.exists() {
+            ensure_dir_safe(dir)?;
+        }
         let path = dir.join(KEY_FILE_NAME);
         // Open with O_NOFOLLOW | O_RDONLY – never follow a symlink.
         let mut opts = std::fs::OpenOptions::new();
@@ -193,6 +208,7 @@ mod unix_file {
     /// after validating it with the same no-follow policy.
     pub(super) fn create_key(dir: &Path) -> AppResult<Zeroizing<[u8; 32]>> {
         std::fs::create_dir_all(dir)?;
+        ensure_dir_safe(dir)?;
         let path = dir.join(KEY_FILE_NAME);
         let key = Zeroizing::new(generate_key());
         write_private(&path, hex::encode(*key).as_bytes())?;
@@ -539,27 +555,80 @@ mod linux {
     }
 
     fn read_source(dir: &Path) -> AppResult<Option<Source>> {
-        match std::fs::read_to_string(dir.join(SOURCE_FILE_NAME)) {
-            Ok(s) => match s.trim() {
-                SOURCE_KEYRING => Ok(Some(Source::Keyring)),
-                SOURCE_FILE => Ok(Some(Source::File)),
-                _ => Err(AppError::Keyring(
-                    "anahtar kaynağı kaydı tanınmıyor; veriler açılmadı.".into(),
-                )),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        if dir.exists() {
+            // Ensure config dir is not a symlink before reading source
+            if let Ok(meta) = std::fs::symlink_metadata(dir) {
+                if meta.file_type().is_symlink() {
+                    return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
+                }
+            }
+        }
+        // Use O_NOFOLLOW for the source file itself
+        let src_path = dir.join(SOURCE_FILE_NAME);
+        let content = {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            match opts.open(&src_path) {
+                Ok(mut f) => {
+                    let mut s = String::new();
+                    use std::io::Read as _;
+                    f.read_to_string(&mut s)?;
+                    s
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(AppError::Crypto("anahtar kaynağı sembolik bağ".into()))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        match content.trim() {
+            SOURCE_KEYRING => Ok(Some(Source::Keyring)),
+            SOURCE_FILE => Ok(Some(Source::File)),
+            _ => Err(AppError::Keyring(
+                "anahtar kaynağı kaydı tanınmıyor; veriler açılmadı.".into(),
+            )),
         }
     }
 
     fn write_source(dir: &Path, source: Source) -> AppResult<()> {
         std::fs::create_dir_all(dir)?;
+        // Verify dir is not a symlink after creation
+        {
+            let meta = std::fs::symlink_metadata(dir)?;
+            if meta.file_type().is_symlink() {
+                return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
+            }
+        }
         let name = match source {
             Source::Keyring => SOURCE_KEYRING,
             Source::File => SOURCE_FILE,
         };
         let tmp = dir.join(format!("{SOURCE_FILE_NAME}.tmp"));
-        std::fs::write(&tmp, name)?;
+        // Create tmp with O_NOFOLLOW | O_EXCL to avoid symlink trick
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true).mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+            let mut f = match opts.open(&tmp) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // If a stale tmp exists, try to remove it and retry once
+                    let _ = std::fs::remove_file(&tmp);
+                    opts.open(&tmp)?
+                }
+                Err(e) => return Err(e.into()),
+            };
+            use std::io::Write as _;
+            f.write_all(name.as_bytes())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, dir.join(SOURCE_FILE_NAME))?;
         Ok(())
     }
@@ -567,6 +636,13 @@ mod linux {
     /// Whether any encrypted document is already on disk (`registry.bin`,
     /// `secret.*.bin`).
     fn sealed_data_present(dir: &Path) -> AppResult<bool> {
+        if dir.exists() {
+            if let Ok(meta) = std::fs::symlink_metadata(dir) {
+                if meta.file_type().is_symlink() {
+                    return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
+                }
+            }
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),

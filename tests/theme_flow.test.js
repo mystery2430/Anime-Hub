@@ -144,3 +144,48 @@ test("theme: persist failure with newer enqueued does not revert newer's draw", 
   assert.deepEqual(drawn, ["dark", "light"]);
   assert.equal(current.theme, "light");
 });
+
+test("theme: when currentSettings null, uses cached localStorage value for rollback, not system", async () => {
+  let current = null;
+  const drawn = [];
+  const cached = [];
+  const flow = createThemeFlow({
+    call: async () => {
+      throw new Error("kayıt yazılamadı");
+    },
+    notify: () => {},
+    errorText: (e) => e.message,
+    getCurrent: () => current,
+    setCurrent: (v) => {
+      current = v;
+    },
+    draw: (p) => drawn.push(p),
+    cacheSet: (p) => cached.push(p),
+    cacheGet: () => "dark",
+    applyNative: async () => {},
+  });
+  assert.equal(await flow.setTheme("light"), false);
+  // optimistic light, then revert to cached dark (not system)
+  assert.deepEqual(drawn, ["light", "dark"]);
+  assert.deepEqual(cached, ["light", "dark"]);
+});
+
+test("theme: when current null and cache empty, falls back to system", async () => {
+  let current = null;
+  const drawn = [];
+  const flow = createThemeFlow({
+    call: async () => {
+      throw new Error("kayıt yazılamadı");
+    },
+    notify: () => {},
+    errorText: (e) => e.message,
+    getCurrent: () => current,
+    setCurrent: () => {},
+    draw: (p) => drawn.push(p),
+    cacheSet: () => {},
+    cacheGet: () => null,
+    applyNative: async () => {},
+  });
+  assert.equal(await flow.setTheme("dark"), false);
+  assert.deepEqual(drawn, ["dark", "system"]);
+});

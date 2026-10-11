@@ -160,12 +160,22 @@ export function createSettingsFlow(deps) {
       return save({ pipAutoEnter: wanted });
     }
 
-    // Android: native first
+    // Android: native first – on thrown error the native side may have already toggled
     let applied;
     try {
       applied = await call("set_pip_auto_enter", { enabled: wanted });
     } catch (e) {
-      notify(errorText(e));
+      // Best-effort revert to previous native state.
+      let reverted = false;
+      try {
+        const rev = await call("set_pip_auto_enter", { enabled: previous });
+        reverted = rev === true;
+      } catch {}
+      if (reverted) {
+        notify(errorText(e));
+      } else {
+        notify(errorText(e) + " PiP durumu belirsiz; önceki değere dönülemedi, uygulamayı yeniden başlatın.");
+      }
       drawSwitches();
       return false;
     }

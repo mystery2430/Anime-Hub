@@ -20,7 +20,8 @@
 import { normalizeTheme } from "./theme.js";
 
 export function createThemeFlow(deps) {
-  const { call, notify, errorText, getCurrent, setCurrent, draw, cacheSet, applyNative } = deps;
+  const { call, notify, errorText, getCurrent, setCurrent, draw, cacheSet, cacheGet, applyNative } =
+    deps;
 
   let seq = 0;
   let chain = Promise.resolve();
@@ -36,8 +37,10 @@ export function createThemeFlow(deps) {
 
   async function run(id, wanted) {
     const current = getCurrent();
-    // previous persisted theme; if nothing loaded, use cached or system
-    const previous = current ? normalizeTheme(current.theme) : normalizeTheme(null);
+    // previous persisted theme; if nothing loaded, use cached localStorage value (first paint) or system
+    const previous = current
+      ? normalizeTheme(current.theme)
+      : normalizeTheme(cacheGet ? cacheGet() : null);
 
     // Optimistic UI – draw and cache immediately
     try {

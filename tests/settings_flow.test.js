@@ -248,14 +248,41 @@ test("PiP: desktop platforms store the preference only, as before", async () => 
   }
 });
 
-test("PiP: a native error is shown, persist is not attempted, and switch is redrawn", async () => {
-  const w = fakeWorld({ pipAutoEnter: false }, { set_pip_auto_enter: new Error("boom") });
-  assert.equal(await w.flow.changePipAutoEnter(true), false);
-  assert.equal(w.current().pipAutoEnter, false);
-  assert.equal(w.state.pipAutoEnter, false);
-  assert.equal(w.cmd("update_settings").length, 0, "persist must not be attempted after native failure");
-  assert.equal(w.notices[0].message, "boom");
-  assert.equal(w.drawCount(), 1);
+test("PiP: a native error is shown, persist is not attempted, and switch is redrawn (with revert attempt)", async () => {
+  const w2 = fakeWorld({ pipAutoEnter: false }, { set_pip_auto_enter: new Error("boom") });
+  assert.equal(await w2.flow.changePipAutoEnter(true), false);
+  assert.equal(w2.current().pipAutoEnter, false);
+  assert.equal(w2.state.pipAutoEnter, false);
+  assert.equal(w2.cmd("update_settings").length, 0, "persist must not be attempted after native failure");
+  // With both calls throwing, revert fails → message includes belirsiz
+  assert.ok(w2.notices[0].message.includes("boom"));
+  assert.ok(w2.notices[0].message.includes("belirsiz"));
+  assert.equal(w2.drawCount(), 1);
+  // When revert succeeds, only original error is shown
+  const notices = [];
+  let current = { pipAutoEnter: false };
+  const flow2 = createSettingsFlow({
+    call: async (cmd, args) => {
+      if (cmd === "app_info") return { platform: "android" };
+      if (cmd === "set_pip_auto_enter") {
+        if (args.enabled === true) throw new Error("boom");
+        if (args.enabled === false) return true;
+        return false;
+      }
+      if (cmd === "update_settings") return { pipAutoEnter: true };
+      return null;
+    },
+    notify: (m) => notices.push(m),
+    errorText: (e) => e.message,
+    refresh: async () => {},
+    drawSwitches: () => {},
+    getCurrent: () => current,
+    setCurrent: (v) => { current = v; },
+    setDevPanel: () => {},
+    refreshDevLog: async () => {},
+  });
+  assert.equal(await flow2.changePipAutoEnter(true), false);
+  assert.ok(notices[0] === "boom", "revert success should show only original error");
 });
 
 test("PiP: ok:false (PiP unsupported) is never silent", async () => {
@@ -378,6 +405,29 @@ test("PiP: rapid toggles are serialized and the last wins (minimal queue)", asyn
   const seq = calls.map((c) => `${c.cmd}:${c.args?.enabled ?? JSON.stringify(c.args?.patch)}`);
   assert.ok(seq.indexOf("set_pip_auto_enter:true") < seq.indexOf("update_settings:{\"pipAutoEnter\":true}"));
   assert.ok(seq.indexOf("update_settings:{\"pipAutoEnter\":true}") < seq.indexOf("set_pip_auto_enter:false"));
+});
+
+test("PiP: startup race – old value does not overwrite newer toggle (live check)", async () => {
+  // Simulate Rust's startup check: startup captured old=false, but live changed to true before startup runs
+  let live = { pipAutoEnter: true };
+  const nativeCalls = [];
+  async function startupApply(oldValue) {
+    const livePip = live.pipAutoEnter;
+    if (livePip !== oldValue) {
+      nativeCalls.push(`skip ${oldValue} (live ${livePip})`);
+      return "skipped";
+    }
+    nativeCalls.push(`apply ${oldValue}`);
+    return "applied";
+  }
+  // Toggle already set live to true, startup tries to apply old false
+  const result = await startupApply(false);
+  assert.equal(result, "skipped");
+  assert.deepEqual(nativeCalls, ["skip false (live true)"]);
+  // If live still equals old, it applies
+  live.pipAutoEnter = false;
+  const result2 = await startupApply(false);
+  assert.equal(result2, "applied");
 });
 
 // ------------------------------------------------------------- bindings
