@@ -915,15 +915,19 @@ internal object SiteNavigationPolicy {
           bytes[4]==0x00.toByte() && bytes[5]==0x00.toByte() && bytes[6]==0x00.toByte() && bytes[7]==0x00.toByte() &&
           bytes[8]==0x00.toByte() && bytes[9]==0x00.toByte() && bytes[10]==0x00.toByte() && bytes[11]==0x00.toByte() &&
           bytes[12]==0x00.toByte() && bytes[13]==0x00.toByte() && bytes[14]==0x00.toByte() && bytes[15]==0x02.toByte()
+        val isPcp3 = bytes[0]==0x20.toByte() && bytes[1]==0x01.toByte() && bytes[2]==0x00.toByte() && bytes[3]==0x01.toByte() &&
+          bytes[4]==0x00.toByte() && bytes[5]==0x00.toByte() && bytes[6]==0x00.toByte() && bytes[7]==0x00.toByte() &&
+          bytes[8]==0x00.toByte() && bytes[9]==0x00.toByte() && bytes[10]==0x00.toByte() && bytes[11]==0x00.toByte() &&
+          bytes[12]==0x00.toByte() && bytes[13]==0x00.toByte() && bytes[14]==0x00.toByte() && bytes[15]==0x03.toByte()
         // 2001:3::/32 AMT
         val isAmt = bytes[2] == 0x00.toByte() && bytes[3] == 0x03.toByte()
         // 2001:4:112::/48 AS112-v6 (approx)
         val isAs112 = bytes[2] == 0x00.toByte() && bytes[3] == 0x04.toByte() && bytes[4] == 0x01.toByte() && bytes[5] == 0x12.toByte()
-        // 2001:20::/28, 2001:30::/28, 2001:10::/28 (ORCHIDv2 etc) – first 28 bits
-        val b2 = bytes[2].toInt() and 0xFF
-        val b3 = bytes[3].toInt() and 0xFF
-        val isOrchid = b2 == 0x00 && (b3 == 0x10 || b3 == 0x20 || b3 == 0x30)
-        val allowedIn23 = isTeredo || isPcp1 || isPcp2 || isAmt || isAs112 || isOrchid
+        // 2001:20::/28 and 2001:30::/28 are true; 2001:10::/28 is deprecated (blocked).
+        // /28 -> mask top 12 bits of second hextet: 0xfff0
+        val seg1 = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
+        val isOrchid = (seg1 and 0xFFF0) == 0x0020 || (seg1 and 0xFFF0) == 0x0030
+        val allowedIn23 = isTeredo || isPcp1 || isPcp2 || isPcp3 || isAmt || isAs112 || isOrchid
         if (!allowedIn23) {
           // Also allow any /23 address that is explicitly documented as true via more-specific table but not in our small whitelist?
           // Fail-closed: treat unknown /23 as blocked.
@@ -942,7 +946,18 @@ internal object SiteNavigationPolicy {
         val v4 = "${bytes[12].toInt() and 0xFF}.${bytes[13].toInt() and 0xFF}.${bytes[14].toInt() and 0xFF}.${bytes[15].toInt() and 0xFF}"
         return isPublicIpv4(v4)
       }
-      // 64:ff9b::/96 translation – globally reachable true, do NOT block (inner IPv4 not checked).
+      // 64:ff9b::/96 translation – globally reachable true per IANA,
+      // but the embedded IPv4 must itself be globally reachable (RFC 6052).
+      if (bytes[0].toInt() and 0xFF) == 0x00 && (bytes[1].toInt() and 0xFF) == 0x64 &&
+        (bytes[2].toInt() and 0xFF) == 0xFF && (bytes[3].toInt() and 0xFF) == 0x9B &&
+        (bytes[4].toInt() and 0xFF) == 0x00 && (bytes[5].toInt() and 0xFF) == 0x00 &&
+        (bytes[6].toInt() and 0xFF) == 0x00 && (bytes[7].toInt() and 0xFF) == 0x00 &&
+        (bytes[8].toInt() and 0xFF) == 0x00 && (bytes[9].toInt() and 0xFF) == 0x00 &&
+        (bytes[10].toInt() and 0xFF) == 0x00 && (bytes[11].toInt() and 0xFF) == 0x00) {
+        // Last 32 bits are IPv4
+        val v4 = "${bytes[12].toInt() and 0xFF}.${bytes[13].toInt() and 0xFF}.${bytes[14].toInt() and 0xFF}.${bytes[15].toInt() and 0xFF}"
+        if (!isPublicIpv4(v4)) return false
+      }
       // The /48 variant already returned false above.
       return true
     } catch (e: Exception) {

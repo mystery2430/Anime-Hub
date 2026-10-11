@@ -129,18 +129,13 @@ export function createSettingsFlow(deps) {
     return save({ blocklist: { rules: savedRules, enabled } });
   }
 
-  // PiP: native -> persist order with compensating transaction.
-  // All PiP toggles are serialized through a dedicated queue so rapid
-  // clicks never interleave and the startup saved-preference native call
-  // (done in Rust setup) does not race with the first toggle. Other
-  // settings remain unblocked.
+  // PiP: all toggles are serialized through a dedicated queue so rapid
+  // clicks never interleave. The actual native+persist work is now atomic
+  // in Rust (`set_pip_auto_enter` holds `pip_lock` across both), so the
+  // startup thread (which also holds `pip_lock`) cannot race with a toggle.
+  // The JS queue is kept for toggle-vs-toggle ordering; startup-vs-toggle
+  // ordering is enforced in Rust via generation+lock.
   let pipChain = Promise.resolve();
-
-  async function rollbackPip(previous, message) {
-    notify(message);
-    await save({ pipAutoEnter: previous });
-    drawSwitches();
-  }
 
   async function doChangePip(wantedRaw) {
     const wanted = Boolean(wantedRaw);
@@ -155,64 +150,46 @@ export function createSettingsFlow(deps) {
       drawSwitches();
       return true;
     }
-    // Desktop: stored only, no native step
+    // Desktop: stored only, no native step.
     if (DESKTOP_PLATFORMS.includes(name)) {
       return save({ pipAutoEnter: wanted });
     }
-
-    // Android: native first – on thrown error the native side may have already toggled
-    let applied;
+    // Android: single atomic Rust call (native+periodic with compensation).
     try {
-      applied = await call("set_pip_auto_enter", { enabled: wanted });
-    } catch (e) {
-      // Best-effort revert to previous native state.
-      let reverted = false;
-      try {
-        const rev = await call("set_pip_auto_enter", { enabled: previous });
-        reverted = rev === true;
-      } catch {}
-      if (reverted) {
-        notify(errorText(e));
+      const saved = await call("set_pip_auto_enter", { enabled: wanted });
+      // Rust returns SettingsView on success.
+      if (saved && typeof saved === "object" && "pipAutoEnter" in saved) {
+        setCurrent(saved);
+      } else if (saved === true) {
+        // Back-compat: older Rust that returned bool – fall back to save.
+        const fallback = await call("update_settings", {
+          patch: { pipAutoEnter: wanted },
+        });
+        setCurrent(fallback);
+      } else if (saved === false) {
+        // Rust signalled unsupported without throwing (should now throw,
+        // but keep for compat).
+        notify(PIP_UNSUPPORTED_MESSAGE);
+        drawSwitches();
+        return false;
       } else {
-        notify(errorText(e) + " PiP durumu belirsiz; önceki değere dönülemedi, uygulamayı yeniden başlatın.");
+        // Unexpected shape – treat as success and refresh from getCurrent.
+        setCurrent(saved);
       }
-      drawSwitches();
-      return false;
-    }
-    if (applied !== true) {
-      notify(PIP_UNSUPPORTED_MESSAGE);
-      drawSwitches();
-      return false;
-    }
-
-    // Native succeeded – now persist. On failure, compensate native.
-    let saved;
-    try {
-      saved = await call("update_settings", { patch: { pipAutoEnter: wanted } });
-    } catch (e) {
-      // Persist failed – try to revert native.
-      let reverted = false;
       try {
-        const rev = await call("set_pip_auto_enter", { enabled: previous });
-        reverted = rev === true;
-      } catch {}
-      if (reverted) {
-        notify(errorText(e));
-      } else {
-        // Compensating revert also failed – do not claim success or "reverted".
-        const base = errorText(e);
-        notify(base + " PiP durumu geri alınamadı; uygulamayı yeniden başlatın.");
+        await refresh();
+      } catch (err) {
+        notify(errorText(err));
       }
+      return true;
+    } catch (e) {
+      const msg = errorText(e);
+      // Rust already attempted best-effort revert and appended "belirsiz"
+      // when it failed; we just surface the message.
+      notify(msg);
       drawSwitches();
       return false;
     }
-    setCurrent(saved);
-    try {
-      await refresh();
-    } catch (err) {
-      notify(errorText(err));
-    }
-    return true;
   }
 
   /** The "auto PiP" switch. See the module comment for the rules. */

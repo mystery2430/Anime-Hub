@@ -127,19 +127,59 @@ pub fn load_master_key(dir: &Path) -> AppResult<MasterKey> {
 #[cfg(all(unix, not(target_os = "android")))]
 mod unix_file {
     use super::*;
+    use std::os::unix::io::FromRawFd as _;
 
     pub(super) const KEY_FILE_NAME: &str = "animehub.key";
 
     fn ensure_dir_safe(dir: &Path) -> AppResult<()> {
-        // Fail closed if dir is a symlink or not a directory.
-        let meta = std::fs::symlink_metadata(dir)?;
-        if meta.file_type().is_symlink() {
-            return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
-        }
+        // Open the directory with O_NOFOLLOW|O_DIRECTORY to prevent symlink
+        // and rename races between the check and later file operations.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let f = opts.open(dir).map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                AppError::Crypto("yapılandırma dizini sembolik bağ".into())
+            } else {
+                AppError::from(e)
+            }
+        })?;
+        let meta = f.metadata()?;
         if !meta.is_dir() {
             return Err(AppError::Crypto("yapılandırma yolu dizin değil".into()));
         }
+        // Extra paranoia: O_NOFOLLOW guarantees symlink rejection, but also
+        // check the path's symlink_metadata.
+        if std::fs::symlink_metadata(dir)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(AppError::Crypto(
+                "yapılandırma dizini sembolik bağ".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Open the config directory and return a fd for openat.
+    fn open_dir_fd(dir: &Path) -> AppResult<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let f = opts.open(dir).map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                AppError::Crypto("yapılandırma dizini sembolik bağ".into())
+            } else {
+                AppError::from(e)
+            }
+        })?;
+        let meta = f.metadata()?;
+        if !meta.is_dir() {
+            return Err(AppError::Crypto(
+                "yapılandırma yolu dizin değil".into(),
+            ));
+        }
+        Ok(f)
     }
 
     // Linux uses `linux::load`; only macOS (and the tests below) need the plain file key.
@@ -162,26 +202,38 @@ mod unix_file {
 
     /// The key in the key file, if there is one. Never creates the file.
     /// Uses `O_NOFOLLOW` and fd metadata to avoid TOCTOU via symlink swap.
+    /// The directory is opened first with `O_NOFOLLOW|O_DIRECTORY` and the
+    /// file is opened via `openat` relative to that fd, so a concurrent
+    /// rename/symlink of the directory cannot bypass the check.
     pub(super) fn existing_key(dir: &Path) -> AppResult<Option<Zeroizing<[u8; 32]>>> {
         if dir.exists() {
             ensure_dir_safe(dir)?;
+        } else {
+            return Ok(None);
         }
-        let path = dir.join(KEY_FILE_NAME);
-        // Open with O_NOFOLLOW | O_RDONLY – never follow a symlink.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut f = match opts.open(&path) {
+        // Open dir fd for openat.
+        let dir_fd = match open_dir_fd(dir) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(AppError::Crypto("anahtar yolu sembolik bağ".into()))
+            Err(e) if e.to_string().contains("No such file") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        use std::os::unix::io::AsRawFd;
+        let raw_fd = dir_fd.as_raw_fd();
+        let c_name = std::ffi::CString::new(KEY_FILE_NAME).unwrap();
+        let fd = unsafe {
+            libc::openat(raw_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW)
+        };
+        let mut f = if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
             }
-            Err(e) => return Err(e.into()),
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(AppError::Crypto("anahtar yolu sembolik bağ".into()));
+            }
+            return Err(err.into());
+        } else {
+            unsafe { std::fs::File::from_raw_fd(fd) }
         };
         // fd metadata validation – fail closed on suspicious file
         {
@@ -217,34 +269,67 @@ mod unix_file {
 
     /// Write with `0600`, creating the file exclusively so a pre-existing
     /// symlink or world-readable file is never silently reused.
-    /// Uses `O_NOFOLLOW | O_EXCL | O_CREAT` and validates the opened fd.
+    /// Uses `O_NOFOLLOW | O_EXCL | O_CREAT` relative to an opened dir fd
+    /// and validates the opened fd. This prevents a concurrent rename of the
+    /// directory from bypassing `ensure_dir_safe`.
     fn write_private(path: &PathBuf, bytes: &[u8]) -> AppResult<()> {
-        use std::os::unix::fs::OpenOptionsExt as _;
         use std::os::unix::fs::PermissionsExt as _;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true).mode(0o600);
-        opts.custom_flags(libc::O_NOFOLLOW);
-        let mut f = match opts.open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        let dir = path.parent().ok_or_else(|| {
+            AppError::Crypto("anahtar yolu dizin değil".into())
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| AppError::Crypto("anahtar yolu geçersiz".into()))?;
+        if dir.exists() {
+            ensure_dir_safe(dir)?;
+        }
+        // Open dir fd for openat; if it does not exist, create it first.
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let dir_fd = open_dir_fd(dir)?;
+        use std::os::unix::io::AsRawFd;
+        let raw_fd = dir_fd.as_raw_fd();
+        let c_name = std::ffi::CString::new(file_name).unwrap();
+        let fd = unsafe {
+            libc::openat(
+                raw_fd,
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        let mut f = if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                || err.raw_os_error() == Some(libc::EEXIST)
+            {
                 // Someone raced us – validate the existing file before adopting.
-                let mut ro = std::fs::OpenOptions::new();
-                ro.read(true);
-                ro.custom_flags(libc::O_NOFOLLOW);
-                let mut existing = ro.open(path).map_err(|e| {
-                    if e.raw_os_error() == Some(libc::ELOOP) {
-                        AppError::Crypto("anahtar yolu sembolik bağ".into())
-                    } else {
-                        e.into()
+                let fd2 = unsafe {
+                    libc::openat(raw_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW)
+                };
+                if fd2 < 0 {
+                    let e2 = std::io::Error::last_os_error();
+                    if e2.raw_os_error() == Some(libc::ELOOP) {
+                        return Err(AppError::Crypto(
+                            "anahtar yolu sembolik bağ".into(),
+                        ));
                     }
-                })?;
+                    return Err(e2.into());
+                }
+                let mut existing = unsafe { std::fs::File::from_raw_fd(fd2) };
                 let meta = existing.metadata()?;
                 if !meta.is_file() {
-                    return Err(AppError::Crypto("anahtar dosyası normal dosya değil".into()));
+                    return Err(AppError::Crypto(
+                        "anahtar dosyası normal dosya değil".into(),
+                    ));
                 }
                 let mode = meta.permissions().mode() & 0o777;
                 if mode != 0o600 {
-                    return Err(AppError::Crypto("anahtar dosyası izinleri hatalı".into()));
+                    return Err(AppError::Crypto(
+                        "anahtar dosyası izinleri hatalı".into(),
+                    ));
                 }
                 let mut raw = String::new();
                 {
@@ -254,10 +339,12 @@ mod unix_file {
                 let _ = decode_hex_key(&raw)?;
                 return Ok(());
             }
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(AppError::Crypto("anahtar yolu sembolik bağ".into()))
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(AppError::Crypto("anahtar yolu sembolik bağ".into()));
             }
-            Err(e) => return Err(e.into()),
+            return Err(err.into());
+        } else {
+            unsafe { std::fs::File::from_raw_fd(fd) }
         };
         // Verify the newly created fd – mode, file type
         {
@@ -555,37 +642,73 @@ mod linux {
     }
 
     fn read_source(dir: &Path) -> AppResult<Option<Source>> {
-        if dir.exists() {
-            // Ensure config dir is not a symlink before reading source
-            if let Ok(meta) = std::fs::symlink_metadata(dir) {
-                if meta.file_type().is_symlink() {
-                    return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
-                }
+        if !dir.exists() {
+            return Ok(None);
+        }
+        // Open dir with O_NOFOLLOW|O_DIRECTORY to prevent rename/symlink race.
+        let mut dir_opts = std::fs::OpenOptions::new();
+        dir_opts.read(true);
+        dir_opts.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let dir_fd = dir_opts.open(dir).map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                AppError::Crypto("yapılandırma dizini sembolik bağ".into())
+            } else {
+                AppError::from(e)
+            }
+        })?;
+        {
+            let meta = dir_fd.metadata()?;
+            if !meta.is_dir() {
+                return Err(AppError::Crypto(
+                    "yapılandırma yolu dizin değil".into(),
+                ));
             }
         }
-        // Use O_NOFOLLOW for the source file itself
-        let src_path = dir.join(SOURCE_FILE_NAME);
+        use std::os::unix::io::AsRawFd;
+        let raw_fd = dir_fd.as_raw_fd();
+        let c_name = std::ffi::CString::new(SOURCE_FILE_NAME).unwrap();
+        let fd = unsafe {
+            libc::openat(raw_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW)
+        };
         let content = {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true);
-            #[cfg(unix)]
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(AppError::Crypto(
+                        "anahtar kaynağı sembolik bağ".into(),
+                    ));
+                }
+                return Err(err.into());
+            }
+            let mut f = unsafe {
+                use std::os::unix::io::FromRawFd;
+                std::fs::File::from_raw_fd(fd)
+            };
+            // Verify opened file is regular and has safe permissions (0600).
             {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                opts.custom_flags(libc::O_NOFOLLOW);
-            }
-            match opts.open(&src_path) {
-                Ok(mut f) => {
-                    let mut s = String::new();
-                    use std::io::Read as _;
-                    f.read_to_string(&mut s)?;
-                    s
+                use std::os::unix::fs::PermissionsExt as _;
+                let meta = f.metadata()?;
+                if !meta.is_file() {
+                    return Err(AppError::Crypto(
+                        "anahtar kaynağı normal dosya değil".into(),
+                    ));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                    return Err(AppError::Crypto("anahtar kaynağı sembolik bağ".into()))
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(AppError::Crypto(
+                        "anahtar kaynağı izinleri hatalı".into(),
+                    ));
                 }
-                Err(e) => return Err(e.into()),
             }
+            let mut s = String::new();
+            {
+                use std::io::Read as _;
+                f.read_to_string(&mut s)?;
+            }
+            s
         };
         match content.trim() {
             SOURCE_KEYRING => Ok(Some(Source::Keyring)),
@@ -598,62 +721,167 @@ mod linux {
 
     fn write_source(dir: &Path, source: Source) -> AppResult<()> {
         std::fs::create_dir_all(dir)?;
-        // Verify dir is not a symlink after creation
+        // Open dir with O_NOFOLLOW|O_DIRECTORY for all subsequent ops.
+        let mut dir_opts = std::fs::OpenOptions::new();
+        dir_opts.read(true);
+        dir_opts.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let dir_fd = dir_opts.open(dir).map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                AppError::Crypto("yapılandırma dizini sembolik bağ".into())
+            } else {
+                AppError::from(e)
+            }
+        })?;
         {
-            let meta = std::fs::symlink_metadata(dir)?;
-            if meta.file_type().is_symlink() {
-                return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
+            let meta = dir_fd.metadata()?;
+            if !meta.is_dir() {
+                return Err(AppError::Crypto(
+                    "yapılandırma yolu dizin değil".into(),
+                ));
             }
         }
         let name = match source {
             Source::Keyring => SOURCE_KEYRING,
             Source::File => SOURCE_FILE,
         };
-        let tmp = dir.join(format!("{SOURCE_FILE_NAME}.tmp"));
-        // Create tmp with O_NOFOLLOW | O_EXCL to avoid symlink trick
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true).mode(0o600);
-            opts.custom_flags(libc::O_NOFOLLOW);
-            let mut f = match opts.open(&tmp) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // If a stale tmp exists, try to remove it and retry once
-                    let _ = std::fs::remove_file(&tmp);
-                    opts.open(&tmp)?
+        let tmp_name = format!("{SOURCE_FILE_NAME}.tmp");
+        let c_tmp = std::ffi::CString::new(tmp_name.clone()).unwrap();
+        let c_final = std::ffi::CString::new(SOURCE_FILE_NAME).unwrap();
+        use std::os::unix::io::AsRawFd;
+        let raw_fd = dir_fd.as_raw_fd();
+        // Create tmp with O_NOFOLLOW|O_EXCL|O_CREAT via openat
+        let fd = unsafe {
+            libc::openat(
+                raw_fd,
+                c_tmp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        let mut f = if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                || err.raw_os_error() == Some(libc::EEXIST)
+            {
+                // Stale tmp – try to unlink via unlinkat and retry once.
+                unsafe {
+                    libc::unlinkat(raw_fd, c_tmp.as_ptr(), 0);
                 }
-                Err(e) => return Err(e.into()),
-            };
+                let fd2 = unsafe {
+                    libc::openat(
+                        raw_fd,
+                        c_tmp.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                        0o600,
+                    )
+                };
+                if fd2 < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                unsafe {
+                    use std::os::unix::io::FromRawFd;
+                    std::fs::File::from_raw_fd(fd2)
+                }
+            } else if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(AppError::Crypto("anahtar kaynağı sembolik bağ".into()));
+            } else {
+                return Err(err.into());
+            }
+        } else {
+            unsafe {
+                use std::os::unix::io::FromRawFd;
+                std::fs::File::from_raw_fd(fd)
+            }
+        };
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let meta = f.metadata()?;
+            if !meta.is_file() {
+                return Err(AppError::Crypto(
+                    "anahtar kaynağı normal dosya değil".into(),
+                ));
+            }
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(AppError::Crypto(
+                    "anahtar kaynağı izinleri hatalı".into(),
+                ));
+            }
+        }
+        {
             use std::io::Write as _;
             f.write_all(name.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, dir.join(SOURCE_FILE_NAME))?;
+        // Atomically rename tmp -> final via renameat
+        let res = unsafe { libc::renameat(raw_fd, c_tmp.as_ptr(), raw_fd, c_final.as_ptr()) };
+        if res != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // Ensure directory entry is durable.
+        unsafe {
+            libc::fsync(raw_fd);
+        }
         Ok(())
     }
 
     /// Whether any encrypted document is already on disk (`registry.bin`,
-    /// `secret.*.bin`).
+    /// `secret.*.bin`). Uses an opened dir fd (`O_NOFOLLOW|O_DIRECTORY`) and
+    /// `fdopendir`/`readdir` so a concurrent rename of the directory cannot
+    /// bypass the symlink check.
     fn sealed_data_present(dir: &Path) -> AppResult<bool> {
-        if dir.exists() {
-            if let Ok(meta) = std::fs::symlink_metadata(dir) {
-                if meta.file_type().is_symlink() {
-                    return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
-                }
+        if !dir.exists() {
+            return Ok(false);
+        }
+        let mut dir_opts = std::fs::OpenOptions::new();
+        dir_opts.read(true);
+        dir_opts.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let dir_file = dir_opts.open(dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return AppError::from(e);
+            }
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                AppError::Crypto("yapılandırma dizini sembolik bağ".into())
+            } else {
+                AppError::from(e)
+            }
+        })?;
+        {
+            let meta = dir_file.metadata()?;
+            if !meta.is_dir() {
+                return Err(AppError::Crypto(
+                    "yapılandırma yolu dizin değil".into(),
+                ));
             }
         }
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries {
-            if entry?.file_name().to_string_lossy().ends_with(".bin") {
-                return Ok(true);
+        use std::os::unix::io::AsRawFd;
+        let raw_fd = dir_file.as_raw_fd();
+        // Duplicate fd for fdopendir (which takes ownership).
+        let dup_fd = unsafe { libc::dup(raw_fd) };
+        if dup_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let dirp = unsafe { libc::fdopendir(dup_fd) };
+        if dirp.is_null() {
+            unsafe { libc::close(dup_fd) };
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut found = false;
+        loop {
+            // readdir is not thread-safe, but we own the DIR* exclusively.
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".bin") {
+                found = true;
+                break;
             }
         }
-        Ok(false)
+        unsafe { libc::closedir(dirp) };
+        Ok(found)
     }
 
     #[cfg(test)]

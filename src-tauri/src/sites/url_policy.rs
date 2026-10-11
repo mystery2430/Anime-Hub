@@ -284,11 +284,22 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                     && seg[5] == 0x0000
                     && seg[6] == 0x0000
                     && seg[7] == 0x0002;
+                let is_pcp3 = seg[0] == 0x2001
+                    && seg[1] == 0x0001
+                    && seg[2] == 0x0000
+                    && seg[3] == 0x0000
+                    && seg[4] == 0x0000
+                    && seg[5] == 0x0000
+                    && seg[6] == 0x0000
+                    && seg[7] == 0x0003;
                 let is_amt = seg[0] == 0x2001 && seg[1] == 0x0003; // 2001:3::/32
                 let is_as112 = seg[0] == 0x2001 && seg[1] == 0x0004 && seg[2] == 0x0112; // 2001:4:112::/48
-                // ORCHIDv2 2001:20::/28, Drone 2001:30::/28, deprecated 2001:10::/28
-                let is_orchid = seg[0] == 0x2001 && (seg[1] == 0x0010 || seg[1] == 0x0020 || seg[1] == 0x0030);
-                let allowed = is_teredo || is_pcp1 || is_pcp2 || is_amt || is_as112 || is_orchid;
+                // ORCHIDv2 2001:20::/28 and Drone 2001:30::/28 are true;
+                // 2001:10::/28 is deprecated and must stay blocked.
+                let is_orchid = seg[0] == 0x2001
+                    && ((seg[1] & 0xfff0) == 0x0020 || (seg[1] & 0xfff0) == 0x0030);
+                let allowed =
+                    is_teredo || is_pcp1 || is_pcp2 || is_pcp3 || is_amt || is_as112 || is_orchid;
                 if !allowed {
                     return false;
                 }
@@ -302,7 +313,13 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                 if !ip_is_public(&std::net::IpAddr::V4(m)) {
                     return false;
                 }
-            } else if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+            } else if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
                 if seg[6] != 0 || seg[7] != 0 {
                     let v4 = std::net::Ipv4Addr::new(
                         ((seg[6] >> 8) & 0xff) as u8,
@@ -315,7 +332,27 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                     }
                 }
             }
-            // 64:ff9b::/96 translation – globally reachable true, do NOT block.
+            // 64:ff9b::/96 translation – globally reachable true per IANA,
+            // but the embedded IPv4 must itself be globally reachable (RFC 6052).
+            // If the last 32 bits encode a private/reserved IPv4, the whole
+            // address is not globally reachable.
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let v4 = std::net::Ipv4Addr::new(
+                    ((seg[6] >> 8) & 0xff) as u8,
+                    (seg[6] & 0xff) as u8,
+                    ((seg[7] >> 8) & 0xff) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+                    return false;
+                }
+            }
             true
         }
     }
@@ -538,7 +575,7 @@ mod tests {
 
     #[test]
     fn ipv6_iana_blocks_and_allows() {
-        // Blocked vectors (must be rejected)
+        // Blocked vectors (must be rejected) – RFC 6052 and IANA 2025-10-09
         for ip in [
             "::",
             "::1",
@@ -559,45 +596,94 @@ mod tests {
             "3fff:1234::1",
             "64:ff9b:1::1",
             "64:ff9b:1::192.0.2.1",
+            // NAT64 /96 with non-global embedded IPv4 must be rejected (RFC 6052)
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::192.168.1.1",
+            "64:ff9b::192.0.2.1",
             "2001:2::1",
             "5f00::1",
             "2001:5::1",
             "2001:0:5::1",
+            // 2001:10::/28 is deprecated (ex-ORCHID) – not globally reachable
+            "2001:10::1",
+            "2001:10:ffff::1",
+            // Inside 2001::/23 but not whitelisted
+            "2001:0:1::1",
+            "2001:1:ffff::1",
         ] {
             let addr: std::net::IpAddr = ip.parse().unwrap_or_else(|_| panic!("parse {ip}"));
             assert!(!is_public_ip(addr), "should block {ip}");
             assert!(is_private_host(&format!("[{ip}]")), "host [{ip}] should be private");
         }
-        // Allowed vectors (must pass)
+        // Allowed vectors (must pass) – more-specific true allocations inside 2001::/23
         for ip in [
             "2001:4860:4860::8888",
             "2606:4700:4700::1111",
-            "64:ff9b::192.0.2.1", // /96 true, even with private inner? actually 192.0.2.1 private but we now allow /96 regardless
+            // NAT64 /96 with global embedded IPv4 is allowed
             "64:ff9b::8.8.8.8",
-            "2001::1", // wait this is inside /23 but we block 2001::1? Actually 2001::1 is 2001:0000:0000:0001::, which is inside /23 and not whitelisted? But 2001::/32 TEREDO is whitelisted, 2001::1 is inside TEREDO /32? 2001::/32 is 2001:0000::/32, so 2001::1 is ::1 within that, so should be allowed. Our whitelist for TEREDO is seg1==0x0000, so 2001::1 has seg1 0x0000, seg2 0x0000, should be allowed. So this is allowed.
+            "64:ff9b::1.1.1.1",
+            "64:ff9b::192.0.1.1",
+            // TEREDO 2001::/32 (N/A per RFC 4380 but more-specific than /23)
+            "2001::1",
+            "2001:0:0:1::1",
             "2001:1::1",
             "2001:1::2",
+            "2001:1::3",
             "2001:3::1",
             "2001:4:112::1",
             "2001:20::1",
+            "2001:20:0:1::1",
+            "2001:2f:ff::1", // still inside 2001:20::/28 (mask 0xfff0)
             "2001:30::1",
-            "2001:10::1",
+            "2001:30:ffff::1",
             "2600::1",
         ] {
-            // Avoid duplicate of blocked above: 2001::1 appears in both? We listed 2001::1 as blocked earlier, but now we list as allowed. Need to distinguish.
-            // 2001::1 with seg1 0x0000 is TEREDO, so allowed. So we should not have blocked it earlier. Remove from blocked.
             let addr: std::net::IpAddr = match ip.parse() {
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            // For the duplicate, we will assert allowed
-            // Skip the blocked check for 2001::1 if we changed mind
-            if ip == "2001::1" {
-                assert!(is_public_ip(addr), "should allow {ip} (TEREDO)");
-                continue;
-            }
             assert!(is_public_ip(addr), "should allow {ip}");
+            assert!(
+                !is_private_host(&format!("[{ip}]")),
+                "host [{ip}] should not be private"
+            );
+            // Also ensure validate_site_url allows it when used as host
+            assert!(
+                validate_site_url(&format!("https://[{ip}]/")).is_ok(),
+                "https://[{ip}]/ should validate"
+            );
         }
+    }
+
+    #[test]
+    fn nat64_inner_ipv4_is_checked() {
+        // RFC 6052: embedded IPv4 must be checked via same public-ip policy.
+        for ip in ["64:ff9b::10.0.0.1", "64:ff9b::192.168.1.1", "64:ff9b::192.0.2.1"] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_public_ip(addr), "NAT64 with private inner should block {ip}");
+        }
+        for ip in ["64:ff9b::8.8.8.8", "64:ff9b::1.1.1.1", "64:ff9b::192.0.1.1"] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_public_ip(addr), "NAT64 with public inner should allow {ip}");
+        }
+        // /48 is always blocked regardless of inner
+        let a48: std::net::IpAddr = "64:ff9b:1::8.8.8.8".parse().unwrap();
+        assert!(!is_public_ip(a48), "64:ff9b:1::/48 must stay blocked");
+    }
+
+    #[test]
+    fn orchid_v2_mask_is_correct() {
+        // 2001:20::/28 covers 0020-002f, 2001:30::/28 covers 0030-003f.
+        // 2001:10::/28 (deprecated) must stay blocked.
+        assert!(is_public_ip("2001:20::1".parse().unwrap()));
+        assert!(is_public_ip("2001:2f:ffff::1".parse().unwrap())); // 002f & fff0 = 0020
+        assert!(is_public_ip("2001:30::1".parse().unwrap()));
+        assert!(is_public_ip("2001:3f::1".parse().unwrap())); // 003f & fff0 = 0030
+        assert!(!is_public_ip("2001:10::1".parse().unwrap()));
+        assert!(!is_public_ip("2001:1f::1".parse().unwrap())); // 001f & fff0 = 0010 -> deprecated
+        assert!(!is_public_ip("2001:40::1".parse().unwrap())); // outside both
+        // 2001:1::3 is a distinct /128, not part of /28
+        assert!(is_public_ip("2001:1::3".parse().unwrap()));
     }
 
     #[test]
