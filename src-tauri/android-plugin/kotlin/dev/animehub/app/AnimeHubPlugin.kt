@@ -890,8 +890,8 @@ internal object SiteNavigationPolicy {
       if (bytes[0] == 0x01.toByte() && bytes[1] == 0x00.toByte() && bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() &&
         bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte() && bytes[6] == 0x00.toByte() && bytes[7] == 0x01.toByte()
       ) return false
-      // 3fff::/20 documentation (RFC 9637) – first 20 bits 0011 1111 1111
-      if ((bytes[0].toInt() and 0xFF) == 0x3F && (bytes[1].toInt() and 0xFF) == 0xFF && (bytes[2].toInt() and 0xF0) == 0x00) return false
+      // 3fff::/20 documentation (RFC 9637) – any 3fff:xxxx is reserved
+      if ((bytes[0].toInt() and 0xFF) == 0x3F && (bytes[1].toInt() and 0xFF) == 0xFF) return false
       // 5f00::/16 SRv6 SIDs
       if ((bytes[0].toInt() and 0xFF) == 0x5F && (bytes[1].toInt() and 0xFF) == 0x00) return false
       // 64:ff9b:1::/48 translation – false (must be checked before /96)
@@ -906,7 +906,7 @@ internal object SiteNavigationPolicy {
       val in2001_23 = (bytes[0].toInt() and 0xFF) == 0x20 && (bytes[1].toInt() and 0xFF) == 0x01 && (bytes[2].toInt() and 0xFE) == 0x00
       if (in2001_23) {
         // Whitelist true allocations inside /23 (TEREDO, PCP, AMT, AS112, ORCHIDv2)
-        val isTeredo = bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() // 2001::/32
+        val isTeredo = bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() && bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte() // 2001::/32 with zero third hextet
         val isPcp1 = bytes[0]==0x20.toByte() && bytes[1]==0x01.toByte() && bytes[2]==0x00.toByte() && bytes[3]==0x01.toByte() &&
           bytes[4]==0x00.toByte() && bytes[5]==0x00.toByte() && bytes[6]==0x00.toByte() && bytes[7]==0x00.toByte() &&
           bytes[8]==0x00.toByte() && bytes[9]==0x00.toByte() && bytes[10]==0x00.toByte() && bytes[11]==0x00.toByte() &&

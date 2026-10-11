@@ -236,8 +236,8 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                 return false;
             }
             let seg = v6.segments();
-            // 3fff::/20 documentation (RFC 9637) – first 20 bits 0011 1111 1111
-            if seg[0] == 0x3fff && (seg[1] & 0xf000) == 0x0000 {
+            // 3fff::/20 documentation (RFC 9637) – any 3fff:xxxx is reserved
+            if seg[0] == 0x3fff {
                 return false;
             }
             // 5f00::/16 SRv6 SIDs
@@ -267,7 +267,7 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
             // 2001::/23 IETF protocol assignments – false unless more-specific true allocation
             if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0x0000 {
                 // Whitelist true allocations inside /23
-                let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000; // 2001::/32
+                let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000 && seg[2] == 0x0000; // 2001::/32 with zero third hextet
                 let is_pcp1 = seg[0] == 0x2001
                     && seg[1] == 0x0001
                     && seg[2] == 0x0000

@@ -17,8 +17,6 @@ use crate::error::{AppError, AppResult};
 #[cfg(not(target_os = "android"))]
 use crate::secure::crypto::generate_key;
 use std::path::Path;
-#[cfg(all(unix, not(target_os = "android")))]
-use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 pub const KEYRING_SERVICE: &str = "dev.animehub.app";
