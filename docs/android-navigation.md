@@ -21,8 +21,14 @@ the WebView is created and is keyed by WebView id (`URL_LOADING_OVERRIDE` in wry
 
 - `shouldOverrideUrlLoading` cancels navigations whose scheme is not `https`
   (apart from `blob`, `data`, `about`) or whose host is local or private. The
-  rules mirror `navigation_allowed` and `is_private_host`. A node test keeps the
-  host suffixes in step.
+  rules mirror `navigation_allowed` and `is_private_host` and are aligned to the
+  IANA IPv4/IPv6 Special-Purpose registries (2025-10-09): see
+  `src-tauri/src/sites/url_policy.rs` and
+  `src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt`.
+  A node test keeps the host suffixes in step; Kotlin now uses
+  `InetAddress`/`Inet6Address` for robust IPv6 (including `::`, `::ffff:*`,
+  `::7f00:1`, `fc00::/7`, `fe80::/10`, `ff00::/8`, `2001:db8::/32`, `100::/64`,
+  `64:ff9b::/96`).
 - Every other callback goes to wry's original client, so the custom protocol,
   page-started tracking (used by IPC) and error recovery are unchanged.
 - The launcher's own origin (`tauri.localhost`) is refused like any other local
@@ -35,6 +41,12 @@ Tauri calls `load()` from `on_webview_created`, which runs after wry calls
 `setWebViewClient(RustWebViewClient)` (wry `src/android/main_pipe.rs`). So the
 guard wraps wry's client, not a default one. `WebView.getWebViewClient()` is
 public from API 26, which matches `minSdkVersion` 26.
+
+The *first* `loadUrl` for the launcher URL runs before `addJavascriptInterface` and
+before `on_webview_created` (see wry `main_pipe.rs` order below). That initial
+launcher document therefore bypasses the guard – which is intended, as the
+launcher origin is trusted bootstrap. Every later `loadUrl` / navigation for a
+site page runs after the hook and goes through `SiteNavigationGuard`.
 
 ## IPC and the site-facing `ipc` object (verified in wry 0.55.1 source)
 
@@ -85,7 +97,7 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 | Blocklist | Lives in Rust. Running it needs a Rust round-trip inside a UI-thread callback. Not done. Android navigations are checked for scheme, host shape and IP rules only. |
 | Numeric IPv4 spellings | Fixed in the Kotlin policy: `2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1` are refused (previously allowed). Relies on WHATWG parsing; not tested in a WebView. |
 | Documentation IPv4 ranges | Fixed: `198.51.100.0/24` and `203.0.113.0/24` are refused, as in Rust. |
-| Multicast IPv4 (`224.0.0.0/4`) | Kotlin refuses it; Rust `is_public_ip` does not check it. Kotlin is stricter; not changed. |
+| Multicast / reserved IPv4 (`224.0.0.0/4`, `240.0.0.0/4`, `0.0.0.0/8`, `192.88.99.0/24`) | Both Kotlin and Rust refuse them (aligned to IANA 2025-10-09; Rust `a >= 224` + `a == 0` + `192.88.99/24`). |
 | DNS rebinding | DNS on the UI thread would stall the WebView. Not done. |
 | Subframes and sub-resources | The guard only sees top-level navigations. |
 | App-initiated `loadUrl` | Not routed through `shouldOverrideUrlLoading`; `open_on_mobile` checks the first URL with `validate_site_url`. |

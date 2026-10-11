@@ -200,28 +200,83 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
 fn ip_is_public(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            let [a, b, _, _] = v4.octets();
+            let [a, b, c, _] = v4.octets();
+            // IANA IPv4 Special-Purpose Registry (2025-10-09) – Globally Reachable == false
+            // plus multicast/reserved. Keep in step with Kotlin SiteNavigationPolicy.
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || a == 0 // 0.0.0.0/8 This network
                 // 100.64.0.0/10 CGNAT
                 || (a == 100 && (64..=127).contains(&b))
-                // 192.0.0.0/24 and 198.18.0.0/15 benchmarking
+                // 192.0.0.0/24 IANA reserved, 192.0.2.0/24 TEST-NET-1
                 || (a == 192 && b == 0)
-                || (a == 198 && (18..=19).contains(&b)))
+                // 192.88.99.0/24 6to4 relay (deprecated)
+                || (a == 192 && b == 88 && c == 99)
+                // 198.18.0.0/15 benchmarking
+                || (a == 198 && (18..=19).contains(&b))
+                // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved/broadcast
+                || a >= 224)
         }
         std::net::IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // ::ffff:0:0/96 mapped IPv4
-                || v6.to_ipv4_mapped().is_some_and(|m| !ip_is_public(&m.into()))
-                // fe80::/10 link-local, fc00::/7 unique-local
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || (v6.segments()[0] & 0xfe00) == 0xfc00)
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            // IPv4-embedded: ::ffff:0:0/96 (mapped) and ::/96 (compatible, deprecated)
+            // `to_ipv4_mapped` covers the former; compatible needs manual check for
+            // `::7f00:1` etc. Both delegate to the IPv4 policy.
+            if let Some(m) = v6.to_ipv4_mapped() {
+                if !ip_is_public(&std::net::IpAddr::V4(m)) {
+                    return false;
+                }
+            } else {
+                // Check IPv4-compatible ::/96 (first 96 bits zero, last 32 bits != 0)
+                let seg = v6.segments();
+                if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+                    // Last 32 bits are an IPv4 address (could be ::7f00:1)
+                    // Avoid treating :: and ::1 as IPv4 (already handled, but last bits zero)
+                    if seg[6] != 0 || seg[7] != 0 {
+                        let v4 = std::net::Ipv4Addr::new(
+                            ((seg[6] >> 8) & 0xff) as u8,
+                            (seg[6] & 0xff) as u8,
+                            ((seg[7] >> 8) & 0xff) as u8,
+                            (seg[7] & 0xff) as u8,
+                        );
+                        if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            let seg = v6.segments();
+            // 2001:db8::/32 documentation
+            if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+                return false;
+            }
+            // 100::/64 discard-only
+            if seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 {
+                return false;
+            }
+            // fe80::/10 link-local, fc00::/7 unique-local
+            if (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // 64:ff9b::/96 translation – check inner IPv4
+            if seg[0] == 0x0064 && seg[1] == 0xff9b {
+                let v4 = std::net::Ipv4Addr::new(
+                    ((seg[6] >> 8) & 0xff) as u8,
+                    (seg[6] & 0xff) as u8,
+                    ((seg[7] >> 8) & 0xff) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+                    return false;
+                }
+            }
+            true
         }
     }
 }

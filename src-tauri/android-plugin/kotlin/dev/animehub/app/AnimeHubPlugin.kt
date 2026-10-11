@@ -57,6 +57,8 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
 import android.widget.Toast
+import java.net.Inet6Address
+import java.net.InetAddress
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -821,6 +823,11 @@ internal object SiteNavigationPolicy {
   private fun isPublicIp(ip: String): Boolean =
     if (ip.contains(':')) isPublicIpv6(ip) else isPublicIpv4(ip)
 
+  /**
+   * IANA IPv4 Special-Purpose Registry (2025-10-09) – Globally Reachable == false
+   * plus multicast/reserved. Keep in step with Rust `ip_is_public` in
+   * `src-tauri/src/sites/url_policy.rs`.
+   */
   private fun isPublicIpv4(ip: String): Boolean {
     val octets = ip.split('.').map { it.toIntOrNull() ?: return false }
     if (octets.size != 4 || octets.any { it !in 0..255 }) return false
@@ -828,34 +835,85 @@ internal object SiteNavigationPolicy {
     val b = octets[1]
     val c = octets[2]
     return !(
-      a == 0 ||                         // 0.0.0.0/8
-      a == 10 ||                        // private
-      a == 127 ||                       // loopback
-      (a == 100 && b in 64..127) ||     // CGNAT
-      (a == 169 && b == 254) ||         // link-local
-      (a == 172 && b in 16..31) ||      // private
-      (a == 192 && b == 0) ||           // IETF protocol assignments, documentation 192.0.0.0/24, 192.0.2.0/24
-      (a == 192 && b == 168) ||         // private
-      (a == 198 && b == 51 && c == 100) || // documentation 198.51.100.0/24 (as Rust is_documentation)
-      (a == 203 && b == 0 && c == 113) ||  // documentation 203.0.113.0/24 (as Rust is_documentation)
-      (a == 198 && (b == 18 || b == 19)) || // benchmarking
-      a >= 224                          // multicast, reserved, broadcast
+      a == 0 ||                         // 0.0.0.0/8 This network
+      a == 10 ||                        // 10.0.0.0/8 private
+      a == 127 ||                       // 127.0.0.0/8 loopback
+      (a == 100 && b in 64..127) ||     // 100.64.0.0/10 CGNAT
+      (a == 169 && b == 254) ||         // 169.254.0.0/16 link-local
+      (a == 172 && b in 16..31) ||      // 172.16.0.0/12 private
+      (a == 192 && b == 0) ||           // 192.0.0.0/24 IANA + 192.0.2.0/24 TEST-NET-1 (covers 192.0.0.0/24 broadly)
+      (a == 192 && b == 88 && c == 99) || // 192.88.99.0/24 6to4 relay (deprecated)
+      (a == 192 && b == 168) ||         // 192.168.0.0/16 private
+      (a == 198 && b == 51 && c == 100) || // 198.51.100.0/24 TEST-NET-2
+      (a == 203 && b == 0 && c == 113) ||  // 203.0.113.0/24 TEST-NET-3
+      (a == 198 && (b == 18 || b == 19)) || // 198.18.0.0/15 benchmarking
+      a >= 224                          // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved + broadcast
     )
   }
 
+  /**
+   * IANA IPv6 Special-Purpose Registry (2025-10-09) – Globally Reachable == false
+   * plus multicast, link-local, ULA, documentation. Uses `InetAddress` for
+   * robust :: compression and IPv4-embedded handling, so `::7f00:1` and
+   * `::ffff:192.168.1.1` are correctly recognised via the embedded IPv4.
+   */
   private fun isPublicIpv6(ip: String): Boolean {
+    // Fast path for the two most common special addresses without needing InetAddress.
     val lower = ip.lowercase()
     if (lower == "::1" || lower == "::") return false
-    if (lower.startsWith("::ffff:")) {
-      val v4 = lower.removePrefix("::ffff:")
-      return IPV4.matches(v4) && isPublicIpv4(v4)
+    // Use InetAddress for correct :: expansion and embedded-IPv4 detection.
+    // This never does DNS for literals (host contains ':').
+    try {
+      val addr = InetAddress.getByName(ip) as? Inet6Address ?: return false
+      if (addr.isAnyLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress) return false
+      val bytes = addr.address // 16 bytes, network order
+      // fe80::/10 link-local: 1111111010
+      if ((bytes[0].toInt() and 0xFF) == 0xFE && (bytes[1].toInt() and 0xC0) == 0x80) return false
+      // fc00::/7 unique local: 1111110x
+      if ((bytes[0].toInt() and 0xFE) == 0xFC) return false
+      // 2001:db8::/32 documentation
+      if ((bytes[0].toInt() and 0xFF) == 0x20 && (bytes[1].toInt() and 0xFF) == 0x01 &&
+        (bytes[2].toInt() and 0xFF) == 0x0D && (bytes[3].toInt() and 0xFF) == 0xB8
+      ) return false
+      // 100::/64 discard-only
+      if ((bytes[0].toInt() and 0xFF) == 0x01 && (bytes[1].toInt() and 0xFF) == 0x00 &&
+        bytes[2] == 0.toByte() && bytes[3] == 0.toByte() &&
+        bytes[4] == 0.toByte() && bytes[5] == 0.toByte() &&
+        bytes[6] == 0.toByte() && bytes[7] == 0.toByte()
+      ) return false
+      // Detect IPv4-embedded: ::ffff:0:0/96 (mapped) and ::/96 (compatible, deprecated)
+      val isMapped = bytes[0] == 0.toByte() && bytes[1] == 0.toByte() && bytes[2] == 0.toByte() && bytes[3] == 0.toByte() &&
+        bytes[4] == 0.toByte() && bytes[5] == 0.toByte() && bytes[6] == 0.toByte() && bytes[7] == 0.toByte() &&
+        bytes[8] == 0.toByte() && bytes[9] == 0.toByte() && (bytes[10].toInt() and 0xFF) == 0xFF && (bytes[11].toInt() and 0xFF) == 0xFF
+      val isCompatible = bytes[0] == 0.toByte() && bytes[1] == 0.toByte() && bytes[2] == 0.toByte() && bytes[3] == 0.toByte() &&
+        bytes[4] == 0.toByte() && bytes[5] == 0.toByte() && bytes[6] == 0.toByte() && bytes[7] == 0.toByte() &&
+        bytes[8] == 0.toByte() && bytes[9] == 0.toByte() && bytes[10] == 0.toByte() && bytes[11] == 0.toByte()
+      if (isMapped || isCompatible) {
+        val v4 = "${bytes[12].toInt() and 0xFF}.${bytes[13].toInt() and 0xFF}.${bytes[14].toInt() and 0xFF}.${bytes[15].toInt() and 0xFF}"
+        return isPublicIpv4(v4)
+      }
+      // 64:ff9b::/96 translation – check inner IPv4 if present
+      if ((bytes[0].toInt() and 0xFF) == 0x00 && (bytes[1].toInt() and 0xFF) == 0x64 &&
+        (bytes[2].toInt() and 0xFF) == 0xFF && (bytes[3].toInt() and 0xFF) == 0x9B
+      ) {
+        val v4 = "${bytes[12].toInt() and 0xFF}.${bytes[13].toInt() and 0xFF}.${bytes[14].toInt() and 0xFF}.${bytes[15].toInt() and 0xFF}"
+        if (!isPublicIpv4(v4)) return false
+      }
+      return true
+    } catch (e: Exception) {
+      // Fallback for malformed input – use the previous string checks for
+      // the two fast-path cases, otherwise reject.
+      if (lower.startsWith("::ffff:")) {
+        val v4 = lower.removePrefix("::ffff:")
+        return IPV4.matches(v4) && isPublicIpv4(v4)
+      }
+      val first = lower.substringBefore(':').ifEmpty { "0" }.toIntOrNull(16) ?: return false
+      return !(
+        (first and 0xffc0) == 0xfe80 ||
+        (first and 0xfe00) == 0xfc00 ||
+        (first and 0xff00) == 0xff00
+      )
     }
-    val first = lower.substringBefore(':').ifEmpty { "0" }.toIntOrNull(16) ?: return false
-    return !(
-      (first and 0xffc0) == 0xfe80 ||   // link-local fe80::/10
-      (first and 0xfe00) == 0xfc00 ||   // unique local fc00::/7
-      (first and 0xff00) == 0xff00      // multicast ff00::/8
-    )
   }
 }
 
@@ -874,6 +932,11 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     replyProxy: JavaScriptReplyProxy,
   ) {
     if (!isMainFrame) return
+    if (!isAllowedOrigin(sourceOrigin)) {
+      Log.w(LOG_TAG, "IPC blocked: unexpected origin ${sourceOrigin.scheme}")
+      AnimeHubDebugLog.add("ipc", "blocked origin scheme=${sourceOrigin.scheme}")
+      return
+    }
     val body = message.data ?: return
     val url = view.url ?: "about:blank"
     // onPostMessage runs on the UI thread. Rust runs blocking commands inline, and
@@ -893,7 +956,22 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     }
   }
 
+  private fun isAllowedOrigin(origin: Uri): Boolean {
+    val scheme = origin.scheme?.lowercase() ?: return false
+    if (scheme != "http" && scheme != "https") return false
+    val host = origin.host?.lowercase() ?: return false
+    if (host != "tauri.localhost") return false
+    if (origin.port != -1) return false
+    // Origin must be bare: no path, query, fragment or userInfo beyond "/".
+    val path = origin.path
+    if (!path.isNullOrEmpty() && path != "/") return false
+    if (!origin.query.isNullOrEmpty() || !origin.fragment.isNullOrEmpty()) return false
+    if (!origin.userInfo.isNullOrEmpty()) return false
+    return true
+  }
+
   companion object {
+    private const val LOG_TAG = "AnimeHubIpc"
     private val IPC_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
       Thread(runnable, "AnimeHubLauncherIpc").apply { isDaemon = true }
     }
