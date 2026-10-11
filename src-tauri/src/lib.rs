@@ -126,9 +126,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(s) = state {
                     // Try to hold `pip_lock` across the live check and the native call.
                     if let Ok(_guard) = s.pip_lock.try_lock() {
-                        let live_gen = s
-                            .pip_generation
-                            .load(std::sync::atomic::Ordering::SeqCst);
+                        let live_gen = s.pip_generation.load(std::sync::atomic::Ordering::SeqCst);
                         let live_val = s
                             .settings
                             .lock()

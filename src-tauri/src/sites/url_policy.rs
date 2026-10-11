@@ -294,8 +294,8 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                     && seg[7] == 0x0003;
                 let is_amt = seg[0] == 0x2001 && seg[1] == 0x0003; // 2001:3::/32
                 let is_as112 = seg[0] == 0x2001 && seg[1] == 0x0004 && seg[2] == 0x0112; // 2001:4:112::/48
-                // ORCHIDv2 2001:20::/28 and Drone 2001:30::/28 are true;
-                // 2001:10::/28 is deprecated and must stay blocked.
+                                                                                         // ORCHIDv2 2001:20::/28 and Drone 2001:30::/28 are true;
+                                                                                         // 2001:10::/28 is deprecated and must stay blocked.
                 let is_orchid = seg[0] == 0x2001
                     && ((seg[1] & 0xfff0) == 0x0020 || (seg[1] & 0xfff0) == 0x0030);
                 let allowed =
@@ -569,7 +569,10 @@ mod tests {
             let addr: std::net::IpAddr = ip.parse().unwrap();
             assert!(is_public_ip(addr), "should allow {ip}");
             assert!(!is_private_host(ip), "host {ip} should not be private");
-            assert!(validate_site_url(&format!("https://{ip}/")).is_ok(), "https://{ip}/ should validate");
+            assert!(
+                validate_site_url(&format!("https://{ip}/")).is_ok(),
+                "https://{ip}/ should validate"
+            );
         }
     }
 
@@ -613,7 +616,10 @@ mod tests {
         ] {
             let addr: std::net::IpAddr = ip.parse().unwrap_or_else(|_| panic!("parse {ip}"));
             assert!(!is_public_ip(addr), "should block {ip}");
-            assert!(is_private_host(&format!("[{ip}]")), "host [{ip}] should be private");
+            assert!(
+                is_private_host(&format!("[{ip}]")),
+                "host [{ip}] should be private"
+            );
         }
         // Allowed vectors (must pass) – more-specific true allocations inside 2001::/23
         for ip in [
@@ -658,13 +664,23 @@ mod tests {
     #[test]
     fn nat64_inner_ipv4_is_checked() {
         // RFC 6052: embedded IPv4 must be checked via same public-ip policy.
-        for ip in ["64:ff9b::10.0.0.1", "64:ff9b::192.168.1.1", "64:ff9b::192.0.2.1"] {
+        for ip in [
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::192.168.1.1",
+            "64:ff9b::192.0.2.1",
+        ] {
             let addr: std::net::IpAddr = ip.parse().unwrap();
-            assert!(!is_public_ip(addr), "NAT64 with private inner should block {ip}");
+            assert!(
+                !is_public_ip(addr),
+                "NAT64 with private inner should block {ip}"
+            );
         }
         for ip in ["64:ff9b::8.8.8.8", "64:ff9b::1.1.1.1", "64:ff9b::192.0.1.1"] {
             let addr: std::net::IpAddr = ip.parse().unwrap();
-            assert!(is_public_ip(addr), "NAT64 with public inner should allow {ip}");
+            assert!(
+                is_public_ip(addr),
+                "NAT64 with public inner should allow {ip}"
+            );
         }
         // /48 is always blocked regardless of inner
         let a48: std::net::IpAddr = "64:ff9b:1::8.8.8.8".parse().unwrap();
@@ -682,7 +698,7 @@ mod tests {
         assert!(!is_public_ip("2001:10::1".parse().unwrap()));
         assert!(!is_public_ip("2001:1f::1".parse().unwrap())); // 001f & fff0 = 0010 -> deprecated
         assert!(!is_public_ip("2001:40::1".parse().unwrap())); // outside both
-        // 2001:1::3 is a distinct /128, not part of /28
+                                                               // 2001:1::3 is a distinct /128, not part of /28
         assert!(is_public_ip("2001:1::3".parse().unwrap()));
     }
 
@@ -705,7 +721,11 @@ mod tests {
         ] {
             let mapped_ip: std::net::IpAddr = mapped.parse().unwrap();
             let inner_ip: std::net::IpAddr = inner.parse().unwrap();
-            assert_eq!(is_public_ip(mapped_ip), is_public_ip(inner_ip), "mapped {mapped} vs inner {inner}");
+            assert_eq!(
+                is_public_ip(mapped_ip),
+                is_public_ip(inner_ip),
+                "mapped {mapped} vs inner {inner}"
+            );
         }
         // Compatible ::7f00:1 should delegate to 127.0.0.1 (blocked)
         let compat: std::net::IpAddr = "::7f00:1".parse().unwrap();

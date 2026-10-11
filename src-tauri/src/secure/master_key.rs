@@ -154,9 +154,7 @@ mod unix_file {
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
         {
-            return Err(AppError::Crypto(
-                "yapılandırma dizini sembolik bağ".into(),
-            ));
+            return Err(AppError::Crypto("yapılandırma dizini sembolik bağ".into()));
         }
         Ok(())
     }
@@ -175,9 +173,7 @@ mod unix_file {
         })?;
         let meta = f.metadata()?;
         if !meta.is_dir() {
-            return Err(AppError::Crypto(
-                "yapılandırma yolu dizin değil".into(),
-            ));
+            return Err(AppError::Crypto("yapılandırma yolu dizin değil".into()));
         }
         Ok(f)
     }
@@ -220,9 +216,8 @@ mod unix_file {
         use std::os::unix::io::AsRawFd;
         let raw_fd = dir_fd.as_raw_fd();
         let c_name = std::ffi::CString::new(KEY_FILE_NAME).unwrap();
-        let fd = unsafe {
-            libc::openat(raw_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW)
-        };
+        let fd =
+            unsafe { libc::openat(raw_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW) };
         let mut f = if fd < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -240,7 +235,9 @@ mod unix_file {
             use std::os::unix::fs::PermissionsExt as _;
             let meta = f.metadata()?;
             if !meta.is_file() {
-                return Err(AppError::Crypto("anahtar dosyası normal dosya değil".into()));
+                return Err(AppError::Crypto(
+                    "anahtar dosyası normal dosya değil".into(),
+                ));
             }
             let mode = meta.permissions().mode() & 0o777;
             if mode != 0o600 {
@@ -274,9 +271,9 @@ mod unix_file {
     /// directory from bypassing `ensure_dir_safe`.
     fn write_private(path: &PathBuf, bytes: &[u8]) -> AppResult<()> {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = path.parent().ok_or_else(|| {
-            AppError::Crypto("anahtar yolu dizin değil".into())
-        })?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| AppError::Crypto("anahtar yolu dizin değil".into()))?;
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -312,9 +309,7 @@ mod unix_file {
                 if fd2 < 0 {
                     let e2 = std::io::Error::last_os_error();
                     if e2.raw_os_error() == Some(libc::ELOOP) {
-                        return Err(AppError::Crypto(
-                            "anahtar yolu sembolik bağ".into(),
-                        ));
+                        return Err(AppError::Crypto("anahtar yolu sembolik bağ".into()));
                     }
                     return Err(e2.into());
                 }
@@ -327,9 +322,7 @@ mod unix_file {
                 }
                 let mode = meta.permissions().mode() & 0o777;
                 if mode != 0o600 {
-                    return Err(AppError::Crypto(
-                        "anahtar dosyası izinleri hatalı".into(),
-                    ));
+                    return Err(AppError::Crypto("anahtar dosyası izinleri hatalı".into()));
                 }
                 let mut raw = String::new();
                 {
@@ -350,7 +343,9 @@ mod unix_file {
         {
             let meta = f.metadata()?;
             if !meta.is_file() {
-                return Err(AppError::Crypto("anahtar dosyası normal dosya değil".into()));
+                return Err(AppError::Crypto(
+                    "anahtar dosyası normal dosya değil".into(),
+                ));
             }
             let mode = meta.permissions().mode() & 0o777;
             if mode != 0o600 {
@@ -434,7 +429,10 @@ mod unix_file {
             std::fs::write(&target, hex::encode(generate_key())).unwrap();
             let link = dir.path().join(KEY_FILE_NAME);
             std::os::unix::fs::symlink(&target, &link).unwrap();
-            assert!(existing_key(dir.path()).is_err(), "symlink must be rejected");
+            assert!(
+                existing_key(dir.path()).is_err(),
+                "symlink must be rejected"
+            );
             assert!(
                 write_private(&link, b"ignored").is_err(),
                 "symlink on create must be rejected"
@@ -659,17 +657,14 @@ mod linux {
         {
             let meta = dir_fd.metadata()?;
             if !meta.is_dir() {
-                return Err(AppError::Crypto(
-                    "yapılandırma yolu dizin değil".into(),
-                ));
+                return Err(AppError::Crypto("yapılandırma yolu dizin değil".into()));
             }
         }
         use std::os::unix::io::AsRawFd;
         let raw_fd = dir_fd.as_raw_fd();
         let c_name = std::ffi::CString::new(SOURCE_FILE_NAME).unwrap();
-        let fd = unsafe {
-            libc::openat(raw_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW)
-        };
+        let fd =
+            unsafe { libc::openat(raw_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW) };
         let content = {
             if fd < 0 {
                 let err = std::io::Error::last_os_error();
@@ -677,9 +672,7 @@ mod linux {
                     return Ok(None);
                 }
                 if err.raw_os_error() == Some(libc::ELOOP) {
-                    return Err(AppError::Crypto(
-                        "anahtar kaynağı sembolik bağ".into(),
-                    ));
+                    return Err(AppError::Crypto("anahtar kaynağı sembolik bağ".into()));
                 }
                 return Err(err.into());
             }
@@ -698,9 +691,7 @@ mod linux {
                 }
                 let mode = meta.permissions().mode() & 0o777;
                 if mode != 0o600 {
-                    return Err(AppError::Crypto(
-                        "anahtar kaynağı izinleri hatalı".into(),
-                    ));
+                    return Err(AppError::Crypto("anahtar kaynağı izinleri hatalı".into()));
                 }
             }
             let mut s = String::new();
@@ -735,9 +726,7 @@ mod linux {
         {
             let meta = dir_fd.metadata()?;
             if !meta.is_dir() {
-                return Err(AppError::Crypto(
-                    "yapılandırma yolu dizin değil".into(),
-                ));
+                return Err(AppError::Crypto("yapılandırma yolu dizin değil".into()));
             }
         }
         let name = match source {
@@ -803,9 +792,7 @@ mod linux {
             }
             let mode = meta.permissions().mode() & 0o777;
             if mode != 0o600 {
-                return Err(AppError::Crypto(
-                    "anahtar kaynağı izinleri hatalı".into(),
-                ));
+                return Err(AppError::Crypto("anahtar kaynağı izinleri hatalı".into()));
             }
         }
         {
@@ -849,9 +836,7 @@ mod linux {
         {
             let meta = dir_file.metadata()?;
             if !meta.is_dir() {
-                return Err(AppError::Crypto(
-                    "yapılandırma yolu dizin değil".into(),
-                ));
+                return Err(AppError::Crypto("yapılandırma yolu dizin değil".into()));
             }
         }
         use std::os::unix::io::AsRawFd;

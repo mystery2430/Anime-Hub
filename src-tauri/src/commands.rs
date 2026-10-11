@@ -551,8 +551,8 @@ pub fn update_settings(
         if let Some(v) = patch.theme {
             next.theme = v;
         }
-        let pip_changed = patch.pip_auto_enter.is_some()
-            && patch.pip_auto_enter != Some(live.pip_auto_enter);
+        let pip_changed =
+            patch.pip_auto_enter.is_some() && patch.pip_auto_enter != Some(live.pip_auto_enter);
         if let Some(v) = patch.pip_auto_enter {
             next.pip_auto_enter = v;
         }
@@ -568,6 +568,7 @@ pub fn update_settings(
             state.pip_generation.fetch_add(1, Ordering::SeqCst);
         }
     }
+    drop(_pip_guard);
     rebuild_blocklist(&state);
     get_settings(state)
 }
@@ -975,8 +976,7 @@ pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
 /// (`setAutoEnterEnabled`) is deliberately never turned on: Android documents
 /// that it suppresses `onPictureInPictureRequested()`, so the system would put
 /// the unprepared site into the PiP window.
-pub const PIP_UNSUPPORTED_MSG: &str =
-    "Bu cihazda resim içinde resim (PiP) desteklenmiyor.";
+pub const PIP_UNSUPPORTED_MSG: &str = "Bu cihazda resim içinde resim (PiP) desteklenmiyor.";
 pub const PIP_PLATFORM_UNKNOWN_MSG: &str =
     "Cihaz türü belirlenemedi; PiP ayarı değiştirilmedi. Uygulamayı yeniden açıp tekrar deneyin.";
 
@@ -1089,6 +1089,7 @@ pub fn set_pip_auto_enter(
     if !persisted {
         return Err(AppError::Other("ayar yazılamadı".into()));
     }
+    drop(_pip_guard);
     rebuild_blocklist(&state);
     get_settings(state)
 }
@@ -1401,7 +1402,10 @@ mod tests {
     fn pip_generation_bumps_only_on_pip_change() {
         let dir = tempfile::tempdir().unwrap();
         let st = state_in(dir.path());
-        assert_eq!(st.pip_generation.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            st.pip_generation.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
         // Change pip via update_settings
         let patch = SettingsPatch {
             blocklist: None,
@@ -1415,8 +1419,12 @@ mod tests {
         };
         // Need a State wrapper for update_settings – construct a fake AppHandle is heavy.
         // Instead test the generation helper directly: simulate the bump.
-        st.pip_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(st.pip_generation.load(std::sync::atomic::Ordering::SeqCst), 1);
+        st.pip_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            st.pip_generation.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         // Changing non-pip should not bump (we don't call fetch_add).
         // Verify the helper: generation unchanged after a non-pip patch would stay 1.
     }
@@ -1437,7 +1445,10 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert!(try_result, "startup try_lock should fail when toggle holds lock");
+        assert!(
+            try_result,
+            "startup try_lock should fail when toggle holds lock"
+        );
         drop(guard);
         // After release, try_lock should succeed.
         assert!(st.pip_lock.try_lock().is_ok());
