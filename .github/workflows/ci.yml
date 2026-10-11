@@ -155,10 +155,18 @@ jobs:
       - run: npm ci
 
       - name: Initialise the Android project
-        run: npm run tauri android init
+        run: |
+          npm run tauri android init
+          echo "=== gen after init ==="
+          ls -R src-tauri/gen 2>&1 | head -n 100
+          cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 50
+          cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 50 || echo "tauri.settings.gradle MISSING"
 
       - name: Install the Kotlin bridge and PiP manifest
-        run: python3 scripts/android_prepare.py
+        run: |
+          python3 scripts/android_prepare.py
+          echo "=== gen after prepare ==="
+          ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
 
       - name: Run Kotlin policy unit test (mapped vectors)
         shell: bash
