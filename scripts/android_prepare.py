@@ -362,6 +362,15 @@ def prepare(root: Path, gen: Path) -> list[str]:
     target.write_text(kt_src.read_text(encoding="utf-8"), encoding="utf-8")
     notes.append(f"copied {class_name}.kt -> {target}")
 
+    # Saf IP policy – Android bagimliligi yok, APK ve unit test ortak kullanir
+    ip_policy_src = kotlin_source(root, package, "IpPolicy")
+    if ip_policy_src.is_file():
+        ip_target = dest / "IpPolicy.kt"
+        ip_target.write_text(ip_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
+        notes.append(f"copied IpPolicy.kt -> {ip_target}")
+    else:
+        notes.append(f"warning: IpPolicy.kt not found at {ip_policy_src}")
+
     # The PiP controller: Kotlin half (template) + the shared WebView JS.
     pip_js = read_pip_controller_js(root)
     pip_template = kotlin_source(root, package, PIP_CONTROLLER_CLASS)
