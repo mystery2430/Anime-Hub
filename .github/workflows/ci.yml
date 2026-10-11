@@ -159,10 +159,16 @@ jobs:
           rm -rf src-tauri/gen/android
           npm run tauri android init
           echo "=== gen after init ==="
-          ls -R src-tauri/gen 2>&1 | head -n 100
-          cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 50
-          cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 50 || echo "tauri.settings.gradle MISSING"
-          ls -l src-tauri/gen/android/tauri.settings.gradle 2>&1 || true
+          ls -R src-tauri/gen 2>&1 | head -n 200
+          echo "=== settings.gradle ==="
+          cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
+          echo "=== tauri.settings.gradle ==="
+          cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 100 || echo "tauri.settings.gradle MISSING"
+          ls -l src-tauri/gen/android/*.gradle 2>&1 | head -n 20
+          echo "=== init done, saving log ==="
+          mkdir -p /tmp
+          ls -R src-tauri/gen > /tmp/init-ls.log 2>&1 || true
+          cat src-tauri/gen/android/settings.gradle > /tmp/settings.log 2>&1 || true
 
       - name: Install the Kotlin bridge and PiP manifest
         run: |
@@ -177,6 +183,9 @@ jobs:
           echo "Running Kotlin policy unit test via Gradle (real production file IpPolicy.kt)..."
           mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
+          echo "=== init log ==="
+          cat /tmp/init-ls.log 2>&1 | head -n 100 || echo "no init log"
+          cat /tmp/settings.log 2>&1 | head -n 50 || echo "no settings log"
           echo "=== src/main IpPolicy.kt ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/IpPolicy.kt || echo "MISSING IpPolicy.kt"
           cat src-tauri/gen/android/app/src/main/java/dev/animehub/app/IpPolicy.kt | head -n 20
