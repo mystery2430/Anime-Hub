@@ -163,22 +163,43 @@ jobs:
       - name: Run Kotlin policy unit test (mapped vectors)
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           echo "Running Kotlin policy unit test via Gradle (real production file IpPolicy.kt)..."
           mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
-          # IpPolicy.kt already copied by android_prepare.py to src/main – test uses the same file APK uses
-          ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/IpPolicy.kt
+          echo "=== src/main IpPolicy.kt ==="
+          ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/IpPolicy.kt || echo "MISSING IpPolicy.kt"
+          cat src-tauri/gen/android/app/src/main/java/dev/animehub/app/IpPolicy.kt | head -n 20
+          echo "=== src/test SiteNavigationPolicyTest.kt ==="
           ls -l src-tauri/gen/android/app/src/test/java/dev/animehub/app/SiteNavigationPolicyTest.kt
+          cat src-tauri/gen/android/app/src/test/java/dev/animehub/app/SiteNavigationPolicyTest.kt
+          echo "=== build.gradle.kts test config ==="
+          grep -n "test" src-tauri/gen/android/app/build.gradle.kts | head -n 20
           cd src-tauri/gen/android
-          ./gradlew :app:testDebugUnitTest --tests "dev.animehub.app.SiteNavigationPolicyTest" --info | tee /tmp/kotlin-test.log
-          tail -n 120 /tmp/kotlin-test.log
-          grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log
+          ./gradlew :app:testDebugUnitTest --tests "dev.animehub.app.SiteNavigationPolicyTest" --info > /tmp/kotlin-test.log 2>&1
+          status=$?
+          echo "=== Gradle exit $status, tail 400 ==="
+          cat /tmp/kotlin-test.log | tail -n 400
+          echo "=== find test results ==="
+          find . -type f -name "*.xml" | head -n 20
+          if [ -f app/build/test-results/testDebugUnitTest/TEST-dev.animehub.app.SiteNavigationPolicyTest.xml ]; then
+            echo "=== TEST XML ==="
+            cat app/build/test-results/testDebugUnitTest/TEST-dev.animehub.app.SiteNavigationPolicyTest.xml
+          fi
+          if [ $status -ne 0 ]; then
+            echo "::error::Kotlin test failed with exit $status"
+            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin test log (first 8000 chars):
+\`\`\`
+$(cat /tmp/kotlin-test.log | head -c 8000)
+\`\`\`" || true
+            exit $status
+          fi
+          grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
           if grep -q "FAILED" /tmp/kotlin-test.log; then
-            echo "::error::Kotlin test has failures"
+            echo "::error::Kotlin test has FAILED in log"
             exit 1
           fi
-          echo "Kotlin policy test passed via Gradle (IpPolicy.kt – same file APK uses)"
+          echo "Kotlin policy test passed via Gradle (IpPolicy.kt – same file APK uses)" 
 
       - name: Upload Kotlin test log
         if: always()
