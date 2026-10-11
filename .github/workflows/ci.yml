@@ -188,10 +188,7 @@ jobs:
           fi
           if [ $status -ne 0 ]; then
             echo "::error::Kotlin test failed with exit $status"
-            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin test log (first 8000 chars):
-\`\`\`
-$(cat /tmp/kotlin-test.log | head -c 8000)
-\`\`\`" || true
+            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin test log head: $(cat /tmp/kotlin-test.log | head -c 8000 | tr '\n' ' ' | head -c 4000)" || true
             exit $status
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
