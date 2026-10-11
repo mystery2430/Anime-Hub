@@ -149,17 +149,48 @@ mod unix_file {
     }
 
     /// The key in the key file, if there is one. Never creates the file.
+    /// Uses `O_NOFOLLOW` and fd metadata to avoid TOCTOU via symlink swap.
     pub(super) fn existing_key(dir: &Path) -> AppResult<Option<Zeroizing<[u8; 32]>>> {
         let path = dir.join(KEY_FILE_NAME);
-        if !path.exists() {
-            return Ok(None);
+        // Open with O_NOFOLLOW | O_RDONLY – never follow a symlink.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW);
         }
-        let raw = std::fs::read(&path)?;
-        decode_hex_key(&String::from_utf8_lossy(&raw)).map(Some)
+        let mut f = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(AppError::Crypto("anahtar yolu sembolik bağ".into()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // fd metadata validation – fail closed on suspicious file
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let meta = f.metadata()?;
+            if !meta.is_file() {
+                return Err(AppError::Crypto("anahtar dosyası normal dosya değil".into()));
+            }
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(AppError::Crypto("anahtar dosyası izinleri hatalı".into()));
+            }
+        }
+        let mut raw = String::new();
+        {
+            use std::io::Read as _;
+            f.read_to_string(&mut raw)?;
+        }
+        decode_hex_key(&raw).map(Some)
     }
 
     /// Create a new key file and return the key stored in it. If another
-    /// process created the file first, the key already on disk is returned.
+    /// process created the file first, the key already on disk is returned
+    /// after validating it with the same no-follow policy.
     pub(super) fn create_key(dir: &Path) -> AppResult<Zeroizing<[u8; 32]>> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(KEY_FILE_NAME);
@@ -170,23 +201,64 @@ mod unix_file {
 
     /// Write with `0600`, creating the file exclusively so a pre-existing
     /// symlink or world-readable file is never silently reused.
+    /// Uses `O_NOFOLLOW | O_EXCL | O_CREAT` and validates the opened fd.
     fn write_private(path: &PathBuf, bytes: &[u8]) -> AppResult<()> {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true).mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
         let mut f = match opts.open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Someone raced us; adopt whatever is there.
-                let raw = std::fs::read(path)?;
-                let _ = decode_hex_key(&String::from_utf8_lossy(&raw))?;
+                // Someone raced us – validate the existing file before adopting.
+                let mut ro = std::fs::OpenOptions::new();
+                ro.read(true);
+                ro.custom_flags(libc::O_NOFOLLOW);
+                let mut existing = ro.open(path).map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        AppError::Crypto("anahtar yolu sembolik bağ".into())
+                    } else {
+                        e.into()
+                    }
+                })?;
+                let meta = existing.metadata()?;
+                if !meta.is_file() {
+                    return Err(AppError::Crypto("anahtar dosyası normal dosya değil".into()));
+                }
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(AppError::Crypto("anahtar dosyası izinleri hatalı".into()));
+                }
+                let mut raw = String::new();
+                {
+                    use std::io::Read as _;
+                    existing.read_to_string(&mut raw)?;
+                }
+                let _ = decode_hex_key(&raw)?;
                 return Ok(());
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(AppError::Crypto("anahtar yolu sembolik bağ".into()))
             }
             Err(e) => return Err(e.into()),
         };
-        use std::io::Write as _;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        // Verify the newly created fd – mode, file type
+        {
+            let meta = f.metadata()?;
+            if !meta.is_file() {
+                return Err(AppError::Crypto("anahtar dosyası normal dosya değil".into()));
+            }
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(AppError::Crypto("anahtar dosyası izinleri hatalı".into()));
+            }
+        }
+        {
+            use std::io::Write as _;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
         Ok(())
     }
 
@@ -236,10 +308,50 @@ mod unix_file {
         fn fallback_writes_exclusively() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(KEY_FILE_NAME);
-            std::fs::write(&path, hex::encode(generate_key())).unwrap();
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+                use std::io::Write as _;
+                f.write_all(hex::encode(generate_key()).as_bytes()).unwrap();
+            }
             // Must adopt the existing file instead of erroring.
             assert!(write_private(&path, b"ignored").is_ok());
             assert_eq!(std::fs::read_to_string(&path).unwrap().len(), 64);
+        }
+
+        #[test]
+        fn symlink_is_rejected_no_follow() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("real.key");
+            std::fs::write(&target, hex::encode(generate_key())).unwrap();
+            let link = dir.path().join(KEY_FILE_NAME);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(existing_key(dir.path()).is_err(), "symlink must be rejected");
+            assert!(
+                write_private(&link, b"ignored").is_err(),
+                "symlink on create must be rejected"
+            );
+        }
+
+        #[test]
+        fn bad_permissions_are_rejected() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(KEY_FILE_NAME);
+            std::fs::write(&path, hex::encode(generate_key())).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                existing_key(dir.path()).is_err(),
+                "world-readable must be rejected"
+            );
+            assert!(
+                write_private(&path, b"ignored").is_err(),
+                "AlreadyExists with bad mode must be rejected"
+            );
         }
     }
 }
