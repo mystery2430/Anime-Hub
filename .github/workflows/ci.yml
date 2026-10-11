@@ -159,20 +159,25 @@ jobs:
           rm -rf src-tauri/gen/android
           echo "=== tauri version ==="
           npx @tauri-apps/cli --version
+          echo "=== node_modules/.bin/tauri ==="
+          ls -l node_modules/.bin/tauri 2>&1 | head -n 20
           echo "=== running tauri android init (verbose) ==="
-          npm run tauri android init -- --verbose > /tmp/tauri-init.log 2>&1 || true
-          cat /tmp/tauri-init.log 2>&1 | head -n 500
-          echo "=== tauri init exit code ==="
-          cat /tmp/tauri-init.log 2>&1 | tail -n 20
+          npm run tauri android init -- --verbose > /tmp/tauri-init.log 2>&1; echo "exit code $?" > /tmp/tauri-exit.log
+          cat /tmp/tauri-init.log 2>&1 | head -n 800
+          echo "=== exit code ==="
+          cat /tmp/tauri-exit.log
           echo "=== gen after init (full) ==="
-          find src-tauri/gen -type f 2>&1 | head -n 100
-          ls -R src-tauri/gen 2>&1 | head -n 300
+          find src-tauri/gen -type f 2>&1 | head -n 200
+          ls -R src-tauri/gen 2>&1 | head -n 500
           echo "=== settings.gradle ==="
           cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
           echo "=== tauri.settings.gradle ==="
           cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 100 || echo "tauri.settings.gradle MISSING"
           ls -l src-tauri/gen/android/*.gradle 2>&1 | head -n 50
           find src-tauri/gen -name "*.gradle" 2>&1 | head -n 50
+          echo "=== cargo check ==="
+          cargo --version 2>&1 | head || echo "cargo not found"
+          rustc --version 2>&1 | head || echo "rustc not found"
           echo "=== init done, saving log ==="
           mkdir -p /tmp
           ls -R src-tauri/gen > /tmp/init-ls.log 2>&1 || true
@@ -181,16 +186,16 @@ jobs:
           if [ ! -f src-tauri/gen/android/tauri.settings.gradle ]; then
             echo "::error::tauri.settings.gradle missing after tauri android init – check tauri-cli version and init output"
             echo "=== ls -R src-tauri/gen ==="
-            ls -R src-tauri/gen 2>&1 | head -n 200
+            ls -R src-tauri/gen 2>&1 | head -n 500
             echo "=== find gradle ==="
-            find src-tauri/gen -name "*.gradle" 2>&1 | head -n 50
+            find src-tauri/gen -name "*.gradle" 2>&1 | head -n 100
             echo "=== cat settings.gradle ==="
             cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
             echo "=== tauri-init.log tail ==="
-            cat /tmp/tauri-init.log 2>&1 | tail -n 100
-            npx @tauri-apps/cli info 2>&1 | head -n 100 || true
-            ls -R src-tauri 2>&1 | head -n 100 || true
-            gh pr comment ${{ github.event.pull_request.number }} --body "init fail: tauri.settings.gradle missing, init log: $(cat /tmp/tauri-init.log 2>&1 | tail -c 3000 | tr '\n' ' ' | head -c 3000)" || true
+            cat /tmp/tauri-init.log 2>&1 | tail -n 500
+            npx @tauri-apps/cli info 2>&1 | head -n 200 || true
+            ls -R src-tauri 2>&1 | head -n 200 || true
+            gh pr comment ${{ github.event.pull_request.number }} --body "init fail: tauri.settings.gradle missing, init log tail: $(cat /tmp/tauri-init.log 2>&1 | tail -c 4000 | tr '\n' ' ' | head -c 3000)" || true
             exit 1
           fi
 
