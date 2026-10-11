@@ -226,12 +226,17 @@ test("PiP: an unrecognised platform name is refused without a save", async () =>
   assert.equal(w.cmd("set_pip_auto_enter").length, 0);
 });
 
-test("PiP: Android applies the saved preference through the native controller once", async () => {
+test("PiP: Android applies the saved preference through the native controller once (native → persist)", async () => {
   const w = fakeWorld({ pipAutoEnter: false }, { set_pip_auto_enter: true });
   assert.equal(await w.flow.changePipAutoEnter(true), true);
   assert.equal(w.current().pipAutoEnter, true);
   assert.equal(w.cmd("update_settings").length, 1);
   assert.deepEqual(w.cmd("set_pip_auto_enter").map((c) => c.args), [{ enabled: true }]);
+  const order = w.calls.map((c) => c.cmd);
+  assert.ok(
+    order.indexOf("set_pip_auto_enter") < order.indexOf("update_settings"),
+    "native must precede persist",
+  );
 });
 
 test("PiP: desktop platforms store the preference only, as before", async () => {
@@ -243,12 +248,14 @@ test("PiP: desktop platforms store the preference only, as before", async () => 
   }
 });
 
-test("PiP: a native error rolls the saved value back", async () => {
+test("PiP: a native error is shown, persist is not attempted, and switch is redrawn", async () => {
   const w = fakeWorld({ pipAutoEnter: false }, { set_pip_auto_enter: new Error("boom") });
   assert.equal(await w.flow.changePipAutoEnter(true), false);
   assert.equal(w.current().pipAutoEnter, false);
   assert.equal(w.state.pipAutoEnter, false);
+  assert.equal(w.cmd("update_settings").length, 0, "persist must not be attempted after native failure");
   assert.equal(w.notices[0].message, "boom");
+  assert.equal(w.drawCount(), 1);
 });
 
 test("PiP: ok:false (PiP unsupported) is never silent", async () => {
@@ -258,37 +265,119 @@ test("PiP: ok:false (PiP unsupported) is never silent", async () => {
   assert.equal(w.notices[0].message, PIP_UNSUPPORTED_MESSAGE);
 });
 
-test("PiP: when the rollback save also fails, the stored value is what is shown", async () => {
-  let saves = 0;
-  let drawn = 0;
+test("PiP: persist failure after native success reverts native (compensating transaction)", async () => {
+  const calls = [];
   const notices = [];
+  let current = { pipAutoEnter: false };
   const flow = createSettingsFlow({
-    call: async (cmd) => {
-      if (cmd === "update_settings") {
-        saves += 1;
-        if (saves === 1) return { pipAutoEnter: true };
-        throw new Error("rollback failed");
-      }
+    call: async (cmd, args) => {
+      calls.push({ cmd, args });
       if (cmd === "app_info") return { platform: "android" };
-      if (cmd === "set_pip_auto_enter") throw new Error("boom");
+      if (cmd === "set_pip_auto_enter") {
+        // first call wanted=true, second call revert to false
+        if (args.enabled === true) return true;
+        if (args.enabled === false) return true;
+        return false;
+      }
+      if (cmd === "update_settings") throw new Error("kayıt yazılamadı");
       return null;
     },
-    notify: (m, k) => notices.push({ message: m, kind: k }),
+    notify: (m) => notices.push(m),
     errorText: (e) => e.message,
     refresh: async () => {},
-    drawSwitches: () => {
-      drawn += 1;
+    drawSwitches: () => {},
+    getCurrent: () => current,
+    setCurrent: (v) => {
+      current = v;
     },
-    getCurrent: () => ({ pipAutoEnter: false }),
-    setCurrent: () => {},
     setDevPanel: () => {},
     refreshDevLog: async () => {},
   });
   assert.equal(await flow.changePipAutoEnter(true), false);
-  assert.equal(saves, 2);
-  assert.ok(drawn >= 2);
-  assert.equal(notices[0].message, "boom");
-  assert.equal(notices.at(-1).message, "rollback failed");
+  // native tried twice: wanted and revert
+  assert.deepEqual(
+    calls.filter((c) => c.cmd === "set_pip_auto_enter").map((c) => c.args),
+    [{ enabled: true }, { enabled: false }],
+  );
+  assert.equal(calls.filter((c) => c.cmd === "update_settings").length, 1);
+  assert.equal(notices[0], "kayıt yazılamadı");
+  assert.equal(current.pipAutoEnter, false, "saved stays previous");
+});
+
+test("PiP: persist failure and revert failure does not claim success nor reverted", async () => {
+  const calls = [];
+  const notices = [];
+  let current = { pipAutoEnter: false };
+  const flow = createSettingsFlow({
+    call: async (cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "app_info") return { platform: "android" };
+      if (cmd === "set_pip_auto_enter") {
+        if (args.enabled === true) return true;
+        if (args.enabled === false) throw new Error("revert boom");
+        return false;
+      }
+      if (cmd === "update_settings") throw new Error("kayıt yazılamadı");
+      return null;
+    },
+    notify: (m) => notices.push(m),
+    errorText: (e) => e.message,
+    refresh: async () => {},
+    drawSwitches: () => {},
+    getCurrent: () => current,
+    setCurrent: (v) => {
+      current = v;
+    },
+    setDevPanel: () => {},
+    refreshDevLog: async () => {},
+  });
+  assert.equal(await flow.changePipAutoEnter(true), false);
+  assert.ok(notices[0].includes("kayıt yazılamadı"));
+  assert.ok(notices[0].includes("geri alınamadı"));
+  assert.equal(current.pipAutoEnter, false);
+});
+
+test("PiP: rapid toggles are serialized and the last wins (minimal queue)", async () => {
+  const calls = [];
+  const delays = [];
+  let current = { pipAutoEnter: false };
+  const flow = createSettingsFlow({
+    call: async (cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "app_info") return { platform: "android" };
+      if (cmd === "set_pip_auto_enter") {
+        // simulate async native
+        await new Promise((r) => setTimeout(r, 10));
+        return true;
+      }
+      if (cmd === "update_settings") {
+        await new Promise((r) => setTimeout(r, 5));
+        current = { pipAutoEnter: args.patch.pipAutoEnter };
+        return structuredClone(current);
+      }
+      return null;
+    },
+    notify: () => {},
+    errorText: (e) => e.message,
+    refresh: async () => {},
+    drawSwitches: () => {},
+    getCurrent: () => current,
+    setCurrent: (v) => {
+      current = v;
+    },
+    setDevPanel: () => {},
+    refreshDevLog: async () => {},
+  });
+  const p1 = flow.changePipAutoEnter(true);
+  const p2 = flow.changePipAutoEnter(false);
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.equal(r1, true);
+  assert.equal(r2, true);
+  assert.equal(current.pipAutoEnter, false, "last toggle wins");
+  // Ensure order: first native true, then persist true, then native false, then persist false
+  const seq = calls.map((c) => `${c.cmd}:${c.args?.enabled ?? JSON.stringify(c.args?.patch)}`);
+  assert.ok(seq.indexOf("set_pip_auto_enter:true") < seq.indexOf("update_settings:{\"pipAutoEnter\":true}"));
+  assert.ok(seq.indexOf("update_settings:{\"pipAutoEnter\":true}") < seq.indexOf("set_pip_auto_enter:false"));
 });
 
 // ------------------------------------------------------------- bindings

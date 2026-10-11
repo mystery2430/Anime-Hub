@@ -129,36 +129,88 @@ export function createSettingsFlow(deps) {
     return save({ blocklist: { rules: savedRules, enabled } });
   }
 
+  // PiP: native -> persist order with compensating transaction.
+  // All PiP toggles are serialized through a dedicated queue so rapid
+  // clicks never interleave and the startup saved-preference native call
+  // (done in Rust setup) does not race with the first toggle. Other
+  // settings remain unblocked.
+  let pipChain = Promise.resolve();
+
   async function rollbackPip(previous, message) {
     notify(message);
     await save({ pipAutoEnter: previous });
     drawSwitches();
   }
 
-  /** The "auto PiP" switch. See the module comment for the rules. */
-  async function changePipAutoEnter(wanted) {
+  async function doChangePip(wantedRaw) {
+    const wanted = Boolean(wantedRaw);
     const name = await resolvePlatform();
     if (!KNOWN_PLATFORMS.includes(name)) {
-      // Unknown platform: do not save, do not call native. Undo the visual change.
       notify(PLATFORM_UNKNOWN_MESSAGE);
       drawSwitches();
       return false;
     }
     const previous = Boolean(getCurrent() && getCurrent().pipAutoEnter);
-    if (!(await save({ pipAutoEnter: wanted }))) return false;
-    if (DESKTOP_PLATFORMS.includes(name)) return true; // stored only, as before
+    if (wanted === previous) {
+      drawSwitches();
+      return true;
+    }
+    // Desktop: stored only, no native step
+    if (DESKTOP_PLATFORMS.includes(name)) {
+      return save({ pipAutoEnter: wanted });
+    }
+
+    // Android: native first
     let applied;
     try {
       applied = await call("set_pip_auto_enter", { enabled: wanted });
     } catch (e) {
-      await rollbackPip(previous, errorText(e));
+      notify(errorText(e));
+      drawSwitches();
       return false;
     }
     if (applied !== true) {
-      await rollbackPip(previous, PIP_UNSUPPORTED_MESSAGE);
+      notify(PIP_UNSUPPORTED_MESSAGE);
+      drawSwitches();
       return false;
     }
+
+    // Native succeeded – now persist. On failure, compensate native.
+    let saved;
+    try {
+      saved = await call("update_settings", { patch: { pipAutoEnter: wanted } });
+    } catch (e) {
+      // Persist failed – try to revert native.
+      let reverted = false;
+      try {
+        const rev = await call("set_pip_auto_enter", { enabled: previous });
+        reverted = rev === true;
+      } catch {}
+      if (reverted) {
+        notify(errorText(e));
+      } else {
+        // Compensating revert also failed – do not claim success or "reverted".
+        const base = errorText(e);
+        notify(base + " PiP durumu geri alınamadı; uygulamayı yeniden başlatın.");
+      }
+      drawSwitches();
+      return false;
+    }
+    setCurrent(saved);
+    try {
+      await refresh();
+    } catch (err) {
+      notify(errorText(err));
+    }
     return true;
+  }
+
+  /** The "auto PiP" switch. See the module comment for the rules. */
+  function changePipAutoEnter(wanted) {
+    const task = pipChain.then(() => doChangePip(wanted));
+    // Keep chain alive even if task rejects
+    pipChain = task.catch(() => {});
+    return task;
   }
 
   return {
