@@ -176,9 +176,18 @@ jobs:
           cat src-tauri/gen/android/settings.gradle > /tmp/settings.log 2>&1 || true
           if [ ! -f src-tauri/gen/android/tauri.settings.gradle ]; then
             echo "::error::tauri.settings.gradle missing after tauri android init – check tauri-cli version and init output"
-            cat /tmp/init-ls.log 2>&1 | head -n 100
+            echo "=== ls -R src-tauri/gen ==="
+            ls -R src-tauri/gen 2>&1 | head -n 200
+            echo "=== find gradle ==="
+            find src-tauri/gen -name "*.gradle" 2>&1 | head -n 50
+            echo "=== cat settings.gradle ==="
+            cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
             npx @tauri-apps/cli info 2>&1 | head -n 100 || true
             ls -R src-tauri 2>&1 | head -n 100 || true
+            # Also save for next step and comment
+            ls -R src-tauri/gen > /tmp/init-fail.log 2>&1 || true
+            cat src-tauri/gen/android/settings.gradle > /tmp/settings-fail.log 2>&1 || true
+            gh pr comment ${{ github.event.pull_request.number }} --body "init fail: $(cat src-tauri/gen/android/settings.gradle 2>&1 | head -c 1500 | tr '\n' ' ') -- $(ls -R src-tauri/gen 2>&1 | head -c 1500 | tr '\n' ' ')" || true
             exit 1
           fi
 
