@@ -890,8 +890,8 @@ internal object SiteNavigationPolicy {
       if (bytes[0] == 0x01.toByte() && bytes[1] == 0x00.toByte() && bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() &&
         bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte() && bytes[6] == 0x00.toByte() && bytes[7] == 0x01.toByte()
       ) return false
-      // 3fff::/20 documentation (RFC 9637) – any 3fff:xxxx is reserved
-      if ((bytes[0].toInt() and 0xFF) == 0x3F && (bytes[1].toInt() and 0xFF) == 0xFF) return false
+      // 3fff::/20 documentation (RFC 9637) – first 20 bits 0011 1111 1111 1111 0000
+      if ((bytes[0].toInt() and 0xFF) == 0x3F && (bytes[1].toInt() and 0xFF) == 0xFF && (bytes[2].toInt() and 0xF0) == 0x00) return false
       // 5f00::/16 SRv6 SIDs
       if ((bytes[0].toInt() and 0xFF) == 0x5F && (bytes[1].toInt() and 0xFF) == 0x00) return false
       // 64:ff9b:1::/48 translation – false (must be checked before /96)
@@ -902,11 +902,15 @@ internal object SiteNavigationPolicy {
       if (bytes[0] == 0x20.toByte() && bytes[1] == 0x01.toByte() && bytes[2] == 0x00.toByte() && bytes[3] == 0x02.toByte() &&
         bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte()
       ) return false
+      // 2002::/16 6to4 – deprecated
+      if (bytes[0] == 0x20.toByte() && bytes[1] == 0x02.toByte()) return false
+      // fec0::/10 site-local – deprecated (RFC 3879)
+      if ((bytes[0].toInt() and 0xFF) == 0xFE && (bytes[1].toInt() and 0xC0) == 0xC0) return false
       // 2001::/23 IETF protocol assignments – false unless more-specific true allocation
+      // 2001::/32 Teredo has N/A, so NOT whitelisted (fail-closed)
       val in2001_23 = (bytes[0].toInt() and 0xFF) == 0x20 && (bytes[1].toInt() and 0xFF) == 0x01 && (bytes[2].toInt() and 0xFE) == 0x00
       if (in2001_23) {
-        // Whitelist true allocations inside /23 (TEREDO, PCP, AMT, AS112, ORCHIDv2)
-        val isTeredo = bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte() && bytes[4] == 0x00.toByte() && bytes[5] == 0x00.toByte() // 2001::/32 with zero third hextet
+        // Whitelist only allocations with Globally Reachable == true
         val isPcp1 = bytes[0]==0x20.toByte() && bytes[1]==0x01.toByte() && bytes[2]==0x00.toByte() && bytes[3]==0x01.toByte() &&
           bytes[4]==0x00.toByte() && bytes[5]==0x00.toByte() && bytes[6]==0x00.toByte() && bytes[7]==0x00.toByte() &&
           bytes[8]==0x00.toByte() && bytes[9]==0x00.toByte() && bytes[10]==0x00.toByte() && bytes[11]==0x00.toByte() &&
@@ -927,7 +931,7 @@ internal object SiteNavigationPolicy {
         // /28 -> mask top 12 bits of second hextet: 0xfff0
         val seg1 = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
         val isOrchid = (seg1 and 0xFFF0) == 0x0020 || (seg1 and 0xFFF0) == 0x0030
-        val allowedIn23 = isTeredo || isPcp1 || isPcp2 || isPcp3 || isAmt || isAs112 || isOrchid
+        val allowedIn23 = isPcp1 || isPcp2 || isPcp3 || isAmt || isAs112 || isOrchid
         if (!allowedIn23) {
           // Also allow any /23 address that is explicitly documented as true via more-specific table but not in our small whitelist?
           // Fail-closed: treat unknown /23 as blocked.
@@ -958,6 +962,18 @@ internal object SiteNavigationPolicy {
         val v4 = "${bytes[12].toInt() and 0xFF}.${bytes[13].toInt() and 0xFF}.${bytes[14].toInt() and 0xFF}.${bytes[15].toInt() and 0xFF}"
         if (!isPublicIpv4(v4)) return false
       }
+      // Fail-closed: only 2000::/3 is global-unicast. Outside that, only
+      // 64:ff9b::/96 with public IPv4 (handled above) is allowed.
+      if ((bytes[0].toInt() and 0xFF) == 0x00 && (bytes[1].toInt() and 0xFF) == 0x64 &&
+        (bytes[2].toInt() and 0xFF) == 0xFF && (bytes[3].toInt() and 0xFF) == 0x9B &&
+        (bytes[4].toInt() and 0xFF) == 0x00 && (bytes[5].toInt() and 0xFF) == 0x00 &&
+        (bytes[6].toInt() and 0xFF) == 0x00 && (bytes[7].toInt() and 0xFF) == 0x00 &&
+        (bytes[8].toInt() and 0xFF) == 0x00 && (bytes[9].toInt() and 0xFF) == 0x00 &&
+        (bytes[10].toInt() and 0xFF) == 0x00 && (bytes[11].toInt() and 0xFF) == 0x00) {
+        return true
+      }
+      val seg0 = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+      if ((seg0 and 0xE000) != 0x2000) return false
       // The /48 variant already returned false above.
       return true
     } catch (e: Exception) {

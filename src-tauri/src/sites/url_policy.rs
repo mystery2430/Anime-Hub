@@ -236,8 +236,8 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                 return false;
             }
             let seg = v6.segments();
-            // 3fff::/20 documentation (RFC 9637) – any 3fff:xxxx is reserved
-            if seg[0] == 0x3fff {
+            // 3fff::/20 documentation (RFC 9637) – first 20 bits 0011 1111 1111 1111 0000
+            if seg[0] == 0x3fff && (seg[1] & 0xf000) == 0x0000 {
                 return false;
             }
             // 5f00::/16 SRv6 SIDs
@@ -264,10 +264,18 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
             if seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0x0000 {
                 return false;
             }
+            // 2002::/16 6to4 – deprecated
+            if seg[0] == 0x2002 {
+                return false;
+            }
+            // fec0::/10 site-local – deprecated (RFC 3879)
+            if (seg[0] & 0xffc0) == 0xfec0 {
+                return false;
+            }
             // 2001::/23 IETF protocol assignments – false unless more-specific true allocation
+            // 2001::/32 Teredo has N/A, so NOT whitelisted (fail-closed)
             if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0x0000 {
-                // Whitelist true allocations inside /23
-                let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000 && seg[2] == 0x0000; // 2001::/32 with zero third hextet
+                // Whitelist only allocations with Globally Reachable == true
                 let is_pcp1 = seg[0] == 0x2001
                     && seg[1] == 0x0001
                     && seg[2] == 0x0000
@@ -298,8 +306,7 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                                                                                          // 2001:10::/28 is deprecated and must stay blocked.
                 let is_orchid = seg[0] == 0x2001
                     && ((seg[1] & 0xfff0) == 0x0020 || (seg[1] & 0xfff0) == 0x0030);
-                let allowed =
-                    is_teredo || is_pcp1 || is_pcp2 || is_pcp3 || is_amt || is_as112 || is_orchid;
+                let allowed = is_pcp1 || is_pcp2 || is_pcp3 || is_amt || is_as112 || is_orchid;
                 if !allowed {
                     return false;
                 }
@@ -309,10 +316,10 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                 return false;
             }
             // IPv4-embedded: ::ffff:0:0/96 (mapped) and ::/96 (compatible, deprecated)
+            // These are outside 2000::/3 but are handled as special cases:
+            // allow only if embedded IPv4 is public, otherwise block.
             if let Some(m) = v6.to_ipv4_mapped() {
-                if !ip_is_public(&std::net::IpAddr::V4(m)) {
-                    return false;
-                }
+                return ip_is_public(&std::net::IpAddr::V4(m));
             } else if seg[0] == 0
                 && seg[1] == 0
                 && seg[2] == 0
@@ -327,9 +334,7 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                     ((seg[7] >> 8) & 0xff) as u8,
                     (seg[7] & 0xff) as u8,
                 );
-                if !ip_is_public(&std::net::IpAddr::V4(v4)) {
-                    return false;
-                }
+                return ip_is_public(&std::net::IpAddr::V4(v4));
             }
             // 64:ff9b::/96 translation – globally reachable true per IANA,
             // but the embedded IPv4 must itself be globally reachable (RFC 6052).
@@ -351,6 +356,20 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                 if !ip_is_public(&std::net::IpAddr::V4(v4)) {
                     return false;
                 }
+            }
+            // Fail-closed: only 2000::/3 is global-unicast. Outside that,
+            // only 64:ff9b::/96 with public IPv4 (handled above) is allowed.
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                return true;
+            }
+            if (seg[0] & 0xe000) != 0x2000 {
+                return false;
             }
             true
         }
@@ -578,6 +597,7 @@ mod tests {
     #[test]
     fn ipv6_iana_blocks_and_allows() {
         // Blocked vectors (must be rejected) – RFC 6052 and IANA 2025-10-09
+        // Includes fail-closed cases outside 2000::/3 and deprecated 6to4/site-local.
         for ip in [
             "::",
             "::1",
@@ -595,7 +615,7 @@ mod tests {
             "100::1",
             "100:0:0:1::1",
             "3fff::1",
-            "3fff:1234::1",
+            "3fff:0fff::1", // inside 3fff::/20 near boundary (high nibble 0x0)
             "64:ff9b:1::1",
             "64:ff9b:1::192.0.2.1",
             // NAT64 /96 with non-global embedded IPv4 must be rejected (RFC 6052)
@@ -609,9 +629,15 @@ mod tests {
             // 2001:10::/28 is deprecated (ex-ORCHID) – not globally reachable
             "2001:10::1",
             "2001:10:ffff::1",
-            // Inside 2001::/23 but not whitelisted
+            // Teredo 2001::/32 has N/A, so fail-closed (not explicitly true)
+            "2001::1",
+            "2001:0:0:1::1",
             "2001:0:1::1",
             "2001:1:ffff::1",
+            // 6to4, site-local, and non-global-unicast
+            "2002::1",
+            "fec0::1",
+            "4000::1",
         ] {
             let addr: std::net::IpAddr = ip.parse().unwrap_or_else(|_| panic!("parse {ip}"));
             assert!(!is_public_ip(addr), "should block {ip}");
@@ -621,6 +647,8 @@ mod tests {
             );
         }
         // Allowed vectors (must pass) – more-specific true allocations inside 2001::/23
+        // Note: 2001::/32 Teredo is N/A, so NOT allowed (fail-closed).
+        // 3fff:1234::1 is outside 3fff::/20 (high nibble 0x1), so it is global-unicast and allowed.
         for ip in [
             "2001:4860:4860::8888",
             "2606:4700:4700::1111",
@@ -628,9 +656,7 @@ mod tests {
             "64:ff9b::8.8.8.8",
             "64:ff9b::1.1.1.1",
             "64:ff9b::192.0.1.1",
-            // TEREDO 2001::/32 (N/A per RFC 4380 but more-specific than /23)
-            "2001::1",
-            "2001:0:0:1::1",
+            "3fff:1234::1", // outside 3fff::/20 (high nibble 0x1), so public
             "2001:1::1",
             "2001:1::2",
             "2001:1::3",
