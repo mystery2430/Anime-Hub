@@ -160,6 +160,18 @@ jobs:
       - name: Install the Kotlin bridge and PiP manifest
         run: python3 scripts/android_prepare.py
 
+      - name: Run Kotlin policy unit test (mapped vectors)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
+          cd src-tauri/gen/android
+          ./gradlew :app:testDebugUnitTest --tests "dev.animehub.app.SiteNavigationPolicyTest" --info | tee /tmp/kotlin-test.log
+          tail -n 80 /tmp/kotlin-test.log
+          # Ensure the test actually passed (look for BUILD SUCCESSFUL and no failures)
+          grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log
+
       - name: Build installable debug APK
         # A debug variant is signed with Android's generated debug key, so the
         # CI artifact can be installed for testing without release keystore

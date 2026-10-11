@@ -713,6 +713,20 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_allows_public_blocks_private() {
+        // Rust and Kotlin must agree on mapped: public inner → allow, private inner → block
+        let pub_mapped: std::net::IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        let priv_mapped: std::net::IpAddr = "::ffff:192.168.1.1".parse().unwrap();
+        let priv_mapped2: std::net::IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_public_ip(pub_mapped), "::ffff:8.8.8.8 should be public (inner 8.8.8.8 public)");
+        assert!(!is_public_ip(priv_mapped), "::ffff:192.168.1.1 should be private (inner private)");
+        assert!(!is_public_ip(priv_mapped2), "::ffff:10.0.0.1 should be private");
+        // Also via is_private_host (brackets)
+        assert!(!is_private_host("[::ffff:8.8.8.8]"));
+        assert!(is_private_host("[::ffff:192.168.1.1]"));
+    }
+
+    #[test]
     fn orchid_v2_mask_is_correct() {
         // 2001:20::/28 covers 0020-002f, 2001:30::/28 covers 0030-003f.
         // 2001:10::/28 (deprecated) must stay blocked.

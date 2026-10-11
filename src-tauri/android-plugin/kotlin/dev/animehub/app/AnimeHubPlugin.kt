@@ -870,7 +870,21 @@ internal object SiteNavigationPolicy {
     val lower = ip.lowercase()
     if (lower == "::1" || lower == "::") return false
     try {
-      val addr = InetAddress.getByName(ip) as? Inet6Address ?: return false
+      val inet = InetAddress.getByName(ip)
+      // Android's InetAddress.getByName normalizes ::ffff:1.2.3.4 to an Inet4Address (1.2.3.4).
+      // Detect that case via the original string containing ':' and '.' and delegate to IPv4 policy.
+      if (inet !is Inet6Address) {
+        if (ip.contains(":") && ip.contains(".")) {
+          // Embedded IPv4 (e.g., ::ffff:8.8.8.8, ::10.0.0.1) – extract last colon part
+          val v4Part = ip.substringAfterLast(':')
+          // v4Part is like "8.8.8.8" ; if it still contains ':', fallback to InetAddress
+          if (v4Part.contains(".")) return isPublicIpv4(v4Part)
+          // Fallback: use the Inet4Address string
+          return isPublicIpv4(inet.hostAddress ?: return false)
+        }
+        return false
+      }
+      val addr = inet
       if (addr.isAnyLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress) return false
       val bytes = addr.address // 16 bytes, network order
 
@@ -981,6 +995,9 @@ internal object SiteNavigationPolicy {
       return false
     }
   }
+
+  // Test-only accessor for CI – calls the real policy
+  fun isPublicIpForTest(ip: String): Boolean = isPublicIp(ip)
 }
 
 /**
