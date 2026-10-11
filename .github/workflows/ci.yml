@@ -189,17 +189,24 @@ jobs:
           cat /tmp/tauri-init.log > /tmp/tauri-init-full.log 2>&1 || true
           if [ ! -f src-tauri/gen/android/tauri.settings.gradle ]; then
             echo "::error::tauri.settings.gradle missing after tauri android init – check tauri-cli version and init output"
+            echo "=== ls -la src-tauri/gen/android ==="
+            ls -la src-tauri/gen/android/ 2>&1 | head -n 100
             echo "=== ls -R src-tauri/gen ==="
             ls -R src-tauri/gen 2>&1 | head -n 500
-            echo "=== find gradle ==="
-            find src-tauri/gen -name "*.gradle" 2>&1 | head -n 100
+            echo "=== find gradle (all) ==="
+            find src-tauri -name "*.gradle" 2>&1 | head -n 100
             echo "=== cat settings.gradle ==="
             cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
+            echo "=== cat tauri.settings.gradle (if exists elsewhere) ==="
+            find src-tauri -name "tauri.settings.gradle" -exec ls -l {} \; 2>&1 | head -n 20
+            find src-tauri -name "tauri.settings.gradle" -exec cat {} \; 2>&1 | head -n 100
             echo "=== tauri-init.log tail ==="
-            cat /tmp/tauri-init.log 2>&1 | tail -n 500
+            cat /tmp/tauri-init.log 2>&1 | tail -n 1000
+            echo "=== tauri-init.log full ==="
+            cat /tmp/tauri-init.log 2>&1 | head -n 1000
             npx @tauri-apps/cli info 2>&1 | head -n 200 || true
             ls -R src-tauri 2>&1 | head -n 200 || true
-            gh pr comment ${{ github.event.pull_request.number }} --body "init fail: tauri.settings.gradle missing, init log tail: $(cat /tmp/tauri-init.log 2>&1 | tail -c 4000 | tr '\n' ' ' | head -c 3000)" || true
+            gh pr comment ${{ github.event.pull_request.number }} --body "init fail: ls $(ls -la src-tauri/gen/android/ 2>&1 | tr '\n' ' ' | head -c 1500) -- settings $(cat src-tauri/gen/android/settings.gradle 2>&1 | tr '\n' ' ' | head -c 1000) -- init tail $(cat /tmp/tauri-init.log 2>&1 | tail -c 3000 | tr '\n' ' ' | head -c 2000)" || true
             exit 1
           fi
 
