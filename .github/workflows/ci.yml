@@ -156,11 +156,13 @@ jobs:
 
       - name: Initialise the Android project
         run: |
+          rm -rf src-tauri/gen/android
           npm run tauri android init
           echo "=== gen after init ==="
           ls -R src-tauri/gen 2>&1 | head -n 100
           cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 50
           cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 50 || echo "tauri.settings.gradle MISSING"
+          ls -l src-tauri/gen/android/tauri.settings.gradle 2>&1 || true
 
       - name: Install the Kotlin bridge and PiP manifest
         run: |
@@ -196,7 +198,9 @@ jobs:
           fi
           if [ $status -ne 0 ]; then
             echo "::error::Kotlin test failed with exit $status"
-            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin test log head: $(cat /tmp/kotlin-test.log | head -c 8000 | tr '\n' ' ' | head -c 4000)" || true
+            echo "=== Kotlin test log tail (for PR comment) ==="
+            cat /tmp/kotlin-test.log | tail -n 200
+            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin test tail: $(cat /tmp/kotlin-test.log | tail -c 7000 | tr '\n' ' ' | head -c 4000)" || true
             exit $status
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
