@@ -157,14 +157,19 @@ jobs:
       - name: Initialise the Android project
         run: |
           rm -rf src-tauri/gen/android
-          npm run tauri android init
-          echo "=== gen after init ==="
-          ls -R src-tauri/gen 2>&1 | head -n 200
+          echo "=== tauri version ==="
+          npx @tauri-apps/cli --version
+          echo "=== running tauri android init (verbose) ==="
+          npm run tauri android init -- --verbose 2>&1 | head -n 300
+          echo "=== gen after init (full) ==="
+          find src-tauri/gen -type f 2>&1 | head -n 100
+          ls -R src-tauri/gen 2>&1 | head -n 300
           echo "=== settings.gradle ==="
           cat src-tauri/gen/android/settings.gradle 2>&1 | head -n 100
           echo "=== tauri.settings.gradle ==="
           cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 100 || echo "tauri.settings.gradle MISSING"
-          ls -l src-tauri/gen/android/*.gradle 2>&1 | head -n 20
+          ls -l src-tauri/gen/android/*.gradle 2>&1 | head -n 50
+          find src-tauri/gen -name "*.gradle" 2>&1 | head -n 50
           echo "=== init done, saving log ==="
           mkdir -p /tmp
           ls -R src-tauri/gen > /tmp/init-ls.log 2>&1 || true
@@ -172,8 +177,8 @@ jobs:
           if [ ! -f src-tauri/gen/android/tauri.settings.gradle ]; then
             echo "::error::tauri.settings.gradle missing after tauri android init – check tauri-cli version and init output"
             cat /tmp/init-ls.log 2>&1 | head -n 100
-            # Try to show tauri info
-            npx @tauri-apps/cli info 2>&1 | head -n 50 || true
+            npx @tauri-apps/cli info 2>&1 | head -n 100 || true
+            ls -R src-tauri 2>&1 | head -n 100 || true
             exit 1
           fi
 
