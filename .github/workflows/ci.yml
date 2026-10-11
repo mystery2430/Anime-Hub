@@ -169,6 +169,13 @@ jobs:
           mkdir -p /tmp
           ls -R src-tauri/gen > /tmp/init-ls.log 2>&1 || true
           cat src-tauri/gen/android/settings.gradle > /tmp/settings.log 2>&1 || true
+          if [ ! -f src-tauri/gen/android/tauri.settings.gradle ]; then
+            echo "::error::tauri.settings.gradle missing after tauri android init – check tauri-cli version and init output"
+            cat /tmp/init-ls.log 2>&1 | head -n 100
+            # Try to show tauri info
+            npx @tauri-apps/cli info 2>&1 | head -n 50 || true
+            exit 1
+          fi
 
       - name: Install the Kotlin bridge and PiP manifest
         run: |
@@ -209,7 +216,9 @@ jobs:
             echo "::error::Kotlin test failed with exit $status"
             echo "=== Kotlin test log tail (for PR comment) ==="
             cat /tmp/kotlin-test.log | tail -n 200
-            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin test tail: $(cat /tmp/kotlin-test.log | tail -c 7000 | tr '\n' ' ' | head -c 4000)" || true
+            echo "=== init ls ==="
+            cat /tmp/init-ls.log 2>&1 | tail -n 50 || echo "no init log"
+            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(cat /tmp/kotlin-test.log | tail -c 4000 | tr '\n' ' ' | head -c 3000) Init: $(cat /tmp/init-ls.log 2>&1 | tail -c 2000 | tr '\n' ' ' | head -c 1000)" || true
             exit $status
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
