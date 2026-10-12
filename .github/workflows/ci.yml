@@ -234,6 +234,15 @@ jobs:
           cat src-tauri/gen/android/app/src/test/java/dev/animehub/app/SiteNavigationPolicyTest.kt
           echo "=== build.gradle.kts test config ==="
           grep -n "test" src-tauri/gen/android/app/build.gradle.kts | head -n 20
+          echo "=== generating Tauri gradle files via cargo (for unit test compilation, see tauri#13902) ==="
+          # tauri_build generates tauri.settings.gradle and tauri.build.gradle.kts only when
+          # TAURI_ANDROID_PROJECT_PATH is set and cargo build runs for an android target.
+          # This provides the real :tauri-android project so AnimeHubPlugin.kt can compile.
+          TAURI_ANDROID_PROJECT_PATH=$(pwd)/src-tauri/gen/android cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android --lib 2>&1 | tail -n 100 || true
+          echo "=== after cargo, tauri files ==="
+          ls -l src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 20
+          cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 30
+          cat src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 30
           echo "=== gradle tasks (for debug) ==="
           cd src-tauri/gen/android
           ./gradlew tasks --all > /tmp/gradle-tasks.log 2>&1 || true
