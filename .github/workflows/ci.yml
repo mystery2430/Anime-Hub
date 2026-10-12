@@ -242,29 +242,30 @@ jobs:
           echo "=== tasks grep test (first 100) ==="
           cat /tmp/gradle-tasks.log | grep -i "test" | head -n 100
           cat /tmp/gradle-tasks.log | tail -n 80
-          # Discover the correct test task name (Tauri+rust creates ABI variants like Arm64Debug)
-          TEST_TASK=$(grep -oE ":[a-zA-Z0-9:]*test[A-Za-z0-9]*UnitTest" /tmp/gradle-tasks.log | head -n 1 || true)
-          if [ -z "$TEST_TASK" ]; then
-            TEST_TASK=$(grep -oE "test[A-Za-z0-9]*UnitTest" /tmp/gradle-tasks.log | head -n 1 || true)
-            if [ -n "$TEST_TASK" ]; then TEST_TASK=":app:$TEST_TASK"; fi
-          fi
-          echo "=== discovered TEST_TASK=$TEST_TASK ==="
-          if [ -z "$TEST_TASK" ]; then TEST_TASK=":app:testDebugUnitTest"; fi
-          echo "=== trying $TEST_TASK ==="
-          ./gradlew "$TEST_TASK" --tests "dev.animehub.app.SiteNavigationPolicyTest" --info > /tmp/kotlin-test.log 2>&1
-          status=$?
-          # Fallback list: try known ABI variants if discovered task failed
-          if [ $status -ne 0 ]; then
-            for fallback in ":app:testArm64DebugUnitTest" ":app:testUniversalDebugUnitTest" ":app:testDebugUnitTest" ":app:test" "test"; do
-              if [ "$fallback" = "$TEST_TASK" ]; then continue; fi
-              echo "=== trying fallback $fallback ==="
-              ./gradlew "$fallback" --tests "dev.animehub.app.SiteNavigationPolicyTest" --info > /tmp/kotlin-test.log 2>&1
-              status=$?
-              echo "=== fallback $fallback exit $status ==="
-              if [ $status -eq 0 ]; then break; fi
-            done
-          fi
-          echo "=== Gradle exit $status, tail 600 ==="
+          # Tauri Rust template creates ABI-specific variants (Arm64Debug, UniversalDebug, etc.)
+          # The generic testDebugUnitTest does not exist – try ABI variants in order.
+          status=1
+          for t in testUniversalDebugUnitTest testArm64DebugUnitTest testDebugUnitTest; do
+            echo "=== trying :app:$t --tests ==="
+            ./gradlew :app:$t --tests "dev.animehub.app.SiteNavigationPolicyTest" --info > /tmp/kotlin-test.log 2>&1
+            status=$?
+            echo "=== $t exit $status ==="
+            cat /tmp/kotlin-test.log | tail -n 200
+            if [ $status -eq 0 ]; then
+              TEST_TASK=":app:$t"
+              break
+            fi
+            # if task not found, try next; otherwise keep log for debugging
+            if grep -q "Cannot locate tasks" /tmp/kotlin-test.log; then
+              echo "task $t not found, trying next"
+              continue
+            else
+              # compilation or test failure – keep this log
+              break
+            fi
+          done
+          echo "=== final TEST_TASK=$TEST_TASK status=$status ==="
+          echo "=== Gradle tail 600 ==="
           cat /tmp/kotlin-test.log | tail -n 600
           echo "=== find test results ==="
           find . -type f -name "TEST-*.xml" | head -n 20
