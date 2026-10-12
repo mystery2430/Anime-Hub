@@ -232,15 +232,22 @@ jobs:
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50 > /tmp/ls-before.log || true
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then
             echo "found AnimeHubPlugin.kt, moving..."
-            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak 2>&1 | head -n 20
-            echo "moved AnimeHubPlugin.kt exit $?"
+            echo "DEBUG123 moving AnimeHubPlugin.kt"
+            rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt
+            # also move to /tmp for restore
+            cp /home/user/Anime-Hub/src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak 2>&1 | head -n 20 || true
+            echo "rm AnimeHubPlugin.kt exit $?"
+            # also ensure file is gone
+            ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt 2>&1 | head -n 5 || echo "AnimeHubPlugin.kt gone after rm"
           else
             echo "AnimeHubPlugin.kt NOT FOUND before move"
           fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then
             echo "found MainActivity.kt, moving..."
-            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt /tmp/MainActivity.kt.bak 2>&1 | head -n 20
-            echo "moved MainActivity.kt exit $?"
+            echo "DEBUG123 moving MainActivity.kt"
+            rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt
+            ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt 2>&1 | head -n 5 || echo "MainActivity.kt gone after rm"
+            echo "rm MainActivity.kt exit $?"
           else
             echo "MainActivity.kt NOT FOUND before move"
           fi
@@ -279,8 +286,11 @@ jobs:
           cat src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 40
           echo "=== cargo log head 100 ==="
           cat /tmp/cargo-tauri.log | head -n 100
-          echo "=== gradle tasks (for debug) ==="
+          echo "=== gradle clean before tasks ==="
           cd src-tauri/gen/android
+          ./gradlew clean > /tmp/gradle-clean.log 2>&1 || true
+          cat /tmp/gradle-clean.log | tail -n 50
+          echo "=== gradle tasks (for debug) ==="
           ./gradlew tasks --all > /tmp/gradle-tasks.log 2>&1 || true
           echo "=== tasks grep UnitTest ==="
           cat /tmp/gradle-tasks.log | grep -i "UnitTest" | head -n 100
@@ -319,8 +329,12 @@ jobs:
           find . -type d -name "test*" | head -n 20
           ls -R app/build/test-results 2>&1 | head -n 100 || echo "no test-results"
           echo "=== restoring Tauri-dependent files for APK build ==="
-          if [ -f /tmp/AnimeHubPlugin.kt.bak ]; then mv /tmp/AnimeHubPlugin.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt && echo "restored AnimeHubPlugin.kt"; fi
-          if [ -f /tmp/MainActivity.kt.bak ]; then mv /tmp/MainActivity.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt && echo "restored MainActivity.kt"; fi
+          # restore via android_prepare.py (which copies both IpPolicy and SiteNavigationPolicy plus AnimeHubPlugin)
+          python3 scripts/android_prepare.py 2>&1 | head -n 20 || true
+          # also ensure MainActivity is back via init (it is generated, not copied, so re-init would be needed, but we just restore from git if missing)
+          if [ ! -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "::warning::AnimeHubPlugin.kt still missing after restore"; fi
+          if [ ! -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still missing after restore – re-creating stub"; mkdir -p src-tauri/gen/android/app/src/main/java/dev/animehub/app; fi
+          ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           if [ $status -ne 0 ]; then
             echo "::error::Kotlin test failed with exit $status"
@@ -333,7 +347,7 @@ jobs:
             echo "=== PR comment ls logs ==="
             cat /tmp/ls-before.log 2>&1 | head -n 20
             cat /tmp/ls-after.log 2>&1 | head -n 20
-            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000) Cargo: $(tail -n 40 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 1500) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 1000) lsBefore: $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 800) lsAfter: $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 800)" || true
+            gh pr comment ${{ github.event.pull_request.number }} --body "DEBUG123 Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 2000) Cargo: $(tail -n 20 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 800) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 500) lsBefore: $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 500) lsAfter: $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 500)" || true
             exit $status
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
