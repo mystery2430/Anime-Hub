@@ -251,7 +251,12 @@ jobs:
           else
             echo "MainActivity.kt NOT FOUND before move"
           fi
-          # AnimeHubPipController is pure Android (no Tauri), keep it; but if it also needs Tauri, move it too – check later
+          # AnimeHubPipController references AnimeHubDebugLog in AnimeHubPlugin.kt, so remove it for pure test (only IpPolicy+SiteNavigationPolicy)
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt ]; then
+            echo "found AnimeHubPipController.kt, removing for pure test"
+            rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt
+            echo "rm AnimeHubPipController.kt"
+          fi
           echo "=== after move, ls -l ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
           ls -l /tmp/AnimeHubPlugin.kt.bak /tmp/MainActivity.kt.bak 2>&1 | head -n 20
@@ -261,6 +266,8 @@ jobs:
           cat /tmp/ls-after.log
           echo "::error::lsBefore $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 800)"
           echo "::error::lsAfter $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 800)"
+          echo "=== after rm, should be only IpPolicy+SiteNavigationPolicy ==="
+          ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 20
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "::warning::AnimeHubPlugin.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt; else echo "::error::AnimeHubPlugin.kt GONE as expected after rm"; fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt; fi
           echo "=== init log ==="
