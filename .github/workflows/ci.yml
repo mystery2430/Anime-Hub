@@ -228,15 +228,19 @@ jobs:
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
           echo "=== ls -R before ==="
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 100
+          # Save before list for PR comment
+          ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50 > /tmp/ls-before.log || true
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then
-            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak
-            echo "moved AnimeHubPlugin.kt (exit $?)"
+            echo "found AnimeHubPlugin.kt, moving..."
+            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak 2>&1 | head -n 20
+            echo "moved AnimeHubPlugin.kt exit $?"
           else
             echo "AnimeHubPlugin.kt NOT FOUND before move"
           fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then
-            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt /tmp/MainActivity.kt.bak
-            echo "moved MainActivity.kt (exit $?)"
+            echo "found MainActivity.kt, moving..."
+            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt /tmp/MainActivity.kt.bak 2>&1 | head -n 20
+            echo "moved MainActivity.kt exit $?"
           else
             echo "MainActivity.kt NOT FOUND before move"
           fi
@@ -246,8 +250,10 @@ jobs:
           ls -l /tmp/AnimeHubPlugin.kt.bak /tmp/MainActivity.kt.bak 2>&1 | head -n 20
           echo "=== ls -R after ==="
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 100
-          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "::warning::AnimeHubPlugin.kt still present after move"; fi
-          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still present after move"; fi
+          ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50 > /tmp/ls-after.log || true
+          cat /tmp/ls-after.log
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "::warning::AnimeHubPlugin.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt; fi
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt; fi
           echo "=== init log ==="
           cat /tmp/init-ls.log 2>&1 | head -n 100 || echo "no init log"
           cat /tmp/settings.log 2>&1 | head -n 50 || echo "no settings log"
@@ -324,10 +330,10 @@ jobs:
             cat /tmp/cargo-tauri.log | tail -n 100
             echo "=== gradle tasks grep UnitTest ==="
             cat /tmp/gradle-tasks.log | grep -i "UnitTest" | head -n 30
-            echo "=== ls after for PR comment ==="
-            ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 30 > /tmp/ls-after.log || true
-            cat /tmp/ls-after.log
-            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000) Cargo: $(tail -n 40 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 1500) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 1000) lsAfter: $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 1000)" || true
+            echo "=== PR comment ls logs ==="
+            cat /tmp/ls-before.log 2>&1 | head -n 20
+            cat /tmp/ls-after.log 2>&1 | head -n 20
+            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000) Cargo: $(tail -n 40 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 1500) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 1000) lsBefore: $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 800) lsAfter: $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 800)" || true
             exit $status
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
