@@ -238,11 +238,18 @@ jobs:
           # tauri_build generates tauri.settings.gradle and tauri.build.gradle.kts only when
           # TAURI_ANDROID_PROJECT_PATH is set and cargo build runs for an android target.
           # This provides the real :tauri-android project so AnimeHubPlugin.kt can compile.
-          TAURI_ANDROID_PROJECT_PATH=$(pwd)/src-tauri/gen/android cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android --lib 2>&1 | tail -n 100 || true
+          set +e
+          TAURI_ANDROID_PROJECT_PATH=$(pwd)/src-tauri/gen/android cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android  > /tmp/cargo-tauri.log 2>&1
+          cargo_status=$?
+          echo "cargo build exit $cargo_status"
+          cat /tmp/cargo-tauri.log | tail -n 200
           echo "=== after cargo, tauri files ==="
           ls -l src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 20
-          cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 30
-          cat src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 30
+          cat src-tauri/gen/android/tauri.settings.gradle 2>&1 | head -n 40
+          cat src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 40
+          echo "=== cargo log head 100 ==="
+          cat /tmp/cargo-tauri.log | head -n 100
+          set -e
           echo "=== gradle tasks (for debug) ==="
           cd src-tauri/gen/android
           ./gradlew tasks --all > /tmp/gradle-tasks.log 2>&1 || true
@@ -286,9 +293,11 @@ jobs:
             echo "::error::Kotlin test failed with exit $status"
             echo "=== Kotlin test log tail (for PR comment, last 400 lines) ==="
             cat /tmp/kotlin-test.log | tail -n 400
+            echo "=== cargo tauri log tail ==="
+            cat /tmp/cargo-tauri.log | tail -n 100
             echo "=== gradle tasks grep UnitTest ==="
             cat /tmp/gradle-tasks.log | grep -i "UnitTest" | head -n 30
-            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(tail -n 80 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3500) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 1500)" || true
+            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000) Cargo: $(tail -n 40 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 1500) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 1000)" || true
             exit $status
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
