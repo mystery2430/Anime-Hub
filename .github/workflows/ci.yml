@@ -232,7 +232,6 @@ jobs:
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50 > /tmp/ls-before.log || true
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then
             echo "found AnimeHubPlugin.kt, moving..."
-            echo "DEBUG123 moving AnimeHubPlugin.kt"
             rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt
             # also move to /tmp for restore
             cp /home/user/Anime-Hub/src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak 2>&1 | head -n 20 || true
@@ -243,19 +242,17 @@ jobs:
             echo "AnimeHubPlugin.kt NOT FOUND before move"
           fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then
-            echo "found MainActivity.kt, moving..."
-            echo "DEBUG123 moving MainActivity.kt"
-            rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt
-            ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt 2>&1 | head -n 5 || echo "MainActivity.kt gone after rm"
-            echo "rm MainActivity.kt exit $?"
+            echo "found MainActivity.kt, moving to /tmp for pure test"
+            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt /tmp/MainActivity.kt.bak
+            echo "moved MainActivity.kt"
           else
             echo "MainActivity.kt NOT FOUND before move"
           fi
           # AnimeHubPipController references AnimeHubDebugLog in AnimeHubPlugin.kt, so remove it for pure test (only IpPolicy+SiteNavigationPolicy)
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt ]; then
             echo "found AnimeHubPipController.kt, removing for pure test"
-            rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt
-            echo "rm AnimeHubPipController.kt"
+            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt /tmp/AnimeHubPipController.kt.bak
+            echo "moved AnimeHubPipController.kt"
           fi
           echo "=== after move, ls -l ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
@@ -264,11 +261,11 @@ jobs:
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 100
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50 > /tmp/ls-after.log || true
           cat /tmp/ls-after.log
-          echo "::error::lsBefore $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 800)"
-          echo "::error::lsAfter $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 800)"
+          echo "lsBefore $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 800)"
+          echo "lsAfter $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 800)"
           echo "=== after rm, should be only IpPolicy+SiteNavigationPolicy ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 20
-          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "::warning::AnimeHubPlugin.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt; else echo "::error::AnimeHubPlugin.kt GONE as expected after rm"; fi
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "AnimeHubPlugin.kt still present after rm (unexpected)"; else echo "AnimeHubPlugin.kt gone as expected"; fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt; fi
           echo "=== init log ==="
           cat /tmp/init-ls.log 2>&1 | head -n 100 || echo "no init log"
@@ -338,11 +335,10 @@ jobs:
           find . -type d -name "test*" | head -n 20
           ls -R app/build/test-results 2>&1 | head -n 100 || echo "no test-results"
           echo "=== restoring Tauri-dependent files for APK build ==="
-          # restore via android_prepare.py (which copies both IpPolicy and SiteNavigationPolicy plus AnimeHubPlugin)
+          if [ -f /tmp/MainActivity.kt.bak ]; then mv /tmp/MainActivity.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt && echo "restored MainActivity.kt"; fi
+          if [ -f /tmp/AnimeHubPipController.kt.bak ]; then mv /tmp/AnimeHubPipController.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt && echo "restored AnimeHubPipController.kt"; fi
+          # AnimeHubPlugin.kt is copied by android_prepare.py, so re-run it to restore
           python3 scripts/android_prepare.py 2>&1 | head -n 20 || true
-          # also ensure MainActivity is back via init (it is generated, not copied, so re-init would be needed, but we just restore from git if missing)
-          if [ ! -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "::warning::AnimeHubPlugin.kt still missing after restore"; fi
-          if [ ! -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still missing after restore – re-creating stub"; mkdir -p src-tauri/gen/android/app/src/main/java/dev/animehub/app; fi
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           if [ $status -ne 0 ]; then
