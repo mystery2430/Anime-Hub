@@ -224,16 +224,30 @@ jobs:
           mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
           echo "=== isolating pure Kotlin for unit test (move Tauri-dependent files, keep IpPolicy+SiteNavigationPolicy) ==="
+          echo "=== before move, ls -l src/main ==="
+          ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
+          echo "=== ls -R before ==="
+          ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 100
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then
-            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak
-            echo "moved AnimeHubPlugin.kt"
+            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak
+            echo "moved AnimeHubPlugin.kt (exit $?)"
+          else
+            echo "AnimeHubPlugin.kt NOT FOUND before move"
           fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then
-            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt /tmp/MainActivity.kt.bak
-            echo "moved MainActivity.kt"
+            mv -v src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt /tmp/MainActivity.kt.bak
+            echo "moved MainActivity.kt (exit $?)"
+          else
+            echo "MainActivity.kt NOT FOUND before move"
           fi
           # AnimeHubPipController is pure Android (no Tauri), keep it; but if it also needs Tauri, move it too – check later
+          echo "=== after move, ls -l ==="
+          ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
+          ls -l /tmp/AnimeHubPlugin.kt.bak /tmp/MainActivity.kt.bak 2>&1 | head -n 20
+          echo "=== ls -R after ==="
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 100
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "::warning::AnimeHubPlugin.kt still present after move"; fi
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still present after move"; fi
           echo "=== init log ==="
           cat /tmp/init-ls.log 2>&1 | head -n 100 || echo "no init log"
           cat /tmp/settings.log 2>&1 | head -n 50 || echo "no settings log"
@@ -310,7 +324,10 @@ jobs:
             cat /tmp/cargo-tauri.log | tail -n 100
             echo "=== gradle tasks grep UnitTest ==="
             cat /tmp/gradle-tasks.log | grep -i "UnitTest" | head -n 30
-            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000) Cargo: $(tail -n 40 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 1500) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 1000)" || true
+            echo "=== ls after for PR comment ==="
+            ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 30 > /tmp/ls-after.log || true
+            cat /tmp/ls-after.log
+            gh pr comment ${{ github.event.pull_request.number }} --body "Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000) Cargo: $(tail -n 40 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 1500) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 1000) lsAfter: $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 1000)" || true
             exit $status
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
