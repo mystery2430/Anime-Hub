@@ -344,6 +344,7 @@ jobs:
             tail -n 100 /tmp/kotlin-test.log 2>&1 | head -n 100
             echo "::error::Kotlin tail $(tail -n 100 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000)"
             echo "::error::grep FAILED $(grep -i "FAILED\|BUILD SUCCESSFUL\|FAILED\|Test run" /tmp/kotlin-test.log | tr '\n' ' ' | head -c 2000)"
+            echo "::error::e file $(grep -m 5 "e: file" /tmp/kotlin-test.log | tr '\n' ' ' | head -c 3000)"
             echo "=== Kotlin test log tail (for PR comment, last 400 lines) ==="
             cat /tmp/kotlin-test.log | tail -n 400
             echo "=== cargo tauri log tail ==="
