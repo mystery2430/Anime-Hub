@@ -223,6 +223,17 @@ jobs:
           ls -l src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 20
           mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
+          echo "=== isolating pure Kotlin for unit test (move Tauri-dependent files, keep IpPolicy+SiteNavigationPolicy) ==="
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then
+            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak
+            echo "moved AnimeHubPlugin.kt"
+          fi
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then
+            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt /tmp/MainActivity.kt.bak
+            echo "moved MainActivity.kt"
+          fi
+          # AnimeHubPipController is pure Android (no Tauri), keep it; but if it also needs Tauri, move it too – check later
+          ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 100
           echo "=== init log ==="
           cat /tmp/init-ls.log 2>&1 | head -n 100 || echo "no init log"
           cat /tmp/settings.log 2>&1 | head -n 50 || echo "no settings log"
@@ -287,6 +298,10 @@ jobs:
           echo "=== list test-results dirs ==="
           find . -type d -name "test*" | head -n 20
           ls -R app/build/test-results 2>&1 | head -n 100 || echo "no test-results"
+          echo "=== restoring Tauri-dependent files for APK build ==="
+          if [ -f /tmp/AnimeHubPlugin.kt.bak ]; then mv /tmp/AnimeHubPlugin.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt && echo "restored AnimeHubPlugin.kt"; fi
+          if [ -f /tmp/MainActivity.kt.bak ]; then mv /tmp/MainActivity.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt && echo "restored MainActivity.kt"; fi
+          ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           if [ $status -ne 0 ]; then
             echo "::error::Kotlin test failed with exit $status"
             echo "=== Kotlin test log tail (for PR comment, last 400 lines) ==="
