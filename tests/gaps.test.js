@@ -324,7 +324,9 @@ test("every overlay goes through the shared stack: focus return, inert backgroun
 });
 
 test("the Android navigation guard keeps the desktop host rules in step", () => {
-  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const ktSite = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicy.kt"));
+  const ktIp = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/IpPolicy.kt"));
+  const kt = ktSite + "\n" + ktIp;
   const rs = read(join(ROOT, "src-tauri/src/sites/url_policy.rs"));
 
   // Suffixes the Rust policy refuses (`h.ends_with(".x")`).
@@ -345,11 +347,12 @@ test("the Android navigation guard keeps the desktop host rules in step", () => 
 });
 
 test("Android navigation policy: numeric IPv4 spellings and documentation ranges are refused like Rust", () => {
-  // Static check only. IP logic now lives in IpPolicy.kt (saf, Android bagimliligi yok)
-  // ve AnimeHubPlugin.kt ona delege eder; her iki dosya da kontrol edilir.
+  // Static check only. IP logic now lives in IpPolicy.kt ve SiteNavigationPolicy.kt (saf, Android bagimliligi yok)
+  // ve her iki dosya da kontrol edilir.
   const ktPlugin = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
   const ktPolicy = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/IpPolicy.kt"));
-  const kt = ktPlugin + "\n" + ktPolicy;
+  const ktSite = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicy.kt"));
+  const kt = ktPlugin + "\n" + ktPolicy + "\n" + ktSite;
   assert.match(kt, /NUMERIC_LABEL = Regex\("""\(0x\[0-9a-f\]\*\|\[0-9\]\+\)""", RegexOption\.IGNORE_CASE\)/);
   assert.match(kt, /if \(NUMERIC_LABEL\.matches\(bare\.substringAfterLast\('\.'\)\)\) \{/);
   // Documentation ranges, as Rust url_policy::is_public_ip rejects them – now in IpPolicy.kt
