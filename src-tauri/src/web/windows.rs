@@ -51,29 +51,6 @@ const SITE_LABEL_PREFIX: &str = "site-";
 /// Title shown while no site is open.
 pub const LAUNCHER_TITLE: &str = "AnimeHub";
 
-/// OpenAnime's home page can render the account avatar before its
-/// authenticated watch-history query has completed. Some client query
-/// managers only revalidate after a visibility change. Nudge that one
-/// same-origin home page after hydration; never reload or touch stored cookies.
-#[cfg(desktop)]
-const OPENANIME_HOME_REVALIDATE_SCRIPT: &str = r#"(function () {
-  "use strict";
-  if (window.__animehubOpenAnimeHomeRevalidationScheduled) return;
-  window.__animehubOpenAnimeHomeRevalidationScheduled = true;
-  window.setTimeout(function () {
-    if (window.location.pathname !== "/" || document.visibilityState !== "visible") return;
-    document.dispatchEvent(new Event("visibilitychange"));
-  }, 1000);
-})();"#;
-
-/// Keep the revalidation workaround limited to OpenAnime's HTTPS home page.
-#[cfg(desktop)]
-fn should_revalidate_openanime_home(url: &Url) -> bool {
-    url.scheme() == "https"
-        && matches!(url.host_str(), Some("openani.me" | "www.openani.me"))
-        && url.path() == "/"
-}
-
 /// Pseudo-navigation the injected overlay uses to ask for the site to close.
 /// Intercepted below; it never leaves the app.
 const CLOSE_SCHEME: &str = "animehub";
@@ -273,11 +250,6 @@ fn open_in_main_window(
         .on_page_load(|webview, payload| {
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 return;
-            }
-            if should_revalidate_openanime_home(payload.url()) {
-                if let Err(e) = webview.eval(OPENANIME_HOME_REVALIDATE_SCRIPT) {
-                    log::warn!("OpenAnime ana sayfa oturum sorgusu yenilenemedi: {e}");
-                }
             }
             if let Err(e) = webview.eval(crate::web::session::OVERLAY_SNIPPET) {
                 log::warn!("geri dönüş katmanı kurulamadı: {e}");
@@ -1078,34 +1050,6 @@ mod tests {
     fn site_labels_cannot_collide_with_the_launcher() {
         assert_ne!(label_for(LAUNCHER_LABEL), LAUNCHER_LABEL);
         assert!(label_for("anything").starts_with(SITE_LABEL_PREFIX));
-    }
-
-    #[test]
-    fn openanime_home_revalidation_is_limited_to_https_root() {
-        let parse = |raw: &str| Url::parse(raw).unwrap();
-
-        assert!(should_revalidate_openanime_home(&parse(
-            "https://openani.me/"
-        )));
-        assert!(should_revalidate_openanime_home(&parse(
-            "https://www.openani.me/"
-        )));
-        assert!(should_revalidate_openanime_home(&parse(
-            "https://openani.me/?source=app"
-        )));
-
-        assert!(!should_revalidate_openanime_home(&parse(
-            "http://openani.me/"
-        )));
-        assert!(!should_revalidate_openanime_home(&parse(
-            "https://openani.me/profile"
-        )));
-        assert!(!should_revalidate_openanime_home(&parse(
-            "https://openani.me/explore"
-        )));
-        assert!(!should_revalidate_openanime_home(&parse(
-            "https://example.com/"
-        )));
     }
 
     /// Minimal app state over a real temp-dir store, for ownership checks.
