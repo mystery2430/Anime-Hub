@@ -1052,6 +1052,23 @@ mod tests {
         assert!(label_for("anything").starts_with(SITE_LABEL_PREFIX));
     }
 
+    #[test]
+    fn desktop_profile_is_provider_agnostic() {
+        // Gpt notu: en az iki sağlayıcı için paylaşılan lifecycle doğrulanmalı, hardcode yok.
+        for site_id in ["builtin-openanime", "builtin-animecix"] {
+            let label = label_for(site_id);
+            assert!(label.starts_with(SITE_LABEL_PREFIX));
+            assert!(!label.contains('/'));
+            let dir = profile_dir_name(site_id);
+            assert!(dir.starts_with("site-"));
+            assert!(!dir.contains('/'));
+        }
+        assert_ne!(
+            label_for("builtin-openanime"),
+            label_for("builtin-animecix")
+        );
+    }
+
     /// Minimal app state over a real temp-dir store, for ownership checks.
     fn state_with_current_site(site_id: Option<&str>) -> AppState {
         let dir = tempfile::tempdir().unwrap();
