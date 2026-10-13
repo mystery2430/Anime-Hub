@@ -74,7 +74,6 @@ fn should_revalidate_openanime_home(url: &Url) -> bool {
         && url.path() == "/"
 }
 
-
 /// Pseudo-navigation the injected overlay uses to ask for the site to close.
 /// Intercepted below; it never leaves the app.
 const CLOSE_SCHEME: &str = "animehub";
