@@ -1085,14 +1085,28 @@ mod tests {
     fn openanime_home_revalidation_is_limited_to_https_root() {
         let parse = |raw: &str| Url::parse(raw).unwrap();
 
-        assert!(should_revalidate_openanime_home(&parse("https://openani.me/")));
-        assert!(should_revalidate_openanime_home(&parse("https://www.openani.me/")));
-        assert!(should_revalidate_openanime_home(&parse("https://openani.me/?source=app")));
+        assert!(should_revalidate_openanime_home(&parse(
+            "https://openani.me/"
+        )));
+        assert!(should_revalidate_openanime_home(&parse(
+            "https://www.openani.me/"
+        )));
+        assert!(should_revalidate_openanime_home(&parse(
+            "https://openani.me/?source=app"
+        )));
 
-        assert!(!should_revalidate_openanime_home(&parse("http://openani.me/")));
-        assert!(!should_revalidate_openanime_home(&parse("https://openani.me/profile")));
-        assert!(!should_revalidate_openanime_home(&parse("https://openani.me/explore")));
-        assert!(!should_revalidate_openanime_home(&parse("https://example.com/")));
+        assert!(!should_revalidate_openanime_home(&parse(
+            "http://openani.me/"
+        )));
+        assert!(!should_revalidate_openanime_home(&parse(
+            "https://openani.me/profile"
+        )));
+        assert!(!should_revalidate_openanime_home(&parse(
+            "https://openani.me/explore"
+        )));
+        assert!(!should_revalidate_openanime_home(&parse(
+            "https://example.com/"
+        )));
     }
 
     /// Minimal app state over a real temp-dir store, for ownership checks.
