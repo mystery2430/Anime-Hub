@@ -246,7 +246,7 @@ pub fn update_site(
 }
 
 #[tauri::command]
-pub fn remove_site(state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<()> {
     {
         let mut reg = state
             .registry
@@ -263,6 +263,31 @@ pub fn remove_site(state: State<'_, AppState>, id: String) -> AppResult<()> {
         .provider
         .delete_secret(&format!("localstorage-{id}"))?;
     state.provider.delete_secret(&format!("indexeddb-{id}"))?;
+    // Desktop: profile directory holds the real cookie DB. Remove it as
+    // well so a later site with the same sanitized name does not inherit
+    // the old jar. Missing dir is success.
+    #[cfg(desktop)]
+    {
+        let base = app.path().app_data_dir().map_err(|e| {
+            log::error!("profil dizini bulunamadı: {e}");
+            AppError::Storage("profil dizini bulunamadı".into())
+        })?;
+        let dir = base
+            .join("profiles")
+            .join(crate::web::session::profile_dir_name(&id));
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::error!("profil dizini silinemedi: {e}");
+                return Err(AppError::Storage("site verisi silinemedi".into()));
+            }
+        }
+        // If the removed site is currently open, close its WebView without
+        // re-exporting its live cookies (which would resurrect the deleted jar).
+        let label = crate::web::windows::label_for(&id);
+        let _ = crate::web::windows::close_site_window_for_clear(&app, &label);
+    }
     Ok(())
 }
 
@@ -407,6 +432,26 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
             // clearing the active provider (or all providers), clear that live
             // jar as well as the encrypted snapshots below.
             crate::android_bridge::webview_cookies_clear()?;
+        }
+    }
+    #[cfg(desktop)]
+    {
+        // Desktop: profile dir holds the real DB. If the currently open site
+        // is among the ids being wiped, close its WebView *without* exporting
+        // its live cookies — otherwise the periodic sync / close export would
+        // resurrect the just-deleted jar and new cookies would appear broken
+        // because the directory was removed underneath a live WebView.
+        let current_label = {
+            let cur = state
+                .current_site
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            cur.as_ref()
+                .filter(|c| ids.iter().any(|id| id == &c.site_id))
+                .map(|c| c.window_label.clone())
+        };
+        if let Some(label) = current_label {
+            let _ = crate::web::windows::close_site_window_for_clear(&app, &label);
         }
     }
     let mut n = 0;

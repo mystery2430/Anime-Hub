@@ -1004,6 +1004,68 @@ pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Close a site WebView for a data wipe, without re-exporting its live
+/// cookies. Used by `clear_site_data` / `remove_site` on desktop where the
+/// profile directory is about to be deleted — exporting would resurrect the
+/// just-deleted jar and the next `create_dir_all` would inherit stale cookies.
+#[cfg(desktop)]
+pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()> {
+    let current = {
+        let state = app.state::<AppState>();
+        let value = state
+            .current_site
+            .lock()
+            .expect("current_site lock")
+            .clone();
+        value
+    };
+    let child_label = current
+        .as_ref()
+        .filter(|c| c.window_label != LAUNCHER_LABEL)
+        .map(|c| c.window_label.clone())
+        .unwrap_or_else(|| label.to_string());
+
+    if let Some(child) = app.get_webview(&child_label) {
+        // Intentionally skip `export_cookies_webview` — the caller is wiping.
+        child.close().map_err(|e| {
+            log::error!("site görünümü kapatılamadı: {e}");
+            AppError::Other("site görünümü kapatılamadı".into())
+        })?;
+    }
+
+    let mut closed_site = None;
+    {
+        let state = app.state::<AppState>();
+        let mut guard = state.current_site.lock().expect("current_site lock");
+        if guard
+            .as_ref()
+            .is_some_and(|c| c.window_label == child_label)
+        {
+            closed_site = guard.as_ref().map(|c| c.site_id.clone());
+            *guard = None;
+        }
+    }
+
+    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+        if let Err(e) = window.set_title(LAUNCHER_TITLE) {
+            log::warn!("pencere başlığı geri alınamadı: {e}");
+        }
+        if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
+            if let Err(e) = window.set_fullscreen(false) {
+                log::warn!("tam ekrandan çıkılamadı: {e}");
+            }
+        }
+        if let Err(e) = window.set_focus() {
+            log::debug!("pencere odaklanamadı: {e}");
+        }
+    }
+
+    if let Some(site_id) = closed_site {
+        let _ = app.emit("animehub://site-closed", site_id);
+    }
+    Ok(())
+}
+
 /// Open a URL in the system browser.
 ///
 /// Used for links a site tries to open in a new window, so the user is not
