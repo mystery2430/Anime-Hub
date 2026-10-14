@@ -6,6 +6,30 @@ Notable user-facing changes are recorded here. Production assets are built and c
 
 No changes yet.
 
+## [0.3.4] — 2026-10-14
+
+### Session & cookie lifecycle (PR #26)
+
+- Desktop profile isolation: `remove_site` now deletes `profiles/site-*` and closes the live WebView before removing the registry entry, so a failed close/delete keeps the tile and the user can retry. Built-in sites are hidden, not deleted.
+- `clear_site_data` no longer exports live cookies before deletion; the whole close+delete is serialized against the periodic sync via `DESKTOP_SESSION_LOCK`/`ANDROID_SESSION_LOCK` and `STORE_LOCK` is held from the start of the write (including seal), so an in-flight sync cannot resurrect a deleted jar.
+- Android: `clear_site_data` for the active site now closes without export, clears `current_site` and the shared `CookieManager` while holding `ANDROID_SESSION_LOCK`, preventing the page/sync worker from recreating data. If the user switched to another site during the operation, the new site is not closed.
+- `open_site` re-validates the `Site` snapshot while holding the lifecycle lock, so a concurrent `remove_site` cannot be bypassed with a stale copy.
+- `clear_site_data(None)` orphan sweep now propagates `read_dir` errors (missing `profiles` is OK) and, for the all-sites path, closes any live WebView even when its ID is not in the registry snapshot before sweeping `profiles/site-*`.
+- Android master-key creation is now fully serialized under `STORE_LOCK` (check+create+write with unique tmp and `fsync`).
+- Deterministic race test `concurrent_site_session_write_and_delete_does_not_resurrect` now holds `STORE_LOCK` to simulate an in-flight write before delete and asserts the jar does not reappear.
+- Rust: `rustls 0.23.45 → 0.23.46`, `cargo fmt --check` and `clippy -D warnings` fixes, Android `aarch64` build green. `npm test` 152 passed.
+
+### Security & platform (PR #21, base for this release)
+
+- IP policy: numeric IPv4 spellings and documentation ranges refused via IANA special-purpose registries (same vectors in Rust and Kotlin, real policy not regex).
+- PiP/theme: optimistic UI with rollback, sequential selection does not let stale async overwrite; PiP native→persist order with compensation on failure.
+- Linux key: `symlink_metadata` replaced by no-follow open + fd metadata verification, `AlreadyExists` same policy, no silent key generation on suspicious files.
+
+### Known limitations (unchanged)
+
+- No physical Android device test for v0.3.4; PiP, IPC, navigation, cookie persistence remain device-unverified. Provider-to-provider `localStorage`/`IndexedDB` isolation on Android is still not guaranteed.
+- Windows installers are not code-signed without secrets.
+
 ## [0.3.3] — 2026-10-10
 
 ### Release safety and known limitations

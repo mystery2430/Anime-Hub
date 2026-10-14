@@ -242,6 +242,17 @@ Ayrıntılı akış, oynatıcı seçim kuralları ve doğrulama durumu:
 
 ---
 
+## v0.3.4 — yayın ve sınırlar
+
+**v0.3.4 için fiziksel Android testi yapılmadı.** CI derlemesi cihaz doğrulaması
+anlamına gelmez; PiP, IPC, gezinti, çerez kalıcılığı ve performans cihaz testi bekliyor.
+**Android’de sağlayıcılar arası aynı-origin localStorage/IndexedDB izolasyonu
+garanti edilmez.** Best-effort aktarım bir güvenlik sınırı değildir. **Çerez/oturum yaşam döngüsü** düzeltmeleri (aktif site wipe’ın sayfa+sync’i yeniden yazmasını engellemesi, stale Site ile yeniden oluşturmayı engelleyen re-validasyon, `STORE_LOCK`’un seal dahil baştan tutulması) PR #26 ile eklendi.
+
+Üretim paketleri PR CI ve iki release workflow kontrolünden sonra yayımlanır.
+CI’daki `animehub-aarch64-debug.apk` yalnızca test içindir, GitHub Release varlığı değildir.
+Ayrıntılar: [v0.3.3 yayın prosedürü](docs/releasing.md) (v0.3.4 aynı akış).
+
 ## v0.3.3 — yayın ve sınırlar
 
 **v0.3.3 için fiziksel Android testi yapılmadı.** CI derlemesi cihaz doğrulaması
@@ -261,8 +272,8 @@ Uygulama mağazalarda yayınlanmaz; doğrudan indirme ile dağıtılır.
 
 | Yöntem | Boyut | Komut |
 |---|---|---|
-| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.3_amd64.deb` |
-| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh AnimeHub-0.3.3-1.x86_64.rpm` |
+| **`.deb`** (Debian/Ubuntu) | ~3.1 MB | `sudo apt install ./AnimeHub_0.3.4_amd64.deb` |
+| **`.rpm`** (Fedora/RHEL) | ~3.1 MB | `sudo rpm -ivh AnimeHub-0.3.4-1.x86_64.rpm` |
 | **AppImage** | ~75 MB | `chmod +x AnimeHub_*.AppImage && ./AnimeHub_*.AppImage` |
 
 ```bash
@@ -276,7 +287,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | **NSIS kurulum** | ~1.9 MB | Releases sayfasından `.exe` indir, çalıştır (`currentUser` modu, yönetici gerekmez) |
 
 > [!NOTE]
-> **Windows paketleri henüz kod imzalı değildir (v0.3.3 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
+> **Windows paketleri henüz kod imzalı değildir (v0.3.4 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
 
@@ -390,7 +401,7 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 
 | Doğrulama | Sonuç |
 |---|---|
-| `npm test` | **152 test geçti**, 0 hata (v0.3.3, yerel, 2026-10-10) |
+| `npm test` | **152 test geçti**, 0 hata (v0.3.4, yerel, 2026-10-14) |
 | `cargo test --all` / `clippy -- -D warnings` / `fmt --check` | Yerelde çalıştırılmadı (Rust araç zinciri yok). Son yeşil CI koşusu daha eski bir commit'te; güncel commit için GitHub Actions'taki Tests işi (`ubuntu-24.04`, `macos-latest`, `windows-latest`) esas alınmalı |
 | `cargo build --release --locked` (LTO, tek codegen unit) | GitHub Actions "Release profile (LTO)" işinde geçti |
 | `cargo audit` + gizli anahtar taraması | "Dependency and secret audit" işinde geçti |
