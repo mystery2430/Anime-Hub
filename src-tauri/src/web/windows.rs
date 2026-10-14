@@ -70,6 +70,36 @@ pub fn lock_android_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
         .map_err(|_| AppError::Storage("Android oturum kilidi alınamadı".into()))
 }
 
+/// Desktop lifecycle lock — serializes every mutation of the live site
+/// session so open / normal close / periodic sync / remove / clear cannot
+/// interleave and resurrect or orphan a profile.
+///
+/// **Lock order (must be respected everywhere to avoid deadlock):**
+/// `DESKTOP_SESSION_LOCK` → `current_site` → `registry` → `SecureStore WRITE_LOCK`
+/// `commands::clear_site_data` snapshots `ids` from `registry` *before*
+/// taking this lock; `commands::remove_site` takes `registry` briefly to
+/// check builtin/hide, releases it, then takes this lock for close+delete.
+/// `open_in_main_window` takes this lock for the entire open (close previous,
+/// create profile dir, add_child, set current_site). `spawn_session_sync`
+/// takes this lock for each tick's ownership check + export. `close_*`
+/// helpers have `*_locked` inner versions that assume the lock is already
+/// held, so `open` can close the previous child without self-deadlock.
+///
+/// The lock is a plain `std::sync::Mutex`, never held across an `await` and
+/// never on the UI thread for longer than a file operation, so it cannot
+/// block window resizing or IPC.
+#[cfg(desktop)]
+static DESKTOP_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock the desktop session. See the `DESKTOP_SESSION_LOCK` docs for the
+/// global lock order.
+#[cfg(desktop)]
+pub fn lock_desktop_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
+    DESKTOP_SESSION_LOCK
+        .lock()
+        .map_err(|_| AppError::Storage("masaüstü oturum kilidi alınamadı".into()))
+}
+
 /// How often a live site session is snapshotted into the encrypted store.
 ///
 /// The close-time export remains the authoritative final write; this interval
@@ -136,6 +166,43 @@ fn open_in_main_window(
     init_script: &str,
     fullscreen: bool,
 ) -> AppResult<String> {
+    // Serialize open against wipe/sync. The inner does the real work while
+    // the lock is held so a concurrent `clear_site_data` cannot delete the
+    // profile directory we are about to create.
+    let _guard = lock_desktop_session()?;
+    open_in_main_window_inner(app, site, url, init_script, fullscreen)
+}
+
+#[cfg(desktop)]
+fn open_in_main_window_inner(
+    app: &AppHandle,
+    site: &Site,
+    url: &Url,
+    init_script: &str,
+    fullscreen: bool,
+) -> AppResult<String> {
+    // Re-validate the `Site` snapshot while holding `DESKTOP_SESSION_LOCK`
+    // (already held by `open_in_main_window`). A concurrent `remove_site`
+    // may have deleted the site after `open_site` cloned it but before we
+    // acquired the lock; without this check we would recreate its profile.
+    {
+        let state = app.state::<AppState>();
+        let reg = state
+            .registry
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        match reg.get(&site.id) {
+            Some(current) => {
+                if current.hidden {
+                    return Err(AppError::SiteNotFound(site.id.clone()));
+                }
+                if current.url != site.url {
+                    return Err(AppError::SiteNotFound(site.id.clone()));
+                }
+            }
+            None => return Err(AppError::SiteNotFound(site.id.clone())),
+        }
+    }
     let label = label_for(&site.id);
     let window = app
         .get_webview_window(LAUNCHER_LABEL)
@@ -151,22 +218,18 @@ fn open_in_main_window(
     }
 
     // One site at a time inside the single window: close a previous session
-    // (saving its jar) before opening the next.
-    close_current_child(app)?;
+    // (saving its jar) before opening the next. Use the `_locked` variant
+    // because we already hold `DESKTOP_SESSION_LOCK` so we must not relock.
+    close_current_child_locked(app)?;
 
     // Per-site profile directory: WebKitGTK's data directory on Linux, and on
     // Windows the WebView2 user-data folder. This is what makes cookies,
     // localStorage, IndexedDB and cache independent per site.
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| {
-            log::error!("uygulama veri dizini alınamadı: {e}");
-            AppError::Storage("uygulama veri dizini alınamadı".into())
-        })?
-        .join("profiles")
-        .join(profile_dir_name(&site.id));
-    std::fs::create_dir_all(&data_dir)?;
+    let base = app.path().app_data_dir().map_err(|e| {
+        log::error!("uygulama veri dizini alınamadı: {e}");
+        AppError::Storage("uygulama veri dizini alınamadı".into())
+    })?;
+    let data_dir = crate::web::session::ensure_profile_dir(&base, &site.id)?;
 
     let host = site.host();
     let nav_host = host.clone();
@@ -305,9 +368,10 @@ fn open_in_main_window(
 }
 
 /// Close whichever site webview is currently shown inside the main window,
-/// if any. Used before hosting a new one.
+/// if any. Used before hosting a new one. Locked variant assumes
+/// `DESKTOP_SESSION_LOCK` is already held (called from `open`).
 #[cfg(desktop)]
-fn close_current_child(app: &AppHandle) -> AppResult<()> {
+fn close_current_child_locked(app: &AppHandle) -> AppResult<()> {
     let label = {
         let state = app.state::<AppState>();
         let current = state.current_site.lock().expect("current_site lock");
@@ -317,9 +381,17 @@ fn close_current_child(app: &AppHandle) -> AppResult<()> {
             .map(|c| c.window_label.clone())
     };
     match label {
-        Some(label) => close_site_window(app, &label),
+        Some(label) => close_site_window_locked(app, &label),
         None => Ok(()),
     }
+}
+
+/// Wrapper that acquires `DESKTOP_SESSION_LOCK` for callers outside `open`.
+#[cfg(desktop)]
+#[allow(dead_code)]
+fn close_current_child(app: &AppHandle) -> AppResult<()> {
+    let _guard = lock_desktop_session()?;
+    close_current_child_locked(app)
 }
 
 /// Watch the main window so the hosted site webview tracks its size.
@@ -380,6 +452,12 @@ fn session_is_current(state: &AppState, site_id: &str) -> bool {
 /// per-site profile directory that the WebView itself persists. The loop
 /// exits on the first tick after the session ends (site closed, another site
 /// opened, or the child webview is gone without a close event).
+///
+/// A desktop-wide lock serializes this snapshot against
+/// `clear_site_data`/`remove_site`'s wipe-close path, so a periodic export
+/// cannot resurrect a jar that was just deleted. The lock is taken *before*
+/// the ownership check so the check and the subsequent write are atomic with
+/// respect to a concurrent wipe.
 #[cfg(desktop)]
 fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: String) {
     std::thread::spawn(move || {
@@ -390,6 +468,18 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
                 log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
                 return;
             }
+            // Hold the desktop session lock across the ownership check and the
+            // cookie export. `clear_site_data`/`remove_site` hold the same
+            // lock across close+delete, so this thread either sees the session
+            // as still current and completes its export *before* the wipe, or
+            // sees it as gone and exits without resurrecting the jar.
+            let _guard = match lock_desktop_session() {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("masaüstü oturum eşitlemesi kilitlenemedi: {e}");
+                    return;
+                }
+            };
             {
                 let state = app.state::<AppState>();
                 if !session_is_current(&state, &site_id) {
@@ -479,6 +569,26 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 
     #[cfg(target_os = "android")]
     let _session_guard = lock_android_session()?;
+    // Re-validate the `Site` snapshot while holding `ANDROID_SESSION_LOCK`.
+    // See `open_in_main_window_inner` for the stale-snapshot race.
+    {
+        let state = app.state::<AppState>();
+        let reg = state
+            .registry
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        match reg.get(&site.id) {
+            Some(current) => {
+                if current.hidden {
+                    return Err(AppError::SiteNotFound(site.id.clone()));
+                }
+                if current.url != site.url {
+                    return Err(AppError::SiteNotFound(site.id.clone()));
+                }
+            }
+            None => return Err(AppError::SiteNotFound(site.id.clone())),
+        }
+    }
     let state = app.state::<AppState>();
 
     // 1. Export the outgoing site's cookies and web storage while its page is
@@ -744,9 +854,16 @@ fn export_cookies(
 
 /// Parse the request-cookie header returned by Android's CookieManager.
 ///
-/// The API exposes name/value pairs, not Set-Cookie attributes; this matches
-/// Wry's existing `cookies_for_url` parsing behavior and keeps CookieJar's
-/// serialized format unchanged.
+/// **Mimari kısıtlama:** `CookieManager.getCookie()` *request* `Cookie`
+/// başlığını (`name=value; name2=value2`) döndürür, `Set-Cookie` değil.
+/// `HttpOnly`, `Secure`, `SameSite`, `Domain`, `Path` ve `Expires` bu
+/// nedenle yakalama anında kaybolur; `capture()` bu alanlara `None`/`false`
+/// yazar ve `restore()` yalnızca minimal `name=value` geri kurar. Sadece
+/// `name=value`'ye dayalı oturum çerezleri korunur; öznitelik bağımlı
+/// davranışlar (`__Host-` prefix, katı `SameSite`) Android'de aslına uygun
+/// geri getirilemez. Bu Android platform kısıtlamasıdır, farklı bir WebView
+/// API'si olmadan düzeltilemez. Wry'nin `cookies_for_url` davranışıyla
+/// uyumludur ve CookieJar formatını değiştirmez.
 #[cfg(any(target_os = "android", test))]
 fn parse_android_cookie_header(header: &str) -> Vec<cookie::Cookie<'static>> {
     header
@@ -931,12 +1048,154 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Close a site WebView for a data wipe, without re-exporting its live
+/// cookies. Used by `clear_site_data` / `remove_site` on desktop where the
+/// profile directory is about to be deleted — exporting would resurrect the
+/// just-deleted jar and the next `create_dir_all` would inherit stale cookies.
+/// The caller must hold [`lock_desktop_session`] across the close and the
+/// subsequent deletes so a concurrent `spawn_session_sync` cannot slip an
+/// export in between.
+#[cfg(desktop)]
+pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()> {
+    let current = {
+        let state = app.state::<AppState>();
+        let value = state
+            .current_site
+            .lock()
+            .expect("current_site lock")
+            .clone();
+        value
+    };
+    let child_label = current
+        .as_ref()
+        .filter(|c| c.window_label != LAUNCHER_LABEL)
+        .map(|c| c.window_label.clone())
+        .unwrap_or_else(|| label.to_string());
+
+    if let Some(child) = app.get_webview(&child_label) {
+        // Intentionally skip `export_cookies_webview` — the caller is wiping.
+        child.close().map_err(|e| {
+            log::error!("site görünümü kapatılamadı: {e}");
+            AppError::Other("site görünümü kapatılamadı".into())
+        })?;
+    }
+
+    let mut closed_site = None;
+    {
+        let state = app.state::<AppState>();
+        let mut guard = state.current_site.lock().expect("current_site lock");
+        if guard
+            .as_ref()
+            .is_some_and(|c| c.window_label == child_label)
+        {
+            closed_site = guard.as_ref().map(|c| c.site_id.clone());
+            *guard = None;
+        }
+    }
+
+    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+        if let Err(e) = window.set_title(LAUNCHER_TITLE) {
+            log::warn!("pencere başlığı geri alınamadı: {e}");
+        }
+        if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
+            if let Err(e) = window.set_fullscreen(false) {
+                log::warn!("tam ekrandan çıkılamadı: {e}");
+            }
+        }
+        if let Err(e) = window.set_focus() {
+            log::debug!("pencere odaklanamadı: {e}");
+        }
+    }
+
+    if let Some(site_id) = closed_site {
+        let _ = app.emit("animehub://site-closed", site_id);
+    }
+    Ok(())
+}
+
+/// Mobile wipe-close: clear the shared WebView without re-exporting the
+/// deleted site's cookies/storage. Used by `remove_site` / `clear_site_data`
+/// when the deleted site is currently open. Holds the Android session lock
+/// so a concurrent `spawn_session_sync` cannot export the doomed jar after
+/// the wipe. No `export_cookies` / `export_site_storage` is called.
+#[cfg(mobile)]
+pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    let _guard = lock_android_session()?;
+    close_site_window_for_clear_locked(app, site_id)
+}
+
+/// Locked variant: caller must hold `ANDROID_SESSION_LOCK` (on Android).
+/// Checks that `site_id` is still the current site before clearing, so a
+/// concurrent site switch does not close the wrong session.
+#[cfg(mobile)]
+pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> AppResult<()> {
+    let current = {
+        let state = app.state::<AppState>();
+        let value = state
+            .current_site
+            .lock()
+            .expect("current_site lock")
+            .clone();
+        value
+    };
+    // Only proceed if the site to delete is still the active one; otherwise
+    // another site has taken over and must not be closed.
+    let should_clear = current.as_ref().is_some_and(|c| c.site_id == site_id);
+    if !should_clear {
+        return Ok(());
+    }
+    let back = {
+        let state = app.state::<AppState>();
+        let value = state
+            .launcher_url
+            .lock()
+            .expect("launcher_url lock")
+            .clone();
+        value
+    };
+    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+        if let Some(url) = back {
+            window.navigate(url).map_err(|e| {
+                log::error!("başlatıcıya dönülemedi: {e}");
+                AppError::Other("başlatıcıya dönülemedi".into())
+            })?;
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        // Clear the shared CookieManager without first exporting the doomed
+        // site's live jar. A failed navigate must not leave the old jar for
+        // the still-active provider, but here the provider is being deleted
+        // so we clear unconditionally for the matching site.
+        crate::android_bridge::webview_cookies_clear()?;
+    }
+    let closed_site = current.as_ref().map(|c| c.site_id.clone());
+    {
+        let state = app.state::<AppState>();
+        let mut guard = state.current_site.lock().expect("current_site lock");
+        if guard.as_ref().is_some_and(|c| c.site_id == site_id) {
+            *guard = None;
+        }
+    }
+    if let Some(site_id) = closed_site {
+        let _ = app.emit("animehub://site-closed", site_id);
+    }
+    Ok(())
+}
+
 /// Close a site session, persisting its cookies first.
 ///
 /// Desktop: remove the child webview; the launcher underneath reappears.
 /// Uses `Webview::close` / `set_fullscreen`, which do not exist on mobile.
 #[cfg(desktop)]
 pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
+    let _guard = lock_desktop_session()?;
+    close_site_window_locked(app, label)
+}
+
+#[cfg(desktop)]
+fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
         // Bind first: the `MutexGuard` temporary must be dropped before
@@ -1114,5 +1373,105 @@ mod tests {
         assert_eq!(cookies[0].value(), "abc=123");
         assert_eq!(cookies[1].name(), "theme");
         assert_eq!(cookies[1].value(), "dark");
+    }
+
+    #[test]
+    fn android_cookie_header_drops_attributes_intentionally() {
+        // `getCookie()` never returns HttpOnly/Secure/etc. StoredCookie
+        // captures what is available; attributes are intentionally lost on
+        // Android and restored as minimal cookies. This test documents the
+        // architectural limitation rather than asserting it is fixed.
+        let cookies = parse_android_cookie_header("sid=abc; HttpOnly; Secure");
+        // The header `sid=abc; HttpOnly` is parsed as two cookies (`sid` and
+        // `HttpOnly` with empty value) because the source is a Cookie request
+        // header, not Set-Cookie. Only name/value of the first cookie is
+        // meaningful.
+        assert_eq!(cookies[0].name(), "sid");
+        assert_eq!(cookies[0].value(), "abc");
+        // No domain/secure/httpOnly survives the Android header.
+        assert!(cookies[0].domain().is_none());
+        assert_eq!(cookies[0].secure(), None);
+    }
+
+    #[test]
+    fn desktop_sync_and_wipe_are_serialized() {
+        // Real concurrency: a sync thread holds `DESKTOP_SESSION_LOCK` for
+        // 80ms (simulating `export_cookies_webview` under the lock), while
+        // the main test thread tries to acquire the same lock for a wipe.
+        // The wipe must wait, not deadlock, and must see the session as no
+        // longer current after the wipe's `current_site` is cleared.
+        #[cfg(desktop)]
+        {
+            use std::sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            };
+            let state = Arc::new(state_with_current_site(Some("s1")));
+            let sync_started = Arc::new(AtomicBool::new(false));
+            let sync_done = Arc::new(AtomicBool::new(false));
+            let state_clone = state.clone();
+            let started_clone = sync_started.clone();
+            let done_clone = sync_done.clone();
+            let handle = std::thread::spawn(move || {
+                let _guard = lock_desktop_session().expect("sync lock");
+                started_clone.store(true, Ordering::SeqCst);
+                // Simulate sync's ownership check + export under the lock.
+                assert!(session_is_current(&state_clone, "s1"));
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                done_clone.store(true, Ordering::SeqCst);
+            });
+            // Wait until sync thread has the lock.
+            while !sync_started.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Wipe thread (main) tries to acquire the same lock — must block,
+            // not deadlock, until sync releases.
+            let wipe_start = std::time::Instant::now();
+            {
+                let _guard = lock_desktop_session().expect("wipe lock");
+                let elapsed = wipe_start.elapsed();
+                assert!(
+                    elapsed >= std::time::Duration::from_millis(50),
+                    "wipe did not wait for sync"
+                );
+                // While holding the wipe lock, simulate clearing current_site.
+                *state.current_site.lock().unwrap() = None;
+                assert!(!session_is_current(&state, "s1"));
+            }
+            handle.join().unwrap();
+            assert!(sync_done.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn builtin_hide_does_not_delete_session_and_user_delete_does() {
+        // Production `Registry::remove` contract: builtin → hidden, user → deleted.
+        // This test exercises the real `Registry` helpers that `remove_site`
+        // relies on, ensuring a future refactor that collapses the two paths
+        // would be caught before it can wipe a builtin's session.
+        use crate::sites::registry::{Category, SiteDraft};
+        let mut reg = crate::sites::registry::Registry::new_default();
+        // Builtin: hide, not delete.
+        let builtin_id = "builtin-openanime";
+        assert!(reg.get(builtin_id).unwrap().builtin);
+        reg.remove(builtin_id).unwrap();
+        let builtin = reg
+            .get(builtin_id)
+            .expect("builtin still present after hide");
+        assert!(builtin.hidden, "builtin remove must hide, not delete");
+        // User site: true deletion.
+        let user = reg
+            .add(SiteDraft {
+                name: "TempUser".into(),
+                url: "https://temp.example/".into(),
+                category: Category::Watching,
+                letter: None,
+                color: None,
+                image: None,
+            })
+            .unwrap();
+        let uid = user.id.clone();
+        reg.remove(&uid).unwrap();
+        assert!(reg.get(&uid).is_none(), "user site must be deleted");
     }
 }

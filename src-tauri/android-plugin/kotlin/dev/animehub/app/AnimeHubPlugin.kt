@@ -362,12 +362,37 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
                 LOG_TAG,
                 "Cookie jar ready: ${cookieHeaders.size} cookie(s), ${elapsedMs}ms"
               )
-              // flush() blocks until disk I/O is complete. CookieManager's
-              // in-memory jar is already ready for the upcoming navigation;
-              // persist non-empty restored jars asynchronously. An empty jar
-              // needs no disk flush; every later site open replaces it again.
-              invoke.resolve(JSObject().put("ok", true))
-              if (cookieHeaders.isNotEmpty()) flushCookieStoreAsync(manager)
+              // Durability: flush on a background thread and resolve
+              // only after it completes. `manager.flush()` is blocking I/O
+              // so it must not run on the UI thread, but the Rust
+              // `webview_cookies_replace`/`clear` must not return success
+              // before the jar is durable — otherwise a process kill
+              // immediately after `clear_site_data` could resurrect the old
+              // jar. Errors are propagated as rejections, not silent
+              // success. Even an empty jar is flushed for the same reason.
+              try {
+                COOKIE_FLUSH_EXECUTOR.execute {
+                  try {
+                    manager.flush()
+                  } catch (e: Exception) {
+                    Log.w(LOG_TAG, "CookieManager flush failed", e)
+                    AnimeHubDebugLog.add("cookie", "flush failed: \${e.message}")
+                    activity.runOnUiThread {
+                      if (!rejectIfActivityUnavailable(invoke)) {
+                        invoke.reject("CookieManager kalıcılığı başarısız", e)
+                      }
+                    }
+                    return@execute
+                  }
+                  activity.runOnUiThread {
+                    if (rejectIfActivityUnavailable(invoke)) return@runOnUiThread
+                    invoke.resolve(JSObject().put("ok", true))
+                  }
+                }
+              } catch (e: Exception) {
+                Log.w(LOG_TAG, "CookieManager flush could not be queued", e)
+                invoke.reject("CookieManager kalıcılığı kuyruğa alınamadı", e)
+              }
               return
             }
             try {

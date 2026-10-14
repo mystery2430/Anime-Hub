@@ -407,6 +407,23 @@ pub fn profile_dir_name(site_id: &str) -> String {
     }
 }
 
+/// Absolute profile directory for `site_id` under `base` (which is
+/// `app_data_dir()`).  Single source of truth for both the WebView creation
+/// path and the wipe path so a future rename is caught in one place.
+pub fn profile_dir_path(base: &std::path::Path, site_id: &str) -> std::path::PathBuf {
+    base.join("profiles").join(profile_dir_name(site_id))
+}
+
+/// Ensure the per-site profile directory exists and return its path.
+pub fn ensure_profile_dir(
+    base: &std::path::Path,
+    site_id: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = profile_dir_path(base, site_id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Which site a session belongs to, for the cookie-swap path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
@@ -903,5 +920,73 @@ mod tests {
         let json = serde_json::to_string(&jar).unwrap();
         let back: CookieJar = serde_json::from_str(&json).unwrap();
         assert_eq!(back, jar);
+    }
+
+    #[test]
+    fn first_load_profile_is_empty_and_isolated() {
+        // Uses the production `ensure_profile_dir` / `profile_dir_path`
+        // helpers so the test fails if the WebView creation path diverges.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let p1 = ensure_profile_dir(base, "site-a").unwrap();
+        let p2_path = profile_dir_path(base, "site-b");
+        // p2 not yet created -> first load is empty and isolated.
+        assert!(!p2_path.exists());
+        let p2 = ensure_profile_dir(base, "site-b").unwrap();
+        assert_eq!(p2, p2_path);
+        assert!(p1.exists() && p2.exists());
+        assert_ne!(p1, p2);
+        // No file in p2 should exist just because p1 had one.
+        std::fs::write(p1.join("Cookies"), b"from-a").unwrap();
+        assert!(
+            !p2.join("Cookies").exists(),
+            "new site must not inherit cookies from sibling"
+        );
+    }
+
+    #[test]
+    fn reused_site_id_gets_empty_profile_not_stale_cookies() {
+        // Regression for reused-id inheritance: deleting a site's profile
+        // dir and then re-creating it for a new site with the same id must
+        // yield an empty dir, not the old Cookies. This mirrors the
+        // production `remove_site` → `open` sequence via `ensure_profile_dir`
+        // and `profile_dir_path`.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let first = ensure_profile_dir(base, "site-reuse").unwrap();
+        std::fs::write(first.join("Cookies"), b"old-jar").unwrap();
+        std::fs::write(first.join("Local Storage"), b"old-ls").unwrap();
+        assert!(first.join("Cookies").exists());
+        // Simulate `remove_site`: delete the whole profile dir.
+        let path = profile_dir_path(base, "site-reuse");
+        assert_eq!(first, path);
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(!path.exists());
+        // Re-open same id: must be a fresh empty dir, not a resurrection.
+        let second = ensure_profile_dir(base, "site-reuse").unwrap();
+        assert_eq!(second, path);
+        assert!(second.exists());
+        assert!(
+            !second.join("Cookies").exists(),
+            "reused id must not inherit old Cookies"
+        );
+        assert!(
+            !second.join("Local Storage").exists(),
+            "reused id must not inherit old storage"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&second).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "recreated profile must be empty, found {entries:?}"
+        );
+    }
+
+    #[test]
+    fn profile_dir_name_is_deterministic_and_safe() {
+        assert_eq!(profile_dir_name("abc-123_X"), "site-abc-123_X");
+        assert_eq!(profile_dir_name("../../../etc"), "site-etc");
+        assert_ne!(profile_dir_name("a"), profile_dir_name("b"));
+        assert!(!profile_dir_name("a/b").contains('/'));
+        assert!(!profile_dir_name("").contains('/'));
     }
 }
