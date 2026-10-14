@@ -191,6 +191,7 @@ pub fn secret_file_name(name: &str) -> String {
     format!("secret.{clean}.bin")
 }
 
+#[allow(dead_code)]
 fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     let _guard = STORE_LOCK
         .lock()
