@@ -1,6 +1,6 @@
 # Çerez / Oturum / Şifreli Depolama — Tam Yaşam Döngüsü Denetimi
 
-**Tarih:** 2026-10-14 (Europe/Istanbul) — *Üçüncü tur takip (kalan 5 kritik yarış)*  
+**Tarih:** 2026-10-14 (Europe/Istanbul) — *Son sabitleme (4 temel problem, release hazır)*  
 **Dal:** `fix/cookie-session-lifecycle` → PR #26 (bu audit) — `main` 2bee80a üzerine izole dal, PR #21 / #24 ile karıştırılmadı, `main`’e merge yok.  
 **Doğrulanan Head’ler:**
 
@@ -15,6 +15,8 @@
 | PR #26 `fix/cookie-session-lifecycle` üçüncü tur head | `0c32b6d` | `0c32b6d2124bfba3d40ace2e3ddf69e37994084f` | https://github.com/mystery2430/Anime-Hub/pull/26 |
 | PR #26 `fix/cookie-session-lifecycle` üçüncü tur + fmt/clippy | `52479bf` | `52479bf819d8b6420b0dd4695afe1c4e9966453a` | https://github.com/mystery2430/Anime-Hub/pull/26 |
 | PR #26 CI (üçüncü tur, yeşil) | `38607263686` | `fix/cookie-session-lifecycle` @ 52479bf | https://github.com/mystery2430/Anime-Hub/actions/runs/38607263686 |
+| PR #26 `fix/cookie-session-lifecycle` son sabitleme | `a505d0c` | `a505d0c0031a6f717e47b10f862a27b298a1ccde` | https://github.com/mystery2430/Anime-Hub/pull/26 |
+| PR #26 CI (son sabitleme, yeşil) | `38617979543` | `fix/cookie-session-lifecycle` @ a505d0c | https://github.com/mystery2430/Anime-Hub/actions/runs/38617979543 |
 
 > Bu audit `main`’i yeniden `git fetch` ile doğrulayıp `fix/cookie-session-lifecycle` dalını sıfırdan oluşturarak yapıldı; önceki dalda kalan `commands.rs`/`windows.rs` kirleri `git checkout --` ile temizlendi. İkinci tur, CI run 38573694668’in 3 hatası (rustfmt, Android E0425, cargo-audit rustls 0.23.45) üzerine eklendi. Rapor ve kod aynı dalda, tek PR (#26) içinde sunulmaktadır; PR açık tutulmaktadır.
 
@@ -76,6 +78,15 @@ Ayrıca inceleme 4 zayıf testi işaret etti: `desktop_session_lock_does_not_dea
 | 5 | **Anahtar oluşturma yarışı ve yetim profiller:** `AndroidStore::load_or_create_key` `create_dir_all`/`path.exists`/`read_to_string`/`sealed_data_present`/`keystore_open` kilit dışında, sadece son `tmp` yazımı kilitli — iki eşzamanlı caller ayrı anahtar oluşturup ikinci birinciyi ezer. Ayrıca `clear_site_data(None)` yetim `profiles/site-*` taramada `if let Ok(entries)=read_dir` ile `Err`’ı sessiz yutar, `PermissionDenied` gibi hataları başarı sayar. | `secure/mod.rs:load_or_create_key` iki kilit (biri sadece yazımda), `commands.rs:clear_site_data` `if let Ok` ile hata yutma. | **Tek kilitli key ve doğru hata:** `load_or_create_key` artık tüm check+create (`create_dir_all` + `path.exists` + `read_to_string` + `sealed_data_present` + `keystore_*` + `tmp` write) tek `STORE_LOCK` altında, içteki ikinci lock kaldırıldı (deadlock yok). Yetim tarama `match read_dir { Ok(entries)=>..., Err(NotFound)=>{}, Err(e)=> return Storage }` — `NotFound` başarı, diğer hata `Storage` ve `log::error`. `secure/mod.rs:load_or_create_key`, `commands.rs:clear_site_data` |
 
 **Etki:** `open` vs `delete` artık `DESKTOP`/`ANDROID` kilidiyle atomik; `remove` başarısızsa registry korunur; `store`’da silinen veri in-flight `seal` sonrası diriltemez; Android anahtarı tek kilitli; yetim `read_dir` hataları gizlenmez.
+
+---
+
+### Son sabitleme — Final 2 engel (2026-10-14, review #9-#10, minimal)
+
+- **#9 Android aktif wipe**: `clear_site_data` artık aktif site silinirken sadece `CookieManager` değil, `close_site_window_for_clear_locked` ile export yapmadan kapatıp `current_site=None` yapıyor; `ANDROID_SESSION_LOCK` baştan tutulduğu için `spawn_session_sync` yeniden yazamıyor, kullanıcı başka siteye geçtiyse yeni site kapatılmıyor.
+- **#10 Tüm siteler yetim taraması**: `clear_site_data(None)` masaüstünde `is_all` ise kayıt defterinde olmasa bile canlı WebView'ı kapatıp sonra `profiles/site-*` tarıyor; canlı profil kilit altında silinmiyor.
+
+Bu iki düzeltme `src-tauri/src/commands.rs:clear_site_data` içinde 36 satır ile yapıldı; şifreleme/AAD/anahtar formatı değişmedi, yeni dal/PR açılmadı, `main`'e merge yok.
 
 ---
 
@@ -220,9 +231,10 @@ docs/audit-cookie-session-lifecycle.md — bu rapor (üçüncü tur güncellendi
 
 - **JS:** `npm test` — **152/152 pass** (yerel sandbox’ta doğrulandı, bu dalda, `npm run build` de başarılı). `npm test` linki: yerel (CI’da `ci` workflow’u da koşar).
 - **Rust (yerel):** Sandbox’ta `cargo`/`rustc` yok — `cargo fmt --check` / `cargo test` / `clippy -D warnings` yerel koşulamadı; kod `cargo fmt`’e uygun elle biçimlendi, `cargo audit` için `Cargo.lock` minimal bump yapıldı. Doğrulama CI’a bırakıldı.
-- **Rust (CI):** İlk run **38573694668 FAILED** (rustfmt + Android E0425 + cargo-audit rustls 0.23.45). İkinci run **38577156614 FAILED** (rustfmt `mod.rs` + Android E0597 `state` + clippy `close_current_child`). Üçüncü run **38579500121 SUCCESS** — tüm job’lar yeşil (önceki tur). Dördüncü tur (0c32b6d/58a4e97) iki FIX sonrası (**ea9b521** rustfmt tek satır + **52479bf** `atomic_write` `allow(dead_code)`) **38607263686 SUCCESS** — tüm job’lar yeşil (bu tur):
+- **Rust (CI):** İlk run **38573694668 FAILED** (rustfmt + Android E0425 + cargo-audit rustls 0.23.45). İkinci run **38577156614 FAILED** (rustfmt `mod.rs` + Android E0597 `state` + clippy `close_current_child`). Üçüncü run **38579500121 SUCCESS** — tüm job’lar yeşil (önceki tur). Dördüncü tur (0c32b6d/58a4e97) iki FIX sonrası (**ea9b521** + **52479bf**) **38607263686 SUCCESS**. Son sabitleme (**a505d0c**, Android aktif kapatma + desktop all-wipe #9/#10) **38617979543 SUCCESS** — tüm job’lar yeşil (6/6):
   - `https://github.com/mystery2430/Anime-Hub/actions/runs/38579500121` (PR #26 @ c639b71, önceki yeşil).
-  - `https://github.com/mystery2430/Anime-Hub/actions/runs/38607263686` (PR #26 @ 52479bf, bu tur — **6/6 yeşil**: `Tests (ubuntu)`, `Tests (macos)`, `Tests (windows)`, `Android compile`, `Dependency and secret audit`, `Release profile`).
+  - `https://github.com/mystery2430/Anime-Hub/actions/runs/38607263686` (PR #26 @ 52479bf, üçüncü tur — 6/6 yeşil).
+  - `https://github.com/mystery2430/Anime-Hub/actions/runs/38617979543` (PR #26 @ a505d0c, son sabitleme — **6/6 yeşil**: `Tests (ubuntu)`, `Tests (macos)`, `Tests (windows)`, `Android compile`, `Dependency and secret audit`, `Release profile`).
   - `Tests (ubuntu-24.04)` ✓ `cargo fmt --check` + `clippy -D warnings` + `cargo test` + `npm test/build`
   - `Tests (macos-latest)` ✓ `clippy` + `cargo test` + `npm`
   - `Tests (windows-latest)` ✓ `clippy` + `cargo test` + `npm`
@@ -254,7 +266,7 @@ docs/audit-cookie-session-lifecycle.md — bu rapor (üçüncü tur güncellendi
 - [x] §6.3 `Secure`/`HttpOnly` kaybı dokümante, fix değil — korundu
 - [x] §7 `clear_site_data(None)` yetim `site-*` dar tarama, `DESKTOP_SESSION_LOCK` + canlı close sonrası — yapıldı
 - [x] §8 4 zayıf test güçlendirildi + 3 yeni regresyon — yapıldı (12 test tablosu)
-- [x] §9 CI yeşil: `cargo fmt --check`, `cargo test`, `clippy -D`, `npm test/build`, Android aarch64, `cargo audit` rustls 0.23.46 — **38607263686 yeşil (6/6, 52479bf), 38579500121 önceki yeşil, yerel `npm` 152/152**
+- [x] §9 CI yeşil: `cargo fmt --check`, `cargo test`, `clippy -D`, `npm test/build`, Android aarch64, `cargo audit` rustls 0.23.46 — **38617979543 yeşil (6/6, a505d0c), 38607263686 önceki yeşil, yerel `npm` 152/152**
 - [x] §11 Üçüncü tur 5 kritik yarış (registry koruma, Android yanlış kapanma, stale open, STORE resurreksiyon, key+orphan hata) — düzeltildi, deterministik test eklendi
 - [x] §10 rapor bu dosya — güncellendi
 - PR #26 **açık** tutuluyor; `main`’e merge yok; PR #21/#24’e dokunulmadı; kitle silme migrasyonu yok; güvenlik kontrolleri kapatılmadı.
