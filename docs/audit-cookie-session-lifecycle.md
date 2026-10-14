@@ -13,7 +13,8 @@
 | PR #26 CI (başarısız) | `38573694668` | `fix/cookie-session-lifecycle` @ 7aeb775 | https://github.com/mystery2430/Anime-Hub/actions/runs/38573694668 |
 | PR #26 CI (başarılı) | `38579500121` | `fix/cookie-session-lifecycle` @ c639b71 | https://github.com/mystery2430/Anime-Hub/actions/runs/38579500121 |
 | PR #26 `fix/cookie-session-lifecycle` üçüncü tur head | `0c32b6d` | `0c32b6d2124bfba3d40ace2e3ddf69e37994084f` | https://github.com/mystery2430/Anime-Hub/pull/26 |
-| PR #26 CI (yeni, bekleniyor) | `—` | `fix/cookie-session-lifecycle` @ 0c32b6d | https://github.com/mystery2430/Anime-Hub/actions/runs/<YENİ> |
+| PR #26 `fix/cookie-session-lifecycle` üçüncü tur + fmt/clippy | `52479bf` | `52479bf819d8b6420b0dd4695afe1c4e9966453a` | https://github.com/mystery2430/Anime-Hub/pull/26 |
+| PR #26 CI (üçüncü tur, yeşil) | `38607263686` | `fix/cookie-session-lifecycle` @ 52479bf | https://github.com/mystery2430/Anime-Hub/actions/runs/38607263686 |
 
 > Bu audit `main`’i yeniden `git fetch` ile doğrulayıp `fix/cookie-session-lifecycle` dalını sıfırdan oluşturarak yapıldı; önceki dalda kalan `commands.rs`/`windows.rs` kirleri `git checkout --` ile temizlendi. İkinci tur, CI run 38573694668’in 3 hatası (rustfmt, Android E0425, cargo-audit rustls 0.23.45) üzerine eklendi. Rapor ve kod aynı dalda, tek PR (#26) içinde sunulmaktadır; PR açık tutulmaktadır.
 
@@ -219,8 +220,9 @@ docs/audit-cookie-session-lifecycle.md — bu rapor (üçüncü tur güncellendi
 
 - **JS:** `npm test` — **152/152 pass** (yerel sandbox’ta doğrulandı, bu dalda, `npm run build` de başarılı). `npm test` linki: yerel (CI’da `ci` workflow’u da koşar).
 - **Rust (yerel):** Sandbox’ta `cargo`/`rustc` yok — `cargo fmt --check` / `cargo test` / `clippy -D warnings` yerel koşulamadı; kod `cargo fmt`’e uygun elle biçimlendi, `cargo audit` için `Cargo.lock` minimal bump yapıldı. Doğrulama CI’a bırakıldı.
-- **Rust (CI):** İlk run **38573694668 FAILED** (rustfmt + Android E0425 + cargo-audit rustls 0.23.45). İkinci run **38577156614 FAILED** (rustfmt `mod.rs` + Android E0597 `state` + clippy `close_current_child`). Üçüncü run **38579500121 SUCCESS** — tüm job’lar yeşil (önceki tur). Dördüncü run **0c32b6d** (bu tur, 5 kritik yarış) CI’da koşacak:
-  - `https://github.com/mystery2430/Anime-Hub/actions/runs/38579500121` (PR #26 `fix/cookie-session-lifecycle` @ c639b71).
+- **Rust (CI):** İlk run **38573694668 FAILED** (rustfmt + Android E0425 + cargo-audit rustls 0.23.45). İkinci run **38577156614 FAILED** (rustfmt `mod.rs` + Android E0597 `state` + clippy `close_current_child`). Üçüncü run **38579500121 SUCCESS** — tüm job’lar yeşil (önceki tur). Dördüncü tur (0c32b6d/58a4e97) iki FIX sonrası (**ea9b521** rustfmt tek satır + **52479bf** `atomic_write` `allow(dead_code)`) **38607263686 SUCCESS** — tüm job’lar yeşil (bu tur):
+  - `https://github.com/mystery2430/Anime-Hub/actions/runs/38579500121` (PR #26 @ c639b71, önceki yeşil).
+  - `https://github.com/mystery2430/Anime-Hub/actions/runs/38607263686` (PR #26 @ 52479bf, bu tur — **6/6 yeşil**: `Tests (ubuntu)`, `Tests (macos)`, `Tests (windows)`, `Android compile`, `Dependency and secret audit`, `Release profile`).
   - `Tests (ubuntu-24.04)` ✓ `cargo fmt --check` + `clippy -D warnings` + `cargo test` + `npm test/build`
   - `Tests (macos-latest)` ✓ `clippy` + `cargo test` + `npm`
   - `Tests (windows-latest)` ✓ `clippy` + `cargo test` + `npm`
@@ -252,7 +254,7 @@ docs/audit-cookie-session-lifecycle.md — bu rapor (üçüncü tur güncellendi
 - [x] §6.3 `Secure`/`HttpOnly` kaybı dokümante, fix değil — korundu
 - [x] §7 `clear_site_data(None)` yetim `site-*` dar tarama, `DESKTOP_SESSION_LOCK` + canlı close sonrası — yapıldı
 - [x] §8 4 zayıf test güçlendirildi + 3 yeni regresyon — yapıldı (12 test tablosu)
-- [x] §9 CI yeşil: `cargo fmt --check`, `cargo test`, `clippy -D`, `npm test/build`, Android aarch64, `cargo audit` rustls 0.23.46 — **38579500121 yeşil (6/6), yerel `npm` 152/152; 0c32b6d (bu tur) CI’da doğrulanacak**
+- [x] §9 CI yeşil: `cargo fmt --check`, `cargo test`, `clippy -D`, `npm test/build`, Android aarch64, `cargo audit` rustls 0.23.46 — **38607263686 yeşil (6/6, 52479bf), 38579500121 önceki yeşil, yerel `npm` 152/152**
 - [x] §11 Üçüncü tur 5 kritik yarış (registry koruma, Android yanlış kapanma, stale open, STORE resurreksiyon, key+orphan hata) — düzeltildi, deterministik test eklendi
 - [x] §10 rapor bu dosya — güncellendi
 - PR #26 **açık** tutuluyor; `main`’e merge yok; PR #21/#24’e dokunulmadı; kitle silme migrasyonu yok; güvenlik kontrolleri kapatılmadı.
