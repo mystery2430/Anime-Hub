@@ -521,20 +521,33 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     };
     #[cfg(target_os = "android")]
     {
-        let current = state
-            .current_site
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        let clear_live_jar = all_sites
-            || current
+        // Android: if the active provider is among the ids being wiped (or
+        // all providers are wiped), close its WebView *without* exporting
+        // live cookies/storage and invalidate `current_site` before deleting
+        // the blobs. This prevents the still-loaded page and its
+        // `spawn_session_sync` worker from recreating the jar after the
+        // wipe. The `ANDROID_SESSION_LOCK` is already held, so the
+        // `*_locked` helper is used to avoid deadlock and to re-check that
+        // `site_id` is still current after acquiring the lock.
+        let current_snapshot = {
+            let cur = state
+                .current_site
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            cur.clone()
+        };
+        let clear_live = all_sites
+            || current_snapshot
                 .as_ref()
                 .is_some_and(|site| ids.iter().any(|id| id == &site.site_id));
-        drop(current);
-        if clear_live_jar {
-            // On Android the CookieManager is shared by every provider; when
-            // clearing the active provider (or all providers), clear that live
-            // jar as well as the encrypted snapshots below.
-            crate::android_bridge::webview_cookies_clear()?;
+        if clear_live {
+            if let Some(active) = current_snapshot {
+                crate::web::windows::close_site_window_for_clear_locked(&app, &active.site_id)?;
+            } else {
+                // `all_sites` with no active session: still clear the shared
+                // CookieManager so no stale cookies survive.
+                crate::android_bridge::webview_cookies_clear()?;
+            }
         }
     }
     #[cfg(desktop)]
@@ -546,14 +559,22 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
         // live WebView (which WebView2/WebKitGTK may recreate). A close
         // failure aborts the wipe so the profile is not deleted underneath a
         // live WebView and the caller does not see a false success.
+        // For the “clear all” path, close any live WebView regardless of
+        // whether its `site_id` appears in `ids` (it may be an unregistered
+        // live profile); otherwise the later orphan sweep could delete the
+        // live `profiles/site-*` directory underneath the WebView.
         let current_label = {
             let cur = state
                 .current_site
                 .lock()
                 .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            cur.as_ref()
-                .filter(|c| ids.iter().any(|id| id == &c.site_id))
-                .map(|c| c.window_label.clone())
+            if is_all {
+                cur.as_ref().map(|c| c.window_label.clone())
+            } else {
+                cur.as_ref()
+                    .filter(|c| ids.iter().any(|id| id == &c.site_id))
+                    .map(|c| c.window_label.clone())
+            }
         };
         if let Some(label) = current_label {
             crate::web::windows::close_site_window_for_clear(&app, &label)?;
