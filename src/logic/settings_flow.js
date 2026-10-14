@@ -129,36 +129,75 @@ export function createSettingsFlow(deps) {
     return save({ blocklist: { rules: savedRules, enabled } });
   }
 
-  async function rollbackPip(previous, message) {
-    notify(message);
-    await save({ pipAutoEnter: previous });
-    drawSwitches();
-  }
+  // PiP: all toggles are serialized through a dedicated queue so rapid
+  // clicks never interleave. The actual native+persist work is now atomic
+  // in Rust (`set_pip_auto_enter` holds `pip_lock` across both), so the
+  // startup thread (which also holds `pip_lock`) cannot race with a toggle.
+  // The JS queue is kept for toggle-vs-toggle ordering; startup-vs-toggle
+  // ordering is enforced in Rust via generation+lock.
+  let pipChain = Promise.resolve();
 
-  /** The "auto PiP" switch. See the module comment for the rules. */
-  async function changePipAutoEnter(wanted) {
+  async function doChangePip(wantedRaw) {
+    const wanted = Boolean(wantedRaw);
     const name = await resolvePlatform();
     if (!KNOWN_PLATFORMS.includes(name)) {
-      // Unknown platform: do not save, do not call native. Undo the visual change.
       notify(PLATFORM_UNKNOWN_MESSAGE);
       drawSwitches();
       return false;
     }
     const previous = Boolean(getCurrent() && getCurrent().pipAutoEnter);
-    if (!(await save({ pipAutoEnter: wanted }))) return false;
-    if (DESKTOP_PLATFORMS.includes(name)) return true; // stored only, as before
-    let applied;
+    if (wanted === previous) {
+      drawSwitches();
+      return true;
+    }
+    // Desktop: stored only, no native step.
+    if (DESKTOP_PLATFORMS.includes(name)) {
+      return save({ pipAutoEnter: wanted });
+    }
+    // Android: single atomic Rust call (native+periodic with compensation).
     try {
-      applied = await call("set_pip_auto_enter", { enabled: wanted });
+      const saved = await call("set_pip_auto_enter", { enabled: wanted });
+      // Rust returns SettingsView on success.
+      if (saved && typeof saved === "object" && "pipAutoEnter" in saved) {
+        setCurrent(saved);
+      } else if (saved === true) {
+        // Back-compat: older Rust that returned bool – fall back to save.
+        const fallback = await call("update_settings", {
+          patch: { pipAutoEnter: wanted },
+        });
+        setCurrent(fallback);
+      } else if (saved === false) {
+        // Rust signalled unsupported without throwing (should now throw,
+        // but keep for compat).
+        notify(PIP_UNSUPPORTED_MESSAGE);
+        drawSwitches();
+        return false;
+      } else {
+        // Unexpected shape – treat as success and refresh from getCurrent.
+        setCurrent(saved);
+      }
+      try {
+        await refresh();
+      } catch (err) {
+        notify(errorText(err));
+      }
+      return true;
     } catch (e) {
-      await rollbackPip(previous, errorText(e));
+      const msg = errorText(e);
+      // Rust already attempted best-effort revert and appended "belirsiz"
+      // when it failed; we just surface the message.
+      notify(msg);
+      drawSwitches();
       return false;
     }
-    if (applied !== true) {
-      await rollbackPip(previous, PIP_UNSUPPORTED_MESSAGE);
-      return false;
-    }
-    return true;
+  }
+
+  /** The "auto PiP" switch. See the module comment for the rules. */
+  function changePipAutoEnter(wanted) {
+    const task = pipChain.then(() => doChangePip(wanted));
+    // Keep chain alive even if task rejects
+    pipChain = task.catch(() => {});
+    return task;
   }
 
   return {

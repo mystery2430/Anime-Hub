@@ -141,6 +141,11 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     const kt = read(join(gen, "app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt"));
     assert.match(kt, /^package dev\.animehub\.app$/m);
     assert.match(kt, /fun keystore_seal/);
+    // IpPolicy.kt – saf IP mantigi, APK ve test ortak kullanir
+    const ipPolicy = read(join(gen, "app/src/main/java/dev/animehub/app/IpPolicy.kt"));
+    assert.match(ipPolicy, /^package dev\.animehub\.app$/m);
+    assert.match(ipPolicy, /object IpPolicy/);
+    assert.match(ipPolicy, /fun isPublicIp\(/);
     const xml = read(join(gen, "app/src/main/AndroidManifest.xml"));
     assert.match(xml, /supportsPictureInPicture="true"/);
     assert.match(xml, /android:scheme="animehub"/);
@@ -319,7 +324,9 @@ test("every overlay goes through the shared stack: focus return, inert backgroun
 });
 
 test("the Android navigation guard keeps the desktop host rules in step", () => {
-  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const ktSite = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicy.kt"));
+  const ktIp = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/IpPolicy.kt"));
+  const kt = ktSite + "\n" + ktIp;
   const rs = read(join(ROOT, "src-tauri/src/sites/url_policy.rs"));
 
   // Suffixes the Rust policy refuses (`h.ends_with(".x")`).
@@ -340,15 +347,20 @@ test("the Android navigation guard keeps the desktop host rules in step", () => 
 });
 
 test("Android navigation policy: numeric IPv4 spellings and documentation ranges are refused like Rust", () => {
-  // Static check only. The same rules were also run on the real Kotlin object with a
-  // stub android.net.Uri (outside the repo, not a CI test). Chromium's URL parsing of
-  // these spellings is per the WHATWG spec and was not tested in a WebView.
-  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  // Static check only. IP logic now lives in IpPolicy.kt ve SiteNavigationPolicy.kt (saf, Android bagimliligi yok)
+  // ve her iki dosya da kontrol edilir.
+  const ktPlugin = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+  const ktPolicy = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/IpPolicy.kt"));
+  const ktSite = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicy.kt"));
+  const kt = ktPlugin + "\n" + ktPolicy + "\n" + ktSite;
   assert.match(kt, /NUMERIC_LABEL = Regex\("""\(0x\[0-9a-f\]\*\|\[0-9\]\+\)""", RegexOption\.IGNORE_CASE\)/);
   assert.match(kt, /if \(NUMERIC_LABEL\.matches\(bare\.substringAfterLast\('\.'\)\)\) \{/);
-  // Documentation ranges, as Rust url_policy::is_public_ip rejects them.
+  // Documentation ranges, as Rust url_policy::is_public_ip rejects them – now in IpPolicy.kt
   assert.match(kt, /\(a == 198 && b == 51 && c == 100\)/);
   assert.match(kt, /\(a == 203 && b == 0 && c == 113\)/);
+  // IpPolicy.kt'nin APK ve test tarafindan ortak kullanildigini dogrula
+  assert.match(ktPolicy, /object IpPolicy/);
+  assert.match(ktPolicy, /fun isPublicIp\(/);
 });
 
 test("Android IPC is limited to the launcher origins and main frame, never a site-facing JavascriptInterface", () => {

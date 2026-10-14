@@ -78,6 +78,9 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))'.dependencies]
 keyring = "4"
 
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+libc = "0.2"
+
 # The Keystore + Picture-in-Picture bridge.
 #
 # This is an unconditional dependency even though it only does real work on

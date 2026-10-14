@@ -57,6 +57,8 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
 import android.widget.Toast
+import java.net.Inet6Address
+import java.net.InetAddress
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -766,98 +768,6 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
   }
 }
 
-/**
- * The desktop site policy, restated for Kotlin. Keep it in step with
- * `navigation_allowed` and `is_private_host` in `src-tauri/src/sites/url_policy.rs`;
- * `tests/gaps.test.js` checks the shared host suffixes.
- *
- * Deliberately has no exception for the launcher's own origin: a site must not
- * be able to load `tauri.localhost` into the WebView, because that origin is
- * the one that receives IPC. The launcher returns through `loadUrl`, which is
- * not routed through this guard.
- */
-internal object SiteNavigationPolicy {
-  private val BLOCKED_HOSTS = setOf(
-    "localhost",
-    "localhost.localdomain",
-    "ip6-localhost",
-    "ip6-loopback",
-    "metadata.google.internal",
-  )
-
-  private val BLOCKED_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home")
-
-  private val IPV4 = Regex("""\d{1,3}(\.\d{1,3}){3}""")
-  // The last label of a host that WHATWG URL parsing reads as an IPv4 number:
-  // 2130706433, 0x7f000001, 0177.0.0.1, 127.1. Chromium normalises these to
-  // a dotted address, so they must go through the IP rules, not the name rules.
-  private val NUMERIC_LABEL = Regex("""(0x[0-9a-f]*|[0-9]+)""", RegexOption.IGNORE_CASE)
-
-  fun allows(uri: Uri): Boolean {
-    val scheme = uri.scheme?.lowercase() ?: return false
-    return when (scheme) {
-      "https" -> hostAllowed(uri.host)
-      // Playback and inline-asset schemes, as in Rust's navigation_allowed.
-      "blob", "data", "about" -> true
-      // Plain http is a downgrade, and every other scheme is refused.
-      else -> false
-    }
-  }
-
-  private fun hostAllowed(rawHost: String?): Boolean {
-    val host = rawHost?.lowercase()?.trimEnd('.')
-    if (host.isNullOrEmpty()) return false
-    val bare = host.removePrefix("[").removeSuffix("]")
-    if (bare.contains(':')) return isPublicIpv6(bare)
-    if (NUMERIC_LABEL.matches(bare.substringAfterLast('.'))) {
-      // Only a canonical dotted-decimal public address passes. Other forms are refused.
-      return IPV4.matches(bare) && isPublicIpv4(bare)
-    }
-    if (IPV4.matches(bare)) return isPublicIpv4(bare)
-    if (host in BLOCKED_HOSTS) return false
-    return BLOCKED_SUFFIXES.none { host.endsWith(it) }
-  }
-
-  private fun isPublicIp(ip: String): Boolean =
-    if (ip.contains(':')) isPublicIpv6(ip) else isPublicIpv4(ip)
-
-  private fun isPublicIpv4(ip: String): Boolean {
-    val octets = ip.split('.').map { it.toIntOrNull() ?: return false }
-    if (octets.size != 4 || octets.any { it !in 0..255 }) return false
-    val a = octets[0]
-    val b = octets[1]
-    val c = octets[2]
-    return !(
-      a == 0 ||                         // 0.0.0.0/8
-      a == 10 ||                        // private
-      a == 127 ||                       // loopback
-      (a == 100 && b in 64..127) ||     // CGNAT
-      (a == 169 && b == 254) ||         // link-local
-      (a == 172 && b in 16..31) ||      // private
-      (a == 192 && b == 0) ||           // IETF protocol assignments, documentation 192.0.0.0/24, 192.0.2.0/24
-      (a == 192 && b == 168) ||         // private
-      (a == 198 && b == 51 && c == 100) || // documentation 198.51.100.0/24 (as Rust is_documentation)
-      (a == 203 && b == 0 && c == 113) ||  // documentation 203.0.113.0/24 (as Rust is_documentation)
-      (a == 198 && (b == 18 || b == 19)) || // benchmarking
-      a >= 224                          // multicast, reserved, broadcast
-    )
-  }
-
-  private fun isPublicIpv6(ip: String): Boolean {
-    val lower = ip.lowercase()
-    if (lower == "::1" || lower == "::") return false
-    if (lower.startsWith("::ffff:")) {
-      val v4 = lower.removePrefix("::ffff:")
-      return IPV4.matches(v4) && isPublicIpv4(v4)
-    }
-    val first = lower.substringBefore(':').ifEmpty { "0" }.toIntOrNull(16) ?: return false
-    return !(
-      (first and 0xffc0) == 0xfe80 ||   // link-local fe80::/10
-      (first and 0xfe00) == 0xfc00 ||   // unique local fc00::/7
-      (first and 0xff00) == 0xff00      // multicast ff00::/8
-    )
-  }
-}
 
 /**
  * Receives `window.ipc.postMessage` from the launcher only. The origin rules
@@ -874,6 +784,11 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     replyProxy: JavaScriptReplyProxy,
   ) {
     if (!isMainFrame) return
+    if (!isAllowedOrigin(sourceOrigin)) {
+      Log.w(LOG_TAG, "IPC blocked: unexpected origin ${sourceOrigin.scheme}")
+      AnimeHubDebugLog.add("ipc", "blocked origin scheme=${sourceOrigin.scheme}")
+      return
+    }
     val body = message.data ?: return
     val url = view.url ?: "about:blank"
     // onPostMessage runs on the UI thread. Rust runs blocking commands inline, and
@@ -893,7 +808,22 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     }
   }
 
+  private fun isAllowedOrigin(origin: Uri): Boolean {
+    val scheme = origin.scheme?.lowercase() ?: return false
+    if (scheme != "http" && scheme != "https") return false
+    val host = origin.host?.lowercase() ?: return false
+    if (host != "tauri.localhost") return false
+    if (origin.port != -1) return false
+    // Origin must be bare: no path, query, fragment or userInfo beyond "/".
+    val path = origin.path
+    if (!path.isNullOrEmpty() && path != "/") return false
+    if (!origin.query.isNullOrEmpty() || !origin.fragment.isNullOrEmpty()) return false
+    if (!origin.userInfo.isNullOrEmpty()) return false
+    return true
+  }
+
   companion object {
+    private const val LOG_TAG = "AnimeHubIpc"
     private val IPC_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
       Thread(runnable, "AnimeHubLauncherIpc").apply { isDaemon = true }
     }

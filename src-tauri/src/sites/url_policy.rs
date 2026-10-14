@@ -168,6 +168,13 @@ pub fn is_private_host(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(h);
+    // If it looks like an IP literal but fails to parse, treat as private (fail-closed).
+    if bare.contains(':') {
+        return match bare.parse::<std::net::IpAddr>() {
+            Ok(ip) => !ip_is_public(&ip),
+            Err(_) => true,
+        };
+    }
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return !ip_is_public(&ip);
     }
@@ -200,28 +207,171 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
 fn ip_is_public(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            let [a, b, _, _] = v4.octets();
+            let [a, b, c, d] = v4.octets();
+            // IANA IPv4 Special-Purpose Registry (2025-10-09) – Globally Reachable == false
+            // plus multicast/reserved. Keep in step with Kotlin SiteNavigationPolicy.
+            // 192.0.0.0/24 has exceptions 192.0.0.9/32 and 192.0.0.10/32 (true).
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || a == 0 // 0.0.0.0/8 This network
                 // 100.64.0.0/10 CGNAT
                 || (a == 100 && (64..=127).contains(&b))
-                // 192.0.0.0/24 and 198.18.0.0/15 benchmarking
-                || (a == 192 && b == 0)
-                || (a == 198 && (18..=19).contains(&b)))
+                // 192.0.0.0/24 IANA reserved, but 192.0.0.9 and .10 are globally reachable (RFC 7723/8155)
+                || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+                // 192.0.2.0/24 TEST-NET-1
+                || (a == 192 && b == 0 && c == 2)
+                // 192.88.99.0/24 6to4 relay (deprecated)
+                || (a == 192 && b == 88 && c == 99)
+                // 198.18.0.0/15 benchmarking
+                || (a == 198 && (18..=19).contains(&b))
+                // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved/broadcast
+                || a >= 224)
         }
         std::net::IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // ::ffff:0:0/96 mapped IPv4
-                || v6.to_ipv4_mapped().is_some_and(|m| !ip_is_public(&m.into()))
-                // fe80::/10 link-local, fc00::/7 unique-local
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || (v6.segments()[0] & 0xfe00) == 0xfc00)
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            let seg = v6.segments();
+            // 3fff::/20 documentation (RFC 9637) – first 20 bits 0011 1111 1111 1111 0000
+            if seg[0] == 0x3fff && (seg[1] & 0xf000) == 0x0000 {
+                return false;
+            }
+            // 5f00::/16 SRv6 SIDs
+            if seg[0] == 0x5f00 {
+                return false;
+            }
+            // 64:ff9b:1::/48 translation – false (must be before /96 handling)
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+                return false;
+            }
+            // 100::/64 discard-only
+            if seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 {
+                return false;
+            }
+            // 100:0:0:1::/64 dummy
+            if seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0x0001 {
+                return false;
+            }
+            // 2001:db8::/32 documentation
+            if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+                return false;
+            }
+            // 2001:2::/48 benchmarking
+            if seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0x0000 {
+                return false;
+            }
+            // 2002::/16 6to4 – deprecated
+            if seg[0] == 0x2002 {
+                return false;
+            }
+            // fec0::/10 site-local – deprecated (RFC 3879)
+            if (seg[0] & 0xffc0) == 0xfec0 {
+                return false;
+            }
+            // 2001::/23 IETF protocol assignments – false unless more-specific true allocation
+            // 2001::/32 Teredo has N/A, so NOT whitelisted (fail-closed)
+            if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0x0000 {
+                // Whitelist only allocations with Globally Reachable == true
+                let is_pcp1 = seg[0] == 0x2001
+                    && seg[1] == 0x0001
+                    && seg[2] == 0x0000
+                    && seg[3] == 0x0000
+                    && seg[4] == 0x0000
+                    && seg[5] == 0x0000
+                    && seg[6] == 0x0000
+                    && seg[7] == 0x0001;
+                let is_pcp2 = seg[0] == 0x2001
+                    && seg[1] == 0x0001
+                    && seg[2] == 0x0000
+                    && seg[3] == 0x0000
+                    && seg[4] == 0x0000
+                    && seg[5] == 0x0000
+                    && seg[6] == 0x0000
+                    && seg[7] == 0x0002;
+                let is_pcp3 = seg[0] == 0x2001
+                    && seg[1] == 0x0001
+                    && seg[2] == 0x0000
+                    && seg[3] == 0x0000
+                    && seg[4] == 0x0000
+                    && seg[5] == 0x0000
+                    && seg[6] == 0x0000
+                    && seg[7] == 0x0003;
+                let is_amt = seg[0] == 0x2001 && seg[1] == 0x0003; // 2001:3::/32
+                let is_as112 = seg[0] == 0x2001 && seg[1] == 0x0004 && seg[2] == 0x0112; // 2001:4:112::/48
+                                                                                         // ORCHIDv2 2001:20::/28 and Drone 2001:30::/28 are true;
+                                                                                         // 2001:10::/28 is deprecated and must stay blocked.
+                let is_orchid = seg[0] == 0x2001
+                    && ((seg[1] & 0xfff0) == 0x0020 || (seg[1] & 0xfff0) == 0x0030);
+                let allowed = is_pcp1 || is_pcp2 || is_pcp3 || is_amt || is_as112 || is_orchid;
+                if !allowed {
+                    return false;
+                }
+            }
+            // fe80::/10 link-local, fc00::/7 unique-local
+            if (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // IPv4-embedded: ::ffff:0:0/96 (mapped) and ::/96 (compatible, deprecated)
+            // These are outside 2000::/3 but are handled as special cases:
+            // allow only if embedded IPv4 is public, otherwise block.
+            if let Some(m) = v6.to_ipv4_mapped() {
+                return ip_is_public(&std::net::IpAddr::V4(m));
+            } else if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+                && (seg[6] != 0 || seg[7] != 0)
+            {
+                let v4 = std::net::Ipv4Addr::new(
+                    ((seg[6] >> 8) & 0xff) as u8,
+                    (seg[6] & 0xff) as u8,
+                    ((seg[7] >> 8) & 0xff) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return ip_is_public(&std::net::IpAddr::V4(v4));
+            }
+            // 64:ff9b::/96 translation – globally reachable true per IANA,
+            // but the embedded IPv4 must itself be globally reachable (RFC 6052).
+            // If the last 32 bits encode a private/reserved IPv4, the whole
+            // address is not globally reachable.
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let v4 = std::net::Ipv4Addr::new(
+                    ((seg[6] >> 8) & 0xff) as u8,
+                    (seg[6] & 0xff) as u8,
+                    ((seg[7] >> 8) & 0xff) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+                    return false;
+                }
+            }
+            // Fail-closed: only 2000::/3 is global-unicast. Outside that,
+            // only 64:ff9b::/96 with public IPv4 (handled above) is allowed.
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                return true;
+            }
+            if (seg[0] & 0xe000) != 0x2000 {
+                return false;
+            }
+            true
         }
     }
 }
@@ -389,5 +539,245 @@ mod tests {
             sanitize_cookie_component("a; Path=/ b\"c\\d\ne"),
             "aPath=/bcde"
         );
+    }
+
+    #[test]
+    fn ipv4_iana_precise_blocks_and_allows() {
+        // Blocked: IANA false
+        for ip in [
+            "0.0.0.1",
+            "10.5.6.7",
+            "100.64.0.1",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.10.20",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.0.0.1",
+            "192.0.0.8",
+            "192.0.0.170",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.1.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_public_ip(addr), "should block {ip}");
+            assert!(is_private_host(ip), "host {ip} should be private");
+        }
+        // Allowed: exceptions and public
+        for ip in [
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.0.1.1",
+            "192.0.3.1",
+            "192.1.0.1",
+            "8.8.8.8",
+            "1.1.1.1",
+            "100.128.0.1",
+            "198.20.0.1",
+            "192.0.4.1",
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_public_ip(addr), "should allow {ip}");
+            assert!(!is_private_host(ip), "host {ip} should not be private");
+            assert!(
+                validate_site_url(&format!("https://{ip}/")).is_ok(),
+                "https://{ip}/ should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_iana_blocks_and_allows() {
+        // Blocked vectors (must be rejected) – RFC 6052 and IANA 2025-10-09
+        // Includes fail-closed cases outside 2000::/3 and deprecated 6to4/site-local.
+        for ip in [
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:10.0.0.1",
+            "::10.0.0.1",
+            "::7f00:1",
+            "::192.168.1.1",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+            "ff00::1",
+            "2001:db8::1",
+            "100::1",
+            "100:0:0:1::1",
+            "3fff::1",
+            "3fff:0fff::1", // inside 3fff::/20 near boundary (high nibble 0x0)
+            "64:ff9b:1::1",
+            "64:ff9b:1::192.0.2.1",
+            // NAT64 /96 with non-global embedded IPv4 must be rejected (RFC 6052)
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::192.168.1.1",
+            "64:ff9b::192.0.2.1",
+            "2001:2::1",
+            "5f00::1",
+            "2001:5::1",
+            "2001:0:5::1",
+            // 2001:10::/28 is deprecated (ex-ORCHID) – not globally reachable
+            "2001:10::1",
+            "2001:10:ffff::1",
+            // Teredo 2001::/32 has N/A, so fail-closed (not explicitly true)
+            "2001::1",
+            "2001:0:0:1::1",
+            "2001:0:1::1",
+            "2001:1:ffff::1",
+            // 6to4, site-local, and non-global-unicast
+            "2002::1",
+            "fec0::1",
+            "4000::1",
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap_or_else(|_| panic!("parse {ip}"));
+            assert!(!is_public_ip(addr), "should block {ip}");
+            assert!(
+                is_private_host(&format!("[{ip}]")),
+                "host [{ip}] should be private"
+            );
+        }
+        // Allowed vectors (must pass) – more-specific true allocations inside 2001::/23
+        // Note: 2001::/32 Teredo is N/A, so NOT allowed (fail-closed).
+        // 3fff:1234::1 is outside 3fff::/20 (high nibble 0x1), so it is global-unicast and allowed.
+        for ip in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            // NAT64 /96 with global embedded IPv4 is allowed
+            "64:ff9b::8.8.8.8",
+            "64:ff9b::1.1.1.1",
+            "64:ff9b::192.0.1.1",
+            "3fff:1234::1", // outside 3fff::/20 (high nibble 0x1), so public
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:20:0:1::1",
+            "2001:2f:ff::1", // still inside 2001:20::/28 (mask 0xfff0)
+            "2001:30::1",
+            "2001:30:ffff::1",
+            "2600::1",
+        ] {
+            let addr: std::net::IpAddr = match ip.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            assert!(is_public_ip(addr), "should allow {ip}");
+            assert!(
+                !is_private_host(&format!("[{ip}]")),
+                "host [{ip}] should not be private"
+            );
+            // Also ensure validate_site_url allows it when used as host
+            assert!(
+                validate_site_url(&format!("https://[{ip}]/")).is_ok(),
+                "https://[{ip}]/ should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_inner_ipv4_is_checked() {
+        // RFC 6052: embedded IPv4 must be checked via same public-ip policy.
+        for ip in [
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::192.168.1.1",
+            "64:ff9b::192.0.2.1",
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(
+                !is_public_ip(addr),
+                "NAT64 with private inner should block {ip}"
+            );
+        }
+        for ip in ["64:ff9b::8.8.8.8", "64:ff9b::1.1.1.1", "64:ff9b::192.0.1.1"] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(
+                is_public_ip(addr),
+                "NAT64 with public inner should allow {ip}"
+            );
+        }
+        // /48 is always blocked regardless of inner
+        let a48: std::net::IpAddr = "64:ff9b:1::8.8.8.8".parse().unwrap();
+        assert!(!is_public_ip(a48), "64:ff9b:1::/48 must stay blocked");
+    }
+
+    #[test]
+    fn ipv4_mapped_allows_public_blocks_private() {
+        // Rust and Kotlin must agree on mapped: public inner → allow, private inner → block
+        let pub_mapped: std::net::IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        let priv_mapped: std::net::IpAddr = "::ffff:192.168.1.1".parse().unwrap();
+        let priv_mapped2: std::net::IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(
+            is_public_ip(pub_mapped),
+            "::ffff:8.8.8.8 should be public (inner 8.8.8.8 public)"
+        );
+        assert!(
+            !is_public_ip(priv_mapped),
+            "::ffff:192.168.1.1 should be private (inner private)"
+        );
+        assert!(
+            !is_public_ip(priv_mapped2),
+            "::ffff:10.0.0.1 should be private"
+        );
+        // Also via is_private_host (brackets)
+        assert!(!is_private_host("[::ffff:8.8.8.8]"));
+        assert!(is_private_host("[::ffff:192.168.1.1]"));
+    }
+
+    #[test]
+    fn orchid_v2_mask_is_correct() {
+        // 2001:20::/28 covers 0020-002f, 2001:30::/28 covers 0030-003f.
+        // 2001:10::/28 (deprecated) must stay blocked.
+        assert!(is_public_ip("2001:20::1".parse().unwrap()));
+        assert!(is_public_ip("2001:2f:ffff::1".parse().unwrap())); // 002f & fff0 = 0020
+        assert!(is_public_ip("2001:30::1".parse().unwrap()));
+        assert!(is_public_ip("2001:3f::1".parse().unwrap())); // 003f & fff0 = 0030
+        assert!(!is_public_ip("2001:10::1".parse().unwrap()));
+        assert!(!is_public_ip("2001:1f::1".parse().unwrap())); // 001f & fff0 = 0010 -> deprecated
+        assert!(!is_public_ip("2001:40::1".parse().unwrap())); // outside both
+                                                               // 2001:1::3 is a distinct /128, not part of /28
+        assert!(is_public_ip("2001:1::3".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_private_host_rejects_invalid_ipv6() {
+        // Invalid literals must be blocked (fail-closed)
+        assert!(is_private_host("[:::]"));
+        assert!(is_private_host("[:::1]"));
+        assert!(is_private_host("[not:an:ip]"));
+        // Valid public should not be private
+        assert!(!is_private_host("[2606:4700:4700::1111]"));
+    }
+
+    #[test]
+    fn ipv4_mapped_consistency() {
+        // Rust and Kotlin must agree: mapped private stays private
+        for (mapped, inner) in [
+            ("::ffff:192.168.1.1", "192.168.1.1"),
+            ("::ffff:8.8.8.8", "8.8.8.8"),
+        ] {
+            let mapped_ip: std::net::IpAddr = mapped.parse().unwrap();
+            let inner_ip: std::net::IpAddr = inner.parse().unwrap();
+            assert_eq!(
+                is_public_ip(mapped_ip),
+                is_public_ip(inner_ip),
+                "mapped {mapped} vs inner {inner}"
+            );
+        }
+        // Compatible ::7f00:1 should delegate to 127.0.0.1 (blocked)
+        let compat: std::net::IpAddr = "::7f00:1".parse().unwrap();
+        let inner: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(is_public_ip(compat), is_public_ip(inner));
     }
 }

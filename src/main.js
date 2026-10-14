@@ -23,6 +23,7 @@ import {
   applyThemeToDom,
   themeLabel,
 } from "./logic/theme.js";
+import { createThemeFlow } from "./logic/theme_flow.js";
 import {
   heroModel,
   displayHost,
@@ -620,26 +621,47 @@ function applyTheme(pref) {
   if (el.settings.theme) el.settings.theme.value = themePref;
 }
 
+// Apply the cached choice immediately so the first paint matches; the
+// backend reconciliation in boot() may correct it afterwards.
+applyTheme(themePref);
+
+let currentSettings = null;
+
+// Theme flow: optimistic draw + queue + rollback. `applyTheme` updates DOM +
+// themePref + selector/buttons; cache is the localStorage mirror.
+let themeFlow = null;
+function ensureThemeFlow() {
+  if (themeFlow) return themeFlow;
+  themeFlow = createThemeFlow({
+    call,
+    notify: (msg, kind) => showNotice(msg, kind),
+    errorText: errMessage,
+    getCurrent: () => currentSettings,
+    setCurrent: (value) => {
+      currentSettings = value;
+    },
+    draw: (pref) => applyTheme(pref),
+    cacheSet: (pref) => {
+      try {
+        localStorage.setItem(THEME_CACHE_KEY, normalizeTheme(pref));
+      } catch {
+        /* private mode etc. — the backend copy still persists */
+      }
+    },
+    cacheGet: () => {
+      try {
+        return localStorage.getItem(THEME_CACHE_KEY);
+      } catch {
+        return null;
+      }
+    },
+    applyNative: (pref) => call("set_window_theme", { theme: normalizeTheme(pref) }),
+  });
+  return themeFlow;
+}
+
 async function setTheme(pref) {
-  applyTheme(pref);
-  try {
-    localStorage.setItem(THEME_CACHE_KEY, themePref);
-  } catch {
-    /* private mode etc. — the backend copy still persists */
-  }
-  // Native window + WebViews (Rust applies it to every webview of the app,
-  // so site pages that respect prefers-color-scheme follow too).
-  try {
-    await call("set_window_theme", { theme: themePref });
-  } catch {
-    /* cosmetic only — never block the UI over it */
-  }
-  // Persist into the encrypted settings.
-  try {
-    await call("update_settings", { patch: { theme: themePref } });
-  } catch (e) {
-    showNotice(errMessage(e));
-  }
+  return ensureThemeFlow().setTheme(pref);
 }
 
 function wireTheme() {
@@ -652,15 +674,9 @@ function wireTheme() {
   }
 }
 
-// Apply the cached choice immediately so the first paint matches; the
-// backend reconciliation in boot() may correct it afterwards.
-applyTheme(themePref);
-
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
-
-let currentSettings = null;
 
 /**
  * Show only the settings that apply to this platform. Rows marked

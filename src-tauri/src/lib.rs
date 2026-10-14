@@ -23,6 +23,7 @@ use secure::master_key::load_master_key;
 use secure::store::SecureStore;
 use secure::SecretProvider;
 use sites::blocklist::Blocklist;
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -107,20 +108,77 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // side and the plugin bridge may not answer in the first moments of the
     // process, so this retries a few times instead of blocking startup. A
     // failure here is only a warning — the toggle keeps working.
+    //
+    // The startup value and the user toggle share `pip_lock`+`pip_generation`
+    // in `AppState`. The retry loop holds `pip_lock` across the live check
+    // and the native call, so a toggle that wins the lock first cannot be
+    // overwritten by a stale startup value later. Generation makes even a
+    // value-preserving toggle (false→true→false) visible as "changed".
     #[cfg(target_os = "android")]
     {
         let pip_auto_enter = settings.pip_auto_enter;
+        // Generation at startup is 0 – the store has just been loaded.
+        let pip_generation = 0u64;
+        let handle = app.handle().clone();
         std::thread::spawn(move || {
             for attempt in 0..4 {
-                match crate::android_bridge::set_pip_auto_enter(pip_auto_enter) {
-                    Ok(applied) => {
-                        log::debug!("PiP auto-enter ayarı uygulandı: {applied}");
+                let state = handle.try_state::<AppState>();
+                if let Some(s) = state {
+                    // Try to hold `pip_lock` across the live check and the native call.
+                    if let Ok(_guard) = s.pip_lock.try_lock() {
+                        let live_gen = s.pip_generation.load(std::sync::atomic::Ordering::SeqCst);
+                        let live_val = s
+                            .settings
+                            .lock()
+                            .map(|g| g.pip_auto_enter)
+                            .unwrap_or(pip_auto_enter);
+                        if !crate::commands::pip_startup_should_apply(
+                            pip_generation,
+                            live_gen,
+                            pip_auto_enter,
+                            live_val,
+                        ) {
+                            log::debug!(
+                                "PiP startup skipped (live {live_val} gen {live_gen} != startup {pip_auto_enter} gen {pip_generation})"
+                            );
+                            return;
+                        }
+                        // `_guard` stays alive while we call the native side.
+                        match crate::android_bridge::set_pip_auto_enter(pip_auto_enter) {
+                            Ok(applied) => {
+                                log::debug!("PiP auto-enter ayarı uygulandı: {applied}");
+                                return;
+                            }
+                            Err(e) if attempt == 3 => {
+                                log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                                return;
+                            }
+                            Err(_) => {
+                                // Drop guard before sleeping and retry.
+                            }
+                        }
+                    } else {
+                        // Another PiP apply holds the lock – a toggle is in flight.
+                        // Stale startup must not overwrite it; skip.
+                        log::debug!("PiP startup skipped (pip_lock busy)");
                         return;
                     }
-                    Err(e) if attempt == 3 => {
-                        log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                } else {
+                    // State not yet available – fall back to direct native call.
+                    match crate::android_bridge::set_pip_auto_enter(pip_auto_enter) {
+                        Ok(applied) => {
+                            log::debug!("PiP auto-enter ayarı uygulandı: {applied}");
+                            return;
+                        }
+                        Err(e) if attempt == 3 => {
+                            log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                            return;
+                        }
+                        Err(_) => {}
                     }
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(400)),
+                }
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
                 }
             }
         });
@@ -153,6 +211,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         startup_warning: Mutex::new(startup_warning),
         launcher_url: Mutex::new(launcher_url),
         current_site: Mutex::new(None),
+        pip_lock: Mutex::new(()),
+        pip_generation: AtomicU64::new(0),
     });
 
     // Route the OAuth redirect into the login command on every platform.
