@@ -1141,9 +1141,7 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
     };
     // Only proceed if the site to delete is still the active one; otherwise
     // another site has taken over and must not be closed.
-    let should_clear = current
-        .as_ref()
-        .is_some_and(|c| c.site_id == site_id);
+    let should_clear = current.as_ref().is_some_and(|c| c.site_id == site_id);
     if !should_clear {
         return Ok(());
     }
