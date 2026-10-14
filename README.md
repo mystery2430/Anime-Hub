@@ -253,13 +253,6 @@ garanti edilmez.** Best-effort aktarım bir güvenlik sınırı değildir. **Çe
 CI’daki `animehub-aarch64-debug.apk` yalnızca test içindir, GitHub Release varlığı değildir.
 Ayrıntılar: [v0.3.3 yayın prosedürü](docs/releasing.md) (v0.3.4 aynı akış).
 
-## v0.3.3 — yayın ve sınırlar
-
-**v0.3.3 için fiziksel Android testi yapılmadı.** CI derlemesi cihaz doğrulaması
-anlamına gelmez; PiP, IPC, gezinti, çerez kalıcılığı ve performans cihaz testi bekliyor.
-**Android’de sağlayıcılar arası aynı-origin localStorage/IndexedDB izolasyonu
-garanti edilmez.** Best-effort aktarım bir güvenlik sınırı değildir.
-
 Üretim paketleri PR CI ve iki release workflow kontrolünden sonra yayımlanır.
 CI’daki `animehub-aarch64-debug.apk` yalnızca test içindir, GitHub Release varlığı değildir.
 Ayrıntılar: [v0.3.3 yayın prosedürü](docs/releasing.md).
