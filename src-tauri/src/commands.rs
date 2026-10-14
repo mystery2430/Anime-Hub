@@ -246,24 +246,133 @@ pub fn update_site(
 }
 
 #[tauri::command]
-pub fn remove_site(state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<()> {
+    // Preserve the registry until the destructive cleanup succeeds, so a
+    // failed close/delete does not orphan the tile. The whole sequence is
+    // serialized by the desktop/android lifecycle lock (`DESKTOP` →
+    // `current_site` → `registry` → `STORE`), and the open path
+    // re-validates the `Site` snapshot while holding the same lock.
+    #[cfg(desktop)]
     {
-        let mut reg = state
-            .registry
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        reg.remove(&id)?;
+        let _desktop_guard = crate::web::windows::lock_desktop_session()?;
+        // Check builtin/hide while holding the lifecycle lock, so a
+        // concurrent `open_site` cannot interleave between the check and the
+        // later registry mutation.
+        let was_builtin = {
+            let reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            reg.get(&id).is_some_and(|s| s.builtin)
+        };
+        if was_builtin {
+            let mut reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            reg.remove(&id)?;
+            drop(reg);
+            persist_registry(&state)?;
+            return Ok(());
+        }
+        // User site: close, delete, then remove from registry. Close and
+        // delete are done before the registry mutation so a failure keeps the
+        // tile and the user can retry.
+        let label = crate::web::windows::label_for(&id);
+        let should_close = {
+            let cur = state
+                .current_site
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            cur.as_ref()
+                .is_some_and(|c| c.window_label == label || c.site_id == id)
+        };
+        if should_close {
+            crate::web::windows::close_site_window_for_clear(&app, &label)?;
+        }
+        state.provider.delete_site_session(&id)?;
+        let base = app.path().app_data_dir().map_err(|e| {
+            log::error!("profil dizini bulunamadı: {e}");
+            AppError::Storage("profil dizini bulunamadı".into())
+        })?;
+        let dir = crate::web::session::profile_dir_path(&base, &id);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::error!("profil dizini silinemedi: {e}");
+                return Err(AppError::Storage("site verisi silinemedi".into()));
+            }
+        }
+        // Re-validate and remove from registry while still holding the
+        // lifecycle lock. If another thread already removed it, treat as
+        // success (data already deleted, idempotent).
+        {
+            let mut reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            match reg.get(&id) {
+                Some(s) if s.builtin => {
+                    reg.remove(&id)?;
+                }
+                Some(_) => {
+                    reg.remove(&id)?;
+                }
+                None => return Ok(()),
+            }
+        }
+        persist_registry(&state)?;
+        Ok(())
     }
-    persist_registry(&state)?;
-    // Delete the jar and the sealed web-storage blobs before reporting
-    // success. A swallowed failure would leave the site's session data on
-    // disk after the tile is gone.
-    state.provider.delete_secret(&format!("cookies-{id}"))?;
-    state
-        .provider
-        .delete_secret(&format!("localstorage-{id}"))?;
-    state.provider.delete_secret(&format!("indexeddb-{id}"))?;
-    Ok(())
+    #[cfg(not(desktop))]
+    {
+        #[cfg(target_os = "android")]
+        let _android_guard = crate::web::windows::lock_android_session()?;
+        let was_builtin = {
+            let reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            reg.get(&id).is_some_and(|s| s.builtin)
+        };
+        if was_builtin {
+            let mut reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            reg.remove(&id)?;
+            drop(reg);
+            persist_registry(&state)?;
+            return Ok(());
+        }
+        let should_close = {
+            let cur = state
+                .current_site
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            cur.as_ref().is_some_and(|c| c.site_id == id)
+        };
+        if should_close {
+            #[cfg(target_os = "android")]
+            crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
+            #[cfg(not(target_os = "android"))]
+            crate::web::windows::close_site_window_for_clear(&app, &id)?;
+        }
+        state.provider.delete_site_session(&id)?;
+        {
+            let mut reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            if reg.get(&id).is_none() {
+                return Ok(());
+            }
+            reg.remove(&id)?;
+        }
+        persist_registry(&state)?;
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -373,13 +482,32 @@ pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
 }
 
 /// Wipe stored cookies for one site, or for all sites when `id` is `None`.
+///
+/// `anilist-token` is intentionally never touched here: it is not per-site
+/// session data and must survive a site-data wipe. The function also keeps
+/// the wipe atomic with respect to the live WebView: on desktop the profile
+/// directory is deleted only after the WebView is closed *without* exporting
+/// its live cookies, and the whole close+delete sequence is serialized
+/// against the periodic sync via the desktop session lock. On Android the
+/// shared CookieManager is cleared while holding the Android session lock.
 #[tauri::command]
 pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u32> {
+    // `is_all` captures whether the caller asked for "all sites" before `id`
+    // is moved. Used for orphan profile cleanup and for Android live-jar
+    // handling.
+    let is_all = id.is_none();
     #[cfg(target_os = "android")]
-    let all_sites = id.is_none();
+    let all_sites = is_all;
     let state = app.state::<AppState>();
+
+    // Serialize the wipe against open/sync/remove via the lifecycle lock.
+    // The lock is taken *before* snapshotting `ids` so the `ids` list is
+    // consistent with the registry while the lock is held. This follows the
+    // documented order `DESKTOP/ANDROID → registry → STORE`.
     #[cfg(target_os = "android")]
     let _session_guard = windows::lock_android_session()?;
+    #[cfg(desktop)]
+    let _desktop_guard = windows::lock_desktop_session()?;
 
     let ids: Vec<String> = match id {
         Some(id) => vec![id],
@@ -409,32 +537,93 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
             crate::android_bridge::webview_cookies_clear()?;
         }
     }
+    #[cfg(desktop)]
+    {
+        // If the currently open site is among the ids being wiped, close its
+        // WebView *without* exporting its live cookies — otherwise the
+        // periodic sync or the normal close path would resurrect the
+        // just-deleted jar, and the directory would be removed underneath a
+        // live WebView (which WebView2/WebKitGTK may recreate). A close
+        // failure aborts the wipe so the profile is not deleted underneath a
+        // live WebView and the caller does not see a false success.
+        let current_label = {
+            let cur = state
+                .current_site
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            cur.as_ref()
+                .filter(|c| ids.iter().any(|id| id == &c.site_id))
+                .map(|c| c.window_label.clone())
+        };
+        if let Some(label) = current_label {
+            crate::web::windows::close_site_window_for_clear(&app, &label)?;
+        }
+    }
     let mut n = 0;
     for id in &ids {
-        state.provider.delete_secret(&format!("cookies-{id}"))?;
-        // The web-storage blobs are part of the site's session data.
-        state
-            .provider
-            .delete_secret(&format!("localstorage-{id}"))?;
-        state.provider.delete_secret(&format!("indexeddb-{id}"))?;
+        state.provider.delete_site_session(id)?;
         n += 1;
     }
     // Desktop profile directories hold the real cookie DB. A missing
-    // directory is success; a failed delete is not.
-    let base = app.path().app_data_dir().map_err(|e| {
-        log::error!("profil dizini bulunamadı: {e}");
-        AppError::Storage("profil dizini bulunamadı".into())
-    })?;
-    for id in &ids {
-        let dir = base
-            .join("profiles")
-            .join(crate::web::session::profile_dir_name(id));
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                log::error!("profil dizini silinemedi: {e}");
-                return Err(AppError::Storage("site verisi silinemedi".into()));
+    // directory is success; a failed delete is not. This runs only on
+    // desktop — on Android there is no per-site directory to remove.
+    #[cfg(desktop)]
+    {
+        let base = app.path().app_data_dir().map_err(|e| {
+            log::error!("profil dizini bulunamadı: {e}");
+            AppError::Storage("profil dizini bulunamadı".into())
+        })?;
+        for id in &ids {
+            let dir = crate::web::session::profile_dir_path(&base, id);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::error!("profil dizini silinemedi: {e}");
+                    return Err(AppError::Storage("site verisi silinemedi".into()));
+                }
+            }
+        }
+        // "Tüm site verilerini temizle" (id == None) must also cover orphan
+        // `profiles/site-*` directories left behind by earlier bugs. Those
+        // orphans are not in `ids` (registry) but are still app-owned
+        // profiles. We scan `profiles/` for any remaining `site-*` dirs and
+        // delete them, but only while holding `DESKTOP_SESSION_LOCK` and after
+        // the live WebView was closed above, so no live profile is removed.
+        // Only directories whose name starts with `site-` are touched; other
+        // files/dirs (e.g. logs) are left alone.
+        if is_all {
+            let profiles_dir = base.join("profiles");
+            match std::fs::read_dir(&profiles_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if !name.starts_with("site-") {
+                            continue;
+                        }
+                        if let Ok(ft) = entry.file_type() {
+                            if !ft.is_dir() {
+                                continue;
+                            }
+                        }
+                        let orphan_dir = profiles_dir.join(&name);
+                        match std::fs::remove_dir_all(&orphan_dir) {
+                            Ok(()) => {
+                                log::info!("yetim profil dizini temizlendi: {name}");
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                log::error!("yetim profil dizini silinemedi ({name}): {e}");
+                                return Err(AppError::Storage("site verisi silinemedi".into()));
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::error!("profil dizini listelenemedi: {e}");
+                    return Err(AppError::Storage("site verisi silinemedi".into()));
+                }
             }
         }
     }

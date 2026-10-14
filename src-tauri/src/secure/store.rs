@@ -8,6 +8,16 @@ use crate::error::{AppError, AppResult};
 use crate::secure::crypto::{derive_subkey, Sealer};
 use crate::secure::master_key::{Backend, MasterKey};
 use std::path::{Path, PathBuf};
+
+/// Shared serialization for every mutation of the encrypted store directory
+/// (writes via `atomic_write`, single deletes, bulk wipes). A write that
+/// started before a delete must not rename its tmp file after the delete has
+/// removed the target, otherwise the secret would be resurrected. The lock
+/// is held for the entire write (tmp create → sync → rename → dir fsync) and
+/// for the entire delete, so the two cannot interleave. Both `SecureStore`
+/// (desktop) and `AndroidStore` (via `crate::secure::store::STORE_LOCK`)
+/// use this same lock, so the guarantee is process-wide.
+pub(crate) static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use zeroize::Zeroizing;
 
 pub struct SecureStore {
@@ -87,11 +97,17 @@ impl SecureStore {
 
     /// Write a named document atomically: temp file, fsync, rename. A crash
     /// mid-write can therefore never truncate the real store.
+    /// The `STORE_LOCK` is held for the entire seal+write so a concurrent
+    /// `delete_site_session` cannot delete the file after we have sealed but
+    /// before we have written, which would otherwise resurrect the jar.
     fn write_doc(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+        let _guard = STORE_LOCK
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
         std::fs::create_dir_all(&self.dir)?;
         let env = self.sealer_for(name).seal(plaintext, &Self::aad(name))?;
         let target = self.path_for(name);
-        atomic_write(&target, &env)
+        atomic_write_locked(&target, &env)
     }
 
     /// Store an opaque secret (e.g. the AniList token JSON).
@@ -106,6 +122,13 @@ impl SecureStore {
     }
 
     pub fn delete_secret(&self, name: &str) -> AppResult<()> {
+        let _guard = STORE_LOCK
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        Self::delete_secret_locked(self, name)
+    }
+
+    fn delete_secret_locked(&self, name: &str) -> AppResult<()> {
         let file = secret_file_name(name);
         let path = self.path_for(&file);
         match std::fs::remove_file(&path) {
@@ -115,8 +138,26 @@ impl SecureStore {
         }
     }
 
+    /// Delete the three per-site session secrets for `site_id` atomically
+    /// with respect to concurrent `put_secret` calls. Holding one `STORE_LOCK`
+    /// for all three deletes prevents a concurrent `put_secret("cookies-…")`
+    /// from resurrecting the jar between the cookie and localStorage deletes.
+    pub(crate) fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+        let _guard = STORE_LOCK
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        for kind in ["cookies", "localstorage", "indexeddb"] {
+            let name = format!("{kind}-{site_id}");
+            Self::delete_secret_locked(self, &name)?;
+        }
+        Ok(())
+    }
+
     /// Wipe every encrypted document (used by "clear site data").
     pub fn wipe_secrets(&self) -> AppResult<usize> {
+        let _guard = STORE_LOCK
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
         let mut n = 0;
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -151,14 +192,42 @@ pub fn secret_file_name(name: &str) -> String {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
+    let _guard = STORE_LOCK
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+    atomic_write_locked(path, bytes)
+}
+
+pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    // Unique temp name so two concurrent writes to the same target never share
+    // the same `.tmp` file: `<name>.tmp.<pid>-<rand>`.
+    let unique = {
+        use rand::RngCore as _;
+        let mut b = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut b);
+        format!("{}-{}", std::process::id(), hex::encode(b))
+    };
+    // `with_extension` replaces only the final extension, so
+    // `secret.foo.bin` -> `secret.foo.tmp.<unique>`; uniqueness is what
+    // matters, not the exact stem.
+    let tmp = path.with_extension(format!("tmp.{unique}"));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // Ensure the rename is durable: fsync the parent directory where the
+    // filesystem supports it. Best-effort — a failure to open/fsync the dir
+    // must not hide a successful write.
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+    // If rename failed the tmp remains; otherwise this is a no-op.
+    let _ = std::fs::remove_file(&tmp);
     Ok(())
 }
 
@@ -328,5 +397,195 @@ mod tests {
         atomic_write(&p, b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         assert!(!dir.path().join("x.tmp").exists());
+        // Unique tmp scheme must also leave no stray .tmp.* file.
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(stray.is_empty(), "unique tmp leaked: {stray:?}");
+    }
+
+    #[test]
+    fn atomic_write_concurrent_same_path_is_not_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("concurrent.bin");
+        let payloads: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("payload-{i}").into_bytes())
+            .collect();
+        let handles: Vec<_> = payloads
+            .clone()
+            .into_iter()
+            .map(|payload| {
+                let p = p.clone();
+                std::thread::spawn(move || atomic_write(&p, &payload).unwrap())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let final_bytes = std::fs::read(&p).unwrap();
+        assert!(
+            payloads.contains(&final_bytes),
+            "corrupt concurrent write produced {final_bytes:?}"
+        );
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "leaked tmp after concurrent writes: {stray:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_file_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overwrite.bin");
+        atomic_write(&p, b"first").unwrap();
+        atomic_write(&p, b"second").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"second");
+    }
+
+    #[test]
+    fn clear_site_data_must_not_touch_anilist_token() {
+        // Exercises the real `delete_site_session` helper that
+        // `remove_site` and `clear_site_data` call — not three manual
+        // `delete_secret` calls — so a future refactor that widens the
+        // prefix is caught. The AniList token lives under
+        // `secret.anilist-token.bin` and must survive any site-data wipe.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_with_dir(dir.path());
+        s.put_secret("anilist-token", b"secret-token").unwrap();
+        s.put_secret("cookies-site-1", b"jar-1").unwrap();
+        s.put_secret("localstorage-site-1", b"ls-1").unwrap();
+        s.put_secret("indexeddb-site-1", b"idx-1").unwrap();
+        // Production path: one atomic `delete_site_session` call, which holds
+        // a single `STORE_LOCK` for all three deletes.
+        s.delete_site_session("site-1").unwrap();
+        assert!(
+            s.get_secret("anilist-token").unwrap().is_some(),
+            "anilist-token must survive site-data wipe"
+        );
+        assert!(s.get_secret("cookies-site-1").unwrap().is_none());
+        assert!(s.get_secret("localstorage-site-1").unwrap().is_none());
+        assert!(s.get_secret("indexeddb-site-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_site_session_write_and_delete_does_not_resurrect() {
+        // Deterministic linearization: a `put_secret` that has already
+        // acquired `STORE_LOCK` (at the start of `write_doc`, before seal)
+        // must block a concurrent `delete_site_session` until it finishes,
+        // and if the write was in-flight *before* the delete, the delete
+        // must win (the file must not reappear).
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        // Pre-seed a jar so there is something to delete, and capture a
+        // valid sealed payload for "new-jar" without needing private APIs.
+        let new_jar_bytes = {
+            let s = store_with_dir(&dir_path);
+            s.put_secret("cookies-site-racer", b"original").unwrap();
+            s.put_secret("cookies-site-racer", b"new-jar").unwrap();
+            std::fs::read(dir_path.join(secret_file_name("cookies-site-racer"))).unwrap()
+        };
+        // Restore original for the race.
+        {
+            let s = store_with_dir(&dir_path);
+            s.put_secret("cookies-site-racer", b"original").unwrap();
+        }
+        // Simulate an in-flight `put` that has already acquired `STORE_LOCK`.
+        let deleter_path = dir_path.clone();
+        let deleter_handle = {
+            let _guard = STORE_LOCK.lock().expect("store lock");
+            let handle = std::thread::spawn(move || {
+                let s = store_with_dir(&deleter_path);
+                s.delete_site_session("site-racer").unwrap();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            // While still holding `STORE_LOCK`, write the pre-sealed
+            // `new-jar` payload via the locked helper (simulating the
+            // in-flight `put`'s final rename). This happens before the
+            // deleter can acquire the lock.
+            {
+                let path = dir_path.join(secret_file_name("cookies-site-racer"));
+                atomic_write_locked(&path, &new_jar_bytes).unwrap();
+            }
+            handle
+        };
+        deleter_handle.join().unwrap();
+        // After the deleter has run, the file must be gone.
+        let s = store_with_dir(&dir_path);
+        assert!(
+            s.get_secret("cookies-site-racer").unwrap().is_none(),
+            "deleted site jar must not resurrect after concurrent in-flight write"
+        );
+        // AniList token must never be touched.
+        let s2 = store_with_dir(&dir_path);
+        s2.put_secret("anilist-token", b"tok").unwrap();
+        let after_token_bytes = {
+            let s = store_with_dir(&dir_path);
+            s.put_secret("cookies-site-racer", b"after-token").unwrap();
+            std::fs::read(dir_path.join(secret_file_name("cookies-site-racer"))).unwrap()
+        };
+        // Restore to have something to delete again.
+        {
+            let s = store_with_dir(&dir_path);
+            s.put_secret("cookies-site-racer", b"original").unwrap();
+        }
+        {
+            let _guard = STORE_LOCK.lock().expect("store lock");
+            let handle = std::thread::spawn({
+                let path = dir_path.clone();
+                move || {
+                    let s = store_with_dir(&path);
+                    s.delete_site_session("site-racer").unwrap();
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            {
+                let path = dir_path.join(secret_file_name("cookies-site-racer"));
+                atomic_write_locked(&path, &after_token_bytes).unwrap();
+            }
+            drop(_guard);
+            handle.join().unwrap();
+        }
+        assert!(
+            store_with_dir(&dir_path)
+                .get_secret("anilist-token")
+                .unwrap()
+                .is_some(),
+            "anilist-token must survive concurrent site wipe"
+        );
+        assert!(
+            store_with_dir(&dir_path)
+                .get_secret("cookies-site-racer")
+                .unwrap()
+                .is_none(),
+            "site-racer must be deleted even after concurrent put"
+        );
+    }
+
+    #[test]
+    fn profile_dir_is_isolated_per_site_and_survives_sibling_delete() {
+        // Uses the same `profile_dir_path` / `ensure_profile_dir` helpers
+        // that `open_in_main_window_inner` and `remove_site` use, so a
+        // future rename of the layout is exercised, not bypassed.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let d1 = crate::web::session::ensure_profile_dir(base, "site-1").unwrap();
+        let d2 = crate::web::session::ensure_profile_dir(base, "site-2").unwrap();
+        assert_ne!(d1, d2, "per-site dirs must be distinct");
+        std::fs::write(d1.join("Cookies"), b"jar-1").unwrap();
+        std::fs::write(d2.join("Cookies"), b"jar-2").unwrap();
+        // Simulate `remove_site("site-1")` dir delete via production path.
+        let expected = crate::web::session::profile_dir_path(base, "site-1");
+        assert_eq!(d1, expected);
+        std::fs::remove_dir_all(&d1).unwrap();
+        assert!(!d1.exists());
+        assert!(d2.exists());
+        assert_eq!(std::fs::read(d2.join("Cookies")).unwrap(), b"jar-2");
     }
 }
