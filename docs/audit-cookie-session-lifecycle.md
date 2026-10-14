@@ -1,6 +1,6 @@
 # Çerez / Oturum / Şifreli Depolama — Tam Yaşam Döngüsü Denetimi
 
-**Tarih:** 2026-10-14 (Europe/Istanbul) — *İkinci tur takip*  
+**Tarih:** 2026-10-14 (Europe/Istanbul) — *Üçüncü tur takip (kalan 5 kritik yarış)*  
 **Dal:** `fix/cookie-session-lifecycle` → PR #26 (bu audit) — `main` 2bee80a üzerine izole dal, PR #21 / #24 ile karıştırılmadı, `main`’e merge yok.  
 **Doğrulanan Head’ler:**
 
@@ -12,6 +12,8 @@
 | PR #26 `fix/cookie-session-lifecycle` ilk audit head | `7aeb775` | `7aeb775b3f78b54df889a03a40911c128babf963` | https://github.com/mystery2430/Anime-Hub/pull/26 |
 | PR #26 CI (başarısız) | `38573694668` | `fix/cookie-session-lifecycle` @ 7aeb775 | https://github.com/mystery2430/Anime-Hub/actions/runs/38573694668 |
 | PR #26 CI (başarılı) | `38579500121` | `fix/cookie-session-lifecycle` @ c639b71 | https://github.com/mystery2430/Anime-Hub/actions/runs/38579500121 |
+| PR #26 `fix/cookie-session-lifecycle` üçüncü tur head | `0c32b6d` | `0c32b6d2124bfba3d40ace2e3ddf69e37994084f` | https://github.com/mystery2430/Anime-Hub/pull/26 |
+| PR #26 CI (yeni, bekleniyor) | `—` | `fix/cookie-session-lifecycle` @ 0c32b6d | https://github.com/mystery2430/Anime-Hub/actions/runs/<YENİ> |
 
 > Bu audit `main`’i yeniden `git fetch` ile doğrulayıp `fix/cookie-session-lifecycle` dalını sıfırdan oluşturarak yapıldı; önceki dalda kalan `commands.rs`/`windows.rs` kirleri `git checkout --` ile temizlendi. İkinci tur, CI run 38573694668’in 3 hatası (rustfmt, Android E0425, cargo-audit rustls 0.23.45) üzerine eklendi. Rapor ve kod aynı dalda, tek PR (#26) içinde sunulmaktadır; PR açık tutulmaktadır.
 
@@ -55,6 +57,24 @@ Ayrıca inceleme 4 zayıf testi işaret etti: `desktop_session_lock_does_not_dea
 | §7 | `clear_site_data(None)` yetim profil sözleşmesi | `is_all = id.is_none()` `match` öncesi yakalanır; desktop’ta `ids`’lerin profilleri silindikten sonra `is_all` ise `profiles/` taranır, yalnızca `site-` prefix’li **dizinler** silinir (`is_dir` kontrolü, `NotFound` yut, diğer hata `Storage`), `DESKTOP_SESSION_LOCK` hâlâ tutulduğu ve canlı WebView zaten kapatıldığı için canlı profil silinmez; tek-site wipe yetim taramaz. | `src-tauri/src/commands.rs:clear_site_data` |
 | §8 | 4 zayıf testin güçlendirilmesi | `desktop_session_lock_does_not_deadlock_on_relock_attempt` → `desktop_sync_and_wipe_are_serialized` (80 ms kilitli sync thread’i, wipe beklemeli, `session_is_current` kontrolü); `wipe_close_path_is_distinct…` → `builtin_hide_does_not_delete_session_and_user_delete_does` (gerçek `Registry::remove`); `clear_site_data_must_not_touch_anilist_token` → `delete_site_session` helper’ı üzerinden; `first_load_profile_is_empty_and_isolated` → `ensure_profile_dir`/`profile_dir_path` üzerinden + yeni `reused_site_id_gets_empty_profile_not_stale_cookies` ve `concurrent_site_session_write_and_delete_does_not_resurrect`. | `src-tauri/src/web/windows.rs`, `src-tauri/src/secure/store.rs`, `src-tauri/src/web/session.rs` |
 | §9 | CI yeşili | `src-tauri/Cargo.lock` rustls 0.23.45 → 0.23.46 (checksum `48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf`, crates.io-index `ru/st/rustls` 0.23.46 satırından), rustfmt (`secure/mod.rs` `Ok(())` virgülü + `windows.rs` split) düzeltildi, Android E0597 (`state` lifetime, `let value` pattern) kapatıldı, clippy `close_current_child` dead_code izinli. `npm test` 152/152 + `npm run build` yerel yeşil. **CI 38579500121 yeşil: 6/6 job success** — `cargo fmt --check` ✓, `clippy -D warnings` ✓, `cargo test` ✓ (ubuntu/macos/windows), `cargo audit` ✓, `android aarch64` ✓, `release LTO` ✓. | `src-tauri/Cargo.lock`, `src-tauri/src/secure/mod.rs`, `src-tauri/src/web/windows.rs`, `src-tauri/android-plugin/...` |
+
+---
+
+## Üçüncü Tur — Kalan 5 Kritik Yarış (PR #26 Yorum 2026-10-14 14:43, 5 madde)
+
+İnceleme, önceki yeşil CI’ın (38579500121) kanıtlamadığı 5 yarış/kalıcı durum hatasını işaret etti. Hepsi bu turda düzeltildi; en küçük yama + kilit sırası + deterministik test ilkesi korundu.
+
+### Bulgu → Düzeltme
+
+| # | Bulgu (Türkçe özet) | Kök neden | Düzeltme (dosya:fonksiyon) |
+|---|---------------------|-----------|----------------------------|
+| 1 | **Silme hatasında tutarsız durum:** `remove_site` registry kaydını (`reg.remove` + `persist`) *temizlikten önce* yapıyordu; `close`/`delete`/`remove_dir_all` başarısız olursa tile kaybolur ama `secret.*` ve `profiles/site-*` kalır, kullanıcı retry edemez (site artık görünmez). | `commands.rs:remove_site` `reg.remove` → `persist` → `DESKTOP` close/delete sırası; `was_builtin` kontrolü `DESKTOP` kilidi dışında. | **Registry koruma:** `remove_site` artık `DESKTOP`/`ANDROID` lifecycle kilidini *en baştan* alır (`DESKTOP→current_site→registry→STORE` sırası), `was_builtin` ve `should_close` `current_site`→`registry` sırasıyla kilit altında kontrol edilir, **önce** `close_site_window_for_clear` `?` (hata yayılır) ve `delete_site_session` + `remove_dir_all` yapılır, **sonra** `reg.remove` + `persist` (hâlâ `DESKTOP` altında) — başarısız cleanup’ta registry korunur, retry edilebilir. Re-validation: `reg.remove` öncesi `reg.get(id)` tekrar kontrol edilir, başka thread silmişse idempotent `Ok(())`. `commands.rs:remove_site` |
+| 2 | **Android’de yanlış oturumun kapanması:** `remove_site` `should_close`’u `current_site` kilidiyle ( `ANDROID` kilidi olmadan) kontrol edip sonra `close_site_window_for_clear(&app, &id)` çağırıyordu; arada aktif site değişirse helper artık aktif olan *diğer* siteyi kapatır ve onun `CookieManager`’ını temizler. | `commands.rs:remove_site` `should_close` `ANDROID` kilidi dışında, `windows.rs:close_site_window_for_clear` `site_id` kontrolü yok, `current.is_some()` ise koşulsuz temizler ve `current_site=None` yapar. | **Doğru site kontrolü:** `remove_site` mobile artık `ANDROID` kilidini en baştan alır ve `should_close`’u o kilit altında hesaplar; `close_site_window_for_clear` `site_id: &str` alır, `close_site_window_for_clear_locked` eklendi (caller must hold `ANDROID`), `current.as_ref().is_some_and(|c| c.site_id==site_id)` ise temizler, değilse `Ok(())` — yanlış oturum asla kapanmaz. `windows.rs:close_site_window_for_clear` + `close_site_window_for_clear_locked` |
+| 3 | **Silinmiş sitenin yeniden açılması:** `open_site` `site`’ı registry’den klonladıktan sonra `open_in_main_window` `DESKTOP` kilidini alır; `remove_site` bu arada registry’den silip kilidi alıp temizliği bitirebilir; `open` kilidi alınca eski `Site` snapshot’ıyla `ensure_profile_dir`’i yeniden oluşturur. | `commands.rs:open_site` `reg.get(&id).clone()` `DESKTOP` kilidi dışında, `windows.rs:open_in_main_window_inner` `profile_dir` oluşturmadan önce registry re-validasyonu yok. | **Stale snapshot re-validation:** `open_in_main_window_inner` (desktop, `DESKTOP` kilidi altında) ve `open_on_mobile` (mobile, `ANDROID` kilidi altında) en başta `reg.get(&site.id)` ile `site`’ın hâlâ var, `hidden==false` ve `url` aynı mı kontrol eder, değilse `SiteNotFound` — silinmiş/hidden site artık profil oluşturamaz. `windows.rs:open_in_main_window_inner` + `open_on_mobile` |
+| 4 | **Depoda çerezlerin dirilmesi:** Yeni test `concurrent_site_session_write_and_delete_does_not_resurrect` `Ok(Some(v))`’de `v==original || v==new-jar`’ı başarı sayıyordu; `new-jar`’ın kalması “silinen veri kesin geri gelmez” garantisini kanıtlamıyor. Ayrıca `SecureStore::write_doc`/`AndroidStore::write_wrapped` `STORE_LOCK`’u sadece son `atomic_write`’ta alıyordu; `seal`/`keystore_seal` ve `create_dir_all` kilit dışında, in-flight `put` `seal`’ı bitirip `delete` sonrası `STORE` kilidini alıp diriltebiliyordu. | `store.rs:write_doc` `create_dir_all` + `seal` kilit dışında → `atomic_write` kilidi; `mod.rs:write_wrapped` `seal`+`keystore_seal` kilit dışında; test deterministik değil. | **STORE baştan kilitleme + deterministik test:** `store.rs:write_doc` ve `secure/mod.rs:write_wrapped` artık `STORE_LOCK`’u *en baştan* ( `create_dir_all` ve `seal`/`keystore_seal` dahil) alır ve `atomic_write_locked` ile yazar (tek lock, re-lock yok). Test artık deterministik: `STORE_LOCK`’u main’de tutarken deleter `delete_site_session` bloklatılır, sonra `atomic_write_locked` ile pre-sealed `new-jar` baytları kilit altında yazılır, sonra lock bırakılır ve deleter silip kazanır — son durumda `get_secret` `None` ve `anilist-token` korunur. `store.rs:write_doc`, `atomic_write`/`atomic_write_locked`, `secure/mod.rs:write_wrapped`, `store.rs:concurrent_*` |
+| 5 | **Anahtar oluşturma yarışı ve yetim profiller:** `AndroidStore::load_or_create_key` `create_dir_all`/`path.exists`/`read_to_string`/`sealed_data_present`/`keystore_open` kilit dışında, sadece son `tmp` yazımı kilitli — iki eşzamanlı caller ayrı anahtar oluşturup ikinci birinciyi ezer. Ayrıca `clear_site_data(None)` yetim `profiles/site-*` taramada `if let Ok(entries)=read_dir` ile `Err`’ı sessiz yutar, `PermissionDenied` gibi hataları başarı sayar. | `secure/mod.rs:load_or_create_key` iki kilit (biri sadece yazımda), `commands.rs:clear_site_data` `if let Ok` ile hata yutma. | **Tek kilitli key ve doğru hata:** `load_or_create_key` artık tüm check+create (`create_dir_all` + `path.exists` + `read_to_string` + `sealed_data_present` + `keystore_*` + `tmp` write) tek `STORE_LOCK` altında, içteki ikinci lock kaldırıldı (deadlock yok). Yetim tarama `match read_dir { Ok(entries)=>..., Err(NotFound)=>{}, Err(e)=> return Storage }` — `NotFound` başarı, diğer hata `Storage` ve `log::error`. `secure/mod.rs:load_or_create_key`, `commands.rs:clear_site_data` |
+
+**Etki:** `open` vs `delete` artık `DESKTOP`/`ANDROID` kilidiyle atomik; `remove` başarısızsa registry korunur; `store`’da silinen veri in-flight `seal` sonrası diriltemez; Android anahtarı tek kilitli; yetim `read_dir` hataları gizlenmez.
 
 ---
 
@@ -164,17 +184,17 @@ Ek mevcut testler de yaşam döngüsünü korur: `secret_aad_prevents_swapping_b
 
 ---
 
-## 8. Değişiklik Özeti (Diff) — İkinci Tur Dahil
+## 8. Değişiklik Özeti (Diff) — Üçüncü Tur Dahil
 
 ```
-src-tauri/src/commands.rs              — remove_site: was_builtin hide vs delete, lock_desktop_session → close_site_window_for_clear ? → delete_site_session (tek STORE_LOCK) → profile_dir_path remove_dir_all; clear_site_data: is_all snapshot, ids registry lock öncesi kopyala, DESKTOP lock → close_for_clear ? → delete_site_session loop → profile_dir_path + is_all yetim site-* tarama (site-* prefix, is_dir, NotFound yut, hata yay)
-src-tauri/src/web/windows.rs           — DESKTOP_SESSION_LOCK order doc, open split wrapper+inner (close_current_child_locked), close wrappers kilitli, close_site_window_for_clear desktop (caller must hold) + mobile (ANDROID lock + webview_cookies_clear export’siz), profile creation ensure_profile_dir ile, 2 güçlü test (desktop_sync_and_wipe_are_serialized, builtin_hide…)
-src-tauri/src/secure/store.rs          — STORE_LOCK pub(crate) paylaşımlı, atomic_write unique tmp <pid>-<rand> + sync+dirfsync, delete_secret/delete_site_session tek kilit (3 silme atomik), 3 yeni/güçlendirilmiş test (clear via helper, isolation via helper, concurrent write/delete)
-src-tauri/src/secure/mod.rs            — AndroidStore Self::sealed_data_present x3, write_wrapped/delete/wipe/key-file aynı STORE_LOCK altında, SecretProvider::delete_site_session trait eklendi (her iki store’da impl)
-src-tauri/src/web/session.rs           — profile_dir_path + ensure_profile_dir tek kaynak, first_load artık üretim helper’ı, reused-site-id regresyon testi eklendi
-src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt — webview_cookies_replace: flush-then-resolve (COOKIE_FLUSH_EXECUTOR + runOnUiThread), boş jar da flush, kuyruk/flush hatası reject
-src-tauri/Cargo.lock                   — rustls 0.23.45 → 0.23.46 (checksum 48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf, crates.io-index ru/st/rustls)
-docs/audit-cookie-session-lifecycle.md — bu rapor (ikinci tur güncellendi)
+src-tauri/src/commands.rs              — remove_site: lifecycle kilidi en baştan (DESKTOP/ANDROID→current_site→registry→STORE), was_builtin ve should_close kilit altında, önce close?+delete_site_session+profile sonra reg.remove+persist (başarısızda registry korunur); clear_site_data: DESKTOP/ANDROID kilidi en baştan sonra ids snapshot (DESKTOP→registry), orphan read_dir NotFound yut diğer hata Storage
+src-tauri/src/web/windows.rs           — DESKTOP_SESSION_LOCK order doc, open split wrapper+inner, open_in_main_window_inner ve open_on_mobile stale Site re-validasyonu (reg.get → hidden/url check), close_site_window_for_clear mobile site_id kontrollü + _locked variant (ANDROID kilidi caller), profile ensure_profile_dir, 2 güçlü test + revalidation
+src-tauri/src/secure/store.rs          — STORE_LOCK baştan (write_doc seal öncesi), atomic_write_locked ayrıldı, delete_site_session tek lock, concurrent test deterministik delete-wins (pre-sealed bayt + STORE_LOCK blok)
+src-tauri/src/secure/mod.rs            — AndroidStore Self::sealed_data_present x3, write_wrapped STORE en baştan (seal dahil), load_or_create_key tüm check+create tek STORE_LOCK (iç lock kaldırıldı), SecretProvider::delete_site_session
+src-tauri/src/web/session.rs           — profile_dir_path + ensure_profile_dir tek kaynak, first_load ve reused-site-id testleri
+src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt — flush-then-resolve (COOKIE_FLUSH_EXECUTOR + runOnUiThread), boş jar da flush, kuyruk/flush hatası reject
+src-tauri/Cargo.lock                   — rustls 0.23.45 → 0.23.46 (48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf)
+docs/audit-cookie-session-lifecycle.md — bu rapor (üçüncü tur güncellendi, 5 kritik yarış eklendi)
 ```
 
 **İlke:** En küçük güvenli yama, yetim süpürme yalnızca `site-*` + `DESKTOP_SESSION_LOCK` altında dar kapsamlı, `key-source`/anahtar izni değiştirilmedi, güvenlik kontrolleri kapatılmadı, test hataları gizlenmedi.
@@ -199,7 +219,7 @@ docs/audit-cookie-session-lifecycle.md — bu rapor (ikinci tur güncellendi)
 
 - **JS:** `npm test` — **152/152 pass** (yerel sandbox’ta doğrulandı, bu dalda, `npm run build` de başarılı). `npm test` linki: yerel (CI’da `ci` workflow’u da koşar).
 - **Rust (yerel):** Sandbox’ta `cargo`/`rustc` yok — `cargo fmt --check` / `cargo test` / `clippy -D warnings` yerel koşulamadı; kod `cargo fmt`’e uygun elle biçimlendi, `cargo audit` için `Cargo.lock` minimal bump yapıldı. Doğrulama CI’a bırakıldı.
-- **Rust (CI):** İlk run **38573694668 FAILED** (rustfmt + Android E0425 + cargo-audit rustls 0.23.45). İkinci run **38577156614 FAILED** (rustfmt `mod.rs` + Android E0597 `state` + clippy `close_current_child`). Üçüncü run **38579500121 SUCCESS** — tüm job’lar yeşil:
+- **Rust (CI):** İlk run **38573694668 FAILED** (rustfmt + Android E0425 + cargo-audit rustls 0.23.45). İkinci run **38577156614 FAILED** (rustfmt `mod.rs` + Android E0597 `state` + clippy `close_current_child`). Üçüncü run **38579500121 SUCCESS** — tüm job’lar yeşil (önceki tur). Dördüncü run **0c32b6d** (bu tur, 5 kritik yarış) CI’da koşacak:
   - `https://github.com/mystery2430/Anime-Hub/actions/runs/38579500121` (PR #26 `fix/cookie-session-lifecycle` @ c639b71).
   - `Tests (ubuntu-24.04)` ✓ `cargo fmt --check` + `clippy -D warnings` + `cargo test` + `npm test/build`
   - `Tests (macos-latest)` ✓ `clippy` + `cargo test` + `npm`
@@ -232,7 +252,8 @@ docs/audit-cookie-session-lifecycle.md — bu rapor (ikinci tur güncellendi)
 - [x] §6.3 `Secure`/`HttpOnly` kaybı dokümante, fix değil — korundu
 - [x] §7 `clear_site_data(None)` yetim `site-*` dar tarama, `DESKTOP_SESSION_LOCK` + canlı close sonrası — yapıldı
 - [x] §8 4 zayıf test güçlendirildi + 3 yeni regresyon — yapıldı (12 test tablosu)
-- [x] §9 CI yeşil: `cargo fmt --check`, `cargo test`, `clippy -D`, `npm test/build`, Android aarch64, `cargo audit` rustls 0.23.46 — **38579500121 yeşil (6/6), yerel `npm` 152/152**
+- [x] §9 CI yeşil: `cargo fmt --check`, `cargo test`, `clippy -D`, `npm test/build`, Android aarch64, `cargo audit` rustls 0.23.46 — **38579500121 yeşil (6/6), yerel `npm` 152/152; 0c32b6d (bu tur) CI’da doğrulanacak**
+- [x] §11 Üçüncü tur 5 kritik yarış (registry koruma, Android yanlış kapanma, stale open, STORE resurreksiyon, key+orphan hata) — düzeltildi, deterministik test eklendi
 - [x] §10 rapor bu dosya — güncellendi
 - PR #26 **açık** tutuluyor; `main`’e merge yok; PR #21/#24’e dokunulmadı; kitle silme migrasyonu yok; güvenlik kontrolleri kapatılmadı.
 
