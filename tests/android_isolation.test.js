@@ -101,12 +101,13 @@ test("site_open gates on MULTI_PROFILE before anything else and never falls back
   const signatureEnd = controllerKt.indexOf(") {", openAt);
   const guard = controllerKt.slice(signatureEnd, signatureEnd + 400);
   assert.match(guard, /if \(!isSupported\(\)\) \{\n\s*onResult\(false, ERR_UNSUPPORTED_MULTI_PROFILE\)/);
-  // No path opens the site when the feature is missing: the sentinel reject
-  // is the only unsupported branch in the file.
+  // No path opens the site when the feature is missing: the open reject is
+  // the only *open* branch, and the delete refusal reports the same feature
+  // gap (clear uses the shared SiteProfileErrors.UNSUPPORTED literal).
   assert.equal(
     (controllerKt.match(/ERR_UNSUPPORTED_MULTI_PROFILE/g) || []).length,
-    2,
-    "declaration + the single reject site",
+    3,
+    "declaration + open reject + delete refusal",
   );
   // Rust classifies exactly that sentinel into the user-facing message.
   assert.match(pluginLibRs, /pub const MULTI_PROFILE_SENTINEL: &str = "unsupported-multi-profile"/);
@@ -183,7 +184,8 @@ test("site cookies never touch the static CookieManager", () => {
   // must go through Profile.getCookieManager() / WebViewCompat.getProfile().
   assert.doesNotMatch(code(controllerKt), /CookieManager\.getInstance\(\)/);
   assert.match(controllerKt, /profile\.cookieManager/);
-  assert.match(controllerKt, /val manager: CookieManager = profile\.cookieManager/);
+  // The migration port binds its manager from the profile it just created.
+  assert.match(controllerKt, /manager = store\.getOrCreateProfile\(profileName\)\.cookieManager/);
   assert.match(controllerKt, /profile\.cookieManager\.flush\(\)/);
 });
 
@@ -200,15 +202,20 @@ test("migration is one-time, profile-scoped, and ordered before first navigation
     body.indexOf("site_open(url.as_str()") < body.indexOf("mark_migration_done"),
     "flag must be written only after a successful open",
   );
-  // Kotlin: virgin profile only; existing profile jars are authoritative.
-  assert.match(controllerKt, /val existing = store\.getProfile\(profileName\)/);
-  assert.match(controllerKt, /if \(existing != null\) \{[\s\S]{0,200}onResult\(false, null\)/);
-  // Flush to disk completes before the WebView is even constructed.
-  assert.match(controllerKt, /manager\.flush\(\)/);
-  const flushAt = controllerKt.indexOf("manager.flush()");
+  // Kotlin: virgin profile only — an existing profile's live cookies are
+  // authoritative and the migration REFUSES (retryable sentinel) instead of
+  // being overwritten by the stale snapshot (A.3).
+  assert.match(controllerKt, /MigrationOutcome\.ProfileAlreadyExists/);
+  assert.match(controllerKt, /onResult\(false, "\$ERR_MIGRATION_RETRY: profil zaten mevcut"\)/);
+  // Flush to disk completes inside the migration flow, before buildWebView.
+  assert.match(controllerKt, /m\.flush\(\)/);
+  const flushAt = controllerKt.indexOf("m.flush()");
   const buildAt = controllerKt.indexOf("private fun buildWebView(");
-  assert.ok(flushAt < buildAt || controllerKt.indexOf("manager.flush()", flushAt + 1) < buildAt,
+  assert.ok(flushAt > 0 && flushAt < buildAt,
     "flush must run during migration, before buildWebView");
+  // Any incomplete attempt reports the Rust-visible retry sentinel.
+  assert.match(controllerKt, /const val ERR_MIGRATION_RETRY = "migration-partial"/);
+  assert.match(windowsRs, /animehub_android::MIGRATION_RETRY_SENTINEL/);
   // localStorage/IndexedDB snapshots are NOT reimported anywhere.
   assert.doesNotMatch(windowsRs, /import_site_storage|localstorage_import|indexeddb_import/);
   assert.doesNotMatch(pluginKt, /fun localstorage_|fun indexeddb_/);
@@ -279,8 +286,22 @@ test("remove_site deletes the profile, queues refusals, bumps the generation", (
   const builtinAt = body.indexOf("if was_builtin");
   const deleteAt = body.indexOf("site_profile_delete");
   assert.ok(builtinAt > 0 && deleteAt > builtinAt, "profile delete must come after the builtin check");
-  // The builtin early-return happens before the delete call.
-  assert.ok(body.slice(builtinAt, deleteAt).includes("return Ok(());"), "builtin must return before deletion");
+  // The builtin early-return happens before the delete call (and reports
+  // the explicit `hidden` outcome, never a bare success).
+  assert.ok(
+    body.slice(builtinAt, deleteAt).includes("return Ok(RemoveSiteOutcome"),
+    "builtin must return its outcome before deletion",
+  );
+  // The outcome flows from the pure mapping: Pending → deferred.
+  assert.ok(
+    body.includes("profile_outcome = profile_removal_for(action)"),
+    "remove_site must report through profile_removal_for",
+  );
+  assert.match(
+    commandsRs,
+    /SiteProfileAction::Pending => ProfileRemoval::Deferred/,
+    "Pending must map to deferred, never to deleted",
+  );
   // Pending → queued (never silently dropped), hard errors → propagate.
   assert.match(body, /SiteProfileAction::Pending => \{\s*w::queue_pending_profile_delete\(&state, &profile\)\?;/);
   // Generation bumps only after a successful/queued delete.
@@ -352,9 +373,16 @@ test("back navigation: fullscreen first, then site history, then the launcher ho
   // default back behaviour (Tauri: no wry callback) stays as before.
   assert.match(controllerKt, /private var backCallback: OnBackPressedCallback\?/);
   assert.match(controllerKt, /backCallback\?\.isEnabled = false/);
-  // The launcher-side hook exists and returns whether it ran.
-  assert.match(mainJs, /window\.__animehubBackToLauncher = \(\) => \{/);
-  assert.match(mainJs, /void backToLauncher\(\);\n\s*return true;/);
+  // The launcher-side hook returns whether a close session ACCEPTED the
+  // request (never a bare "it ran"), and exposes the status Kotlin polls
+  // for the real outcome (pending | closed | failed:<reason> | idle).
+  assert.match(
+    mainJs,
+    /window\.__animehubBackToLauncher = \(\) => backSession\.requestClose\(\)\.accepted;/,
+  );
+  assert.match(mainJs, /window\.__animehubBackStatus = \(\) => backSession\.statusString\(\);/);
+  // A.5: the label must not be dropped in a finally after invoking close.
+  assert.doesNotMatch(mainJs, /finally \{\s*\n\s*openSiteLabel = null;/);
   // No site-facing close-scheme ever appears on Android.
   assert.doesNotMatch(controllerKt, /animehub:\/\/close-site/);
 });
@@ -395,11 +423,19 @@ test("the site WebView has no page-facing IPC surface", () => {
 });
 
 test("navigation policy wraps the site client too", () => {
-  // Same guard as the launcher: scheme/host policy stays mandatory.
+  // Same guard as the launcher: scheme/host policy stays mandatory. The
+  // guard was split out of AnimeHubPlugin.kt so the CI unit test can
+  // type-check it — android_prepare.py MUST copy the new file or neither
+  // the APK nor the test compile resolves it.
   assert.match(controllerKt, /webView\.webViewClient = SiteNavigationGuard\(/);
-  const guard = pluginKt.indexOf("class SiteNavigationGuard");
-  assert.ok(guard > 0, "guard lives in the plugin file");
-  assert.match(pluginKt.slice(guard, guard + 600), /SiteNavigationPolicy\.allows\(uri\)/);
+  const guardKt = read(
+    "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt",
+  );
+  assert.match(guardKt, /class SiteNavigationGuard/);
+  assert.match(guardKt, /SiteNavigationPolicy\.allows\(uri\)/);
+  assert.match(preparePy, /"SiteNavigationGuard"/);
+  assert.match(preparePy, /"AnimeHubDebugLog"/);
+  assert.match(preparePy, /"SiteProfileOps"/);
 });
 
 // ---------------------------------------------------------------------------

@@ -601,8 +601,11 @@ pub const ANDROID_PROFILE_PREFIX: &str = "site-";
 /// on-disk deletion is still pending.
 const PROFILE_GENERATION_PREFIX: &str = "profilegen-";
 
-/// Secret key marking that the site's pre-profile cookie jar has been handed
-/// to its WebView profile (attempted once, successfully). Deleted together
+/// Secret key marking that the site's pre-profile cookie jar has been
+/// handed to its WebView profile. Written ONLY after the import fully
+/// completed (every cookie accepted and flushed); a failed attempt is never
+/// recorded — instead the virgin profile name is retired (queued + generation
+/// bump) and the migration retries on a fresh generation. Deleted together
 /// with the session data in `delete_site_session`, so a cleared site never
 /// re-imports the wiped jar.
 const MIGRATION_FLAG_PREFIX: &str = "profilemig-";
@@ -612,6 +615,11 @@ const MIGRATION_FLAG_PREFIX: &str = "profilemig-";
 /// temporarily without the API). Drained at the next process start, before
 /// any site WebView can open.
 pub const PENDING_PROFILE_DELETES_KEY: &str = "android-pending-profile-deletes";
+
+/// Secret key where the RAW bytes of a corrupt pending-delete list are
+/// kept before the working copy is salvaged/overwritten — the names inside
+/// are the only record of on-disk profile data still awaiting deletion.
+pub const CORRUPT_QUEUE_BACKUP_KEY: &str = "android-pending-profile-deletes-corrupt";
 
 /// Deterministic Android WebView profile name for a site.
 ///
@@ -635,25 +643,165 @@ pub fn android_profile_name(site_id: &str, generation: u32) -> String {
     format!("{ANDROID_PROFILE_PREFIX}{}-g{generation}", &digest[..32])
 }
 
-/// The persisted generation for `site_id` (0 when never bumped).
-pub fn profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
-    match state
-        .provider
-        .get_secret(&format!("{PROFILE_GENERATION_PREFIX}{site_id}"))?
-    {
+/// Strict shape of a provider-namespace profile name — the same rule Kotlin
+/// enforces before it will touch delete/clear:
+/// `site-<32 lowercase hex chars>-g<1..10 digits>` with the generation
+/// parsing as `u32`. Never loosened: the Default profile and arbitrary
+/// provider names must stay unreachable even for a corrupted queue entry.
+pub fn is_valid_site_profile_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(ANDROID_PROFILE_PREFIX) else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    // hex digest (32) + "-g" + digits (1..=10)
+    if bytes.len() < 35 || bytes[32] != b'-' || bytes[33] != b'g' {
+        return false;
+    }
+    if !bytes[..32].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) {
+        return false;
+    }
+    let digits = &rest[34..];
+    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    digits.parse::<u32>().is_ok()
+}
+
+/// Salvage every valid profile name out of raw (possibly corrupt) bytes.
+///
+/// The scan is byte-level on purpose: even a structurally broken JSON file
+/// keeps readable `site-…-gN` tokens, and dropping only the unparseable
+/// part preserves the deletions still owed — silently emptying the queue
+/// would strand those names forever (until the orphan sweep at best).
+pub fn scan_valid_profile_names(raw: &[u8]) -> Vec<String> {
+    let needle = ANDROID_PROFILE_PREFIX.as_bytes();
+    // A valid name is exactly 5 + 32 + 2 + (1..=10) bytes.
+    let min_len = 5 + 32 + 2 + 1;
+    let max_len = 5 + 32 + 2 + 10;
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= raw.len() {
+        if &raw[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        let mut matched_end = None;
+        let window_end = (i + max_len).min(raw.len());
+        for end in (i + min_len)..=window_end {
+            if let Ok(candidate) = std::str::from_utf8(&raw[i..end]) {
+                if is_valid_site_profile_name(candidate) {
+                    found.push(candidate.to_string());
+                    matched_end = Some(end);
+                    break;
+                }
+            }
+        }
+        match matched_end {
+            Some(end) => i = end,
+            None => i += 1,
+        }
+    }
+    found
+}
+
+/// Pure recovery rule for the pending-delete queue. A JSON list that parses
+/// keeps only structurally valid names (corrupt if any were dropped); a
+/// broken document is salvaged name-by-name from the raw bytes (always
+/// corrupt). Returns `(names, was_corrupt)`.
+pub fn recover_pending_profile_deletes(raw: &[u8]) -> (Vec<String>, bool) {
+    match serde_json::from_slice::<Vec<String>>(raw) {
+        Ok(list) => {
+            let total = list.len();
+            let kept: Vec<String> = list
+                .into_iter()
+                .filter(|name| is_valid_site_profile_name(name))
+                .collect();
+            let dropped = total - kept.len();
+            if dropped > 0 {
+                log::warn!("bekleyen profil silme listesinden {dropped} geçersiz ad çıkarıldı");
+            }
+            (kept, dropped > 0)
+        }
+        Err(e) => {
+            let salvaged = scan_valid_profile_names(raw);
+            log::warn!(
+                "bekleyen profil silme listesi bozuk ({e}); {} ad ham kopyadan kurtarıldı",
+                salvaged.len()
+            );
+            (salvaged, true)
+        }
+    }
+}
+
+/// Pure recovery rule for a corrupt generation counter: take the highest
+/// generation queued for THIS site plus one (0 with an empty queue), so a
+/// name whose deletion is still pending is never handed out again.
+/// Reusing generation 0 blindly could recreate data Chromium is about to
+/// delete; a queued `u32::MAX` has no next value and must refuse.
+pub fn recover_generation_for(site_id: &str, queued: &[String]) -> AppResult<u32> {
+    let prefix = queued_site_profile_prefix(site_id);
+    let max_queued = queued
+        .iter()
+        .filter_map(|name| name.strip_prefix(&prefix).and_then(|s| s.parse::<u32>().ok()))
+        .max();
+    match max_queued {
+        Some(u32::MAX) => Err(AppError::Storage(format!(
+            "bekleyen profil silme nesli taştı ({site_id})"
+        ))),
+        Some(max) => Ok(max + 1),
         None => Ok(0),
-        Some(bytes) => Ok(String::from_utf8(bytes.to_vec())
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)),
+    }
+}
+
+/// `site-<hash(site_id)>-g` — the fixed prefix shared by all generations of
+/// one site's profile names (used for queue matching).
+fn queued_site_profile_prefix(site_id: &str) -> String {
+    let sample = android_profile_name(site_id, 0);
+    sample
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .to_string()
+}
+
+/// The persisted generation for `site_id` (0 when never bumped).
+///
+/// A corrupt value is recovered from the pending-delete queue instead of
+/// silently becoming 0 — the old fallback could re-open a name whose
+/// on-disk deletion was still queued — and the recovered value is persisted
+/// so every later path sees the same truth.
+pub fn profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
+    let key = format!("{PROFILE_GENERATION_PREFIX}{site_id}");
+    let Some(bytes) = state.provider.get_secret(&key)? else {
+        return Ok(0);
+    };
+    match std::str::from_utf8(&bytes)
+        .ok()
+        .map(|s| s.trim().parse::<u32>())
+    {
+        Some(Ok(generation)) => Ok(generation),
+        _ => {
+            log::warn!("profil nesli bozuk, kuyruktan geri yükleniyor ({site_id})");
+            let queued = read_pending_profile_deletes(state)?;
+            let recovered = recover_generation_for(site_id, &queued)?;
+            state
+                .provider
+                .put_secret(&key, recovered.to_string().as_bytes())?;
+            Ok(recovered)
+        }
     }
 }
 
 /// Advance the generation after a delete of the *current* name was accepted
 /// or queued, so the next open of this site id derives a fresh name and can
 /// never collide with a deletion still finishing on disk.
+///
+/// `checked_add` — at `u32::MAX` the name space is exhausted. The old
+/// `saturating_add` would have pinned the counter and reused the exact name
+/// whose deletion was just queued, forever.
 pub fn bump_profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
-    let next = profile_generation(state, site_id)?.saturating_add(1);
+    let current = profile_generation(state, site_id)?;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| AppError::Storage(format!("profil nesli taştı ({site_id})")))?;
     state.provider.put_secret(
         &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
         next.to_string().as_bytes(),
@@ -661,20 +809,63 @@ pub fn bump_profile_generation(state: &AppState, site_id: &str) -> AppResult<u32
     Ok(next)
 }
 
-/// Read the deferred profile-deletion queue. A corrupt list is treated as
-/// empty: the names leak only as on-disk profile data, which the `is_all`
-/// orphan sweep collects later; crashing here would block every open.
-pub fn read_pending_profile_deletes(state: &AppState) -> AppResult<Vec<String>> {
-    match state.provider.get_secret(PENDING_PROFILE_DELETES_KEY)? {
-        None => Ok(Vec::new()),
-        Some(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(list) => Ok(list),
-            Err(e) => {
-                log::warn!("bekleyen profil silme listesi okunamadı: {e}");
-                Ok(Vec::new())
-            }
-        },
+/// Advance the stored generation past a queued deletion of *this* stored
+/// name, if one exists (pure). The bumped value is `max_queued + 1` for this
+/// site, which by construction is not in the queue, so exactly one step is
+/// needed. `(generation, was_advanced)`.
+pub fn resolve_queued_free_generation(
+    site_id: &str,
+    stored: u32,
+    queued: &[String],
+) -> AppResult<(u32, bool)> {
+    let stored_name = android_profile_name(site_id, stored);
+    if !queued.iter().any(|name| name == &stored_name) {
+        return Ok((stored, false));
     }
+    let prefix = queued_site_profile_prefix(site_id);
+    let max_queued = queued
+        .iter()
+        .filter_map(|name| name.strip_prefix(&prefix).and_then(|s| s.parse::<u32>().ok()))
+        .max()
+        .unwrap_or(stored);
+    let next = max_queued
+        .checked_add(1)
+        .ok_or_else(|| AppError::Storage(format!("bekleyen profil nesli taştı ({site_id})")))?;
+    Ok((next, true))
+}
+
+/// Read the deferred profile-deletion queue.
+///
+/// A corrupt list is never treated as empty: valid names are salvaged from
+/// the raw bytes, the original bytes are backed up under
+/// [`CORRUPT_QUEUE_BACKUP_KEY`], and the working copy is repaired in place.
+/// Dropping the queue silently would strand those profile deletions (best
+/// case the orphan sweep collects them — worst case a re-open races a
+/// deletion nobody recorded any more).
+pub fn read_pending_profile_deletes(state: &AppState) -> AppResult<Vec<String>> {
+    let Some(bytes) = state.provider.get_secret(PENDING_PROFILE_DELETES_KEY)? else {
+        return Ok(Vec::new());
+    };
+    let (list, corrupt) = recover_pending_profile_deletes(&bytes);
+    if corrupt {
+        // Best effort both ways: a failed backup or repair only means the
+        // salvage repeats on the next read; never block open behind it.
+        if let Err(e) = state.provider.put_secret(CORRUPT_QUEUE_BACKUP_KEY, &bytes) {
+            log::warn!("bozuk silme kuyruğu yedeği yazılamadı: {e}");
+        }
+        match serde_json::to_vec(&list) {
+            Ok(repaired) => {
+                if let Err(e) = state
+                    .provider
+                    .put_secret(PENDING_PROFILE_DELETES_KEY, &repaired)
+                {
+                    log::warn!("bozuk silme kuyruğu onarılamadı: {e}");
+                }
+            }
+            Err(e) => log::warn!("bozuk silme kuyruğu yeniden yazılamadı: {e}"),
+        }
+    }
+    Ok(list)
 }
 
 /// Queue a profile name for deletion at the next process start (deduped).
@@ -755,8 +946,21 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         }
     }
 
-    // 2. The profile for this site at its current generation.
-    let generation = profile_generation(&state, &site.id)?;
+    // 2. The profile for this site at its current generation — advanced past
+    //    a queued deletion of that exact stored name (a stale/corrupt
+    //    generation would otherwise hand out a profile whose deletion is
+    //    still in flight) and persisted when advanced, so every later path
+    //    (clear, delete, orphan sweep) derives the same name.
+    let stored_generation = profile_generation(&state, &site.id)?;
+    let queued = read_pending_profile_deletes(&state)?;
+    let (generation, advanced) =
+        resolve_queued_free_generation(&site.id, stored_generation, &queued)?;
+    if advanced {
+        state.provider.put_secret(
+            &format!("{PROFILE_GENERATION_PREFIX}{}", site.id),
+            generation.to_string().as_bytes(),
+        )?;
+    }
     let profile = android_profile_name(&site.id, generation);
 
     // 3. One-time migration of the pre-profile cookie jar (0.3.4 installs).
@@ -764,12 +968,12 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     //    dump was lossy and origin-checking it again would revive the TOCTOU
     //    problems profiles remove. The blobs themselves stay untouched until
     //    the user clears or deletes the site.
-    let migration_attempted = state
+    let pending_migration = state
         .provider
         .get_secret(&format!("{MIGRATION_FLAG_PREFIX}{}", site.id))?
         .is_none();
     let mut cookie_headers = Vec::new();
-    if migration_attempted {
+    if pending_migration {
         if let Some(bytes) = state.provider.get_secret(&format!("cookies-{}", site.id))? {
             let jar: CookieJar = serde_json::from_slice(&bytes)?;
             let now = crate::anilist::now_unix();
@@ -783,12 +987,60 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 
     // 4. Create the profiled WebView. Any failure — including the
     //    MULTI_PROFILE-unsupported refusal — leaves no session behind.
-    crate::android_bridge::site_open(url.as_str(), &profile, init_script, &cookie_headers)?;
+    //
+    //    A `migration-partial` failure means the virgin-profile import did
+    //    NOT complete (a cookie was rejected, an exception fired, a callback
+    //    or the flush never landed — Kotlin fails instead of faking it).
+    //    Retire THAT profile name (queue + generation bump) and retry
+    //    exactly once on a fresh generation: a half-imported profile must
+    //    never pass as complete, and the legacy snapshot stays untouched
+    //    until the import really lands. A second `migration-partial` fails
+    //    the open with a retryable, visible error — flag and jar intact, so
+    //    the NEXT open starts the whole migration over from a virgin name.
+    let mut open_result =
+        crate::android_bridge::site_open(url.as_str(), &profile, init_script, &cookie_headers);
+    if let Err(AppError::Other(message)) = &open_result {
+        if pending_migration
+            && !cookie_headers.is_empty()
+            && message.contains(animehub_android::MIGRATION_RETRY_SENTINEL)
+        {
+            log::warn!(
+                "profil göçü tamamlanamadı ({})={message}; profil emekliye ayrılıyor",
+                site.id
+            );
+            queue_pending_profile_delete(&state, &profile)?;
+            let retry_generation = bump_profile_generation(&state, &site.id)?;
+            let retry_profile = android_profile_name(&site.id, retry_generation);
+            open_result = crate::android_bridge::site_open(
+                url.as_str(),
+                &retry_profile,
+                init_script,
+                &cookie_headers,
+            );
+            if let Err(AppError::Other(retry_message)) = &open_result {
+                if retry_message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) {
+                    // Retire this attempt too and surface a retryable error.
+                    if let Err(e) = queue_pending_profile_delete(&state, &retry_profile) {
+                        log::warn!("ikinci göç profili kuyruğa alınamadı: {e}");
+                    }
+                    if let Err(e) = bump_profile_generation(&state, &site.id) {
+                        log::warn!("göç sonrası nesil artırılamadı: {e}");
+                    }
+                    return Err(AppError::Other(format!(
+                        "site çerezleri profiline taşınamadı: {retry_message}. Çerezler saklandı; sonraki açılışta yeniden denenecek."
+                    )));
+                }
+            }
+        }
+    }
+    open_result?;
 
-    if migration_attempted {
-        // Record the attempt only after the open succeeded: a failed open
-        // must be retried next time, and an existing profile's live cookies
-        // must never be overwritten by a stale snapshot on a later attempt.
+    if pending_migration {
+        // Record the attempt only after a fully successful import: a failed
+        // open must be retried next time, and an existing profile's live
+        // cookies must never be overwritten by a stale snapshot later. With
+        // the strict Kotlin criterion, reaching this line means every cookie
+        // was accepted and the flush completed.
         if let Err(e) = mark_migration_done(&state, &site.id) {
             log::warn!("profil göç bayrağı yazılamadı ({}): {e}", site.id);
         }
@@ -1407,18 +1659,208 @@ mod tests {
 
     #[test]
     fn pending_profile_deletes_queue_dedupes_and_forgets() {
+        // Fixtures use the REAL name shape (32 lowercase hex): the reader
+        // drops anything `is_valid_site_profile_name` rejects, and the
+        // validator is never loosened for tests.
+        let name_a = format!("{}{}-g0", ANDROID_PROFILE_PREFIX, "a".repeat(32));
+        let name_b = format!("{}{}-g0", ANDROID_PROFILE_PREFIX, "b".repeat(32));
         let state = state_with_current_site(None);
         assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
-        queue_pending_profile_delete(&state, "site-aaaa-g0").unwrap();
-        queue_pending_profile_delete(&state, "site-aaaa-g0").unwrap();
-        queue_pending_profile_delete(&state, "site-bbbb-g0").unwrap();
+        queue_pending_profile_delete(&state, &name_a).unwrap();
+        queue_pending_profile_delete(&state, &name_a).unwrap();
+        queue_pending_profile_delete(&state, &name_b).unwrap();
         let queued = read_pending_profile_deletes(&state).unwrap();
-        assert_eq!(queued, vec!["site-aaaa-g0", "site-bbbb-g0"]);
-        forget_pending_profile_delete(&state, "site-aaaa-g0").unwrap();
+        assert_eq!(queued, vec![name_a.clone(), name_b.clone()]);
+        forget_pending_profile_delete(&state, &name_a).unwrap();
         let queued = read_pending_profile_deletes(&state).unwrap();
-        assert_eq!(queued, vec!["site-bbbb-g0"]);
-        forget_pending_profile_delete(&state, "site-bbbb-g0").unwrap();
+        assert_eq!(queued, vec![name_b.clone()]);
+        forget_pending_profile_delete(&state, &name_b).unwrap();
         assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn profile_name_validator_is_strict_and_namespace_scoped() {
+        let hex32 = "a".repeat(32);
+        assert!(is_valid_site_profile_name(&format!("site-{hex32}-g0")));
+        assert!(is_valid_site_profile_name(&format!("site-{hex32}-g123456")));
+        // Full u32 range stays representable (10 digits).
+        assert!(is_valid_site_profile_name(&format!("site-{hex32}-g4294967295")));
+        // Never a handle for anything outside our namespace:
+        assert!(!is_valid_site_profile_name(&format!("site-{}-g0", "a".repeat(31))));
+        assert!(!is_valid_site_profile_name(&format!("site-{}-g0", "A".repeat(32))));
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g")));
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g-1")));
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g+1")));
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g01234567890")));
+        // 10 digits beyond u32 must not validate as a "generation".
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g9999999999")));
+        assert!(!is_valid_site_profile_name("Default"));
+        assert!(!is_valid_site_profile_name(&format!("xsite-{hex32}-g0")));
+    }
+
+    #[test]
+    fn scan_valid_profile_names_salvages_broken_bytes() {
+        let name_a = format!("site-{}-g3", "c".repeat(32));
+        let name_b = format!("site-{}-g0", "d".repeat(32));
+        // Structurally broken JSON: quotes/brackets missing, an invalid
+        // short-hex name, and noise around the valid tokens.
+        let raw = format!(
+            "{{garbage [{name_a}, \"site-e-f0\", tail {name_b} end"
+        );
+        let found = scan_valid_profile_names(raw.as_bytes());
+        assert_eq!(found, vec![name_a, name_b]);
+        // Clean input keeps order and nothing extra.
+        let clean = serde_json::to_vec(&["unrelated".to_string()]).unwrap();
+        assert!(scan_valid_profile_names(&clean).is_empty());
+    }
+
+    #[test]
+    fn recover_pending_profile_deletes_reports_corruption() {
+        // Parses but contains junk entries: junk dropped, still corrupt.
+        let name_a = format!("site-{}-g1", "f".repeat(32));
+        let mixed = serde_json::to_vec(&[name_a.clone(), "Default".to_string()]).unwrap();
+        let (list, corrupt) = recover_pending_profile_deletes(&mixed);
+        assert_eq!(list, vec![name_a.clone()]);
+        assert!(corrupt);
+        // Broken document: salvaged, always corrupt.
+        let broken = format!("[{name_a}").into_bytes();
+        let (list, corrupt) = recover_pending_profile_deletes(&broken);
+        assert_eq!(list, vec![name_a.clone()]);
+        assert!(corrupt);
+        // Clean document: untouched, not corrupt.
+        let clean = serde_json::to_vec(&[name_a]).unwrap();
+        let (list, corrupt) = recover_pending_profile_deletes(&clean);
+        assert_eq!(list.len(), 1);
+        assert!(!corrupt);
+    }
+
+    #[test]
+    fn corrupt_queue_is_backed_up_and_repaired_on_read() {
+        let state = state_with_current_site(None);
+        let name = format!("site-{}-g2", "1".repeat(32));
+        // Broken JSON that still contains one valid name.
+        let raw = format!("[{{oops {name}").into_bytes();
+        state
+            .provider
+            .put_secret(PENDING_PROFILE_DELETES_KEY, &raw)
+            .unwrap();
+
+        let list = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(list, vec![name.clone()], "salvaged, never silently empty");
+        // The raw bytes were preserved before the working copy was repaired.
+        let backup = state
+            .provider
+            .get_secret(CORRUPT_QUEUE_BACKUP_KEY)
+            .unwrap()
+            .expect("corrupt backup must exist");
+        assert_eq!(backup.as_slice(), raw.as_slice());
+        // The working copy is now valid JSON so later reads stop repairing.
+        let reread = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(reread, vec![name]);
+    }
+
+    #[test]
+    fn corrupt_generation_recovers_from_the_queue_and_persists() {
+        let state = state_with_current_site(None);
+        let queued_name = android_profile_name("user-1", 3);
+        queue_pending_profile_delete(&state, &queued_name).unwrap();
+        // A generation for a DIFFERENT site must not influence recovery.
+        queue_pending_profile_delete(&state, &android_profile_name("user-2", 7)).unwrap();
+        state
+            .provider
+            .put_secret(
+                &format!("{PROFILE_GENERATION_PREFIX}user-1"),
+                b"not-a-number",
+            )
+            .unwrap();
+
+        // Recovered to max-queued-for-this-site + 1 — never silently 0,
+        // which could re-open a name whose deletion is still queued.
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), 4);
+        // And persisted: the next read comes from storage, not recovery.
+        let stored = state
+            .provider
+            .get_secret(&format!("{PROFILE_GENERATION_PREFIX}user-1"))
+            .unwrap()
+            .expect("recovered generation persisted");
+        assert_eq!(String::from_utf8_lossy(&stored), "4");
+        // user-1's queue entry no longer collides with the derived name.
+        let resolved = android_profile_name("user-1", 4);
+        assert!(!read_pending_profile_deletes(&state).unwrap().contains(&resolved));
+        // An untouched site still starts at 0.
+        assert_eq!(profile_generation(&state, "user-3").unwrap(), 0);
+    }
+
+    #[test]
+    fn corrupt_generation_with_no_queue_recovers_to_zero() {
+        let state = state_with_current_site(None);
+        state
+            .provider
+            .put_secret(
+                &format!("{PROFILE_GENERATION_PREFIX}user-1"),
+                b"3.4",
+            )
+            .unwrap();
+        // No queued deletions at all: 0 is safe (nothing pending for it).
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn bump_profile_generation_refuses_to_overflow() {
+        let state = state_with_current_site(None);
+        state
+            .provider
+            .put_secret(
+                &format!("{PROFILE_GENERATION_PREFIX}user-1"),
+                u32::MAX.to_string().as_bytes(),
+            )
+            .unwrap();
+        // saturating_add would pin at MAX and reuse the queued name forever.
+        assert!(bump_profile_generation(&state, "user-1").is_err());
+        // The stored value is untouched by the refused bump.
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn generation_recovery_at_queued_max_refuses() {
+        let queued = vec![android_profile_name("user-1", u32::MAX)];
+        assert!(recover_generation_for("user-1", &queued).is_err());
+        // No queued name → plain 0.
+        assert_eq!(recover_generation_for("user-1", &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_queued_free_generation_only_moves_on_real_collision() {
+        let own = android_profile_name("user-1", 2);
+        let other = android_profile_name("user-2", 2);
+        // Nothing queued: unchanged.
+        assert_eq!(resolve_queued_free_generation("user-1", 2, &[]).unwrap(), (2, false));
+        // Someone else's name: unchanged.
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[other]).unwrap(),
+            (2, false)
+        );
+        // A different generation of this site: unchanged (names differ).
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[android_profile_name("user-1", 5)])
+                .unwrap(),
+            (2, false)
+        );
+        // The stored name itself is queued: advance past the queue maximum,
+        // which by construction cannot be in the queue either.
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[own.clone()]).unwrap(),
+            (3, true)
+        );
+        assert_eq!(
+            resolve_queued_free_generation(
+                "user-1",
+                2,
+                &[own, android_profile_name("user-1", 9)]
+            )
+            .unwrap(),
+            (10, true)
+        );
     }
 
     #[test]

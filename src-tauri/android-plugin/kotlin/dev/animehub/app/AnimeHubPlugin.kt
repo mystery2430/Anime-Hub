@@ -511,66 +511,6 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 }
 
 /**
- * Top-level navigation guard for the shared site WebView (Android only).
- *
- * Desktop enforces the site policy in Tauri's `on_navigation` hook. Android has
- * no equivalent for the single launcher WebView: wry's navigation handler is
- * fixed when the WebView is created and is not reachable from app code. So this
- * class wraps wry's `WebViewClient` and cancels the navigations that the desktop
- * policy would refuse.
- *
- * Scope (verified against wry 0.55.1 source and the Android WebView docs, not on
- * a device):
- *  - Covered: top-level navigations that the WebView routes through
- *    `shouldOverrideUrlLoading` (link clicks, `location` changes, main-frame
- *    redirects as delivered by the WebView).
- *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
- *    `open_on_mobile` already validates the first URL), subframes, and
- *    sub-resources.
- *  - Not covered: the blocklist and DNS rebinding checks. Those live in Rust;
- *    running DNS on the UI thread from this callback is not acceptable.
- *
- * Every other callback is forwarded unchanged, so wry's custom-protocol
- * handling, the IPC page-started tracking and the error recovery keep working.
- */
-class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
-
-  override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-    val uri = request.url
-    if (!SiteNavigationPolicy.allows(uri)) {
-      // Host and scheme only: paths and queries can carry tokens.
-      Log.w(LOG_TAG, "navigation blocked: ${uri.scheme}://${uri.host}")
-      // Scheme only in the in-app log: the host can identify the site.
-      AnimeHubDebugLog.add("nav", "blocked scheme=${uri.scheme}")
-      return true
-    }
-    return inner.shouldOverrideUrlLoading(view, request)
-  }
-
-  override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
-    inner.shouldInterceptRequest(view, request)
-
-  override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) =
-    inner.onPageStarted(view, url, favicon)
-
-  override fun onPageFinished(view: WebView, url: String) =
-    inner.onPageFinished(view, url)
-
-  override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-    // Error code and frame only: the description and URL are left out.
-    if (request.isForMainFrame) {
-      AnimeHubDebugLog.add("web", "main frame error code=${error.errorCode}")
-    }
-    inner.onReceivedError(view, request, error)
-  }
-
-  companion object {
-    private const val LOG_TAG = "AnimeHubNavGuard"
-  }
-}
-
-
-/**
  * Receives `window.ipc.postMessage` from the launcher only. The origin rules
  * stop the object being injected into site pages at all; the main-frame check
  * is a second, cheap guard. `Rust.ipc` gets the same arguments as wry's object:
@@ -631,25 +571,4 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     const val OBJECT_NAME = "ipc"
     val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
   }
-}
-
-/**
- * In-app diagnostics for the launcher's developer panel, read through the
- * `debug_log` plugin command. Holds the last 200 lines of status text only:
- * a short area tag, the outcome, and error codes. Never site URLs or hosts,
- * and never message bodies or cookie values.
- */
-object AnimeHubDebugLog {
-  private const val MAX_LINES = 200
-  private val lines = ArrayDeque<String>()
-  private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
-
-  @Synchronized
-  fun add(area: String, message: String) {
-    if (lines.size >= MAX_LINES) lines.removeFirst()
-    lines.addLast(stamp.format(Date()) + " [" + area + "] " + message)
-  }
-
-  @Synchronized
-  fun snapshot(): List<String> = lines.toList()
 }

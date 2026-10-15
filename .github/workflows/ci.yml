@@ -223,7 +223,8 @@ jobs:
           ls -l src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 20
           mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
-          echo "=== isolating pure Kotlin for unit test (move Tauri-dependent files, keep IpPolicy+SiteNavigationPolicy) ==="
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
+          echo "=== isolating: move AnimeHubPlugin.kt + MainActivity.kt only; keep the real site controller chain ==="
           echo "=== before move, ls -l src/main ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
           echo "=== ls -R before ==="
@@ -248,21 +249,14 @@ jobs:
           else
             echo "MainActivity.kt NOT FOUND before move"
           fi
-          # AnimeHubPipController references AnimeHubDebugLog in AnimeHubPlugin.kt, so remove it for pure test (only IpPolicy+SiteNavigationPolicy)
-          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt ]; then
-            echo "found AnimeHubPipController.kt, removing for pure test"
-            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt /tmp/AnimeHubPipController.kt.bak
-            echo "moved AnimeHubPipController.kt"
-          fi
-          # AnimeHubSiteController references AnimeHubDebugLog / SiteNavigationGuard /
-          # AnimeHubPipController from AnimeHubPlugin.kt, so it cannot compile in the
-          # isolated unit-test source set either. Removed here, restored with the
-          # others below (and again by the android_prepare re-run).
-          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt ]; then
-            echo "found AnimeHubSiteController.kt, removing for pure test"
-            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt /tmp/AnimeHubSiteController.kt.bak
-            echo "moved AnimeHubSiteController.kt"
-          fi
+          # TRUST MITIGATION (round 3): ONLY AnimeHubPlugin.kt (tauri types)
+          # and the generated MainActivity leave the source set. The REAL
+          # AnimeHubSiteController.kt, AnimeHubPipController.kt, the split
+          # AnimeHubDebugLog.kt / SiteNavigationGuard.kt, SiteProfileOps.kt,
+          # SiteNavigationPolicy.kt and IpPolicy.kt STAY — so
+          # `:app:test*UnitTest` type-checks the production controller every
+          # run instead of trusting the (unreadable) APK-step logs. Nothing
+          # kept here references Tauri or MainActivity; they compile pure.
           echo "=== after move, ls -l ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
           ls -l /tmp/AnimeHubPlugin.kt.bak /tmp/MainActivity.kt.bak 2>&1 | head -n 20
@@ -272,7 +266,7 @@ jobs:
           cat /tmp/ls-after.log
           echo "lsBefore $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 800)"
           echo "lsAfter $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 800)"
-          echo "=== after rm, should be only IpPolicy+SiteNavigationPolicy ==="
+          echo "=== after isolation, Plugin+MainActivity gone, real controller kept ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 20
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "AnimeHubPlugin.kt still present after rm (unexpected)"; else echo "AnimeHubPlugin.kt gone as expected"; fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt; fi
@@ -317,7 +311,7 @@ jobs:
           status=1
           for t in testUniversalDebugUnitTest testArm64DebugUnitTest testDebugUnitTest; do
             echo "=== trying :app:$t --tests ==="
-            ./gradlew :app:$t --tests "dev.animehub.app.SiteNavigationPolicyTest" --info > /tmp/kotlin-test.log 2>&1
+            ./gradlew :app:$t --tests "dev.animehub.app.*Test" --info > /tmp/kotlin-test.log 2>&1
             status=$?
             echo "=== $t exit $status ==="
             cat /tmp/kotlin-test.log | tail -n 200
@@ -345,8 +339,6 @@ jobs:
           ls -R app/build/test-results 2>&1 | head -n 100 || echo "no test-results"
           echo "=== restoring Tauri-dependent files for APK build ==="
           if [ -f /tmp/MainActivity.kt.bak ]; then mv /tmp/MainActivity.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt && echo "restored MainActivity.kt"; fi
-          if [ -f /tmp/AnimeHubPipController.kt.bak ]; then mv /tmp/AnimeHubPipController.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt && echo "restored AnimeHubPipController.kt"; fi
-          if [ -f /tmp/AnimeHubSiteController.kt.bak ]; then mv /tmp/AnimeHubSiteController.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt && echo "restored AnimeHubSiteController.kt"; fi
           # AnimeHubPlugin.kt is copied by android_prepare.py, so re-run it to restore
           python3 scripts/android_prepare.py 2>&1 | head -n 20 || true
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
@@ -375,7 +367,7 @@ jobs:
             echo "::error::Kotlin test has FAILED in log"
             exit 1
           fi
-          echo "Kotlin policy test passed via Gradle (IpPolicy.kt – same file APK uses)"
+          echo "Kotlin tests passed via Gradle (SiteNavigationPolicyTest + SiteProfileOpsTest; production AnimeHubSiteController.kt type-checked in the same source set)"
 
       - name: Upload Kotlin test log
         if: always()

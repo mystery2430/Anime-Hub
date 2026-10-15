@@ -23,14 +23,35 @@
 // * Cookies live in the profile itself. The legacy encrypted cookie jar of a
 //   0.3.4 install is imported **once**, into a profile that does not exist
 //   yet, through `Profile.getCookieManager()` (never the static
-//   `CookieManager.getInstance()`, which is the launcher's default profile),
-//   and only after every set-cookie callback and the blocking `flush()`
-//   completed — i.e. before the first navigation of that profile.
+//   `CookieManager.getInstance()`, which is the launcher's default profile).
+//   Success is strict: every `setCookie` callback accepted AND `flush()`
+//   completed before the WebView is constructed. Any rejection, exception,
+//   timeout or an already-existing profile fails the attempt with the
+//   `migration-partial` sentinel; Rust then retires that profile name
+//   (queue + generation bump) and retries on a virgin one. The legacy
+//   snapshot is only consumed after a real success.
 // * localStorage / IndexedDB snapshots are NOT imported: the old JSON dump
 //   was lossy (indexes, key paths, structured-clone values) and re-injecting
 //   it would recreate the cross-site TOCTOU problems this architecture
 //   removes. Rust deletes the migration flag once attempted; see
 //   `docs/android-storage-isolation.md`.
+//
+// FAILURE HANDLING
+// ----------------
+// The sequencing lives in `SiteProfileOps` (pure Kotlin, executed by the CI
+// unit tests). Invariants enforced here:
+// * normal close (`flush=true`) reports success only after the profile
+//   flush succeeded; a flush/resolve failure keeps the view AND the session
+//   ownership so Kotlin and Rust cannot disagree, and back/close is retryable;
+// * a failed open rolls back the view and releases the active slot (only if
+//   it still holds that view), so the next open never sees a stuck
+//   `ERR_ACTIVE_SITE`;
+// * Activity teardown schedules the flush on the background executor and
+//   never blocks the UI thread or claims durability it did not await;
+// * the launcher back hook only *starts* the normal `close_site` flow;
+//   Kotlin polls its status, surfaces failures with a native Toast (visible
+//   above the site view) and falls back to a native close when the launcher
+//   cannot answer.
 //
 // This file is a TEMPLATE-FREE copy: `scripts/android_prepare.py` copies it
 // verbatim next to the generated MainActivity.kt, like AnimeHubPlugin.kt.
@@ -39,9 +60,12 @@ package dev.animehub.app
 
 import android.app.Activity
 import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
@@ -55,6 +79,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
+import org.json.JSONTokener
 
 /**
  * Owns the site WebView: creation with its own profile, show/hide over the
@@ -63,12 +88,22 @@ import java.util.concurrent.Executors
  *
  * All WebView and ProfileStore work runs on the UI thread (both APIs are
  * `@UiThread`); the blocking `CookieManager.flush()` always runs on
- * [FLUSH_EXECUTOR], never on the UI thread.
+ * [FLUSH_EXECUTOR], never on the UI thread. Flow sequencing (close / clear /
+ * migration) lives in [SiteCloseFlow], [SiteClearFlow] and
+ * [SiteMigrationFlow]; this file only wires the Android ports.
  */
 object AnimeHubSiteController {
 
   /** Rejected-open sentinel; Rust maps it to the user-facing guidance. */
   const val ERR_UNSUPPORTED_MULTI_PROFILE = "unsupported-multi-profile"
+
+  /**
+   * The pending one-time migration could not complete against a virgin
+   * profile; Rust retires this profile name and retries later. Exact
+   * literal shared with `SiteProfileErrors.MIGRATION_RETRY` (the plugin
+   * crate asserts it against this source).
+   */
+  const val ERR_MIGRATION_RETRY = "migration-partial"
 
   /** Another site WebView is already attached (Rust serialises opens). */
   const val ERR_ACTIVE_SITE = "active-site-open"
@@ -85,13 +120,11 @@ object AnimeHubSiteController {
     Thread(runnable, "AnimeHubSiteFlush").apply { isDaemon = true }
   }
 
-  /** The live site WebView, if one is attached to the Activity. */
-  @Volatile
-  private var activeWebView: WeakReference<WebView>? = null
+  /** UI-thread scheduler for flow watchdogs and the back-status poll. */
+  private val mainHandler = Handler(Looper.getMainLooper())
 
-  /** Profile name of the active site WebView (mirrors the Rust session). */
-  @Volatile
-  private var activeProfileName: String? = null
+  /** The live site WebView + its profile, as one indivisible slot. */
+  private val active = SiteSessionState<WebView>()
 
   /** The launcher's Tauri/Wry WebView, for PiP re-binding and back fallback. */
   @Volatile
@@ -104,6 +137,14 @@ object AnimeHubSiteController {
   private var customView: View? = null
   private var customViewCallback: WebChromeClient.CustomViewCallback? = null
 
+  // Back-close handshake with the launcher JS (window.__animehubBack*).
+  private const val BACK_HOOK_SCRIPT =
+    "!!(window.__animehubBackToLauncher && (window.__animehubBackToLauncher(), true))"
+  private const val BACK_STATUS_SCRIPT =
+    "window.__animehubBackStatus ? window.__animehubBackStatus() : null"
+  private const val BACK_POLL_MS = 200L
+  private const val BACK_MAX_POLLS = 25
+
   // ------------------------------------------------------------------- state
 
   /** Remember the launcher WebView (`AnimeHubPlugin.load`). */
@@ -112,7 +153,7 @@ object AnimeHubSiteController {
   }
 
   /** The profile name of the open site, if any (used by delete guards). */
-  fun activeProfile(): String? = activeProfileName
+  fun activeProfile(): String? = active.activeProfile
 
   fun isSupported(): Boolean = WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
 
@@ -132,8 +173,9 @@ object AnimeHubSiteController {
    *
    * When [cookies] is non-empty and the profile does not exist yet (first
    * open after the 0.3.4 migration), the legacy jar is written into the
-   * profile's own cookie manager and flushed to disk before the WebView is
-   * even constructed.
+   * profile's own cookie manager with a strict success criterion and flushed
+   * to disk before the WebView is even constructed. A failed attempt reports
+   * [ERR_MIGRATION_RETRY] so Rust can retire the profile and retry.
    */
   fun open(
     activity: Activity,
@@ -156,7 +198,7 @@ object AnimeHubSiteController {
         onResult(false, "Android Activity artık kullanılamıyor")
         return@runOnUiThread
       }
-      if (activeWebView?.get() != null) {
+      if (active.hasActive()) {
         onResult(false, ERR_ACTIVE_SITE)
         return@runOnUiThread
       }
@@ -180,6 +222,8 @@ object AnimeHubSiteController {
    * One-time import of the legacy encrypted cookie jar into a *virgin*
    * profile. Existing profiles keep their own live cookies: their state is
    * authoritative and must never be overwritten by a stale snapshot.
+   * Anything short of a full, flushed success reports
+   * [ERR_MIGRATION_RETRY] — see [SiteMigrationFlow] for the criterion.
    */
   private fun migrateCookies(
     activity: Activity,
@@ -188,56 +232,73 @@ object AnimeHubSiteController {
     cookies: List<String>,
     onResult: (migrated: Boolean, error: String?) -> Unit,
   ) {
-    val store = ProfileStore.getInstance()
-    val existing = store.getProfile(profileName)
-    if (existing != null) {
-      // Profile already exists: nothing to migrate, do not touch its jar.
-      onResult(false, null)
-      return
+    val port = migrationPort(activity, url, profileName)
+    SiteMigrationFlow.run(cookies, port) { outcome ->
+      when (outcome) {
+        is MigrationOutcome.Complete -> {
+          AnimeHubDebugLog.add("cookie", "migrated into profile (${outcome.accepted} accepted)")
+          onResult(true, null)
+        }
+        MigrationOutcome.ProfileAlreadyExists -> {
+          AnimeHubDebugLog.add("cookie", "migration refused: profile already exists")
+          onResult(false, "$ERR_MIGRATION_RETRY: profil zaten mevcut")
+        }
+        is MigrationOutcome.Failed -> {
+          Log.w(LOG_TAG, "cookie migration failed: ${outcome.reason}")
+          AnimeHubDebugLog.add("cookie", "migration failed (${outcome.reason})")
+          onResult(false, "$ERR_MIGRATION_RETRY: ${outcome.reason}")
+        }
+      }
     }
-    val profile = store.getOrCreateProfile(profileName)
-    val manager: CookieManager = profile.cookieManager
-    var rejected = 0
-    fun setNext(index: Int) {
-      if (index >= cookies.size) {
-        // Every callback has fired; make the jar durable before the first
-        // navigation, then hand back to the UI thread for the WebView.
+  }
+
+  /** Android wiring for [SiteMigrationFlow]; callbacks land on the UI thread. */
+  private fun migrationPort(activity: Activity, url: String, profileName: String): SiteMigrationPort =
+    object : SiteMigrationPort {
+      private var manager: CookieManager? = null
+
+      override fun profileExists(): Boolean = ProfileStore.getInstance().getProfile(profileName) != null
+
+      override fun createProfile() {
+        val store = ProfileStore.getInstance()
+        manager = store.getOrCreateProfile(profileName).cookieManager
+      }
+
+      override fun setCookie(cookie: String, onAccepted: (Boolean) -> Unit) {
+        val m = manager ?: throw IllegalStateException("profil cookie yöneticisi yok")
+        m.setCookie(url, cookie) { accepted ->
+          activity.runOnUiThread { onAccepted(accepted == true) }
+        }
+      }
+
+      override fun flushCookies(onDone: (Throwable?) -> Unit) {
+        val m = manager ?: run {
+          activity.runOnUiThread { onDone(IllegalStateException("profil cookie yöneticisi yok")) }
+          return
+        }
         try {
           FLUSH_EXECUTOR.execute {
-            try {
-              manager.flush()
+            val error = try {
+              m.flush()
+              null
             } catch (e: Exception) {
-              activity.runOnUiThread {
-                onResult(false, "çerez aktarımı kalıcı hale getirilemedi: ${e.message}")
-              }
-              return@execute
+              e
             }
-            activity.runOnUiThread {
-              if (rejected > 0) {
-                Log.w(LOG_TAG, "profile cookie import rejected $rejected cookie(s)")
-              }
-              AnimeHubDebugLog.add("cookie", "migrated into profile ($rejected rejected)")
-              onResult(true, null)
-            }
+            activity.runOnUiThread { onDone(error) }
           }
         } catch (e: Exception) {
-          onResult(false, "çerez aktarımı kuyruğa alınamadı: ${e.message}")
+          activity.runOnUiThread { onDone(e) }
         }
-        return
       }
-      try {
-        manager.setCookie(url, cookies[index]) { accepted ->
-          activity.runOnUiThread {
-            if (accepted != true) rejected += 1
-            setNext(index + 1)
-          }
+
+      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+        try {
+          mainHandler.postDelayed({ onTimeout() }, millis)
+        } catch (_: Exception) {
+          // A dead looper only exists with a dead process; ignore.
         }
-      } catch (e: Exception) {
-        onResult(false, "çerez aktarımı başarısız: ${e.message}")
       }
     }
-    setNext(0)
-  }
 
   /** Construct, configure, attach and navigate the site WebView. UI thread. */
   private fun buildWebView(
@@ -299,8 +360,11 @@ object AnimeHubSiteController {
       // (8) Back button: history first, launcher second, never the task.
       ensureBackCallback(activity).isEnabled = true
 
-      activeWebView = WeakReference(webView)
-      activeProfileName = profileName
+      // (9) Claim the slot BEFORE navigating: from here on, any failure must
+      // release exactly this view (see the catch block).
+      if (!active.acquire(webView, profileName)) {
+        throw IllegalStateException("aktif site görünümü zaten var")
+      }
       AnimeHubDebugLog.add("site", "opened (migrated=$migrated)")
 
       webView.loadUrl(url)
@@ -318,8 +382,15 @@ object AnimeHubSiteController {
       } catch (_: Exception) {
         // Best effort; the Activity is likely going away anyway.
       }
-      if (backCallback?.isEnabled == true) backCallback?.isEnabled = false
-      launcherWebView?.get()?.let { launcher -> AnimeHubPipController.attach(activity, launcher) }
+      // Release the slot only if it still holds THIS view (a newer session
+      // must never be cleared by a stale failure), then restore global state
+      // — but only while no other site view is active.
+      if (webView != null) active.releaseIf(webView)
+      if (!active.hasActive()) {
+        if (backCallback?.isEnabled == true) backCallback?.isEnabled = false
+        exitCustomViewIfNeeded()
+        launcherWebView?.get()?.let { launcher -> AnimeHubPipController.attach(activity, launcher) }
+      }
       onResult(false, "site açılamadı: ${e.message}")
     }
   }
@@ -329,52 +400,70 @@ object AnimeHubSiteController {
   /**
    * Detach and destroy the active site WebView, restoring PiP and focus to
    * the launcher. With [flush] the profile's cookies are written to disk
-   * first (normal close); wipe paths pass `false` — their data is about to
-   * be cleared or deleted anyway. Idempotent: closing with no active site is
-   * a success, which is what keeps a stale Rust session harmless.
+   * first (normal close) and **failure keeps the view and the session
+   * ownership** — the caller (Rust `close_site`) must see the error so
+   * `current_site` and this slot never diverge, and the close can be
+   * retried. Wipe paths pass `false`: their data is about to be cleared or
+   * deleted anyway, so this branch never touches the flush path.
+   * Idempotent: closing with no active site is a success, which is what
+   * keeps a stale Rust session harmless.
    */
   fun close(activity: Activity, flush: Boolean, onResult: (error: String?) -> Unit) {
     activity.runOnUiThread {
-      val webView = activeWebView?.get()
-      val profileName = activeProfileName
-      if (webView == null) {
-        finishClose(activity, null)
-        onResult(null)
-        return@runOnUiThread
-      }
-      if (!flush || profileName == null) {
-        finishClose(activity, webView)
-        onResult(null)
-        return@runOnUiThread
-      }
-      val profile: Profile = try {
-        WebViewCompat.getProfile(webView)
-      } catch (e: Exception) {
-        finishClose(activity, webView)
-        onResult(null)
-        return@runOnUiThread
-      }
-      try {
-        FLUSH_EXECUTOR.execute {
-          try {
-            profile.cookieManager.flush()
-          } catch (e: Exception) {
-            Log.w(LOG_TAG, "profile cookie flush failed (${e.javaClass.simpleName})")
+      val port =
+        object : SiteClosePort {
+          override fun hasActiveView(): Boolean = active.hasActive()
+
+          override fun resolveProfileName(): Result<String> = runCatching {
+            val view = active.activeToken ?: error("aktif site görünümü yok")
+            WebViewCompat.getProfile(view).name
           }
-          activity.runOnUiThread {
-            finishClose(activity, webView)
-            onResult(null)
+
+          override fun flushCookies(profileName: String, onDone: (Throwable?) -> Unit) {
+            val view = active.activeToken
+            val profile =
+              try {
+                if (view != null) WebViewCompat.getProfile(view) else null
+              } catch (_: Exception) {
+                null
+              }
+            if (profile == null) {
+              onDone(IllegalStateException("profil çözümlenemedi"))
+              return
+            }
+            try {
+              FLUSH_EXECUTOR.execute {
+                val error = try {
+                  profile.cookieManager.flush()
+                  null
+                } catch (e: Exception) {
+                  e
+                }
+                activity.runOnUiThread { onDone(error) }
+              }
+            } catch (e: Exception) {
+              activity.runOnUiThread { onDone(e) }
+            }
+          }
+
+          override fun destroyActiveView() {
+            finishClose(activity)
           }
         }
-      } catch (e: Exception) {
-        finishClose(activity, webView)
-        onResult("çerez kalıcılığı kuyruğa alınamadı: ${e.message}")
+      SiteCloseFlow.run(port, flush) { error ->
+        if (error != null) {
+          Log.w(LOG_TAG, "site close refused: $error")
+          AnimeHubDebugLog.add("site", "close refused (${error.take(60)})")
+        }
+        onResult(error)
       }
     }
   }
 
   /** UI thread. Remove, destroy, re-bind PiP/focus to the launcher. */
-  private fun finishClose(activity: Activity, webView: WebView?) {
+  private fun finishClose(activity: Activity) {
+    val webView = active.activeToken
+    active.clear()
     if (webView != null) {
       try {
         (webView.parent as? ViewGroup)?.removeView(webView)
@@ -386,10 +475,6 @@ object AnimeHubSiteController {
       } catch (_: Exception) {
         // Destroying twice must never break the close path.
       }
-    }
-    if (activeWebView?.get() === webView || webView == null) {
-      activeWebView = null
-      activeProfileName = null
     }
     exitCustomViewIfNeeded()
     backCallback?.isEnabled = false
@@ -404,33 +489,43 @@ object AnimeHubSiteController {
   /** WryActivity pauses only its own WebView; the site view follows too. */
   fun onPause(activity: Activity) {
     if (!liveActivity(activity)) return
-    activeWebView?.get()?.onPause()
+    active.activeToken?.onPause()
   }
 
   fun onResume(activity: Activity) {
     if (!liveActivity(activity)) return
-    activeWebView?.get()?.onResume()
+    active.activeToken?.onResume()
   }
 
   /**
-   * Activity teardown: flush the site profile (same durability guarantee the
-   * launcher's onDestroy gives the default profile), then destroy the view.
-   * Never touches the default profile.
+   * Activity teardown: schedule the site profile's flush on the background
+   * executor (the same durability attempt the launcher's onDestroy gives the
+   * default profile), then destroy the view. The flush is **never awaited**
+   * and never runs on the UI thread — `flush()` may block on disk I/O — so
+   * this path makes no durability claim: the write either lands during the
+   * process's remaining lifetime or the periodic sync/normal close already
+   * persisted it earlier. Never touches the default profile.
    */
   fun destroy(activity: Activity) {
-    val webView = activeWebView?.get()
-    val profileName = activeProfileName
-    activeWebView = null
-    activeProfileName = null
+    val webView = active.activeToken
+    val profileName = active.clear()
     exitCustomViewIfNeeded()
     backCallback?.isEnabled = false
     if (webView == null) return
     if (profileName != null) {
       try {
         val profile = WebViewCompat.getProfile(webView)
-        profile.cookieManager.flush()
-      } catch (_: Exception) {
-        Log.w(LOG_TAG, "profile flush on destroy failed")
+        FLUSH_EXECUTOR.execute {
+          try {
+            profile.cookieManager.flush()
+            AnimeHubDebugLog.add("site", "destroy-time flush completed")
+          } catch (e: Exception) {
+            Log.w(LOG_TAG, "profile flush on destroy failed (${e.javaClass.simpleName})")
+            AnimeHubDebugLog.add("site", "destroy-time flush failed (${e.javaClass.simpleName})")
+          }
+        }
+      } catch (e: Exception) {
+        Log.w(LOG_TAG, "profile flush on destroy skipped (${e.javaClass.simpleName})")
       }
     }
     try {
@@ -443,7 +538,7 @@ object AnimeHubSiteController {
     } catch (_: Exception) {
       // Never crash teardown.
     }
-    AnimeHubDebugLog.add("site", "destroyed with activity")
+    AnimeHubDebugLog.add("site", "destroyed with activity (flush scheduled, not awaited)")
   }
 
   /**
@@ -459,7 +554,7 @@ object AnimeHubSiteController {
           exitCustomViewIfNeeded()
           return
         }
-        val webView = activeWebView?.get()
+        val webView = active.activeToken
         if (webView != null && webView.canGoBack()) {
           webView.goBack()
           return
@@ -482,57 +577,126 @@ object AnimeHubSiteController {
 
   /**
    * Preferred close path: ask the launcher page to run the normal
-   * `close_site` flow (Rust state, `animehub://site-closed`, cookie
-   * flush bookkeeping) by evaluating a launcher-side hook. If the launcher
-   * cannot answer, close directly — the Rust session may then be stale for a
-   * moment, which every Rust path re-checks against this controller.
+   * `close_site` flow (Rust state, `animehub://site-closed`, native view
+   * close through this controller) by evaluating the launcher-side hook.
+   * The hook only reports whether a close was *started* — it never claims
+   * success. Kotlin then polls `window.__animehubBackStatus()`:
+   *  * `closed` → Rust already drove the whole transition (view gone);
+   *  * `failed:<msg>` → surface it with a native Toast (the launcher's own
+   *    notice would sit *behind* the site view) and keep everything so the
+   *    next back press retries;
+   *  * `pending` → keep waiting within a budget (a flush may be slow);
+   *  * no answer → close natively through the same flush-first path.
+   * Every step re-checks that the captured view is still the active one, so
+   * a stale callback can never close a newer site.
    */
   private fun closeViaLauncher(activity: Activity) {
+    val captured = active.activeToken ?: return
     val launcher = launcherWebView?.get()
-    val script =
-      "!!(window.__animehubBackToLauncher && (window.__animehubBackToLauncher(), true))"
-    if (launcher == null) {
-      close(activity, flush = true) { }
+    if (launcher == null || launcher === captured) {
+      nativeFallbackClose(activity, captured)
       return
     }
     try {
-      launcher.evaluateJavascript(script) { result ->
-        if (result != "true") {
-          AnimeHubDebugLog.add("site", "launcher back hook unavailable; closed natively")
-          close(activity, flush = true) { }
+      launcher.evaluateJavascript(BACK_HOOK_SCRIPT) { result ->
+        if (result == "true") {
+          pollBackStatus(activity, launcher, captured, 0)
+        } else {
+          AnimeHubDebugLog.add("site", "launcher back hook unavailable; closing natively")
+          nativeFallbackClose(activity, captured)
         }
       }
     } catch (_: Exception) {
-      AnimeHubDebugLog.add("site", "launcher back hook failed; closed natively")
-      close(activity, flush = true) { }
+      AnimeHubDebugLog.add("site", "launcher back hook failed; closing natively")
+      nativeFallbackClose(activity, captured)
+    }
+  }
+
+  /** UI thread. One poll of the launcher close status; see [closeViaLauncher]. */
+  private fun pollBackStatus(activity: Activity, launcher: WebView, captured: WebView, attempt: Int) {
+    if (active.activeToken !== captured) return
+    try {
+      launcher.evaluateJavascript(BACK_STATUS_SCRIPT) { raw ->
+        if (active.activeToken !== captured) return@evaluateJavascript
+        val status =
+          try {
+            JSONTokener(raw).nextValue() as? String
+          } catch (_: Exception) {
+            null
+          }
+        when (SiteBackStatus.decide(status, attempt, BACK_MAX_POLLS)) {
+          BackCloseDecision.POLL ->
+            mainHandler.postDelayed({ pollBackStatus(activity, launcher, captured, attempt + 1) }, BACK_POLL_MS)
+          BackCloseDecision.CLOSED ->
+            AnimeHubDebugLog.add("site", "closed via launcher close_site flow")
+          BackCloseDecision.FAILED -> {
+            val message = SiteBackStatus.failureMessage(status)
+            AnimeHubDebugLog.add("site", "launcher close failed")
+            toast(activity, "Site kapatılamadı: $message — tekrar deneyebilirsiniz")
+          }
+          BackCloseDecision.FALLBACK -> nativeFallbackClose(activity, captured)
+          BackCloseDecision.GIVE_UP ->
+            AnimeHubDebugLog.add("site", "close still pending after poll budget")
+        }
+      }
+    } catch (_: Exception) {
+      nativeFallbackClose(activity, captured)
+    }
+  }
+
+  /**
+   * Direct flush-first close for when the launcher cannot run (or answer)
+   * the normal flow. Failures are surfaced with a Toast — never swallowed:
+   * the view stays open, the Rust session stays claimed and the user can
+   * retry from the back button.
+   */
+  private fun nativeFallbackClose(activity: Activity, captured: WebView) {
+    if (active.activeToken !== captured) return
+    close(activity, flush = true) { error ->
+      if (error != null) {
+        AnimeHubDebugLog.add("site", "native close failed")
+        toast(activity, "Site kapatılamadı: $error — tekrar deneyebilirsiniz")
+      }
+    }
+  }
+
+  /** A short system message — the only surface guaranteed above the site view. */
+  private fun toast(activity: Activity, message: String) {
+    try {
+      activity.runOnUiThread {
+        Toast.makeText(activity.applicationContext, message, Toast.LENGTH_LONG).show()
+      }
+    } catch (_: Exception) {
+      Log.w(LOG_TAG, "close-failure toast failed")
     }
   }
 
   // ----------------------------------------------------------- profile data
 
   /**
-   * Clear one site profile in place: cookies (profile manager, then flush),
-   * web storage and geolocation permissions. The profile itself survives, so
-   * the next open of the same site starts logged out without a delete/recreate
-   * race. HTTP cache and service-worker registrations are NOT part of this
-   * path — documented in docs/android-storage-isolation.md.
+   * Clear one site profile in place: profile cookies (`removeAllCookies`
+   * with its callback result checked), every stored geolocation permission
+   * (awaited), `WebStorage.deleteAllData()` and a final flush. The sequence,
+   * watchdogs and error aggregation live in [SiteClearFlow]; success is only
+   * reported when every required step completed, so Rust keeps its encrypted
+   * session blobs on any failure and the user can retry.
    *
-   * `deleted=false`-style states resolve normally: an absent profile is
-   * already clean. Unsupported providers resolve without touching anything
-   * (no profile data can be addressed through this API there); Rust logs it.
+   * The profile itself survives, so the next open of the same site starts
+   * logged out without a delete/recreate race. HTTP cache and
+   * service-worker registrations are NOT part of this path — no
+   * profile-scoped API clears them; documented in
+   * docs/android-storage-isolation.md.
+   *
+   * Unsupported providers report [SiteProfileErrors.UNSUPPORTED] — never a
+   * success over data this build cannot address.
    */
   fun clearProfileData(activity: Activity, profileName: String, onResult: (error: String?) -> Unit) {
     if (!profileNameIsValid(profileName)) {
       onResult("geçersiz profil adı")
       return
     }
-    if (activeProfileName == profileName) {
+    if (active.activeProfile == profileName) {
       onResult("aktif site verisi önce kapatılmalı")
-      return
-    }
-    if (!isSupported()) {
-      AnimeHubDebugLog.add("site", "clear skipped: profile feature unavailable")
-      onResult(null)
       return
     }
     activity.runOnUiThread {
@@ -540,46 +704,106 @@ object AnimeHubSiteController {
         onResult("Android Activity artık kullanılamıyor")
         return@runOnUiThread
       }
-      try {
-        val profile = ProfileStore.getInstance().getProfile(profileName)
-        if (profile == null) {
-          onResult(null)
-          return@runOnUiThread
-        }
-        val manager: CookieManager = profile.cookieManager
-        val storage = profile.webStorage
-        val geo: GeolocationPermissions = profile.geolocationPermissions
-        manager.removeAllCookies {
-          try {
-            geo.removeAll { }
-          } catch (_: Exception) {
-            // Geolocation permissions are best-effort; cookies and storage
-            // below are the contract.
+      val port =
+        object : SiteClearPort {
+          private var cached: Profile? = null
+
+          override fun profileExists(): Boolean {
+            val profile = ProfileStore.getInstance().getProfile(profileName) ?: return false
+            cached = profile
+            return true
           }
-          try {
-            storage.deleteAllData()
-          } catch (e: Exception) {
-            activity.runOnUiThread {
-              onResult("site deposu temizlenemedi: ${e.message}")
+
+          override fun removeAllCookies(onDone: (Boolean) -> Unit) {
+            val profile = cached
+            if (profile == null) {
+              onDone(false)
+              return
             }
-            return@removeAllCookies
-          }
-          try {
-            FLUSH_EXECUTOR.execute {
-              try {
-                manager.flush()
-              } catch (_: Exception) {
-                Log.w(LOG_TAG, "profile cookie flush after clear failed")
+            try {
+              profile.cookieManager.removeAllCookies { ok ->
+                activity.runOnUiThread { onDone(ok == true) }
               }
-              activity.runOnUiThread { onResult(null) }
+            } catch (_: Exception) {
+              activity.runOnUiThread { onDone(false) }
             }
-          } catch (e: Exception) {
-            activity.runOnUiThread { onResult("çerez temizliği kuyruğa alınamadı: ${e.message}") }
+          }
+
+          override fun deleteAllStorage() {
+            val profile = cached ?: error("profil yok")
+            profile.webStorage.deleteAllData()
+          }
+
+          override fun clearGeolocationPermissions(onDone: (Boolean) -> Unit) {
+            val profile = cached
+            if (profile == null) {
+              onDone(false)
+              return
+            }
+            val geo: GeolocationPermissions = profile.geolocationPermissions
+            try {
+              // `GeolocationPermissions` exposes no removeAll-with-callback;
+              // enumerate the stored origins (awaited), clear each one, and
+              // only then settle the step.
+              geo.getOrigins { origins ->
+                activity.runOnUiThread {
+                  try {
+                    if (origins != null) {
+                      for (origin in origins) geo.clear(origin)
+                    }
+                    onDone(true)
+                  } catch (_: Exception) {
+                    onDone(false)
+                  }
+                }
+              }
+            } catch (_: Exception) {
+              activity.runOnUiThread { onDone(false) }
+            }
+          }
+
+          override fun flushCookies(onDone: (Throwable?) -> Unit) {
+            val profile = cached
+            if (profile == null) {
+              onDone(IllegalStateException("profil yok"))
+              return
+            }
+            try {
+              FLUSH_EXECUTOR.execute {
+                val error = try {
+                  profile.cookieManager.flush()
+                  null
+                } catch (e: Exception) {
+                  e
+                }
+                activity.runOnUiThread { onDone(error) }
+              }
+            } catch (e: Exception) {
+              activity.runOnUiThread { onDone(e) }
+            }
+          }
+
+          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+            try {
+              mainHandler.postDelayed({ onTimeout() }, millis)
+            } catch (_: Exception) {
+              // Dead looper ⇒ dead process; nothing to time out.
+            }
           }
         }
-      } catch (e: Exception) {
-        Log.e(LOG_TAG, "profile clear failed (${e.javaClass.simpleName})")
-        onResult("site verisi temizlenemedi: ${e.message}")
+      SiteClearFlow.run(isSupported(), port) { error ->
+        when (error) {
+          null -> AnimeHubDebugLog.add("site", "profile data cleared")
+          SiteProfileErrors.UNSUPPORTED -> {
+            AnimeHubDebugLog.add("site", "clear refused: profile feature unavailable")
+            Log.w(LOG_TAG, "profile clear refused: MULTI_PROFILE unsupported")
+          }
+          else -> {
+            Log.w(LOG_TAG, "profile clear failed: $error")
+            AnimeHubDebugLog.add("site", "clear failed (${error.take(60)})")
+          }
+        }
+        onResult(error)
       }
     }
   }
@@ -587,16 +811,19 @@ object AnimeHubSiteController {
   /**
    * Delete a site profile's data.
    *
-   * Resolves `{deleted, pending}`:
+   * Resolves `{deleted, pending, error}`:
    *  * `deleted=true`  — the provider accepted the deletion (disk work may
    *    still finish asynchronously; Rust bumps the generation so the same
    *    name is never immediately recreated).
-   *  * `deleted=false, pending=false` — the profile does not exist (already
-   *    clean).
+   *  * `deleted=false, pending=false, error=null` — the profile does not
+   *    exist (already clean).
    *  * `deleted=false, pending=true` — the profile is loaded in this process
-   *    (Chromium refuses to delete an in-use context) or the provider does
-   *    not support the API right now. Rust queues the name and retries at
-   *    the next process start, before any site can open.
+   *    (Chromium refuses to delete an in-use context). Rust queues the name
+   *    and retries at the next process start, before any site can open, and
+   *    reports it as *deferred*, never as deleted.
+   *  * `deleted=false, pending=false, error=unsupported-multi-profile` — the
+   *    provider cannot address profiles at all. Distinct from deferred: Rust
+   *    reports the feature gap and queues nothing.
    *
    * Rejects (hard failure — the caller must NOT drop its record) for invalid
    * names, an active WebView on that profile, or unexpected exceptions.
@@ -606,13 +833,14 @@ object AnimeHubSiteController {
       onResult(false, false, "geçersiz profil adı")
       return
     }
-    if (activeProfileName == profileName) {
+    if (active.activeProfile == profileName) {
       onResult(false, false, "aktif site profili önce kapatılmalı")
       return
     }
     if (!isSupported()) {
-      // Profiles could only exist from an earlier provider build; retry later.
-      onResult(false, true, null)
+      // No profile can be addressed through this API — report the feature
+      // gap honestly instead of pretending a deletion was deferred.
+      onResult(false, false, ERR_UNSUPPORTED_MULTI_PROFILE)
       return
     }
     // NOTE: no getProfile/getOrCreateProfile here on purpose — merely loading
@@ -646,17 +874,18 @@ object AnimeHubSiteController {
 
   /** Durability hook for the periodic Rust session sync. */
   fun flush(activity: Activity, onResult: (error: String?) -> Unit) {
-    val webView = activeWebView?.get()
-    if (webView == null) {
+    val view = active.activeToken
+    if (view == null) {
       onResult(null)
       return
     }
-    val profile: Profile = try {
-      WebViewCompat.getProfile(webView)
-    } catch (_: Exception) {
-      onResult(null)
-      return
-    }
+    val profile: Profile =
+      try {
+        WebViewCompat.getProfile(view)
+      } catch (e: Exception) {
+        onResult("profil çözümlenemedi: ${e.message}")
+        return
+      }
     try {
       FLUSH_EXECUTOR.execute {
         try {
@@ -677,8 +906,8 @@ object AnimeHubSiteController {
   /**
    * `WebChromeClient` fullscreen video. The site view is hidden and the
    * player view is added above it; back exits fullscreen first (handled in
-   * [ensureBackCallback]). wry's own client declines custom views, so this is
-   * an intentional capability of the new site WebView, documented as such.
+   * [ensureBackCallback]). wry's own client declines custom views, so this
+   * is an intentional capability of the new site WebView, documented as such.
    */
   private class SiteChromeClient(
     private val onShow: (View, WebChromeClient.CustomViewCallback) -> Unit,
@@ -695,7 +924,7 @@ object AnimeHubSiteController {
 
   /** UI thread. Add the fullscreen player view above the (hidden) site view. */
   private fun enterCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
-    val activity = activeWebView?.get()?.context as? Activity
+    val activity = active.activeToken?.context as? Activity
     if (customView != null || activity == null) {
       callback.onCustomViewHidden()
       return
@@ -707,7 +936,7 @@ object AnimeHubSiteController {
       view,
       ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
     )
-    activeWebView?.get()?.visibility = View.INVISIBLE
+    active.activeToken?.visibility = View.INVISIBLE
   }
 
   /** Remove the fullscreen video view and reveal the site WebView again. */
@@ -721,7 +950,7 @@ object AnimeHubSiteController {
     } catch (_: Exception) {
       // Already gone with the Activity.
     }
-    activeWebView?.get()?.visibility = View.VISIBLE
+    active.activeToken?.visibility = View.VISIBLE
     try {
       callback?.onCustomViewHidden()
     } catch (_: Exception) {

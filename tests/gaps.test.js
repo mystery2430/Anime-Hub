@@ -72,7 +72,7 @@ test("CI android job builds and uploads an installable debug APK", () => {
 test("the obsolete Android storage-isolation warning is gone from the UI", () => {
   const ui = read(join(ROOT, "src/main.js"));
   const start = ui.indexOf("async function openSite(tile)");
-  const end = ui.indexOf("/** Ask the backend to close", start);
+  const end = ui.indexOf("export async function backToLauncher", start);
   assert.ok(start >= 0 && end > start, "openSite function should be present");
   const openSite = ui.slice(start, end);
   assert.equal(openSite.includes("opened.isolated"), false);
@@ -458,14 +458,22 @@ test("Android IPC is limited to the launcher origins and main frame, never a sit
 test("Android in-app log: one shared buffer, no site URLs or hosts in any line", () => {
   const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
   const pip = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
-  // The buffer lives in the copied plugin file, not in a new file android_prepare.py would skip.
-  assert.match(kt, /^object AnimeHubDebugLog \{/m);
+  const debugLog = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubDebugLog.kt"));
+  const controller = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubSiteController.kt"));
+  const prepare = read(join(ROOT, "scripts/android_prepare.py"));
+  // The buffer moved to its own file so the CI unit test compiles it — and
+  // android_prepare.py must copy that file or the APK would not build.
+  assert.match(debugLog, /^object AnimeHubDebugLog \{/m);
+  assert.equal(/^object AnimeHubDebugLog \{/m.test(kt), false, "buffer no longer in the plugin file");
+  assert.match(prepare, /"AnimeHubDebugLog"/, "the split buffer file must be copied");
   assert.doesNotMatch(pip, /object AnimeHubPipLog/);
+  // The @Command entry point stays on the plugin class (Tauri dispatches
+  // commands through the registered instance's methods only).
   assert.match(kt, /@Command\s+fun debug_log\(/);
   const rs = read(join(ROOT, "src-tauri/android-plugin/src/lib.rs"));
   assert.match(rs, /CMD_DEBUG_LOG: &str = "debug_log"/);
   // Every add() call: no URL, host, path or uri object in the message.
-  const calls = [...(kt + pip).matchAll(/AnimeHubDebugLog\.add\(([^\n]*)\)/g)].map((m) => m[1]);
+  const calls = [...(kt + pip + controller + debugLog).matchAll(/AnimeHubDebugLog\.add\(([^\n]*)\)/g)].map((m) => m[1]);
   assert.ok(calls.length >= 8, `expected the log calls, found ${calls.length}`);
   for (const args of calls) {
     assert.doesNotMatch(args, /\.host\b|\burl\b|\.path\b|\bhost\b|\buri\b(?!\.scheme\b)|\bbody\b/i, args);

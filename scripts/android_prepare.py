@@ -447,6 +447,25 @@ def prepare(root: Path, gen: Path) -> list[str]:
     else:
         notes.append(f"warning: SiteNavigationPolicy.kt not found at {site_policy_src}")
 
+    # Auxiliary units the bridge/controller depend on. They used to live
+    # INSIDE AnimeHubPlugin.kt; after the split each is its own file and is
+    # REQUIRED — without it neither the APK build nor the CI unit-test
+    # compile (which type-checks AnimeHubSiteController.kt against them)
+    # can resolve the references. Package-checked like the controller.
+    for aux in ("AnimeHubDebugLog", "SiteNavigationGuard", "SiteProfileOps"):
+        aux_src = kotlin_source(root, package, aux)
+        if not aux_src.is_file():
+            raise SystemExit(f"auxiliary Kotlin file not found at {aux_src}")
+        aux_pkg = package_of(aux_src)
+        if aux_pkg != package:
+            raise SystemExit(
+                f"Kotlin package {aux_pkg!r} != register_android_plugin package {package!r} "
+                f"({aux_src})"
+            )
+        aux_target = dest / f"{aux}.kt"
+        aux_target.write_text(aux_src.read_text(encoding="utf-8"), encoding="utf-8")
+        notes.append(f"copied {aux}.kt -> {aux_target}")
+
     # The PiP controller: Kotlin half (template) + the shared WebView JS.
     pip_js = read_pip_controller_js(root)
     pip_template = kotlin_source(root, package, PIP_CONTROLLER_CLASS)

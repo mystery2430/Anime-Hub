@@ -17,7 +17,8 @@ Rust: open_site → windows::open_site_window (android) ─ under ANDROID_SESSIO
         │  1. re-validate the registry snapshot
         │  2. close the outgoing site view (profile flushed, view destroyed)
         │  3. profile  = android_profile_name(site_id, generation)
-        │  4. one-time cookie migration (flag-gated), if any
+        │  4. one-time cookie migration (flag-gated, strict; a failed
+        │     attempt retires that virgin profile name and retries)
         ▼
 Kotlin: site_open → AnimeHubSiteController
         │  5. WebViewFeature.MULTI_PROFILE gate → refuse with a sentinel
@@ -65,6 +66,14 @@ site-<first 32 hex chars of SHA-256(site_id)>-g<generation>
   deletion that is still finishing (WebView profile deletion may complete
   asynchronously). The marker is deliberately *not* deleted with the session,
   so even a registry restored from an old backup cannot reuse a queued name.
+* Counter hardening (round 3): the bump uses `checked_add` — at `u32::MAX`
+  the operation refuses with an error instead of saturating (which would pin
+  the counter and reuse the exact queued name forever). A **corrupt** stored
+  value is never silently read as `0`: it is recovered to
+  `max(generation queued for this site) + 1` (0 only when nothing is queued)
+  and persisted immediately. On open, the stored name is additionally checked
+  against the queue and advanced past it (`resolve_queued_free_generation`)
+  before the profile name is derived.
 
 ### `WebViewFeature.MULTI_PROFILE` gate
 
@@ -105,11 +114,14 @@ the project actually resolves — one Kotlin family (2.1.20) for the APK build
 *and* for the CI unit-test run, which compiles this same generated project.
 Gradle 8.14.3 (template wrapper) and AGP 8.11.0 both support Kotlin 2.1.
 This is version alignment, not error suppression: nothing is excluded from
-either compile because of the metadata rule (the only source-set exclusion in
-CI is the pre-existing "pure Kotlin" isolation that removes files depending on
-the Tauri Android library — `AnimeHubPlugin.kt`, `MainActivity.kt`,
-`AnimeHubPipController.kt`, and now `AnimeHubSiteController.kt`, which
-references their symbols).
+either compile because of the metadata rule. The CI unit-test source-set
+isolation removes only the two Tauri-coupled files (`AnimeHubPlugin.kt` and
+the generated `MainActivity.kt`); the production chain —
+`AnimeHubSiteController.kt`, `AnimeHubPipController.kt`, the split
+`AnimeHubDebugLog.kt`/`SiteNavigationGuard.kt`, `SiteProfileOps.kt`,
+`SiteNavigationPolicy.kt`, `IpPolicy.kt` — **stays in the test compile**, so
+every CI run type-checks the real controller instead of trusting the
+APK-step logs.
 
 *Runtime* support depends on the device's WebView provider version, which is
 what the feature gate checks.
@@ -139,7 +151,7 @@ cookies are untouched.
 
 | 0.3.4 data | Migrated? | How / why |
 | --- | --- | --- |
-| Encrypted cookie jar (`cookies-<site_id>`) | **Yes, once** | On the first open of a site under the new version, while the profile does not exist yet: Rust reads the jar (expired cookies pruned), passes the `Set-Cookie` headers to `site_open`; Kotlin writes them through the **profile's** `Profile.getCookieManager()`, waits for every `setCookie` callback, `flush()`es to disk, and only then constructs the WebView and navigates. The `profilemig-<site_id>` flag is written after a successful open; a failed open is retried next time. An existing profile is never overwritten — its live cookies are authoritative. |
+| Encrypted cookie jar (`cookies-<site_id>`) | **Yes, once, strictly** | On the first open of a site under the new version, while the profile does not exist yet: Rust reads the jar (expired cookies pruned), passes the `Set-Cookie` headers to `site_open`; Kotlin writes them through the **profile's** `Profile.getCookieManager()` (never the static default-profile manager), waits for every `setCookie` callback **and** the background `flush()`, with per-cookie and flush timeouts — and only then constructs the WebView and navigates. The `profilemig-<site_id>` flag is written **only after that full success**. Any rejection, exception, lost callback, flush failure — or an already-existing profile, whose live cookies are authoritative and must not be overwritten — fails the attempt with the `migration-partial` sentinel: Rust queues that virgin name for deletion, bumps the generation and retries **once** on a fresh name; a second failure surfaces a visible, retryable error ("site çerezleri profiline taşınamadı …") with the flag and the jar **both kept**, so the next open starts the migration over. A partially imported profile can therefore never pass as complete, and the legacy jar survives until a real success (or until the user's own clear/remove drops it). |
 | `localStorage` snapshot (`localstorage-<site_id>`) | **No** | Only imported when origin verification, completion confirmation and data safety can all be guaranteed — they cannot be, without reviving the origin TOCTOU of the old import path (write lands in whichever document is loaded) and without keeping the JS-eval bridge this change deletes. The blobs are **kept on disk** (not deleted early) until the user clears or removes that site; they are simply never re-injected. |
 | IndexedDB snapshot (`indexeddb-<site_id>`) | **No, deliberately** | The dump was lossy (indexes, key paths, structured-clone/Blob values do not round-trip) and is never silently re-imported. Kept on disk like the localStorage snapshot, removed only by the user's own clear/delete. |
 
@@ -162,17 +174,40 @@ remove, no legacy data remains (`delete_site_session` also drops the
 | Clear all | active site closed | same in-place clear per registered site + orphan sweep over `ProfileStore.getAllProfileNames()`, restricted to `site-*` names not owned by the current registry | untouched |
 | App teardown | view destroyed, profile flushed | — | — |
 
-* `deleteProfile` outcomes: `deleted=true` → accepted (disk work may still be
-  finishing; generation bumps so the name is never immediately reused);
-  `deleted=false, pending=false` → profile absent (nothing to do);
-  `deleted=false, pending=true` → the profile is loaded in this process
-  (Chromium refuses to delete an in-use context) or the provider temporarily
-  lacks the API. Pending names go to the encrypted
-  `android-pending-profile-deletes` queue (deduped) and are drained **at the
-  next process start, before any site can open**. Anything still pending
-  stays queued; the clear-all orphan sweep is the second net.
-* A hard error (unexpected exception, invalid name, active view on that
-  profile) rejects: no success is reported and no record is dropped.
+* **One outcome vocabulary, backend to UI** (`remove_site` returns
+  `{profile: …}`; `clear_site_data` returns only on a verified clear):
+  * `deleted` — the provider accepted the deletion (disk work may still be
+    finishing; the generation bumps so the name is never immediately
+    reused) or the profile was already absent (nothing left behind);
+  * `deferred` — Chromium refused because the profile is loaded in this
+    process. The name goes to the encrypted
+    `android-pending-profile-deletes` queue (deduped) and drains **at the
+    next process start, before any site can open**; the UI says so
+    explicitly ("bir sonraki açılışta otomatik silinecek") — it is never
+    presented as an instant delete. Anything still pending stays queued;
+    the clear-all orphan sweep is the second net;
+  * `unsupported` — the provider has no profile API (feature gap). The
+    command **rejects** with the MULTI_PROFILE guidance, keeps the record
+    and queues nothing: a permanent feature gap is never disguised as
+    deferred-forever success;
+  * `hidden` — built-in site: hidden, profile kept;
+  * `notApplicable` — platforms without WebView profiles.
+  * `error` — invalid name, active view on that profile, an unexpected
+    exception, **or any incomplete clear step**: no success is reported and
+    no record/session blob is dropped.
+* **Clear coverage (what a success really means):** profile cookies
+  (`removeAllCookies` with the callback result checked), every stored
+  geolocation permission (enumerated via `getOrigins` and awaited —
+  `GeolocationPermissions` has no removeAll-with-callback), then
+  `WebStorage.deleteAllData()` (Web Storage + Web SQL), then a final
+  `flush()` — each awaited step has a watchdog and every step is attempted,
+  with the first error aggregated and returned. Rust keeps its encrypted
+  session blobs whenever that error is non-null, so a half-finished wipe is
+  retryable. **Not covered:** HTTP cache and service-worker registrations —
+  no profile-scoped API clears them without a delete/recreate of the whole
+  profile (deleting the profile *does* remove them; in-place clear keeps
+  the profile). Documented rather than approximated with a
+  default-profile-affecting call.
 * The default profile and the launcher's data are never part of any of these
   paths.
 
@@ -188,10 +223,20 @@ remove, no legacy data remains (`delete_site_session` also drops the
 * **Fullscreen video**: the site view implements `onShowCustomView`/
   `onHideCustomView` (wry's own client declines custom views — this is an
   intentional capability of the new view, not a port of launcher behaviour).
-  Back exits fullscreen first, then walks site history, then returns to the
-  launcher via the `window.__animehubBackToLauncher` hook (the normal
-  `close_site` flow), and only falls back to a native close if the launcher
-  cannot answer. The task is never finished from the site view.
+  Back exits fullscreen first, then walks site history, then asks the
+  launcher to run the normal `close_site` flow through
+  `window.__animehubBackToLauncher` — which returns whether a close session
+  *accepted* the request, never a bare success claim. Kotlin then polls
+  `window.__animehubBackStatus()` (~200 ms, bounded): `closed` means the
+  whole transition finished; `failed:<reason>` keeps the view and the session
+  ownership and surfaces the reason with a native Toast (the launcher's own
+  notice would sit behind the site view); `pending` keeps waiting (a flush
+  may be slow — no second close is started); no answer falls back to a
+  native flush-first close with an identity guard, and its failure is also
+  surfaced, not swallowed. The launcher JS keeps its label until the
+  `animehub://site-closed` event (ownership-checked) — there is no
+  `finally`-clear that would report success while Rust still holds the
+  session. The task is never finished from the site view.
 * **Navigation protection**: the site client is wrapped in the same
   `SiteNavigationGuard`/`SiteNavigationPolicy` as the launcher. The blocklist,
   DNS-rebinding, subframe, redirect and app-initiated-load gaps documented in
@@ -207,16 +252,48 @@ remove, no legacy data remains (`delete_site_session` also drops the
   `ANDROID_SESSION_LOCK`; the ownership check (`session_is_current`) gates the
   flush loop.
 
-Static coverage: `tests/android_isolation.test.js` (naming, gate ordering,
-setProfile ordering, migration order, removed machinery, deletion/queue
-ordering, back/PiP/IPC surface, dependency pin), `gaps.test.js` (prepare
-pipeline incl. the new controller copy and lifecycle hooks), Rust unit tests
-in `web/windows.rs` (name determinism/charset/uniqueness, generation
-round-trip, queue dedupe, migration flag), `android-plugin` crate tests
-(command surface + controller contract).
+**Behavioural coverage (mocks/injected callbacks, no new dependencies):**
+
+* `SiteProfileOpsTest.kt` (30 cases, executed by the CI Gradle unit-test
+  step against the real sequencing code in `SiteProfileOps.kt`): close
+  durability (flush failure keeps the view, resolve failure is an error,
+  exactly-once completion), clear verification (unsupported refuses without
+  touching ports, absent profile, full order, cookie/geo/storage/flush
+  failures each fail the clear while later steps still run, geolocation
+  watchdog on a lost callback, never a success after a failed flush),
+  the strict migration criterion (virgin-only, every cookie + flush,
+  rejection/exception/flush/watchdog failures, exactly-once),
+  session-slot rollback after a failed open (stale failure cannot clear a
+  newer session), and the back-status decision matrix. These catch the
+  real error paths A.1–A.5 were about; the controller only *wires* them.
+* `tests/back_close.test.js` (11 cases): the launcher close session —
+  label survives pending/failed closes (no `finally`-clear), failure
+  reason surfaced, no concurrent `close_site`, stale `site-closed` events
+  ignored, retry settles to `closed`.
+
+**Static/source coverage** (auxiliary only): `tests/android_isolation.test.js`
+(naming, gate ordering, setProfile ordering, migration order, removed
+machinery, deletion/queue ordering, back/PiP/IPC surface, dependency pin),
+`gaps.test.js` (prepare pipeline incl. the required copies of the split
+files), Rust unit tests in `web/windows.rs` (name determinism/charset/
+uniqueness, strict validator, byte-salvage of a corrupt queue + backup +
+repair, corrupt-generation recovery, `checked_add` refusal, queue
+resolution, round-trip/dedupe/migration flag), `commands.rs`
+(`profile_removal_for` mapping + serialized outcome names), `android-plugin`
+crate tests (command surface, controller contract, sentinel literals).
+State-machine coverage that needs a real device/provider (actual
+`ProfileStore` behaviour, real callback latencies) is **not** claimed here.
 
 ## Verification status (honest)
 
+* **Behaviour tests run in CI, device still untested.** The CI Kotlin
+  unit-test step executes `SiteProfileOpsTest` (and the policy test) against
+  the same generated project the APK uses — real flow code, fake ports — so
+  the close/clear/migration error paths above are *executed* on every run,
+  and the same step type-checks the production `AnimeHubSiteController.kt`
+  left in the source set. `tests/back_close.test.js` runs with `npm test`.
+  This is still not a device: provider-specific behaviour (real
+  `ProfileStore`/Chromium timing, MULTI_PROFILE absent) is untested here.
 * **Compiled, not device-tested.** The CI "Android compile (aarch64)" job
   builds the debug APK (Kotlin + Rust + Gradle), which proves the code
   compiles and links; it proves nothing about runtime behaviour. No physical

@@ -72,6 +72,14 @@ pub const CMD_SITE_PROFILE_NAMES: &str = "site_profile_names";
 /// shared profile.
 pub const MULTI_PROFILE_SENTINEL: &str = "unsupported-multi-profile";
 
+/// Kotlin's `SiteProfileErrors.MIGRATION_RETRY` / `ERR_MIGRATION_RETRY`.
+/// A bridge error containing this string means the one-time legacy-cookie
+/// import did NOT complete against a virgin profile (a cookie was rejected,
+/// an exception fired, or the flush never landed). The open flow retires
+/// that profile name and retries; callers must never treat such an attempt
+/// as success or as an already-migrated state.
+pub const MIGRATION_RETRY_SENTINEL: &str = "migration-partial";
+
 /// Alias under which the Kotlin side is registered.
 pub const PLUGIN_ALIAS: &str = "animehub-android";
 
@@ -180,6 +188,15 @@ pub struct SiteProfileNamesResult {
 pub fn is_unsupported_multi_profile(error: &Error) -> bool {
     match error {
         Error::Bridge(message) => message.contains(MULTI_PROFILE_SENTINEL),
+        _ => false,
+    }
+}
+
+/// See [`MIGRATION_RETRY_SENTINEL`]: an incomplete virgin-profile cookie
+/// migration that must be retired (queue + generation bump) and retried.
+pub fn is_migration_retry(error: &Error) -> bool {
+    match error {
+        Error::Bridge(message) => message.contains(MIGRATION_RETRY_SENTINEL),
         _ => false,
     }
 }
@@ -525,6 +542,12 @@ mod tests {
         assert_eq!(CMD_SITE_FLUSH, "site_flush");
         assert_eq!(CMD_SITE_PROFILE_NAMES, "site_profile_names");
         assert_eq!(MULTI_PROFILE_SENTINEL, "unsupported-multi-profile");
+        assert_eq!(MIGRATION_RETRY_SENTINEL, "migration-partial");
+        // The classifier must key off exactly the const Kotlin produces.
+        assert!(is_migration_retry(&Error::Bridge(
+            "migration-partial: çerez reddedildi (1/2)".into()
+        )));
+        assert!(!is_migration_retry(&Error::Bridge("something else".into())));
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
     }
 

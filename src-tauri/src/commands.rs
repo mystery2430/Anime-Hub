@@ -256,8 +256,52 @@ pub fn update_site(
     Ok(to_view(&site, false))
 }
 
+/// What happened to the site's *profile data* during `remove_site`.
+///
+/// One explicit vocabulary for Kotlin ⇄ Rust ⇄ JS, so the UI never has to
+/// infer an outcome from missing fields (A.8 delete/clear/UI contract):
+/// * `deleted`     — accepted now (disk work may finish asynchronously), or
+///                   absent (already clean);
+/// * `deferred`    — provider refused because the profile is loaded in this
+///                   process; the name is queued and retried at next start;
+/// * `unsupported` — the provider has no profile API (feature gap; the
+///                   command surfaces it as an error and keeps the record);
+/// * `hidden`      — builtin site: hidden, no profile to delete;
+/// * `notApplicable` — platforms without WebView profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProfileRemoval {
+    Deleted,
+    Deferred,
+    Unsupported,
+    Hidden,
+    NotApplicable,
+}
+
+/// `remove_site` result: registry/session success plus the profile outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RemoveSiteOutcome {
+    pub profile: ProfileRemoval,
+}
+
+/// Pure mapping from the bridge's delete action to the contract above —
+/// tested directly so a registry change can never be paired with a wrong
+/// outcome string. `Absent` means the profile was already clean, which the
+/// UI reports as `deleted` (nothing is left behind either way).
+pub fn profile_removal_for(action: crate::android_bridge::SiteProfileAction) -> ProfileRemoval {
+    use crate::android_bridge::SiteProfileAction;
+    match action {
+        SiteProfileAction::Deleted | SiteProfileAction::Absent => ProfileRemoval::Deleted,
+        SiteProfileAction::Pending => ProfileRemoval::Deferred,
+    }
+}
+
 #[tauri::command]
-pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub fn remove_site(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<RemoveSiteOutcome> {
     // Preserve the registry until the destructive cleanup succeeds, so a
     // failed close/delete does not orphan the tile. The whole sequence is
     // serialized by the desktop/android lifecycle lock (`DESKTOP` →
@@ -284,7 +328,9 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
             reg.remove(&id)?;
             drop(reg);
             persist_registry(&state)?;
-            return Ok(());
+            return Ok(RemoveSiteOutcome {
+                profile: ProfileRemoval::Hidden,
+            });
         }
         // User site: close, delete, then remove from registry. Close and
         // delete are done before the registry mutation so a failure keeps the
@@ -330,11 +376,17 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
                 Some(_) => {
                     reg.remove(&id)?;
                 }
-                None => return Ok(()),
+                None => {
+                    return Ok(RemoveSiteOutcome {
+                        profile: ProfileRemoval::Deleted,
+                    })
+                }
             }
         }
         persist_registry(&state)?;
-        Ok(())
+        Ok(RemoveSiteOutcome {
+            profile: ProfileRemoval::Deleted,
+        })
     }
     #[cfg(not(desktop))]
     {
@@ -355,8 +407,15 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
             reg.remove(&id)?;
             drop(reg);
             persist_registry(&state)?;
-            return Ok(());
+            return Ok(RemoveSiteOutcome {
+                profile: ProfileRemoval::Hidden,
+            });
         }
+        // Platform default for this block: no WebView profiles (iOS).
+        #[cfg(not(target_os = "android"))]
+        let profile_outcome = ProfileRemoval::NotApplicable;
+        #[cfg(target_os = "android")]
+        let profile_outcome;
         let should_close = {
             let cur = state
                 .current_site
@@ -372,25 +431,29 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
         }
         // Android: the site's data lives in its WebView profile. Delete the
         // profile *before* the registry mutation so a failure keeps the tile
-        // and the user can retry. `Pending` (profile loaded in this process,
-        // or a temporarily unsupported provider) is queued for the next
-        // process start and counts as progress, not failure. The generation
-        // bumps only after the delete was accepted/queued, so a subsequent
-        // open of this id derives a fresh name and can never collide with a
-        // deletion still finishing on disk; if the bump itself fails we abort
-        // with the registry intact (a retry re-attempts the same name, which
-        // is idempotent).
+        // and the user can retry. `Pending` (profile loaded in this process)
+        // is queued for the next process start and reported as `deferred` —
+        // never as deleted. An `unsupported-multi-profile` refusal (a
+        // provider feature gap) propagates as an error so the record stays
+        // and the UI shows the MULTI_PROFILE guidance; it must not be faked
+        // as deferred-forever success. The generation bumps only after the
+        // delete was accepted/queued, so a subsequent open of this id derives
+        // a fresh name and can never collide with a deletion still finishing
+        // on disk; if the bump itself fails we abort with the registry intact
+        // (a retry re-attempts the same name, which is idempotent).
         #[cfg(target_os = "android")]
         {
-            use crate::android_bridge::SiteProfileAction;
             use crate::web::windows as w;
             let generation = w::profile_generation(&state, &id)?;
             let profile = w::android_profile_name(&id, generation);
-            match crate::android_bridge::site_profile_delete(&profile)? {
-                SiteProfileAction::Pending => {
+            let action = crate::android_bridge::site_profile_delete(&profile)?;
+            profile_outcome = profile_removal_for(action);
+            match action {
+                crate::android_bridge::SiteProfileAction::Pending => {
                     w::queue_pending_profile_delete(&state, &profile)?;
                 }
-                SiteProfileAction::Deleted | SiteProfileAction::Absent => {}
+                crate::android_bridge::SiteProfileAction::Deleted
+                | crate::android_bridge::SiteProfileAction::Absent => {}
             }
             w::bump_profile_generation(&state, &id)?;
         }
@@ -401,12 +464,16 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
                 .lock()
                 .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
             if reg.get(&id).is_none() {
-                return Ok(());
+                return Ok(RemoveSiteOutcome {
+                    profile: profile_outcome,
+                });
             }
             reg.remove(&id)?;
         }
         persist_registry(&state)?;
-        Ok(())
+        Ok(RemoveSiteOutcome {
+            profile: profile_outcome,
+        })
     }
 }
 
@@ -1486,6 +1553,37 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn profile_removal_outcome_mapping_is_exact() {
+        use crate::android_bridge::SiteProfileAction;
+        // Absent means "already clean" — the UI contract reports it as
+        // deleted (nothing is left behind), never as deferred.
+        assert_eq!(
+            profile_removal_for(SiteProfileAction::Deleted),
+            ProfileRemoval::Deleted
+        );
+        assert_eq!(
+            profile_removal_for(SiteProfileAction::Absent),
+            ProfileRemoval::Deleted
+        );
+        assert_eq!(
+            profile_removal_for(SiteProfileAction::Pending),
+            ProfileRemoval::Deferred
+        );
+        // The serialized names the JS relies on (A.8 contract).
+        assert_eq!(serde_json::to_string(&ProfileRemoval::Deferred).unwrap(), "\"deferred\"");
+        assert_eq!(serde_json::to_string(&ProfileRemoval::Deleted).unwrap(), "\"deleted\"");
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Unsupported).unwrap(),
+            "\"unsupported\""
+        );
+        assert_eq!(serde_json::to_string(&ProfileRemoval::Hidden).unwrap(), "\"hidden\"");
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::NotApplicable).unwrap(),
+            "\"notApplicable\""
+        );
     }
 
     #[test]

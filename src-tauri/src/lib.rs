@@ -345,6 +345,16 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
                 // later start. Never reported to the user as deleted.
                 log::warn!("ertelenen profil silme bir kez daha ertelendi");
             }
+            Err(crate::error::AppError::Unsupported(_)) => {
+                // The provider has no profile API on this device: nothing
+                // will delete here until it does. Keep the name queued (so a
+                // later provider update can drain it) and continue — a
+                // feature gap must not abort the remaining names or be
+                // reported as success.
+                log::warn!(
+                    "ertelenen profil silme atlandı: sağlayıcı profilleri desteklemiyor ({name})"
+                );
+            }
             Err(e) => {
                 log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
                 return Ok(false);

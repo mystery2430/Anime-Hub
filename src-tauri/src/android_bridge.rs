@@ -54,9 +54,12 @@ pub enum SiteProfileAction {
     Deleted,
     /// No such profile — already clean.
     Absent,
-    /// Deletion could not run right now (loaded in this process, or the
-    /// provider does not support profiles). The caller queues the name and
-    /// retries at the next process start.
+    /// Deletion could not run right now because the profile is loaded in
+    /// this process. The caller queues the name and retries at the next
+    /// process start. A provider WITHOUT profile support no longer lands
+    /// here — Kotlin reports `unsupported-multi-profile` as an error and the
+    /// bridge classifies it as [`AppError::Unsupported`], a feature gap that
+    /// must never be presented as "deferred".
     Pending,
 }
 
@@ -96,25 +99,47 @@ pub fn site_close(flush: bool) -> AppResult<()> {
 
 /// Delete one site profile's data — never the default profile: Kotlin
 /// validates the name against `android_profile_name`'s exact shape.
+///
+/// `unsupported-multi-profile` classifies to [`AppError::Unsupported`] so
+/// callers can distinguish "feature gap" from "try again later".
 #[cfg(target_os = "android")]
 pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
-    let r = animehub_android::site_profile_delete(profile.to_string())
-        .map_err(|e| AppError::Other(e.to_string()))?;
-    if r.deleted {
-        Ok(SiteProfileAction::Deleted)
-    } else if r.pending {
-        Ok(SiteProfileAction::Pending)
-    } else {
-        Ok(SiteProfileAction::Absent)
+    match animehub_android::site_profile_delete(profile.to_string()) {
+        Ok(r) => {
+            if r.deleted {
+                Ok(SiteProfileAction::Deleted)
+            } else if r.pending {
+                Ok(SiteProfileAction::Pending)
+            } else {
+                Ok(SiteProfileAction::Absent)
+            }
+        }
+        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
+            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
+        )),
+        Err(e) => Err(AppError::Other(e.to_string())),
     }
 }
 
-/// Clear one site profile in place (cookies, web storage, permissions).
+/// Clear one site profile in place (cookies, web storage, geolocation
+/// permissions, storage, final flush).
+///
+/// The Kotlin flow only reports success when every required step completed
+/// (see `SiteClearFlow`); any failure — including the provider being unable
+/// to address profiles at all — propagates here as an error. `clear_site_data`
+/// therefore aborts BEFORE `delete_site_session`, so Rust's encrypted session
+/// blobs stay intact for a retry and a half-finished wipe is never surfaced
+/// as a false success. An `unsupported-multi-profile` result classifies to
+/// [`AppError::Unsupported`] with the user-facing MULTI_PROFILE guidance.
 #[cfg(target_os = "android")]
 pub fn site_clear_data(profile: &str) -> AppResult<()> {
-    animehub_android::site_clear_data(profile.to_string())
-        .map_err(|e| AppError::Other(e.to_string()))?;
-    Ok(())
+    match animehub_android::site_clear_data(profile.to_string()) {
+        Ok(_) => Ok(()),
+        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
+            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
+        )),
+        Err(e) => Err(AppError::Other(e.to_string())),
+    }
 }
 
 /// Flush the active site profile's cookie jar (periodic durability sync).

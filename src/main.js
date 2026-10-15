@@ -35,6 +35,7 @@ import {
   createSettingsFlow,
   switchStates,
 } from "./logic/settings_flow.js";
+import { createBackSession } from "./logic/back_close.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -129,6 +130,18 @@ const gridFor = (category) =>
 let editingId = null;
 /** Last site opened, so "back" knows what to close. */
 let openSiteLabel = null;
+
+/**
+ * Close session driving the Android back handshake
+ * (`window.__animehubBackToLauncher` / `__animehubBackStatus`). Keeps
+ * `openSiteLabel` honest across pending/failed closes — see
+ * `logic/back_close.js` for the contract with Kotlin's `SiteBackStatus`.
+ */
+const backSession = createBackSession({
+  call,
+  notify: (message) => showNotice(`Site kapatılamadı: ${message}`, "warn"),
+  errorText: errMessage,
+});
 
 // ---------------------------------------------------------------------------
 // Notices
@@ -314,21 +327,23 @@ async function openSite(tile) {
   try {
     const opened = await call("open_site", { id: tile.id });
     openSiteLabel = opened.label;
+    backSession.opened(opened.label, tile.id);
   } catch (e) {
     showNotice(errMessage(e));
   }
 }
 
-/** Ask the backend to close the site WebView and return to the launcher. */
+/**
+ * Ask the backend to close the site WebView and return to the launcher.
+ *
+ * The label is intentionally NOT cleared here: `close_site` may still be
+ * pending or may fail, and claiming success in a `finally` is exactly the
+ * A.5 divergence (JS idle, Rust still open). The session settles to
+ * `closed` only after the invoke resolves, to `failed:<reason>` otherwise,
+ * and the `animehub://site-closed` event performs the actual label clear.
+ */
 export async function backToLauncher() {
-  if (!openSiteLabel) return;
-  try {
-    await call("close_site", { label: openSiteLabel });
-  } catch (e) {
-    showNotice(errMessage(e));
-  } finally {
-    openSiteLabel = null;
-  }
+  backSession.requestClose();
 }
 
 /**
@@ -336,13 +351,19 @@ export async function backToLauncher() {
  * When the site WebView has no history left, the native side evaluates this
  * in the launcher so the normal `close_site` flow — Rust state, the
  * `animehub://site-closed` event, bookkeeping — runs exactly as if the user
- * had asked for it here. Returns whether the hook existed, so Kotlin can
- * fall back to a native close if the launcher ever cannot answer.
+ * had asked for it here.
+ *
+ * Returns whether a close session actually accepted the request (a label
+ * exists). Kotlin then polls `__animehubBackStatus()` for the real outcome:
+ * `pending` while the flow runs, `closed` on success, `failed:<reason>` on
+ * error (which it surfaces with a Toast — the launcher's own notice would
+ * sit behind the site view), or `idle` when there was nothing to close and
+ * it should fall back to a native close.
  */
-window.__animehubBackToLauncher = () => {
-  void backToLauncher();
-  return true;
-};
+window.__animehubBackToLauncher = () => backSession.requestClose().accepted;
+
+/** Status string consumed by Kotlin's `SiteBackStatus` poll. */
+window.__animehubBackStatus = () => backSession.statusString();
 
 // ---------------------------------------------------------------------------
 // Site add / edit / remove
@@ -520,8 +541,20 @@ async function removeSite(tile) {
   const verb = tile.builtin ? "gizlemek" : "silmek";
   if (!window.confirm(`"${tile.name}" kaydını ${verb} istiyor musunuz?`)) return;
   try {
-    await call("remove_site", { id: tile.id });
+    const result = await call("remove_site", { id: tile.id });
     await refreshLauncher();
+    // `remove_site` reports the profile outcome explicitly (A.8 contract):
+    // `deferred` is progress-with-retry (in-use profile, drained at next
+    // start) — say so instead of letting it pass as an instant delete.
+    // `unsupported` arrives as a rejection with the MULTI_PROFILE guidance
+    // (handled in catch), never as a silent success.
+    const outcome = result && typeof result === "object" ? result.profile : null;
+    if (outcome === "deferred") {
+      showNotice(
+        "Profil verisi şu an kullanımda; bir sonraki açılışta otomatik silinecek.",
+        "info",
+      );
+    }
   } catch (e) {
     showNotice(errMessage(e));
   }
@@ -1048,11 +1081,13 @@ async function wireBackendEvents() {
     void refreshAniListStatus();
     void refreshHero();
   });
-  // The Rust side can close a site on its own (the injected back button /
-  // Esc navigates to animehub://close-site, handled natively). Clear the
-  // label so the launcher's own "back" bookkeeping stays honest.
-  await on("animehub://site-closed", () => {
-    openSiteLabel = null;
+  // The Rust side emits this when the `close_site` flow actually finished
+  // (including closes started by the Android back hook). Clear the label
+  // ONLY for the site this session owns — a stale event from an earlier
+  // close must not orphan a newer one (A.5).
+  await on("animehub://site-closed", (payload) => {
+    const siteId = typeof payload === "string" ? payload : null;
+    if (backSession.closedByEvent(siteId)) openSiteLabel = null;
   });
 }
 
