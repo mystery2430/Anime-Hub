@@ -79,9 +79,9 @@ pub fn site_open(
         cookies.to_vec(),
     ) {
         Ok(r) => Ok(r.migrated),
-        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => {
-            Err(AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string()))
-        }
+        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
+            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
+        )),
         Err(e) => Err(AppError::Other(e.to_string())),
     }
 }

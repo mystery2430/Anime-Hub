@@ -158,9 +158,12 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(siteController, /WebViewFeature\.MULTI_PROFILE/);
     // Reproducible androidx.webkit pin (multi-profile needs it; the fakeGen
     // template ships no webkit line, so this also covers the append path).
+    // 1.15.0, not 1.16.0: 1.16.0 drags kotlin-stdlib 2.1.20 into the
+    // template's Kotlin 1.9 toolchain and the compile fails (CI-verified).
     const gradleFile = read(join(gen, "app/build.gradle.kts"));
-    assert.match(gradleFile, /implementation\("androidx\.webkit:webkit:1\.16\.0"\)/);
+    assert.match(gradleFile, /implementation\("androidx\.webkit:webkit:1\.15\.0"\)/);
     assert.equal(gradleFile.includes("webkit:1.14.0"), false);
+    assert.equal(gradleFile.includes("webkit:1.16.0"), false);
     assert.equal(gradleFile.split("androidx.webkit:webkit:").length, 1 + 1, "exactly one webkit dep");
 
     // IpPolicy.kt – saf IP mantigi, APK ve test ortak kullanir

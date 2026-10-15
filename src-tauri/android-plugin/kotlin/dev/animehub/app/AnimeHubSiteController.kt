@@ -44,7 +44,6 @@ import android.view.View
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import android.webkit.CookieManager
-import android.webkit.CustomViewCallback
 import android.webkit.GeolocationPermissions
 import android.webkit.WebChromeClient
 import android.webkit.WebView
@@ -103,7 +102,7 @@ object AnimeHubSiteController {
 
   /** Fullscreen video view currently shown by [SiteChromeClient]. */
   private var customView: View? = null
-  private var customViewCallback: CustomViewCallback? = null
+  private var customViewCallback: WebChromeClient.CustomViewCallback? = null
 
   // ------------------------------------------------------------------- state
 
@@ -272,7 +271,8 @@ object AnimeHubSiteController {
       // documented Android limitation.
       val evalOnPageStart = !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
       webView.webViewClient = SiteNavigationGuard(SiteWebViewClient(initScript, evalOnPageStart))
-      webView.webChromeClient = SiteChromeClient()
+      webView.webChromeClient =
+        SiteChromeClient({ view, callback -> enterCustomView(view, callback) }, { exitCustomViewIfNeeded() })
 
       // (5) Document-start script (cosmetic rules, popup guard, PiP
       // controller). Self-guarding, so the page-start fallback can never
@@ -680,30 +680,34 @@ object AnimeHubSiteController {
    * [ensureBackCallback]). wry's own client declines custom views, so this is
    * an intentional capability of the new site WebView, documented as such.
    */
-  private inner class SiteChromeClient : WebChromeClient() {
-    override fun onShowCustomView(view: View, callback: CustomViewCallback) {
-      val activity = activeWebView?.get()?.context as? Activity
-      if (customView != null) {
-        callback.onCustomViewHidden()
-        return
-      }
-      if (activity == null) {
-        callback.onCustomViewHidden()
-        return
-      }
-      customView = view
-      customViewCallback = callback
-      val content = activity.findViewById<ViewGroup>(android.R.id.content)
-      content.addView(
-        view,
-        ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
-      )
-      activeWebView?.get()?.visibility = View.INVISIBLE
+  private class SiteChromeClient(
+    private val onShow: (View, WebChromeClient.CustomViewCallback) -> Unit,
+    private val onHide: () -> Unit,
+  ) : WebChromeClient() {
+    override fun onShowCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
+      onShow(view, callback)
     }
 
     override fun onHideCustomView() {
-      exitCustomViewIfNeeded()
+      onHide()
     }
+  }
+
+  /** UI thread. Add the fullscreen player view above the (hidden) site view. */
+  private fun enterCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
+    val activity = activeWebView?.get()?.context as? Activity
+    if (customView != null || activity == null) {
+      callback.onCustomViewHidden()
+      return
+    }
+    customView = view
+    customViewCallback = callback
+    val content = activity.findViewById<ViewGroup>(android.R.id.content)
+    content.addView(
+      view,
+      ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
+    )
+    activeWebView?.get()?.visibility = View.INVISIBLE
   }
 
   /** Remove the fullscreen video view and reveal the site WebView again. */

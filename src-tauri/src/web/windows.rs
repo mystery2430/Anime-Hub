@@ -50,9 +50,9 @@ use crate::web::dns::{classify_host, DnsClass};
 // are never snapshotted.
 #[cfg(mobile)]
 use crate::web::session::restore;
-use crate::web::session::{profile_dir_name, CookieJar};
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
+use crate::web::session::{profile_dir_name, CookieJar};
 use tauri::{AppHandle, Emitter, Manager};
 #[cfg(desktop)]
 use tauri::{LogicalPosition, PhysicalPosition, Position, Size, WebviewUrl};
@@ -1358,8 +1358,13 @@ mod tests {
         // Conservative charset the WebView provider accepts anywhere, and
         // never the raw id: sanitised/odd ids must not change that shape.
         assert!(name.starts_with("site-"));
-        assert!(name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
-        assert_eq!(android_profile_name("../../etc/passwd", 0).len(), name.len());
+        assert!(name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert_eq!(
+            android_profile_name("../../etc/passwd", 0).len(),
+            name.len()
+        );
         // Not derived from the URL or display name: only site_id matters.
         assert_eq!(name, android_profile_name("builtin-openanime", 0));
         // Never the default profile's name.
@@ -1379,8 +1384,14 @@ mod tests {
         assert_ne!(b, c);
         // The generation distinguishes re-created profiles from names whose
         // deletion may still be finishing on disk.
-        assert_ne!(android_profile_name("user-1", 0), android_profile_name("user-1", 1));
-        assert_eq!(android_profile_name("user-1", 1), android_profile_name("user-1", 1));
+        assert_ne!(
+            android_profile_name("user-1", 0),
+            android_profile_name("user-1", 1)
+        );
+        assert_eq!(
+            android_profile_name("user-1", 1),
+            android_profile_name("user-1", 1)
+        );
     }
 
     #[test]
@@ -1424,23 +1435,19 @@ mod tests {
             "fresh site has not migrated"
         );
         mark_migration_done(&state, id).unwrap();
-        assert!(
-            state
-                .provider
-                .get_secret(&format!("profilemig-{id}"))
-                .unwrap()
-                .is_some()
-        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
         // Clearing/removing the site deletes the flag with the rest of the
         // session data, so a wiped site never re-imports its wiped jar.
         state.provider.delete_site_session(id).unwrap();
-        assert!(
-            state
-                .provider
-                .get_secret(&format!("profilemig-{id}"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -84,13 +84,21 @@ removes.
 
 ### Dependency pin
 
-`scripts/android_prepare.py` pins `androidx.webkit:webkit:1.16.0` in the
+`scripts/android_prepare.py` pins `androidx.webkit:webkit:1.15.0` in the
 generated `app/build.gradle.kts` (replacing whatever the `tauri android init`
-template shipped, idempotently — never stacking a second dependency). 1.16.0
-is the current stable (May 2026), minSdk 24 (the app pins `minSdkVersion: 26`
-in `tauri.conf.json`); no RC/alpha. The multi-profile APIs themselves have
-been stable since androidx.webkit 1.9.0; *runtime* support depends on the
-device's WebView provider version, which is what the feature gate checks.
+template shipped, idempotently — never stacking a second dependency), minSdk
+24 against the app's pinned `minSdkVersion: 26`; no RC/alpha.
+
+**Why not 1.16.0** (checked against the published POMs, and reproduced by CI):
+1.16.0 declares `org.jetbrains.kotlin:kotlin-stdlib:2.1.20`, which Gradle's
+highest-wins resolution forces onto the generated project; the template's
+Kotlin 1.9 compiler cannot read Kotlin 2.1 metadata and the build fails with
+*"Module was compiled with an incompatible version of Kotlin"*. 1.15.0 (and
+1.14.0, the template's own version) declare no `kotlin-stdlib` at all, so
+**1.15.0 is the highest stable, conflict-free release** — and every
+multi-profile API this app uses has been stable since androidx.webkit 1.9.0.
+*Runtime* support depends on the device's WebView provider version, which is
+what the feature gate checks.
 
 ## What was removed
 

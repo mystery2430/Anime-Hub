@@ -49,13 +49,20 @@ SITE_CONTROLLER_CLASS = "AnimeHubSiteController"
 # Kotlin template -> generated controller, and the JS that fills its placeholder.
 PIP_CONTROLLER_CLASS = "AnimeHubPipController"
 # androidx.webkit pin: multi-profile (WebViewCompat.setProfile / ProfileStore,
-# stable since androidx.webkit 1.9.0) plus the current stable release. The
-# Tauri template ships its own version of this dependency; this script
-# *replaces* it (or adds it once) so the build does not depend on which CLI
-# version generated the project. 1.16.0 is stable, requires minSdk 24, and the
-# app pins minSdk 26 in tauri.conf.json — no RC/alpha, no version conflict
-# left to Gradle's highest-wins tie-breaking.
-WEBKIT_PIN = 'implementation("androidx.webkit:webkit:1.16.0")'
+# stable since androidx.webkit 1.9.0 — every API this app uses). The Tauri
+# template ships its own version of this dependency; this script *replaces*
+# it (or adds it once) so the build does not depend on which CLI version
+# generated the project.
+#
+# Why 1.15.0 and not the newer 1.16.0 (checked against the published POMs,
+# 2026-10-15): 1.16.0 declares org.jetbrains.kotlin:kotlin-stdlib:2.1.20,
+# which Gradle's highest-wins resolution forces onto the generated project —
+# and its Kotlin 2.1 metadata cannot be read by the template's Kotlin 1.9
+# compiler ("Module was compiled with an incompatible version of Kotlin",
+# CI failure). 1.15.0 and 1.14.0 declare no kotlin-stdlib at all; 1.15.0 is
+# therefore the highest stable, conflict-free release. minSdk 24 fits the
+# app's pinned minSdk 26. No RC/alpha.
+WEBKIT_PIN = 'implementation("androidx.webkit:webkit:1.15.0")'
 WEBKIT_DEP_RE = re.compile(r'implementation\(\s*"androidx\.webkit:webkit:[^"]+"\s*\)')
 PIP_CONTROLLER_JS_REL = ("src-tauri", "src", "web", "pip_controller.js")
 PIP_CONTROLLER_KT_REL = ("src-tauri", "android-plugin", "kotlin")
@@ -479,7 +486,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
     # so the build must not depend on whichever version the generated
     # template happened to ship.
     if WEBKIT_PIN in text:
-        notes.append("androidx.webkit already pinned to 1.16.0")
+        notes.append("androidx.webkit already pinned to 1.15.0")
     else:
         pinned, replaced = WEBKIT_DEP_RE.subn(WEBKIT_PIN, text)
         if replaced == 0:
@@ -491,7 +498,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
                 pinned += "\ndependencies {\n    " + WEBKIT_PIN + "\n}\n"
         text = pinned
         gradle_changed = True
-        notes.append("pinned androidx.webkit:webkit:1.16.0 (multi-profile)")
+        notes.append("pinned androidx.webkit:webkit:1.15.0 (multi-profile)")
 
     if SIGN_MARKER in text:
         notes.append(f"signing config already present in {gradle}")

@@ -638,8 +638,7 @@ mod tests {
 
     #[test]
     fn site_controller_enforces_the_multi_profile_contract() {
-        let controller =
-            include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
+        let controller = include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
         // Runtime support check before anything else happens on open.
         assert!(
             controller.contains("WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)"),
