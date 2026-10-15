@@ -29,11 +29,15 @@ a maintainer. Publication runs only on successful main CI, never on PR code.
 
 ## Required release disclosures
 
-No physical Android test was performed for v0.3.3. Compile/test success does not
-prove PiP, IPC, navigation, persistence or performance on a device. Android
-provider-to-provider same-origin localStorage/IndexedDB isolation is **not
-guaranteed**; best-effort transfer is not a security boundary or lossless backup.
-Android navigation lacks blocklist/DNS-rebinding/subframe/app-load coverage.
+No physical Android test was performed for v0.3.3 or the per-site-profile
+change that followed it. Compile/test success does not prove PiP, IPC,
+navigation, persistence or performance on a device. Android isolation now runs
+on per-site WebView profiles (`WebViewFeature.MULTI_PROFILE`, runtime-checked;
+unsupported providers refuse the open — see
+`docs/android-storage-isolation.md` for what migrates and what a device must
+still verify: A-write/B-absent at the same origin, cookie non-mixing,
+clear/delete leaving the launcher untouched, back/PiP ladders). Android
+navigation still lacks blocklist/DNS-rebinding/subframe/app-load coverage.
 Windows packages remain unsigned without signing credentials. Real Linux Secret
 Service behavior still needs manual validation. Cargo advisory warnings, if any,
 must be reported separately from a successful audit exit status.

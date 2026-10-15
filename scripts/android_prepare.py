@@ -9,12 +9,19 @@ classes, the PiP lifecycle on the generated `MainActivity` and
 Three things are generated into the app package:
 
 1. `AnimeHubPlugin.kt` — copied verbatim from `android-plugin/kotlin/`.
-2. `AnimeHubPipController.kt` — a template whose
+2. `AnimeHubSiteController.kt` — the per-site WebView + androidx.webkit
+   profile controller, copied verbatim. Required: `AnimeHubPlugin.kt` routes
+   every `site_*` command through it, so a missing file would only fail the
+   Kotlin compile.
+3. `AnimeHubPipController.kt` — a template whose
    `__ANIMEHUB_PIP_CONTROLLER_JS__` placeholder is filled with the *same*
    `src-tauri/src/web/pip_controller.js` that Rust injects into site pages, so
    the WebView-side controller cannot drift between the two consumers.
-3. the PiP lifecycle block inside the generated `MainActivity.kt`, delimited by
-   markers and replaced on every run.
+4. the PiP/site-WebView lifecycle block inside the generated `MainActivity.kt`,
+   delimited by markers and replaced on every run.
+5. a reproducible `androidx.webkit:webkit:1.16.0` dependency pin in
+   `app/build.gradle.kts` (multi-profile APIs; the template's own version is
+   replaced, never stacked).
 
 `src-tauri/gen/android` is generated: never edit those files by hand, re-run
 this script instead.
@@ -37,8 +44,19 @@ from pathlib import Path
 
 PIP_ATTR = 'android:supportsPictureInPicture="true"'
 SIGN_MARKER = "AnimeHub release signing"
+# Required verbatim copies next to MainActivity (package-checked).
+SITE_CONTROLLER_CLASS = "AnimeHubSiteController"
 # Kotlin template -> generated controller, and the JS that fills its placeholder.
 PIP_CONTROLLER_CLASS = "AnimeHubPipController"
+# androidx.webkit pin: multi-profile (WebViewCompat.setProfile / ProfileStore,
+# stable since androidx.webkit 1.9.0) plus the current stable release. The
+# Tauri template ships its own version of this dependency; this script
+# *replaces* it (or adds it once) so the build does not depend on which CLI
+# version generated the project. 1.16.0 is stable, requires minSdk 24, and the
+# app pins minSdk 26 in tauri.conf.json — no RC/alpha, no version conflict
+# left to Gradle's highest-wins tie-breaking.
+WEBKIT_PIN = 'implementation("androidx.webkit:webkit:1.16.0")'
+WEBKIT_DEP_RE = re.compile(r'implementation\(\s*"androidx\.webkit:webkit:[^"]+"\s*\)')
 PIP_CONTROLLER_JS_REL = ("src-tauri", "src", "web", "pip_controller.js")
 PIP_CONTROLLER_KT_REL = ("src-tauri", "android-plugin", "kotlin")
 PIP_JS_PLACEHOLDER = "__ANIMEHUB_PIP_CONTROLLER_JS__"
@@ -204,7 +222,9 @@ def pip_lifecycle_block() -> str:
 
   override fun onWebViewCreate(webView: WebView) {{
     super.onWebViewCreate(webView)
-    // The Tauri/Wry WebView is the one the launcher and every site page share.
+    // This is the launcher's Tauri/Wry WebView: default profile, launcher
+    // origin only. Sites open in their own profiled WebViews above it and
+    // re-bind PiP themselves (AnimeHubSiteController).
     AnimeHubPipController.attach(this, webView)
   }}
 
@@ -254,14 +274,27 @@ def pip_lifecycle_block() -> str:
   }}
 
   override fun onPause() {{
-    // WryActivity.onPause() pauses the WebView; in PiP it must keep rendering.
+    // WryActivity.onPause() pauses the launcher WebView; the site WebView
+    // (when one is attached) must pause with the Activity too — unless the
+    // Activity is in PiP, where the visible page has to keep rendering.
     super.onPause()
+    AnimeHubSiteController.onPause(this)
     if (isInPictureInPictureMode) {{
       AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
     }}
   }}
 
+  override fun onResume() {{
+    super.onResume()
+    // Pair of the site-WebView pause above. WryActivity.onResume() already
+    // resumed the launcher WebView.
+    AnimeHubSiteController.onResume(this)
+  }}
+
   override fun onDestroy() {{
+    // Site WebView first: flush its profile cookies and destroy the view
+    // while the Activity is still whole, then unbind PiP from it.
+    AnimeHubSiteController.destroy(this)
     AnimeHubPipController.detach(this)
     super.onDestroy()
     if (isFinishing) {{
@@ -371,6 +404,23 @@ def prepare(root: Path, gen: Path) -> list[str]:
     else:
         notes.append(f"warning: IpPolicy.kt not found at {ip_policy_src}")
 
+    # The per-site WebView/profile controller: required, the plugin's site
+    # commands have no other implementation.
+    site_controller_src = kotlin_source(root, package, SITE_CONTROLLER_CLASS)
+    if not site_controller_src.is_file():
+        raise SystemExit(f"site controller not found at {site_controller_src}")
+    site_controller_pkg = package_of(site_controller_src)
+    if site_controller_pkg != package:
+        raise SystemExit(
+            f"Kotlin package {site_controller_pkg!r} != register_android_plugin package {package!r} "
+            f"({site_controller_src})"
+        )
+    site_controller_target = dest / f"{SITE_CONTROLLER_CLASS}.kt"
+    site_controller_target.write_text(
+        site_controller_src.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    notes.append(f"copied {SITE_CONTROLLER_CLASS}.kt -> {site_controller_target}")
+
     site_policy_src = kotlin_source(root, package, "SiteNavigationPolicy")
     if site_policy_src.is_file():
         site_target = dest / "SiteNavigationPolicy.kt"
@@ -422,13 +472,37 @@ def prepare(root: Path, gen: Path) -> list[str]:
 
     gradle = gen / "app" / "build.gradle.kts"
     text = gradle.read_text(encoding="utf-8")
+    gradle_changed = False
+
+    # Reproducible androidx.webkit pin: the multi-profile APIs the site
+    # controller needs are versioned with this library (stable since 1.9.0),
+    # so the build must not depend on whichever version the generated
+    # template happened to ship.
+    if WEBKIT_PIN in text:
+        notes.append("androidx.webkit already pinned to 1.16.0")
+    else:
+        pinned, replaced = WEBKIT_DEP_RE.subn(WEBKIT_PIN, text)
+        if replaced == 0:
+            if "dependencies {" in pinned:
+                pinned = pinned.replace(
+                    "dependencies {", "dependencies {\n    " + WEBKIT_PIN, 1
+                )
+            else:
+                pinned += "\ndependencies {\n    " + WEBKIT_PIN + "\n}\n"
+        text = pinned
+        gradle_changed = True
+        notes.append("pinned androidx.webkit:webkit:1.16.0 (multi-profile)")
+
     if SIGN_MARKER in text:
         notes.append(f"signing config already present in {gradle}")
     else:
         if "import java.util.Properties" not in text:
             text = "import java.util.Properties\n" + text
-        gradle.write_text(text + SIGN_BLOCK, encoding="utf-8")
+        text = text + SIGN_BLOCK
+        gradle_changed = True
         notes.append(f"injected release signing config into {gradle}")
+    if gradle_changed:
+        gradle.write_text(text, encoding="utf-8")
     return notes
 
 

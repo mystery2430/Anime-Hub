@@ -8,17 +8,22 @@
 //! so cookies, localStorage, IndexedDB and cache never cross between sites.
 //!
 //! ## Android
-//! The system WebView has **no** per-profile data directory API, so a
-//! directory-per-site partition is impossible. Instead we partition by
-//! *swapping the cookie jar*: on opening a site we export the previous site's
-//! cookies into its encrypted blob, wipe the live jar, and restore the target
-//! site's cookies. Login state (which is cookie-borne on every site in scope)
-//! is therefore isolated.
-//!
-//! **Documented limitation:** on Android, `localStorage` / IndexedDB / cache
-//! are shared between sites because the platform offers no way to partition
-//! them. Sites that keep auth state in `localStorage` would leak it. This is
-//! surfaced in the About screen rather than hidden.
+//! The launcher keeps Tauri/Wry's single WebView on the **default** profile.
+//! Sites open in a *separate* native WebView above it, bound to their own
+//! persistent androidx.webkit profile (`WebViewCompat.setProfile`, assigned
+//! before any other WebView API call and before the first navigation), so
+//! cookies, localStorage, IndexedDB and cache are partitioned per `site_id` —
+//! including between two sites that share an origin. The legacy cookie-jar
+//! swap and the JSON localStorage/IndexedDB snapshot export/import are gone:
+//! profiles persist by themselves, the dump was never a security boundary,
+//! and re-injecting it would revive the origin TOCTOU it had. One migration
+//! remains: the 0.3.4 encrypted cookie jar is imported once into a *virgin*
+//! profile's own `CookieManager` before that profile's first navigation.
+//! Providers without `WebViewFeature.MULTI_PROFILE` refuse the open outright —
+//! there is no silent fallback to the shared profile. Profile names derive
+//! from the registered `site_id` only (see `web/windows.rs`:
+//! `android_profile_name`), never from the URL or display name. See
+//! `docs/android-storage-isolation.md`.
 
 use crate::error::AppError;
 use crate::sites::blocklist::Blocklist;
@@ -424,7 +429,7 @@ pub fn ensure_profile_dir(
     Ok(dir)
 }
 
-/// Which site a session belongs to, for the cookie-swap path.
+/// Which site a session belongs to (ownership checks for open/close/wipe).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     pub site_id: String,

@@ -36,8 +36,8 @@ pub struct AppState {
     /// Which site currently owns the WebView session.
     ///
     /// On desktop this names the extra window; on Android it names the site
-    /// whose cookies are currently loaded into the single shared WebView, so
-    /// `open_site` knows which jar to export before swapping.
+    /// whose profiled WebView is currently attached above the launcher, so
+    /// open/close/wipe/flush all serialize against the same fact.
     pub current_site: Mutex<Option<CurrentSite>>,
     /// Serialize Picture-in-Picture native applies (startup vs toggle, and
     /// rapid toggles). `set_pip_auto_enter` and the startup thread both hold
@@ -370,6 +370,30 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
             #[cfg(not(target_os = "android"))]
             crate::web::windows::close_site_window_for_clear(&app, &id)?;
         }
+        // Android: the site's data lives in its WebView profile. Delete the
+        // profile *before* the registry mutation so a failure keeps the tile
+        // and the user can retry. `Pending` (profile loaded in this process,
+        // or a temporarily unsupported provider) is queued for the next
+        // process start and counts as progress, not failure. The generation
+        // bumps only after the delete was accepted/queued, so a subsequent
+        // open of this id derives a fresh name and can never collide with a
+        // deletion still finishing on disk; if the bump itself fails we abort
+        // with the registry intact (a retry re-attempts the same name, which
+        // is idempotent).
+        #[cfg(target_os = "android")]
+        {
+            use crate::android_bridge::SiteProfileAction;
+            use crate::web::windows as w;
+            let generation = w::profile_generation(&state, &id)?;
+            let profile = w::android_profile_name(&id, generation);
+            match crate::android_bridge::site_profile_delete(&profile)? {
+                SiteProfileAction::Pending => {
+                    w::queue_pending_profile_delete(&state, &profile)?;
+                }
+                SiteProfileAction::Deleted | SiteProfileAction::Absent => {}
+            }
+            w::bump_profile_generation(&state, &id)?;
+        }
         state.provider.delete_site_session(&id)?;
         {
             let mut reg = state
@@ -405,7 +429,9 @@ pub fn set_site_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> 
 /// Open a site in its own isolated, full-screen WebView.
 ///
 /// Desktop: a new window with a per-site profile directory.
-/// Android: the main WebView is navigated, with the cookie jar swapped first.
+/// Android: a separate native WebView above the launcher, bound to its own
+/// androidx.webkit profile (refused outright when the provider lacks
+/// `MULTI_PROFILE`).
 #[tauri::command]
 pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     let (site, settings) = {
@@ -471,22 +497,27 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     .map(|label| OpenedSite {
         label,
         mobile: cfg!(any(target_os = "android", target_os = "ios")),
-        isolated: !cfg!(any(target_os = "android", target_os = "ios")),
+        // Android now gives real per-site isolation (one WebView profile per
+        // site); iOS still shares the single WebView.
+        isolated: !cfg!(target_os = "ios"),
     })
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenedSite {
-    /// Window label (desktop) or `"main"` (mobile).
+    /// Window label (desktop) or the site label (mobile bookkeeping).
     pub label: String,
     pub mobile: bool,
-    /// Whether this platform gives true per-site storage isolation.
-    /// `false` on Android — see `web::session` for why.
+    /// Whether this platform gives true per-site storage isolation: per-site
+    /// profile directories on desktop, per-site WebView profiles on Android,
+    /// single shared WebView on iOS.
     pub isolated: bool,
 }
 
-/// Close a site session and persist its cookie jar (mobile cookie-swap path).
+/// Close a site session. Mobile keeps the shared WebView's jar (iOS) or
+/// flushes/destroys the site's profiled WebView (Android); desktop removes
+/// the child WebView.
 #[tauri::command]
 pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
     windows::close_site_window(&app, &label)
@@ -499,8 +530,10 @@ pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
 /// the wipe atomic with respect to the live WebView: on desktop the profile
 /// directory is deleted only after the WebView is closed *without* exporting
 /// its live cookies, and the whole close+delete sequence is serialized
-/// against the periodic sync via the desktop session lock. On Android the
-/// shared CookieManager is cleared while holding the Android session lock.
+/// against the periodic sync via the desktop session lock. On Android each
+/// target site's profile is cleared in place (profile cookie manager +
+/// web storage) while holding the Android session lock; the launcher's
+/// default profile and its data are never touched.
 #[tauri::command]
 pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u32> {
     // `is_all` captures whether the caller asked for "all sites" before `id`
@@ -554,11 +587,10 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
         if clear_live {
             if let Some(active) = current_snapshot {
                 crate::web::windows::close_site_window_for_clear_locked(&app, &active.site_id)?;
-            } else {
-                // `all_sites` with no active session: still clear the shared
-                // CookieManager so no stale cookies survive.
-                crate::android_bridge::webview_cookies_clear()?;
             }
+            // No `else`: with no active site view there is no shared jar to
+            // clear any more — site cookies live in per-site profiles, and
+            // the launcher's default profile is never part of a site wipe.
         }
     }
     #[cfg(desktop)]
@@ -593,8 +625,52 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     }
     let mut n = 0;
     for id in &ids {
+        // Android: clear the site's profile in place — its own cookie
+        // manager, web storage and permissions. The profile object itself
+        // survives, so the next open starts logged out without a
+        // delete/recreate race. An absent profile is already clean; a hard
+        // failure aborts so the caller never sees a false success.
+        #[cfg(target_os = "android")]
+        {
+            let generation = windows::profile_generation(&state, id)?;
+            let profile = windows::android_profile_name(id, generation);
+            crate::android_bridge::site_clear_data(&profile)?;
+        }
         state.provider.delete_site_session(id)?;
         n += 1;
+    }
+    // Android orphan sweep for "clear all": profile names that no registered
+    // site currently owns (an interrupted remove, an old generation, an
+    // imported registry). Mirrors the desktop `profiles/site-*` sweep — only
+    // names in our namespace are ever addressed, the live site view was
+    // closed above, and `Pending` results are queued instead of dropped.
+    #[cfg(target_os = "android")]
+    if is_all {
+        use crate::android_bridge::SiteProfileAction;
+        let mut owned = std::collections::HashSet::new();
+        {
+            let reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            for site in reg.sites.iter() {
+                let generation = windows::profile_generation(&state, &site.id)?;
+                owned.insert(windows::android_profile_name(&site.id, generation));
+            }
+        }
+        for name in crate::android_bridge::site_profile_names()? {
+            if !name.starts_with(windows::ANDROID_PROFILE_PREFIX) || owned.contains(&name) {
+                continue;
+            }
+            match crate::android_bridge::site_profile_delete(&name)? {
+                SiteProfileAction::Pending => {
+                    windows::queue_pending_profile_delete(&state, &name)?;
+                }
+                SiteProfileAction::Deleted | SiteProfileAction::Absent => {
+                    log::info!("yetim site profili temizlendi");
+                }
+            }
+        }
     }
     // Desktop profile directories hold the real cookie DB. A missing
     // directory is success; a failed delete is not. This runs only on
@@ -1343,7 +1419,6 @@ pub fn app_info(app: AppHandle) -> AppResult<AppInfo> {
         key_backend_os_backed: state.provider.backend().is_os_backed(),
         webview: webview_name(),
         anilist_configured: s.anilist.is_configured(),
-        android_isolation_note: cfg!(target_os = "android"),
     })
 }
 
@@ -1357,9 +1432,6 @@ pub struct AppInfo {
     pub key_backend_os_backed: bool,
     pub webview: String,
     pub anilist_configured: bool,
-    /// `true` on Android, where cookie jars are swapped but same-origin
-    /// localStorage/IndexedDB provider isolation remains unresolved.
-    pub android_isolation_note: bool,
 }
 
 pub fn platform_name() -> String {

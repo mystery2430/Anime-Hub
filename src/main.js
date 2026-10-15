@@ -331,6 +331,19 @@ export async function backToLauncher() {
   }
 }
 
+/**
+ * Android system-back hook (`AnimeHubSiteController.closeViaLauncher`).
+ * When the site WebView has no history left, the native side evaluates this
+ * in the launcher so the normal `close_site` flow — Rust state, the
+ * `animehub://site-closed` event, bookkeeping — runs exactly as if the user
+ * had asked for it here. Returns whether the hook existed, so Kotlin can
+ * fall back to a native close if the launcher ever cannot answer.
+ */
+window.__animehubBackToLauncher = () => {
+  void backToLauncher();
+  return true;
+};
+
 // ---------------------------------------------------------------------------
 // Site add / edit / remove
 // ---------------------------------------------------------------------------
@@ -905,13 +918,6 @@ async function openAbout() {
       "AniList",
       info.anilistConfigured ? "Yerel entegrasyon etkin" : "Yapılandırılmamış (WebView)",
     );
-    if (info.androidIsolationNote) {
-      appendAboutRow(
-        "Oturum izolasyonu",
-        "Android: çerez kavanozu site geçişlerinde değiştirilir; aynı kaynaklı localStorage/IndexedDB yalıtımı henüz çözülmedi.",
-        true,
-      );
-    }
     appendAboutRow("Lisans", "MIT");
   } catch (e) {
     el.aboutList.textContent = "";

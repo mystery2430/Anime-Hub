@@ -69,7 +69,7 @@ test("CI android job builds and uploads an installable debug APK", () => {
   assert.match(yml, /actions\/upload-artifact@v7/);
 });
 
-test("opening an Android site no longer shows the storage-isolation toast", () => {
+test("the obsolete Android storage-isolation warning is gone from the UI", () => {
   const ui = read(join(ROOT, "src/main.js"));
   const start = ui.indexOf("async function openSite(tile)");
   const end = ui.indexOf("/** Ask the backend to close", start);
@@ -77,7 +77,14 @@ test("opening an Android site no longer shows the storage-isolation toast", () =
   const openSite = ui.slice(start, end);
   assert.equal(openSite.includes("opened.isolated"), false);
   assert.equal(openSite.includes("şifreli blob'lara aktarılır"), false);
-  assert.match(ui, /aynı kaynaklı localStorage\/IndexedDB yalıtımı henüz çözülmedi/);
+  // Android now isolates per site through WebView profiles, so the old
+  // "same-origin isolation not yet solved" claim must not reappear anywhere,
+  // and the flag that surfaced it was removed with the claim.
+  assert.equal(
+    ui.includes("aynı kaynaklı localStorage/IndexedDB yalıtımı henüz çözülmedi"),
+    false,
+  );
+  assert.equal(ui.includes("androidIsolationNote"), false);
 });
 
 // The file `tauri android init` writes (crates/tauri-cli/templates/mobile/
@@ -141,6 +148,21 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     const kt = read(join(gen, "app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt"));
     assert.match(kt, /^package dev\.animehub\.app$/m);
     assert.match(kt, /fun keystore_seal/);
+    // The site-profile controller is required: AnimeHubPlugin's site_*
+    // commands have no other implementation.
+    const siteController = read(
+      join(gen, "app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt"),
+    );
+    assert.match(siteController, /^package dev\.animehub\.app$/m);
+    assert.match(siteController, /object AnimeHubSiteController/);
+    assert.match(siteController, /WebViewFeature\.MULTI_PROFILE/);
+    // Reproducible androidx.webkit pin (multi-profile needs it; the fakeGen
+    // template ships no webkit line, so this also covers the append path).
+    const gradleFile = read(join(gen, "app/build.gradle.kts"));
+    assert.match(gradleFile, /implementation\("androidx\.webkit:webkit:1\.16\.0"\)/);
+    assert.equal(gradleFile.includes("webkit:1.14.0"), false);
+    assert.equal(gradleFile.split("androidx.webkit:webkit:").length, 1 + 1, "exactly one webkit dep");
+
     // IpPolicy.kt – saf IP mantigi, APK ve test ortak kullanir
     const ipPolicy = read(join(gen, "app/src/main/java/dev/animehub/app/IpPolicy.kt"));
     assert.match(ipPolicy, /^package dev\.animehub\.app$/m);
@@ -182,9 +204,17 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(activity, /override fun onPictureInPictureRequested\(\): Boolean/);
     assert.match(activity, /override fun onUserLeaveHint\(\)/);
     assert.match(activity, /onPictureInPictureModeChanged\(/);
-    // WryActivity.onPause() pauses the WebView; PiP must keep it rendering.
+    // WryActivity.onPause() pauses the launcher WebView; the site view
+    // follows the Activity lifecycle, and PiP keeps rendering.
     assert.match(activity, /override fun onPause\(\)/);
     assert.match(activity, /keepRenderingInPip\(/);
+    assert.match(activity, /override fun onResume\(\)/);
+    assert.match(activity, /AnimeHubSiteController\.onPause\(this\)/);
+    assert.match(activity, /AnimeHubSiteController\.onResume\(this\)/);
+    // Site view torn down (profile flushed) before PiP unbind on destroy.
+    const destroyAt = activity.indexOf("AnimeHubSiteController.destroy(this)");
+    const detachAt = activity.indexOf("AnimeHubPipController.detach(this)");
+    assert.ok(destroyAt > 0 && destroyAt < detachAt);
     // A finished Activity leaves Tauri's per-process state stale: end the process.
     assert.match(activity, /if \(isFinishing\) \{/);
     assert.match(activity, /android\.os\.Process\.killProcess\(android\.os\.Process\.myPid\(\)\)/);

@@ -373,7 +373,11 @@ impl SecretProvider for AndroidStore {
         let _guard = crate::secure::store::STORE_LOCK
             .lock()
             .map_err(|_| crate::error::AppError::Storage("kilit alınamadı".into()))?;
-        for kind in ["cookies", "localstorage", "indexeddb"] {
+        // Keep the kind list in step with `SecureStore::delete_site_session`:
+        // legacy blobs plus the profile-migration flag; the generation
+        // counter (`profilegen-*`) intentionally survives so a stale registry
+        // can never re-open an already-deleted profile name.
+        for kind in ["cookies", "localstorage", "indexeddb", "profilemig"] {
             let name = format!("{kind}-{site_id}");
             let path = self.path_for(&store::secret_file_name(&name));
             match std::fs::remove_file(&path) {

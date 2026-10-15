@@ -47,6 +47,12 @@ pub enum AppError {
     #[error("Beklenmeyen hata: {0}")]
     Other(String),
 
+    /// A platform/feature the current environment cannot provide (e.g. a
+    /// WebView provider without `MULTI_PROFILE`). The message is written to
+    /// be shown to the user as-is.
+    #[error("{0}")]
+    Unsupported(String),
+
     /// A tile photo the user attached. The message is already safe to show.
     #[error("{0}")]
     Icon(String),
@@ -78,6 +84,7 @@ impl AppError {
             AppError::Unauthorized => "unauthorized",
             AppError::Network(_) => "network",
             AppError::Other(_) => "other",
+            AppError::Unsupported(_) => "unsupported",
             AppError::Icon(_) => "icon",
         }
     }

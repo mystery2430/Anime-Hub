@@ -303,7 +303,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 |---|---|---|---|
 | 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Releases sayfasındaki paketler CI sürümünde üretildi |
 | 🪟 **Windows** | ✅ Doğrulandı | `.exe` (NSIS) | DPAPI + WebView2 profili; kurulum Windows üzerinde elle doğrulandı |
-| 🤖 **Android** | ⚠️ CI derlemesi; fiziksel test yok | 3 ABI için imzalı `.apk` | CookieManager çerez kavanozu takası; aynı-origin localStorage/IndexedDB sağlayıcı yalıtımı çözülmedi |
+| 🤖 **Android** | ⚠️ CI derlemesi; fiziksel test yok | 3 ABI için imzalı `.apk` | Site başına ayrı WebView profili (androidx.webkit MULTI_PROFILE): çerez/localStorage/IndexedDB site bazında izole; sağlayıcı `MULTI_PROFILE` desteklemiyorsa site açılmaz ve hata gösterilir |
 | 🍎 **macOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 | 🍏 **iOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 

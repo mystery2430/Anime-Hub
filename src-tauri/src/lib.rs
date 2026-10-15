@@ -215,6 +215,48 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         pip_generation: AtomicU64::new(0),
     });
 
+    // Android: finish deferred profile deletions before the frontend can
+    // open anything (see `drain_pending_profile_deletes`). A throwaway
+    // thread, like the PiP startup apply: the Kotlin bridge may not answer
+    // in the first moments of the process, so failures are retried a few
+    // times and then left for the next start — the queue never loses an
+    // entry because of a slow boot.
+    #[cfg(target_os = "android")]
+    {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+            for attempt in 0..8 {
+                let stop = match handle.try_state::<AppState>() {
+                    Some(state) => match crate::web::windows::lock_android_session() {
+                        Ok(_guard) => match drain_pending_profile_deletes(&state) {
+                            Ok(done) => done,
+                            Err(e) => {
+                                // Storage failure: retrying now would fail the
+                                // same way; the queue stays for the next start.
+                                log::error!("ertelenen profil silmeleri okunamadı: {e}");
+                                true
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("ertelenen profil silmeleri kilitlenemedi: {e}");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if stop {
+                    return;
+                }
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+            log::warn!(
+                "ertelenen profil silmeleri bu açılışta işlenemedi; sonraki açılışta yeniden denenecek"
+            );
+        });
+    }
+
     // Route the OAuth redirect into the login command on every platform.
     //
     // On desktop the scheme is not registered by the OS installer, so do it
@@ -267,6 +309,49 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     Ok(())
+}
+
+/// Drain the deferred Android profile-deletion queue for one round.
+///
+/// Returns `Ok(true)` when the queue needs no further attempts this process
+/// (emptied, or the remainder only awaits a later start), `Ok(false)` when
+/// the plugin bridge was not ready yet and the caller should retry.
+///
+/// Chromium refuses to delete a profile that is loaded in the current
+/// process (`AwBrowserContextStore::Delete` returns in-use), and a provider
+/// without `MULTI_PROFILE` cannot delete at all — both outcomes were queued
+/// by `remove_site` instead of being reported as a success. Draining runs at
+/// startup *before* any site can open, so a queued name can never be
+/// re-created while its on-disk deletion is still pending. A name that still
+/// refuses to delete stays queued; the "clear all" orphan sweep in
+/// `clear_site_data` is the second safety net.
+#[cfg(target_os = "android")]
+fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult<bool> {
+    use crate::android_bridge::SiteProfileAction;
+    use crate::web::windows as w;
+    let pending = w::read_pending_profile_deletes(state)?;
+    if pending.is_empty() {
+        return Ok(true);
+    }
+    log::info!("ertelenen profil silmeleri deneniyor: {}", pending.len());
+    for name in &pending {
+        match crate::android_bridge::site_profile_delete(name) {
+            Ok(SiteProfileAction::Deleted) | Ok(SiteProfileAction::Absent) => {
+                w::forget_pending_profile_delete(state, name)?;
+                log::info!("ertelenen profil verisi silindi");
+            }
+            Ok(SiteProfileAction::Pending) => {
+                // Still in use or still unsupported: keep it queued for a
+                // later start. Never reported to the user as deleted.
+                log::warn!("ertelenen profil silme bir kez daha ertelendi");
+            }
+            Err(e) => {
+                log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Choose the secret backend for this platform.

@@ -7,13 +7,12 @@
 //!   key is never present in this process.
 //! * **Picture-in-Picture** — `PictureInPictureParams` /
 //!   `enterPictureInPictureMode()` live on the host `Activity`.
-//! * **Per-site cookies** — Android's shared `CookieManager` is read and
-//!   replaced through a null-safe, callback-aware Kotlin API.
-//! * **Per-site WebView storage** — on Android the system WebView has no
-//!   per-profile data directory, so `localStorage` / IndexedDB are
-//!   exported/imported (and Keystore-sealed) from Kotlin via
-//!   `evaluateJavascript`, the only synchronous-enough channel the app has
-//!   into the shared WebView.
+//! * **Per-site WebView profiles** — each registered site opens in its own
+//!   native WebView bound to its own androidx.webkit `Profile` (own
+//!   localStorage, IndexedDB, cookies), through the `site_*` commands. The
+//!   Kotlin half refuses to open when the WebView provider lacks
+//!   `WebViewFeature.MULTI_PROFILE` — there is no silent fallback to the
+//!   shared default profile.
 //!
 //! The Kotlin half lives at
 //! `src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt` and is
@@ -38,20 +37,14 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Shape returned by the Kotlin Keystore/storage-export functions.
+/// Shape returned by the Kotlin Keystore functions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeystoreResult {
     pub value: String,
 }
 
-/// Shape returned by Kotlin commands that provide a plain string value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StringResult {
-    pub value: String,
-}
-
-/// Shape returned by the Kotlin storage-import, cookie-replace and PiP functions.
+/// Shape returned by Kotlin commands that report a boolean outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OkResult {
     pub ok: bool,
@@ -66,12 +59,18 @@ pub const CMD_KEYSTORE_OPEN: &str = "keystore_open";
 pub const CMD_ENTER_PIP: &str = "enter_pip";
 pub const CMD_SET_PIP_AUTO_ENTER: &str = "set_pip_auto_enter";
 pub const CMD_DEBUG_LOG: &str = "debug_log";
-pub const CMD_LOCALSTORAGE_EXPORT: &str = "localstorage_export";
-pub const CMD_LOCALSTORAGE_IMPORT: &str = "localstorage_import";
-pub const CMD_INDEXEDDB_EXPORT: &str = "indexeddb_export";
-pub const CMD_INDEXEDDB_IMPORT: &str = "indexeddb_import";
-pub const CMD_WEBVIEW_COOKIES_GET: &str = "webview_cookies_get";
-pub const CMD_WEBVIEW_COOKIES_REPLACE: &str = "webview_cookies_replace";
+pub const CMD_SITE_OPEN: &str = "site_open";
+pub const CMD_SITE_CLOSE: &str = "site_close";
+pub const CMD_SITE_PROFILE_DELETE: &str = "site_profile_delete";
+pub const CMD_SITE_CLEAR_DATA: &str = "site_clear_data";
+pub const CMD_SITE_FLUSH: &str = "site_flush";
+pub const CMD_SITE_PROFILE_NAMES: &str = "site_profile_names";
+
+/// Kotlin's `AnimeHubSiteController.ERR_UNSUPPORTED_MULTI_PROFILE`. A bridge
+/// error containing this string means the WebView provider cannot isolate
+/// sites; callers must surface user-facing guidance, never retry on the
+/// shared profile.
+pub const MULTI_PROFILE_SENTINEL: &str = "unsupported-multi-profile";
 
 /// Alias under which the Kotlin side is registered.
 pub const PLUGIN_ALIAS: &str = "animehub-android";
@@ -117,106 +116,166 @@ pub fn keystore_open(purpose: String, sealed: String) -> Result<KeystoreResult> 
     }
 }
 
-/// Export the shared WebView's `localStorage` as Keystore-sealed base64.
+// ---------------------------------------------------------------------------
+// Per-site WebView profile commands (Android only).
+// ---------------------------------------------------------------------------
+
+/// Wire format for `site_open`.
 ///
-/// Blocks until the page's JS has been evaluated and the blob sealed, so the
-/// caller can rely on the export being complete when this returns. The page
-/// must still be the site whose storage is being exported — call this before
-/// navigating away.
-pub fn localstorage_export(purpose: String) -> Result<KeystoreResult> {
-    #[cfg(target_os = "android")]
-    {
-        call_plugin(CMD_LOCALSTORAGE_EXPORT, PurposePayload { purpose })
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = purpose;
-        Err(Error::Unsupported)
+/// Intentionally not `Debug`: `cookies` carries the one-time legacy jar.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SiteOpenPayload {
+    url: String,
+    profile: String,
+    init_script: String,
+    cookies: Vec<String>,
+}
+
+/// Wire format for `site_close`.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+struct SiteClosePayload {
+    flush: bool,
+}
+
+/// Wire format for `site_profile_delete` / `site_clear_data`.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+struct SiteProfilePayload {
+    profile: String,
+}
+
+/// Kotlin's `{migrated}` reply from `site_open`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteOpenResult {
+    /// `true` when the legacy cookie jar was imported into the profile.
+    pub migrated: bool,
+}
+
+/// Kotlin's `{deleted, pending}` reply from `site_profile_delete`.
+///
+/// * `deleted=true` — the provider accepted the deletion (disk work may
+///   finish asynchronously).
+/// * `deleted=false, pending=false` — the profile does not exist.
+/// * `deleted=false, pending=true` — in use in this process or the provider
+///   lacks the API; the caller must queue the name for the next start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteProfileDeleteResult {
+    pub deleted: bool,
+    pub pending: bool,
+}
+
+/// Kotlin's `{names, unsupported}` reply from `site_profile_names`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteProfileNamesResult {
+    pub names: Vec<String>,
+    /// Provider cannot enumerate profiles (MULTI_PROFILE unsupported).
+    #[serde(default)]
+    pub unsupported: bool,
+}
+
+/// Whether a bridge error is Kotlin's "MULTI_PROFILE unsupported" sentinel.
+pub fn is_unsupported_multi_profile(error: &Error) -> bool {
+    match error {
+        Error::Bridge(message) => message.contains(MULTI_PROFILE_SENTINEL),
+        _ => false,
     }
 }
 
-/// Restore a [`localstorage_export`] blob into the currently loaded page.
-pub fn localstorage_import(purpose: String, sealed: String) -> Result<OkResult> {
+/// Open `url` in a new site WebView bound to `profile`.
+///
+/// `cookies` (the decrypted 0.3.4 jar, as `Set-Cookie` headers) is imported
+/// only by Kotlin when the profile does not exist yet, through the profile's
+/// own cookie manager, and only after the callbacks and `flush()` complete —
+/// i.e. before the first navigation. An empty list skips the migration.
+pub fn site_open(
+    url: String,
+    profile: String,
+    init_script: String,
+    cookies: Vec<String>,
+) -> Result<SiteOpenResult> {
     #[cfg(target_os = "android")]
     {
         call_plugin(
-            CMD_LOCALSTORAGE_IMPORT,
-            PurposeValuePayload {
-                purpose,
-                value: sealed,
+            CMD_SITE_OPEN,
+            SiteOpenPayload {
+                url,
+                profile,
+                init_script,
+                cookies,
             },
         )
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (purpose, sealed);
+        let _ = (url, profile, init_script, cookies);
         Err(Error::Unsupported)
     }
 }
 
-/// Export the shared WebView's IndexedDB databases (best effort: document
-/// values only — indexes, key paths and exotic key types are not preserved).
-pub fn indexeddb_export(purpose: String) -> Result<KeystoreResult> {
+/// Close (and flush unless `flush=false`) the active site WebView.
+/// Idempotent: no active site resolves normally.
+pub fn site_close(flush: bool) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_INDEXEDDB_EXPORT, PurposePayload { purpose })
+        call_plugin(CMD_SITE_CLOSE, SiteClosePayload { flush })
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = purpose;
+        let _ = flush;
         Err(Error::Unsupported)
     }
 }
 
-/// Restore an [`indexeddb_export`] blob into the currently loaded page.
-pub fn indexeddb_import(purpose: String, sealed: String) -> Result<OkResult> {
+/// Delete a site profile's data (never the default profile — Kotlin validates
+/// the name against `android_profile_name`'s shape).
+pub fn site_profile_delete(profile: String) -> Result<SiteProfileDeleteResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(
-            CMD_INDEXEDDB_IMPORT,
-            PurposeValuePayload {
-                purpose,
-                value: sealed,
-            },
-        )
+        call_plugin(CMD_SITE_PROFILE_DELETE, SiteProfilePayload { profile })
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (purpose, sealed);
+        let _ = profile;
         Err(Error::Unsupported)
     }
 }
 
-/// Read the live Android WebView's cookie header for `url`.
-///
-/// Unlike Wry's Android `cookies()` API (which is unsupported), this uses
-/// Android's shared CookieManager through the Kotlin plugin. Kotlin maps the
-/// normal no-cookies `null` result to an empty string.
-pub fn webview_cookies_get(url: String) -> Result<StringResult> {
+/// Clear one site profile in place (cookies, web storage, permissions).
+pub fn site_clear_data(profile: String) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_WEBVIEW_COOKIES_GET, CookieUrlPayload { url })
+        call_plugin(CMD_SITE_CLEAR_DATA, SiteProfilePayload { profile })
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = url;
+        let _ = profile;
         Err(Error::Unsupported)
     }
 }
 
-/// Replace Android's shared CookieManager contents and wait until each
-/// accepted cookie has been set before the caller navigates the WebView.
-pub fn webview_cookies_replace(url: String, cookies: Vec<String>) -> Result<OkResult> {
+/// Flush the active site profile's cookie jar (periodic durability sync).
+pub fn site_flush() -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(
-            CMD_WEBVIEW_COOKIES_REPLACE,
-            CookieReplacePayload { url, cookies },
-        )
+        call_plugin(CMD_SITE_FLUSH, NoArgs {})
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (url, cookies);
+        Err(Error::Unsupported)
+    }
+}
+
+/// Every profile name the provider store knows, or `unsupported=true`.
+pub fn site_profile_names() -> Result<SiteProfileNamesResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(CMD_SITE_PROFILE_NAMES, NoArgs {})
+    }
+    #[cfg(not(target_os = "android"))]
+    {
         Err(Error::Unsupported)
     }
 }
@@ -306,41 +365,13 @@ type MobileCall =
 static HANDLE: std::sync::OnceLock<std::sync::Mutex<Option<Box<MobileCall>>>> =
     std::sync::OnceLock::new();
 
-/// Wire format for `{ purpose, value }` commands (keystore seal/open and both
-/// storage imports).
+/// Wire format for `{ purpose, value }` commands (keystore seal/open).
 #[cfg(target_os = "android")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PurposeValuePayload {
     purpose: String,
     value: String,
-}
-
-/// Wire format for the export commands, which only need the key purpose.
-#[cfg(target_os = "android")]
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PurposePayload {
-    purpose: String,
-}
-
-/// Wire format for reading cookies for one WebView URL.
-#[cfg(target_os = "android")]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CookieUrlPayload {
-    url: String,
-}
-
-/// Wire format for an ordered Android CookieManager replacement.
-///
-/// Intentionally not `Debug`: this payload contains authentication cookies.
-#[cfg(target_os = "android")]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CookieReplacePayload {
-    url: String,
-    cookies: Vec<String>,
 }
 
 /// Wire format for `enter_pip`.
@@ -439,19 +470,17 @@ mod tests {
             assert!(matches!(enter_pip(16, 9), Err(Error::Unsupported)));
             assert!(matches!(set_pip_auto_enter(true), Err(Error::Unsupported)));
             assert!(matches!(
-                localstorage_export("p".into()),
+                site_open(
+                    "https://example.com/".into(),
+                    "site-00000000000000000000000000000000-g0".into(),
+                    String::new(),
+                    Vec::new(),
+                ),
                 Err(Error::Unsupported)
             ));
+            assert!(matches!(site_close(true), Err(Error::Unsupported)));
             assert!(matches!(
-                localstorage_import("p".into(), "eA==".into()),
-                Err(Error::Unsupported)
-            ));
-            assert!(matches!(
-                indexeddb_export("p".into()),
-                Err(Error::Unsupported)
-            ));
-            assert!(matches!(
-                indexeddb_import("p".into(), "eA==".into()),
+                site_profile_delete("site-00000000000000000000000000000000-g0".into()),
                 Err(Error::Unsupported)
             ));
         }
@@ -489,12 +518,13 @@ mod tests {
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
         assert_eq!(CMD_DEBUG_LOG, "debug_log");
-        assert_eq!(CMD_LOCALSTORAGE_EXPORT, "localstorage_export");
-        assert_eq!(CMD_LOCALSTORAGE_IMPORT, "localstorage_import");
-        assert_eq!(CMD_INDEXEDDB_EXPORT, "indexeddb_export");
-        assert_eq!(CMD_INDEXEDDB_IMPORT, "indexeddb_import");
-        assert_eq!(CMD_WEBVIEW_COOKIES_GET, "webview_cookies_get");
-        assert_eq!(CMD_WEBVIEW_COOKIES_REPLACE, "webview_cookies_replace");
+        assert_eq!(CMD_SITE_OPEN, "site_open");
+        assert_eq!(CMD_SITE_CLOSE, "site_close");
+        assert_eq!(CMD_SITE_PROFILE_DELETE, "site_profile_delete");
+        assert_eq!(CMD_SITE_CLEAR_DATA, "site_clear_data");
+        assert_eq!(CMD_SITE_FLUSH, "site_flush");
+        assert_eq!(CMD_SITE_PROFILE_NAMES, "site_profile_names");
+        assert_eq!(MULTI_PROFILE_SENTINEL, "unsupported-multi-profile");
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
     }
 
@@ -576,24 +606,90 @@ mod tests {
             CMD_ENTER_PIP,
             CMD_SET_PIP_AUTO_ENTER,
             CMD_DEBUG_LOG,
-            CMD_LOCALSTORAGE_EXPORT,
-            CMD_LOCALSTORAGE_IMPORT,
-            CMD_INDEXEDDB_EXPORT,
-            CMD_INDEXEDDB_IMPORT,
-            CMD_WEBVIEW_COOKIES_GET,
-            CMD_WEBVIEW_COOKIES_REPLACE,
+            CMD_SITE_OPEN,
+            CMD_SITE_CLOSE,
+            CMD_SITE_PROFILE_DELETE,
+            CMD_SITE_CLEAR_DATA,
+            CMD_SITE_FLUSH,
+            CMD_SITE_PROFILE_NAMES,
         ] {
             let marker = format!("fun {cmd}(");
             assert!(kt.contains(&marker), "Kotlin side is missing `fun {cmd}(`");
         }
+        // The legacy JSON storage/cookie transfer commands are gone.
+        for gone in [
+            "fun localstorage_export(",
+            "fun localstorage_import(",
+            "fun indexeddb_export(",
+            "fun indexeddb_import(",
+            "fun webview_cookies_get(",
+            "fun webview_cookies_replace(",
+        ] {
+            assert!(
+                !kt.contains(gone),
+                "removed command still present on the Kotlin side: {gone}"
+            );
+        }
         assert!(
-            kt.contains("CookieManager.getInstance().getCookie(url) ?: \"\""),
-            "an empty Android cookie jar must not return null across Kotlin"
+            !kt.contains("@JavascriptInterface") && !kt.contains("addJavascriptInterface"),
+            "the plugin must not expose any page-facing JavascriptInterface"
+        );
+    }
+
+    #[test]
+    fn site_controller_enforces_the_multi_profile_contract() {
+        let controller =
+            include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
+        // Runtime support check before anything else happens on open.
+        assert!(
+            controller.contains("WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)"),
+            "open must gate on WebViewFeature.MULTI_PROFILE"
         );
         assert!(
-            kt.contains("manager.removeAllCookies")
-                && kt.contains("manager.setCookie(url, cookieHeaders[index])"),
-            "Android cookies must be cleared and restored sequentially before navigation"
+            controller.contains(&format!(
+                "const val ERR_UNSUPPORTED_MULTI_PROFILE = \"{MULTI_PROFILE_SENTINEL}\""
+            )),
+            "the sentinel Rust classifies must match the Kotlin constant"
+        );
+        // No silent fallback: an unsupported provider must reject, not open.
+        assert!(
+            controller.contains("onResult(false, ERR_UNSUPPORTED_MULTI_PROFILE)"),
+            "unsupported providers must fail the open"
+        );
+        // Profile assignment before any other WebView API call: the constructor
+        // is immediately followed by setProfile.
+        assert!(
+            controller.contains("webView = WebView(activity)") // setProfile follows
+                && controller.contains("WebViewCompat.setProfile(webView, profileName)"),
+            "setProfile must be called on the fresh WebView"
+        );
+        // Site cookies only ever touch the profile's own manager.
+        assert!(
+            controller.contains("profile.cookieManager"),
+            "cookie work must go through Profile.getCookieManager()"
+        );
+        // Profile names are validated against the Rust derivation shape, so a
+        // stray call can never reach the Default profile.
+        assert!(
+            controller.contains("Regex(\"\"\"site-[0-9a-f]{32}-g\\d{1,10}\"\"\")"),
+            "profile names must be validated before use"
+        );
+        // Orphan sweep support: enumeration exists and is feature-gated.
+        assert!(
+            controller.contains("fun allProfileNames(): List<String>?"),
+            "the clear-all orphan sweep needs profile enumeration"
+        );
+        // Back button: site history first, launcher second, never finish().
+        assert!(
+            controller.contains("webView.canGoBack()")
+                && controller.contains("closeViaLauncher(activity)"),
+            "back must walk site history before returning to the launcher"
+        );
+        // The new file must not carry page-facing script interfaces either.
+        assert!(
+            !controller.contains("@JavascriptInterface")
+                && !controller.contains("addJavascriptInterface"),
+            "no JavascriptInterface on the site WebView"
         );
     }
 }
