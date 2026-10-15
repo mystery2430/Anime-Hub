@@ -1423,7 +1423,6 @@ mod tests {
 
     #[test]
     fn migration_flag_marks_once_and_clears_with_the_session() {
-        use crate::secure::SecretProvider;
         let state = state_with_current_site(None);
         let id = "user-migrate";
         assert!(

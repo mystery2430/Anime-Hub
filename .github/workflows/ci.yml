@@ -254,6 +254,15 @@ jobs:
             mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt /tmp/AnimeHubPipController.kt.bak
             echo "moved AnimeHubPipController.kt"
           fi
+          # AnimeHubSiteController references AnimeHubDebugLog / SiteNavigationGuard /
+          # AnimeHubPipController from AnimeHubPlugin.kt, so it cannot compile in the
+          # isolated unit-test source set either. Removed here, restored with the
+          # others below (and again by the android_prepare re-run).
+          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt ]; then
+            echo "found AnimeHubSiteController.kt, removing for pure test"
+            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt /tmp/AnimeHubSiteController.kt.bak
+            echo "moved AnimeHubSiteController.kt"
+          fi
           echo "=== after move, ls -l ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
           ls -l /tmp/AnimeHubPlugin.kt.bak /tmp/MainActivity.kt.bak 2>&1 | head -n 20
@@ -337,6 +346,7 @@ jobs:
           echo "=== restoring Tauri-dependent files for APK build ==="
           if [ -f /tmp/MainActivity.kt.bak ]; then mv /tmp/MainActivity.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt && echo "restored MainActivity.kt"; fi
           if [ -f /tmp/AnimeHubPipController.kt.bak ]; then mv /tmp/AnimeHubPipController.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt && echo "restored AnimeHubPipController.kt"; fi
+          if [ -f /tmp/AnimeHubSiteController.kt.bak ]; then mv /tmp/AnimeHubSiteController.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt && echo "restored AnimeHubSiteController.kt"; fi
           # AnimeHubPlugin.kt is copied by android_prepare.py, so re-run it to restore
           python3 scripts/android_prepare.py 2>&1 | head -n 20 || true
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
