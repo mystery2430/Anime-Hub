@@ -52,18 +52,29 @@ PIP_CONTROLLER_CLASS = "AnimeHubPipController"
 # stable since androidx.webkit 1.9.0 — every API this app uses). The Tauri
 # template ships its own version of this dependency; this script *replaces*
 # it (or adds it once) so the build does not depend on which CLI version
-# generated the project.
+# generated the project. 1.16.0 is the researched current stable, minSdk 24
+# against the app's pinned minSdk 26. No RC/alpha.
 #
-# Why 1.15.0 and not the newer 1.16.0 (checked against the published POMs,
-# 2026-10-15): 1.16.0 declares org.jetbrains.kotlin:kotlin-stdlib:2.1.20,
-# which Gradle's highest-wins resolution forces onto the generated project —
-# and its Kotlin 2.1 metadata cannot be read by the template's Kotlin 1.9
-# compiler ("Module was compiled with an incompatible version of Kotlin",
-# CI failure). 1.15.0 and 1.14.0 declare no kotlin-stdlib at all; 1.15.0 is
-# therefore the highest stable, conflict-free release. minSdk 24 fits the
-# app's pinned minSdk 26. No RC/alpha.
-WEBKIT_PIN = 'implementation("androidx.webkit:webkit:1.15.0")'
+# VERSION ALIGNMENT (do not "fix" one side alone): 1.16.0 declares
+# org.jetbrains.kotlin:kotlin-stdlib:2.1.20. Gradle's highest-wins resolution
+# puts that stdlib on the generated project's classpath, and the Tauri 2.11
+# template's kotlin-gradle-plugin:1.9.25 cannot read Kotlin 2.1 metadata —
+# CI reproduced it as "Module was compiled with an incompatible version of
+# Kotlin / The binary version of its metadata is 2.1.0, expected version is
+# 1.9.0". The fix is to align the compiler *up* with the stdlib the project
+# actually resolves (KGP 2.1.20 == the stdlib family), not to downgrade
+# webkit and not to exclude files from the test compile.
+WEBKIT_PIN = 'implementation("androidx.webkit:webkit:1.16.0")'
 WEBKIT_DEP_RE = re.compile(r'implementation\(\s*"androidx\.webkit:webkit:[^"]+"\s*\)')
+
+# Root build.gradle.kts pin: the generated project's Kotlin Gradle plugin,
+# raised from the template's 1.9.25 to 2.1.20 so the compiler reading the
+# classpath (kotlin-stdlib 2.1.20 via androidx.webkit, plus everything else
+# Gradle resolves to 2.1.x) is the SAME Kotlin family — one compiler version
+# for the APK build and for the CI unit-test run. Gradle 8.14.3 (template
+# wrapper) and AGP 8.11.0 both support Kotlin 2.1.
+KGP_PIN = 'classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.20")'
+KGP_DEP_RE = re.compile(r'classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]+"\)')
 PIP_CONTROLLER_JS_REL = ("src-tauri", "src", "web", "pip_controller.js")
 PIP_CONTROLLER_KT_REL = ("src-tauri", "android-plugin", "kotlin")
 PIP_JS_PLACEHOLDER = "__ANIMEHUB_PIP_CONTROLLER_JS__"
@@ -477,6 +488,35 @@ def prepare(root: Path, gen: Path) -> list[str]:
     ensure_proguard(proguard, package, class_name)
     notes.append(f"proguard keep for {package}.{class_name}")
 
+    # Align the project's Kotlin plugin with the stdlib the app resolves
+    # (see KGP_PIN). Lives in the ROOT build.gradle.kts of the generated
+    # project; idempotent, same style as the webkit pin below.
+    root_gradle = gen / "build.gradle.kts"
+    if not root_gradle.is_file():
+        notes.append("warning: root build.gradle.kts missing; Kotlin plugin not aligned")
+    else:
+        root_text = root_gradle.read_text(encoding="utf-8")
+        if KGP_PIN in root_text:
+            notes.append("kotlin-gradle-plugin already pinned to 2.1.20")
+        else:
+            aligned, replaced = KGP_DEP_RE.subn(KGP_PIN, root_text)
+            if replaced == 0:
+                # Template changed shape: put the pin in front of the AGP
+                # classpath so both stay inside the buildscript block.
+                agp = re.search(r'\s*classpath\("com\.android\.tools\.build:gradle:[^"]+"\)', aligned)
+                if agp:
+                    aligned = aligned[: agp.start()] + "\n        " + KGP_PIN + aligned[agp.start():]
+                else:
+                    aligned = aligned.replace(
+                        "buildscript {",
+                        'buildscript {\n    dependencies {\n        ' + KGP_PIN + "\n    }",
+                        1,
+                    )
+            root_gradle.write_text(aligned, encoding="utf-8")
+            notes.append(
+                "pinned kotlin-gradle-plugin:2.1.20 (aligns compiler with kotlin-stdlib 2.1.20)"
+            )
+
     gradle = gen / "app" / "build.gradle.kts"
     text = gradle.read_text(encoding="utf-8")
     gradle_changed = False
@@ -486,7 +526,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
     # so the build must not depend on whichever version the generated
     # template happened to ship.
     if WEBKIT_PIN in text:
-        notes.append("androidx.webkit already pinned to 1.15.0")
+        notes.append("androidx.webkit already pinned to 1.16.0")
     else:
         pinned, replaced = WEBKIT_DEP_RE.subn(WEBKIT_PIN, text)
         if replaced == 0:
@@ -498,7 +538,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
                 pinned += "\ndependencies {\n    " + WEBKIT_PIN + "\n}\n"
         text = pinned
         gradle_changed = True
-        notes.append("pinned androidx.webkit:webkit:1.15.0 (multi-profile)")
+        notes.append("pinned androidx.webkit:webkit:1.16.0 (multi-profile)")
 
     if SIGN_MARKER in text:
         notes.append(f"signing config already present in {gradle}")

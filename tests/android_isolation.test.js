@@ -411,15 +411,22 @@ test("android_prepare copies the site controller and pins androidx.webkit", () =
   assert.match(preparePy, /raise SystemExit\(f"site controller not found at \{site_controller_src\}"\)/);
   assert.match(preparePy, /copied \{SITE_CONTROLLER_CLASS\}\.kt/);
   // Reproducible pin, replacing whatever the generated template shipped.
-  assert.match(preparePy, /WEBKIT_PIN = 'implementation\("androidx\.webkit:webkit:1\.15\.0"\)'/);
+  assert.match(preparePy, /WEBKIT_PIN = 'implementation\("androidx\.webkit:webkit:1\.16\.0"\)'/);
   assert.match(preparePy, /WEBKIT_DEP_RE = re\.compile\(/);
-  assert.match(preparePy, /pinned androidx\.webkit:webkit:1\.15\.0/);
+  assert.match(preparePy, /pinned androidx\.webkit:webkit:1\.16\.0/);
   // The pin must be a stable release with no RC/alpha sibling referenced.
   assert.equal(/webkit:1\.\d+\.\d+-(alpha|beta|rc)/.test(preparePy), false);
-  // The 1.16.0 conflict that forced 1.15.0 stays documented where the pin is
-  // chosen, so nobody "helpfully" bumps back into the Kotlin 1.9 / stdlib 2.1
-  // metadata failure the CI showed.
-  assert.match(preparePy, /kotlin-stdlib:2\.1\.20/);
+  // Version compatibility, not error suppression: 1.16.0 resolves
+  // kotlin-stdlib 2.1.20, so the generated project's compiler must join the
+  // same family (KGP 2.1.20). Both halves of the alignment are pinned in the
+  // prepare script; the CI unit-test run compiles with this same project.
+  assert.match(
+    preparePy,
+    /KGP_PIN = 'classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:2\.1\.20"\)'/,
+  );
+  assert.match(preparePy, /KGP_DEP_RE = re\.compile\(/);
+  assert.match(preparePy, /pinned kotlin-gradle-plugin:2\.1\.20/);
+  assert.match(preparePy, /kotlin-stdlib:2\.1\.20/, "the alignment rationale stays documented");
 });
 
 test("the injected lifecycle block owns the site view across pause/resume/destroy", () => {
@@ -440,7 +447,8 @@ test("docs describe the profile architecture, migration and what survives", () =
   const doc = read("docs/android-storage-isolation.md");
   assert.match(doc, /Profile/i);
   assert.match(doc, /MULTI_PROFILE/);
-  assert.match(doc, /1\.15\.0/);
+  assert.match(doc, /1\.16\.0/);
+  assert.match(doc, /kotlin-gradle-plugin:2\.1\.20/);
   // Migration honesty: cookies migrate, snapshots do not.
   assert.match(doc, /cookie/i);
   assert.match(doc, /localStorage/i);

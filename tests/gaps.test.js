@@ -121,6 +121,22 @@ function fakeGen(packageName, baseClass) {
 </manifest>
 `,
   );
+  // Root build.gradle.kts as `tauri android init` (CLI 2.11) writes it —
+  // kotlin-gradle-plugin 1.9.25 is the pin android_prepare must align.
+  writeFileSync(
+    join(gen, "build.gradle.kts"),
+    `buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.11.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25")
+    }
+}
+`,
+  );
   writeFileSync(
     join(gen, "app/build.gradle.kts"),
     `plugins {
@@ -158,13 +174,23 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(siteController, /WebViewFeature\.MULTI_PROFILE/);
     // Reproducible androidx.webkit pin (multi-profile needs it; the fakeGen
     // template ships no webkit line, so this also covers the append path).
-    // 1.15.0, not 1.16.0: 1.16.0 drags kotlin-stdlib 2.1.20 into the
-    // template's Kotlin 1.9 toolchain and the compile fails (CI-verified).
     const gradleFile = read(join(gen, "app/build.gradle.kts"));
-    assert.match(gradleFile, /implementation\("androidx\.webkit:webkit:1\.15\.0"\)/);
+    assert.match(gradleFile, /implementation\("androidx\.webkit:webkit:1\.16\.0"\)/);
     assert.equal(gradleFile.includes("webkit:1.14.0"), false);
-    assert.equal(gradleFile.includes("webkit:1.16.0"), false);
     assert.equal(gradleFile.split("androidx.webkit:webkit:").length, 1 + 1, "exactly one webkit dep");
+    // ...and the compiler-side half of the same contract: the generated
+    // project's Kotlin Gradle plugin is raised to the kotlin-stdlib family
+    // webkit 1.16.0 resolves (2.1.20), so the compiler reading the classpath
+    // is the same Kotlin that wrote it. Without this, CI fails with
+    // "Module was compiled with an incompatible version of Kotlin".
+    const rootGradle = read(join(gen, "build.gradle.kts"));
+    assert.match(rootGradle, /classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:2\.1\.20"\)/);
+    assert.equal(rootGradle.includes("kotlin-gradle-plugin:1.9.25"), false);
+    assert.equal(
+      rootGradle.split("kotlin-gradle-plugin:").length,
+      1 + 1,
+      "exactly one kotlin-gradle-plugin classpath",
+    );
 
     // IpPolicy.kt – saf IP mantigi, APK ve test ortak kullanir
     const ipPolicy = read(join(gen, "app/src/main/java/dev/animehub/app/IpPolicy.kt"));
@@ -244,6 +270,9 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     // signing block injected exactly once (marker pair, not duplicated)
     const gradle2 = read(join(gen, "app/build.gradle.kts"));
     assert.equal(gradle2.split("AnimeHub release signing").length - 1, 2);
+    const rootGradle2 = read(join(gen, "build.gradle.kts"));
+    assert.equal(rootGradle2.split("kotlin-gradle-plugin:").length, 1 + 1, "KGP pin idempotent");
+    assert.match(rootGradle2, /kotlin-gradle-plugin:2\.1\.20/);
   } finally {
     rmSync(gen, { recursive: true, force: true });
   }

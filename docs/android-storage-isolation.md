@@ -82,21 +82,35 @@ There is **no fallback** to the shared/default profile: opening "but not
 isolated" would silently reintroduce the cross-site mixing this feature
 removes.
 
-### Dependency pin
+### Dependency pin (two halves that must move together)
 
-`scripts/android_prepare.py` pins `androidx.webkit:webkit:1.15.0` in the
-generated `app/build.gradle.kts` (replacing whatever the `tauri android init`
-template shipped, idempotently — never stacking a second dependency), minSdk
-24 against the app's pinned `minSdkVersion: 26`; no RC/alpha.
+`scripts/android_prepare.py` pins **both** sides of the Kotlin/AndroidX
+contract in the generated project, idempotently:
 
-**Why not 1.16.0** (checked against the published POMs, and reproduced by CI):
-1.16.0 declares `org.jetbrains.kotlin:kotlin-stdlib:2.1.20`, which Gradle's
-highest-wins resolution forces onto the generated project; the template's
-Kotlin 1.9 compiler cannot read Kotlin 2.1 metadata and the build fails with
-*"Module was compiled with an incompatible version of Kotlin"*. 1.15.0 (and
-1.14.0, the template's own version) declare no `kotlin-stdlib` at all, so
-**1.15.0 is the highest stable, conflict-free release** — and every
-multi-profile API this app uses has been stable since androidx.webkit 1.9.0.
+1. `androidx.webkit:webkit:1.16.0` in `app/build.gradle.kts` — the researched
+   current stable (May 2026), multi-profile APIs stable since androidx.webkit
+   1.9.0, minSdk 24 against the app's pinned `minSdkVersion: 26`; no RC/alpha.
+   The template's own version (1.14.0 on Tauri CLI 2.11) is *replaced*, never
+   stacked.
+2. `kotlin-gradle-plugin:2.1.20` in the root `build.gradle.kts`, raised from
+   the template's `1.9.25`.
+
+**Why both:** 1.16.0's POM declares `org.jetbrains.kotlin:kotlin-stdlib:2.1.20`,
+and Gradle's highest-wins resolution puts that stdlib on the project
+classpath. The template's Kotlin 1.9 compiler cannot read Kotlin 2.1 metadata;
+CI reproduced exactly that ("Module was compiled with an incompatible version
+of Kotlin — metadata is 2.1.0, expected version is 1.9.0" against
+`kotlin-stdlib-2.1.20.jar`). The fix aligns the **compiler** with the stdlib
+the project actually resolves — one Kotlin family (2.1.20) for the APK build
+*and* for the CI unit-test run, which compiles this same generated project.
+Gradle 8.14.3 (template wrapper) and AGP 8.11.0 both support Kotlin 2.1.
+This is version alignment, not error suppression: nothing is excluded from
+either compile because of the metadata rule (the only source-set exclusion in
+CI is the pre-existing "pure Kotlin" isolation that removes files depending on
+the Tauri Android library — `AnimeHubPlugin.kt`, `MainActivity.kt`,
+`AnimeHubPipController.kt`, and now `AnimeHubSiteController.kt`, which
+references their symbols).
+
 *Runtime* support depends on the device's WebView provider version, which is
 what the feature gate checks.
 
