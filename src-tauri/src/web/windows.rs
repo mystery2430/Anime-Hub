@@ -1870,7 +1870,7 @@ mod tests {
         // The stored name itself is queued: advance past the queue maximum,
         // which by construction cannot be in the queue either.
         assert_eq!(
-            resolve_queued_free_generation("user-1", 2, &[own.clone()]).unwrap(),
+            resolve_queued_free_generation("user-1", 2, std::slice::from_ref(&own)).unwrap(),
             (3, true)
         );
         assert_eq!(

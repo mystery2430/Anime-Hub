@@ -260,13 +260,13 @@ pub fn update_site(
 ///
 /// One explicit vocabulary for Kotlin ⇄ Rust ⇄ JS, so the UI never has to
 /// infer an outcome from missing fields (A.8 delete/clear/UI contract):
-/// * `deleted`     — accepted now (disk work may finish asynchronously), or
-///                   absent (already clean);
-/// * `deferred`    — provider refused because the profile is loaded in this
-///                   process; the name is queued and retried at next start;
+/// * `deleted` — accepted now (disk work may finish asynchronously), or
+///   absent (already clean);
+/// * `deferred` — provider refused because the profile is loaded in this
+///   process; the name is queued and retried at next start;
 /// * `unsupported` — the provider has no profile API (feature gap; the
-///                   command surfaces it as an error and keeps the record);
-/// * `hidden`      — builtin site: hidden, no profile to delete;
+///   command surfaces it as an error and keeps the record);
+/// * `hidden` — builtin site: hidden, no profile to delete;
 /// * `notApplicable` — platforms without WebView profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
