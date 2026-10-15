@@ -657,7 +657,10 @@ pub fn is_valid_site_profile_name(name: &str) -> bool {
     if bytes.len() < 35 || bytes[32] != b'-' || bytes[33] != b'g' {
         return false;
     }
-    if !bytes[..32].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) {
+    if !bytes[..32]
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
         return false;
     }
     let digits = &rest[34..];
@@ -742,7 +745,10 @@ pub fn recover_generation_for(site_id: &str, queued: &[String]) -> AppResult<u32
     let prefix = queued_site_profile_prefix(site_id);
     let max_queued = queued
         .iter()
-        .filter_map(|name| name.strip_prefix(&prefix).and_then(|s| s.parse::<u32>().ok()))
+        .filter_map(|name| {
+            name.strip_prefix(&prefix)
+                .and_then(|s| s.parse::<u32>().ok())
+        })
         .max();
     match max_queued {
         Some(u32::MAX) => Err(AppError::Storage(format!(
@@ -825,7 +831,10 @@ pub fn resolve_queued_free_generation(
     let prefix = queued_site_profile_prefix(site_id);
     let max_queued = queued
         .iter()
-        .filter_map(|name| name.strip_prefix(&prefix).and_then(|s| s.parse::<u32>().ok()))
+        .filter_map(|name| {
+            name.strip_prefix(&prefix)
+                .and_then(|s| s.parse::<u32>().ok())
+        })
         .max()
         .unwrap_or(stored);
     let next = max_queued
@@ -1684,16 +1693,28 @@ mod tests {
         assert!(is_valid_site_profile_name(&format!("site-{hex32}-g0")));
         assert!(is_valid_site_profile_name(&format!("site-{hex32}-g123456")));
         // Full u32 range stays representable (10 digits).
-        assert!(is_valid_site_profile_name(&format!("site-{hex32}-g4294967295")));
+        assert!(is_valid_site_profile_name(&format!(
+            "site-{hex32}-g4294967295"
+        )));
         // Never a handle for anything outside our namespace:
-        assert!(!is_valid_site_profile_name(&format!("site-{}-g0", "a".repeat(31))));
-        assert!(!is_valid_site_profile_name(&format!("site-{}-g0", "A".repeat(32))));
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{}-g0",
+            "a".repeat(31)
+        )));
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{}-g0",
+            "A".repeat(32)
+        )));
         assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g")));
         assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g-1")));
         assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g+1")));
-        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g01234567890")));
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{hex32}-g01234567890"
+        )));
         // 10 digits beyond u32 must not validate as a "generation".
-        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g9999999999")));
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{hex32}-g9999999999"
+        )));
         assert!(!is_valid_site_profile_name("Default"));
         assert!(!is_valid_site_profile_name(&format!("xsite-{hex32}-g0")));
     }
@@ -1704,9 +1725,7 @@ mod tests {
         let name_b = format!("site-{}-g0", "d".repeat(32));
         // Structurally broken JSON: quotes/brackets missing, an invalid
         // short-hex name, and noise around the valid tokens.
-        let raw = format!(
-            "{{garbage [{name_a}, \"site-e-f0\", tail {name_b} end"
-        );
+        let raw = format!("{{garbage [{name_a}, \"site-e-f0\", tail {name_b} end");
         let found = scan_valid_profile_names(raw.as_bytes());
         assert_eq!(found, vec![name_a, name_b]);
         // Clean input keeps order and nothing extra.
@@ -1786,7 +1805,9 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&stored), "4");
         // user-1's queue entry no longer collides with the derived name.
         let resolved = android_profile_name("user-1", 4);
-        assert!(!read_pending_profile_deletes(&state).unwrap().contains(&resolved));
+        assert!(!read_pending_profile_deletes(&state)
+            .unwrap()
+            .contains(&resolved));
         // An untouched site still starts at 0.
         assert_eq!(profile_generation(&state, "user-3").unwrap(), 0);
     }
@@ -1796,10 +1817,7 @@ mod tests {
         let state = state_with_current_site(None);
         state
             .provider
-            .put_secret(
-                &format!("{PROFILE_GENERATION_PREFIX}user-1"),
-                b"3.4",
-            )
+            .put_secret(&format!("{PROFILE_GENERATION_PREFIX}user-1"), b"3.4")
             .unwrap();
         // No queued deletions at all: 0 is safe (nothing pending for it).
         assert_eq!(profile_generation(&state, "user-1").unwrap(), 0);
@@ -1834,7 +1852,10 @@ mod tests {
         let own = android_profile_name("user-1", 2);
         let other = android_profile_name("user-2", 2);
         // Nothing queued: unchanged.
-        assert_eq!(resolve_queued_free_generation("user-1", 2, &[]).unwrap(), (2, false));
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[]).unwrap(),
+            (2, false)
+        );
         // Someone else's name: unchanged.
         assert_eq!(
             resolve_queued_free_generation("user-1", 2, &[other]).unwrap(),
@@ -1853,12 +1874,8 @@ mod tests {
             (3, true)
         );
         assert_eq!(
-            resolve_queued_free_generation(
-                "user-1",
-                2,
-                &[own, android_profile_name("user-1", 9)]
-            )
-            .unwrap(),
+            resolve_queued_free_generation("user-1", 2, &[own, android_profile_name("user-1", 9)])
+                .unwrap(),
             (10, true)
         );
     }

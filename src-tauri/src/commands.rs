@@ -1573,13 +1573,22 @@ mod tests {
             ProfileRemoval::Deferred
         );
         // The serialized names the JS relies on (A.8 contract).
-        assert_eq!(serde_json::to_string(&ProfileRemoval::Deferred).unwrap(), "\"deferred\"");
-        assert_eq!(serde_json::to_string(&ProfileRemoval::Deleted).unwrap(), "\"deleted\"");
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Deferred).unwrap(),
+            "\"deferred\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Deleted).unwrap(),
+            "\"deleted\""
+        );
         assert_eq!(
             serde_json::to_string(&ProfileRemoval::Unsupported).unwrap(),
             "\"unsupported\""
         );
-        assert_eq!(serde_json::to_string(&ProfileRemoval::Hidden).unwrap(), "\"hidden\"");
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Hidden).unwrap(),
+            "\"hidden\""
+        );
         assert_eq!(
             serde_json::to_string(&ProfileRemoval::NotApplicable).unwrap(),
             "\"notApplicable\""
