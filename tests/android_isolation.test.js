@@ -94,20 +94,28 @@ test("delete and clear refuse names outside the derivation", () => {
 // MULTI_PROFILE runtime gate — no silent fallback
 // ---------------------------------------------------------------------------
 
-test("site_open gates on MULTI_PROFILE before anything else and never falls back", () => {
-  // The check is the first thing open() does, ahead of validation/UI work.
-  const openAt = controllerKt.indexOf("fun open(");
-  assert.ok(openAt > 0);
-  const signatureEnd = controllerKt.indexOf(") {", openAt);
-  const guard = controllerKt.slice(signatureEnd, signatureEnd + 400);
-  assert.match(guard, /if \(!isSupported\(\)\) \{\n\s*onResult\(false, ERR_UNSUPPORTED_MULTI_PROFILE\)/);
-  // No path opens the site when the feature is missing: the open reject is
-  // the only *open* branch, and the delete refusal reports the same feature
-  // gap (clear uses the shared SiteProfileErrors.UNSUPPORTED literal).
+test("both open phases gate on MULTI_PROFILE before anything else and never fall back", () => {
+  // The check is the first thing EACH entry point does, ahead of
+  // validation/UI work: phase 1 (migrate) and phase 2 (the view).
+  for (const entry of ["fun migrate(", "fun open("]) {
+    const at = controllerKt.indexOf(entry);
+    assert.ok(at > 0, `${entry} missing`);
+    const signatureEnd = controllerKt.indexOf(") {", at);
+    const guard = controllerKt.slice(signatureEnd, signatureEnd + 400);
+    assert.match(
+      guard,
+      /if \(!isSupported\(\)\) \{\n\s*onResult\(ERR_UNSUPPORTED_MULTI_PROFILE\)/,
+      `${entry} must refuse an unsupported provider first`,
+    );
+  }
+  // No path opens the site when the feature is missing: both phases reject,
+  // and the delete refusal reports the same feature gap (clear uses the
+  // shared SiteProfileErrors.UNSUPPORTED literal). Counted over code only —
+  // the KDoc references are documentation, not branches.
   assert.equal(
-    (controllerKt.match(/ERR_UNSUPPORTED_MULTI_PROFILE/g) || []).length,
-    3,
-    "declaration + open reject + delete refusal",
+    (code(controllerKt).match(/ERR_UNSUPPORTED_MULTI_PROFILE/g) || []).length,
+    4,
+    "declaration + migrate reject + open reject + delete refusal",
   );
   // Rust classifies exactly that sentinel into the user-facing message.
   assert.match(pluginLibRs, /pub const MULTI_PROFILE_SENTINEL: &str = "unsupported-multi-profile"/);
@@ -190,23 +198,46 @@ test("site cookies never touch the static CookieManager", () => {
 });
 
 test("migration is one-time, profile-scoped, and ordered before first navigation", () => {
-  // Rust side: flag read → cookies passed → open → flag written only on success.
+  // Rust side: `run_mobile_open_protocol` owns migrate → durable flag → open.
+  const protoAt = windowsRs.indexOf("pub fn run_mobile_open_protocol");
+  assert.ok(protoAt > 0, "the two-phase protocol function is missing");
+  const body = windowsRs.slice(protoAt, windowsRs.indexOf("\n}\n", protoAt));
+  assert.match(body, /MIGRATION_FLAG_PREFIX/, "migration must be flag-gated");
+  assert.match(body, /mark_migration_done/, "the protocol writes the flag");
+  assert.match(body, /ops\.migrate\(/, "phase 1 migrates without a view");
+  assert.match(body, /ops\.open\(/, "phase 2 builds the view");
+  // THE ordering contract (audit defect D): the flag becomes durable AFTER a
+  // strict migration success and BEFORE any view exists.
+  assert.ok(
+    body.indexOf("ops.migrate(") < body.indexOf("mark_migration_done"),
+    "the flag may only follow a completed migration",
+  );
+  assert.ok(
+    body.indexOf("mark_migration_done") < body.indexOf("ops.open("),
+    "the view may only be built after the flag is durable",
+  );
+  // A failed flag write ABORTS the open — never the old log-and-continue,
+  // which left a shown profile with a missing flag and got it retired.
+  assert.match(body, /kalıcılaştırılamadı/, "the abort must be user-visible");
+  assert.doesNotMatch(
+    body,
+    /log::warn!\("profil göç bayrağı yazılamadı/,
+    "a failed flag write must not be a mere warning any more",
+  );
+  // `open_on_mobile` delegates and claims the session only afterwards.
   const openAt = windowsRs.indexOf("fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {");
   assert.ok(openAt > 0, "android open_on_mobile missing");
-  const body = windowsRs.slice(openAt, windowsRs.indexOf("\n}\n", openAt));
-  assert.match(body, /MIGRATION_FLAG_PREFIX/, "migration must be flag-gated");
-  assert.match(body, /mark_migration_done/, "the flag is written after the open");
-  assert.match(body, /site_open\(url\.as_str\(\), &profile, init_script, &cookie_headers\)/, "cookies ride the open call");
-  // The flag write must come AFTER the site_open call (failed opens retry).
+  const openBody = windowsRs.slice(openAt, windowsRs.indexOf("\n}\n", openAt));
+  assert.match(openBody, /run_mobile_open_protocol\(/);
   assert.ok(
-    body.indexOf("site_open(url.as_str()") < body.indexOf("mark_migration_done"),
-    "flag must be written only after a successful open",
+    openBody.indexOf("run_mobile_open_protocol(") < openBody.indexOf("Some(CurrentSite {"),
+    "current_site is claimed only after the protocol succeeded",
   );
   // Kotlin: virgin profile only — an existing profile's live cookies are
   // authoritative and the migration REFUSES (retryable sentinel) instead of
   // being overwritten by the stale snapshot (A.3).
   assert.match(controllerKt, /MigrationOutcome\.ProfileAlreadyExists/);
-  assert.match(controllerKt, /onResult\(false, "\$ERR_MIGRATION_RETRY: profil zaten mevcut"\)/);
+  assert.match(controllerKt, /onResult\("\$ERR_MIGRATION_RETRY: profil zaten mevcut"\)/);
   // Flush to disk completes inside the migration flow, before buildWebView.
   assert.match(controllerKt, /m\.flush\(\)/);
   const flushAt = controllerKt.indexOf("m.flush()");
@@ -361,7 +392,134 @@ test("the Android open path never navigates the launcher or evals the overlay", 
   assert.doesNotMatch(body, /OVERLAY_SNIPPET/);
   assert.doesNotMatch(body, /window\.navigate/);
   assert.doesNotMatch(body, /clear_all_browsing_data/);
-  assert.match(body, /site_open\(/, "the site view is opened through the profiled bridge");
+  assert.match(
+    body,
+    /run_mobile_open_protocol\(/,
+    "the site view is opened through the two-phase profiled protocol",
+  );
+});
+
+test("the open is two-phased: site_migrate carries the jar, site_open carries no cookies", () => {
+  // Plugin crate: distinct commands; the phase-2 payload cannot migrate.
+  assert.match(pluginLibRs, /pub const CMD_SITE_MIGRATE: &str = "site_migrate"/);
+  assert.match(pluginLibRs, /pub fn site_migrate\(/);
+  const openPayloadAt = pluginLibRs.indexOf("struct SiteOpenPayload");
+  assert.ok(openPayloadAt > 0);
+  const openPayload = pluginLibRs.slice(openPayloadAt, pluginLibRs.indexOf("}", openPayloadAt));
+  assert.doesNotMatch(openPayload, /cookies/, "phase 2 must not be able to migrate behind the flag");
+  const migPayloadAt = pluginLibRs.indexOf("struct SiteMigratePayload");
+  assert.ok(migPayloadAt > 0);
+  assert.match(
+    pluginLibRs.slice(migPayloadAt, pluginLibRs.indexOf("}", migPayloadAt)),
+    /cookies: Vec<String>/,
+  );
+  // Bridge: both phases exist and neither carries the other's job.
+  assert.match(
+    bridgeRs,
+    /pub fn site_migrate\(url: &str, profile: &str, cookies: &\[String\]\) -> AppResult<\(\)>/,
+  );
+  assert.match(
+    bridgeRs,
+    /pub fn site_open\(url: &str, profile: &str, init_script: &str\) -> AppResult<\(\)>/,
+  );
+  // Kotlin: an @Command per phase; site_open never parses a cookie array.
+  assert.match(pluginKt, /fun site_migrate\(invoke: Invoke\)/);
+  assert.match(pluginKt, /AnimeHubSiteController\.migrate\(activity, url, profileName, cookies\)/);
+  assert.match(pluginKt, /AnimeHubSiteController\.open\(activity, url, profileName, initScript\)/);
+  const siteOpenAt = pluginKt.indexOf("fun site_open(invoke: Invoke)");
+  assert.ok(siteOpenAt > 0);
+  const siteOpenBody = pluginKt.slice(siteOpenAt, pluginKt.indexOf("\n  }\n", siteOpenAt));
+  assert.doesNotMatch(siteOpenBody, /cookies/i, "the phase-2 command never sees the jar");
+});
+
+test("every awaited flush is watchdog-bounded, in close and clear alike", () => {
+  const ops = read(
+    "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt",
+  );
+  // Close: the port exposes a watchdog and the flow bounds the flush await.
+  const closePortAt = ops.indexOf("interface SiteClosePort");
+  assert.ok(closePortAt > 0);
+  const closePort = ops.slice(closePortAt, ops.indexOf("\n}\n", closePortAt));
+  assert.match(closePort, /fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\)/);
+  const closeFlowAt = ops.indexOf("object SiteCloseFlow");
+  const closeFlow = ops.slice(closeFlowAt, ops.indexOf("\n}\n", closeFlowAt));
+  assert.match(closeFlow, /const val FLUSH_TIMEOUT_MS: Long = 15_000/);
+  assert.match(closeFlow, /port\.scheduleTimeout\(FLUSH_TIMEOUT_MS\)/);
+  assert.match(
+    closeFlow,
+    /if \(!settled\.compareAndSet\(false, true\)\) return@flushCookies/,
+    "a late flush callback must lose the race",
+  );
+  // The view is destroyed only by the settled winner, after the guard.
+  const flushCbAt = closeFlow.indexOf("port.flushCookies(profileName) { error ->");
+  assert.ok(flushCbAt > 0);
+  const flushCb = closeFlow.slice(flushCbAt);
+  assert.ok(
+    flushCb.indexOf("settled.compareAndSet") < flushCb.indexOf("port.destroyActiveView()"),
+    "destroy must sit behind the once-guard",
+  );
+  // Clear: the FINAL flush is bounded too (it used to be a naked await).
+  const clearFlowAt = ops.indexOf("object SiteClearFlow");
+  const clearFlow = ops.slice(clearFlowAt, ops.indexOf("\n}\n", clearFlowAt));
+  assert.match(clearFlow, /const val FLUSH_TIMEOUT_MS: Long = 15_000/);
+  assert.match(clearFlow, /port\.scheduleTimeout\(FLUSH_TIMEOUT_MS\)/);
+  assert.match(
+    clearFlow,
+    /if \(!flushSettled\.compareAndSet\(false, true\)\) return@flushCookies/,
+  );
+  // Migration keeps its own bounds.
+  assert.match(ops, /const val COOKIE_TIMEOUT_MS: Long = 10_000/);
+  // The controller implements the close watchdog over the main looper.
+  const closeAt = controllerKt.indexOf("fun close(activity: Activity, flush: Boolean");
+  assert.ok(closeAt > 0);
+  const closeBody = controllerKt.slice(closeAt, controllerKt.indexOf("SiteCloseFlow.run", closeAt));
+  assert.match(closeBody, /override fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\)/);
+  assert.match(closeBody, /mainHandler\.postDelayed/);
+  // The doc's "every awaited step has a watchdog" claim is now backed by the
+  // flush constants it names.
+  assert.match(read("docs/android-storage-isolation.md"), /FLUSH_TIMEOUT_MS/);
+});
+
+test("all blocking flushes share ONE worker, with stuck detection not new threads", () => {
+  // Every AWAITED flush (migration, close, clear, the periodic sync) routes
+  // through submitFlush — the single place that answers a caller and can
+  // therefore notice a stuck worker.
+  assert.match(controllerKt, /private fun submitFlush\(/);
+  assert.equal(
+    (controllerKt.match(/submitFlush\(activity, "/g) || []).length,
+    4,
+    "migration, close, clear and the periodic sync",
+  );
+  // The only other submission is destroy's deliberately fire-and-forget
+  // flush: never awaited, no caller to answer, documented as making no
+  // durability claim.
+  assert.equal(
+    (controllerKt.match(/FLUSH_EXECUTOR\.execute/g) || []).length,
+    2,
+    "submitFlush plus the destroy-time fire-and-forget",
+  );
+  const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity)");
+  assert.ok(destroyAt > 0);
+  const destroyBody = controllerKt.slice(destroyAt, controllerKt.indexOf("\n  }\n", destroyAt));
+  assert.match(destroyBody, /FLUSH_EXECUTOR\.execute/);
+  const teardownDoc = controllerKt.slice(
+    controllerKt.indexOf("Activity teardown:"),
+    destroyAt,
+  );
+  assert.match(teardownDoc, /never awaited/, "destroy's flush stays fire-and-forget, documented");
+  // A watchdog answers the caller; it cannot cancel the blocking provider
+  // call, so a stuck worker must be observable instead of hidden.
+  assert.match(controllerKt, /FLUSH_STUCK_WARN_MS/);
+  assert.match(controllerKt, /flush worker stuck/);
+  assert.equal(
+    (controllerKt.match(/Executors\.newSingleThreadExecutor/g) || []).length,
+    1,
+  );
+  assert.doesNotMatch(
+    controllerKt,
+    /newCachedThreadPool|newFixedThreadPool|newWorkStealingPool/,
+    "no thread pool inflation to dodge a stuck flush",
+  );
 });
 
 test("back navigation: fullscreen first, then site history, then the launcher hook", () => {

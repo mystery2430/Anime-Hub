@@ -118,12 +118,17 @@ export function createBackSession({ call, notify, errorText }) {
 
     /**
      * `animehub://site-closed` bookkeeping. Clears the session only when the
-     * event belongs to it: a payload matching the owned site (or an
-     * unverifiable payload with no owned id) clears; anything else is stale
-     * and ignored.
+     * event provably belongs to it:
+     *  * an owned id requires an EXACT payload match — a missing, null or
+     *    empty payload proves nothing about ownership, so it is treated as
+     *    stale and ignored (every current Rust producer emits the site id;
+     *    this keeps a future producer that forgets it from silently
+     *    orphaning an active session);
+     *  * with no owned id there is nothing to match against, so the event
+     *    clears (the pre-existing contract for unverifiable payloads).
      */
     closedByEvent(payloadSiteId) {
-      if (siteId && payloadSiteId && payloadSiteId !== siteId) return false;
+      if (siteId && payloadSiteId !== siteId) return false;
       label = null;
       siteId = null;
       state = "idle";

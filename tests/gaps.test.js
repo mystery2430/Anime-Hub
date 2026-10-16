@@ -69,6 +69,40 @@ test("CI android job builds and uploads an installable debug APK", () => {
   assert.match(yml, /actions\/upload-artifact@v7/);
 });
 
+test("CI Kotlin step copies its test sources and reports the real cargo status", () => {
+  const yml = read(join(ROOT, ".github/workflows/ci.yml"));
+  // Both behaviour-test sources must reach the Gradle test source set, and a
+  // failed copy has to fail the step: `--tests "dev.animehub.app.*Test"`
+  // passes when ANY matching class exists, so a silently missing
+  // SiteProfileOpsTest.kt would shrink the suite to the policy test while
+  // the job stayed green.
+  for (const name of ["SiteNavigationPolicyTest.kt", "SiteProfileOpsTest.kt"]) {
+    const at = yml.indexOf(
+      `cp src-tauri/android-plugin/kotlin/dev/animehub/app/${name}`,
+    );
+    assert.ok(at > 0, `${name} must be copied into the test source set`);
+    const line = yml.slice(at, yml.indexOf("\n", at));
+    assert.match(line, /\|\| \{/, `${name}: a failed copy must fail the step`);
+    assert.equal(line.includes("|| true"), false, `${name}: never masked`);
+  }
+  // The tauri-gradle generation build stays non-gating on purpose (the real
+  // gates are the Gradle exit code and the APK step), but the status it
+  // prints must come from cargo itself: `$?` after `|| true` is always 0 and
+  // made a failed generation look green in the log.
+  const cargoAt = yml.indexOf(
+    "cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android",
+  );
+  assert.ok(cargoAt > 0, "the tauri-gradle generation build is missing");
+  const cargoLine = yml.slice(cargoAt, yml.indexOf("\n", cargoAt));
+  assert.equal(cargoLine.includes("|| true"), false, "cargo status must not be masked");
+  const statusAt = yml.indexOf("cargo_status=$?", cargoAt);
+  assert.ok(statusAt > cargoAt, "the status is captured right after the build");
+  assert.match(yml, /set \+e/, "the step stays non-gating via set +e, not via masking");
+  // The real gates keep failing the job on their own.
+  assert.match(yml, /BUILD SUCCESSFUL" \/tmp\/kotlin-test\.log \|\| \{ echo "::error::BUILD SUCCESSFUL not found"; exit 1; \}/);
+  assert.match(yml, /exit \$status/);
+});
+
 test("the obsolete Android storage-isolation warning is gone from the UI", () => {
   const ui = read(join(ROOT, "src/main.js"));
   const start = ui.indexOf("async function openSite(tile)");

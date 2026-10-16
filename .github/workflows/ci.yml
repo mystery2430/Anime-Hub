@@ -222,8 +222,13 @@ jobs:
           fi
           ls -l src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 20
           mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
-          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
-          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
+          # The Gradle `--tests "dev.animehub.app.*Test"` glob passes when ANY
+          # matching class exists, so a failed copy would silently shrink the
+          # suite (a missing SiteProfileOpsTest.kt would drop all 30 flow
+          # tests) while the step stayed green. A missing source is a hard
+          # failure — no `|| true`, no continue-on-error.
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteNavigationPolicyTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteProfileOpsTest.kt could not be copied into the test source set"; exit 1; }
           echo "=== isolating: move AnimeHubPlugin.kt + MainActivity.kt only; keep the real site controller chain ==="
           echo "=== before move, ls -l src/main ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
@@ -285,7 +290,14 @@ jobs:
           # tauri_build generates tauri.settings.gradle and tauri.build.gradle.kts only when
           # TAURI_ANDROID_PROJECT_PATH is set and cargo build runs for an android target.
           # This provides the real :tauri-android project so AnimeHubPlugin.kt can compile.
-          TAURI_ANDROID_PROJECT_PATH=$(pwd)/src-tauri/gen/android cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android  > /tmp/cargo-tauri.log 2>&1 || true
+          # Non-gating on purpose: this build only exists to make tauri_build
+          # emit tauri.settings.gradle / app/tauri.build.gradle.kts for the
+          # unit-test source set; the real gates below are the Gradle test
+          # exit code and the APK step. The step runs under `set +e`, so the
+          # failure does not abort here — but `$?` must be captured from the
+          # build itself, NOT from a trailing `|| true` (which pinned the
+          # reported status to 0 and made a failed generation look green).
+          TAURI_ANDROID_PROJECT_PATH=$(pwd)/src-tauri/gen/android cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android  > /tmp/cargo-tauri.log 2>&1
           cargo_status=$?
           echo "cargo build exit $cargo_status"
           cat /tmp/cargo-tauri.log | tail -n 200

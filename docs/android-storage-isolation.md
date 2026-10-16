@@ -16,23 +16,46 @@ provider's **default** profile. A site never navigates that WebView. Instead:
 Rust: open_site → windows::open_site_window (android) ─ under ANDROID_SESSION_LOCK
         │  1. re-validate the registry snapshot
         │  2. close the outgoing site view (profile flushed, view destroyed)
-        │  3. profile  = android_profile_name(site_id, generation)
-        │  4. one-time cookie migration (flag-gated, strict; a failed
-        │     attempt retires that virgin profile name and retries)
+        │  3. run_mobile_open_protocol: profile =
+        │     android_profile_name(site_id, generation); one-time migration
+        │     is flag-gated and strict (a failed attempt retires that virgin
+        │     profile name and retries once)
         ▼
-Kotlin: site_open → AnimeHubSiteController
-        │  5. WebViewFeature.MULTI_PROFILE gate → refuse with a sentinel
-        │  6. (virgin profile) Profile.getCookieManager(): set cookies →
-        │     every callback → flush() on a background thread
-        │  7. WebView() → WebViewCompat.setProfile(view, profile)   ← first API call
-        │  8. settings, SiteNavigationGuard, document-start script
-        │  9. content.addView(...) — site view covers the launcher
-        │ 10. PiP re-binds to the site view; back callback enabled
-        │ 11. loadUrl(url)
+Kotlin: site_migrate → AnimeHubSiteController.migrate    (PHASE 1 — no view)
+        │  4. WebViewFeature.MULTI_PROFILE gate → refuse with a sentinel
+        │  5. (virgin profile) Profile.getCookieManager(): set cookies →
+        │     every callback → flush() on the single flush worker; each
+        │     awaited step is watchdog-bounded
         ▼
-close  → flush profile cookies → removeView → destroy → PiP/focus back to
-         launcher (launcher page never moved, so revealing it is all there is)
+Rust:   6. `profilemig-<site_id>` is written — durable BEFORE any view
+        │     exists. A failed write ABORTS the open: nothing was shown, the
+        │     jar is kept, and the next open can safely retry.
+        ▼
+Kotlin: site_open → AnimeHubSiteController.open          (PHASE 2 — the view)
+        │  7. MULTI_PROFILE gate again → refuse with a sentinel
+        │  8. WebView() → WebViewCompat.setProfile(view, profile)   ← first API call
+        │  9. settings, SiteNavigationGuard, document-start script
+        │ 10. content.addView(...) — site view covers the launcher
+        │ 11. PiP re-binds to the site view; back callback enabled
+        │ 12. loadUrl(url)
+        ▼
+close  → flush profile cookies (watchdog-bounded; a timeout or a failure
+         KEEPS the view and the session ownership for a retry) → removeView →
+         destroy → PiP/focus back to launcher (launcher page never moved, so
+         revealing it is all there is)
 ```
+
+**Why two phases.** While the open was a single `site_open` call, the
+migration flag was written *after* the WebView existed and a failed write was
+only logged. A missing flag then meant "migration pending" even for a profile
+the user was already using, so the next open saw the existing profile,
+reported `migration-partial`, retired that healthy name and re-imported the
+stale jar — losing the site's localStorage/IndexedDB at the next startup
+drain. With the flag durable before phase 2, "flag missing" can only mean "no
+view has been shown yet", which makes retire-and-retry the safe resolution.
+`run_mobile_open_protocol` (in `web/windows.rs`) owns this ordering and is
+covered by host-side behaviour tests with a scripted plugin and an injected
+storage write failure.
 
 * **Launcher**: default profile, `main` origin, IPC-restricted as before.
   Site clear/delete paths never address it (`Default` is rejected by name
@@ -151,7 +174,7 @@ cookies are untouched.
 
 | 0.3.4 data | Migrated? | How / why |
 | --- | --- | --- |
-| Encrypted cookie jar (`cookies-<site_id>`) | **Yes, once, strictly** | On the first open of a site under the new version, while the profile does not exist yet: Rust reads the jar (expired cookies pruned), passes the `Set-Cookie` headers to `site_open`; Kotlin writes them through the **profile's** `Profile.getCookieManager()` (never the static default-profile manager), waits for every `setCookie` callback **and** the background `flush()`, with per-cookie and flush timeouts — and only then constructs the WebView and navigates. The `profilemig-<site_id>` flag is written **only after that full success**. Any rejection, exception, lost callback, flush failure — or an already-existing profile, whose live cookies are authoritative and must not be overwritten — fails the attempt with the `migration-partial` sentinel: Rust queues that virgin name for deletion, bumps the generation and retries **once** on a fresh name; a second failure surfaces a visible, retryable error ("site çerezleri profiline taşınamadı …") with the flag and the jar **both kept**, so the next open starts the migration over. A partially imported profile can therefore never pass as complete, and the legacy jar survives until a real success (or until the user's own clear/remove drops it). |
+| Encrypted cookie jar (`cookies-<site_id>`) | **Yes, once, strictly** | On the first open of a site under the new version, while the profile does not exist yet: Rust reads the jar (expired cookies pruned) and passes the `Set-Cookie` headers to **`site_migrate`** (phase 1 — no WebView is created); Kotlin writes them through the **profile's** `Profile.getCookieManager()` (never the static default-profile manager) and waits for every `setCookie` callback **and** the background `flush()`, with per-cookie and flush timeouts. Only after that full success does Rust write the `profilemig-<site_id>` flag — **durably, before phase 2 (`site_open`) constructs the WebView and navigates**. A failed flag write therefore aborts the open with a visible, retryable error while nothing has been shown: no orphan view, no split Rust/Kotlin ownership, jar and (missing) flag untouched for the next attempt. Any rejection, exception, lost callback, flush failure — or an already-existing profile, whose live cookies are authoritative and must not be overwritten — fails phase 1 with the `migration-partial` sentinel: Rust queues that virgin name for deletion, bumps the generation and retries **once** on a fresh name; a second failure surfaces a visible, retryable error ("site çerezleri profiline taşınamadı …") with the flag and the jar **both kept**, so the next open starts the migration over. Because the flag is durable before any view exists, a `migration-partial` on reopen can only ever retire a profile the user has **not** seen — a shown profile is never queued or rebuilt from the stale jar. A partially imported profile can therefore never pass as complete, and the legacy jar survives until a real success (or until the user's own clear/remove drops it). |
 | `localStorage` snapshot (`localstorage-<site_id>`) | **No** | Only imported when origin verification, completion confirmation and data safety can all be guaranteed — they cannot be, without reviving the origin TOCTOU of the old import path (write lands in whichever document is loaded) and without keeping the JS-eval bridge this change deletes. The blobs are **kept on disk** (not deleted early) until the user clears or removes that site; they are simply never re-injected. |
 | IndexedDB snapshot (`indexeddb-<site_id>`) | **No, deliberately** | The dump was lossy (indexes, key paths, structured-clone/Blob values do not round-trip) and is never silently re-imported. Kept on disk like the localStorage snapshot, removed only by the user's own clear/delete. |
 
@@ -200,10 +223,14 @@ remove, no legacy data remains (`delete_site_session` also drops the
   geolocation permission (enumerated via `getOrigins` and awaited —
   `GeolocationPermissions` has no removeAll-with-callback), then
   `WebStorage.deleteAllData()` (Web Storage + Web SQL), then a final
-  `flush()` — each awaited step has a watchdog and every step is attempted,
-  with the first error aggregated and returned. Rust keeps its encrypted
-  session blobs whenever that error is non-null, so a half-finished wipe is
-  retryable. **Not covered:** HTTP cache and service-worker registrations —
+  `flush()`. **Every** awaited callback is bounded by a watchdog —
+  `STEP_TIMEOUT_MS` (10 s) per step and `FLUSH_TIMEOUT_MS` (15 s) for the
+  final flush — and every step is attempted, with the first error aggregated
+  and returned. A watchdog that fires before its callback records a timeout
+  error, so Rust keeps its encrypted session blobs and the wipe stays
+  retryable; a callback arriving *after* the watchdog is ignored and can
+  never flip the delivered failure back to success. **Not covered:** HTTP
+  cache and service-worker registrations —
   no profile-scoped API clears them without a delete/recreate of the whole
   profile (deleting the profile *does* remove them; in-place clear keeps
   the profile). Documented rather than approximated with a
@@ -251,34 +278,68 @@ remove, no legacy data remains (`delete_site_session` also drops the
 * **Locks**: open/close/sync/remove/clear still serialize on
   `ANDROID_SESSION_LOCK`; the ownership check (`session_is_current`) gates the
   flush loop.
+* **Flush awaits are bounded, and the worker is observable**: every flow that
+  waits for `CookieManager.flush()` — migration, normal close, clear — arms a
+  watchdog (`FLUSH_TIMEOUT_MS`, 15 s; `STEP_TIMEOUT_MS`, 10 s for the other
+  clear steps), so a callback that never arrives answers the caller with a
+  failure instead of holding the session lock forever. A normal close that
+  times out keeps the view AND the session ownership (Rust `current_site`
+  and the Kotlin slot stay identical, the close is retryable), and a flush
+  callback landing after the timeout is ignored: it can neither flip the
+  failure to success nor destroy a view whose ownership was never released.
+  All flushes run on ONE single-threaded worker (`FLUSH_EXECUTOR`) — a
+  watchdog answers the *caller*; it cannot cancel the blocking provider call
+  underneath, so a genuinely stuck flush would pile later flushes up behind
+  it. `submitFlush` detects that (a new flush queued while the worker has
+  been busy ≥ 10 s) and logs it to logcat and the in-app debug log instead
+  of hiding it; no extra threads are spawned to paper over it.
 
 **Behavioural coverage (mocks/injected callbacks, no new dependencies):**
 
-* `SiteProfileOpsTest.kt` (30 cases, executed by the CI Gradle unit-test
+* `SiteProfileOpsTest.kt` (36 cases, executed by the CI Gradle unit-test
   step against the real sequencing code in `SiteProfileOps.kt`): close
   durability (flush failure keeps the view, resolve failure is an error,
-  exactly-once completion), clear verification (unsupported refuses without
-  touching ports, absent profile, full order, cookie/geo/storage/flush
-  failures each fail the clear while later steps still run, geolocation
-  watchdog on a lost callback, never a success after a failed flush),
+  exactly-once completion, **flush watchdog on a lost callback, a late
+  successful flush cannot rescue a timed-out close or destroy the view,
+  callback-wins-the-race, retry after a timeout**), clear verification
+  (unsupported refuses without touching ports, absent profile, full order,
+  cookie/geo/storage/flush failures each fail the clear while later steps
+  still run, geolocation watchdog on a lost callback, **final-flush
+  watchdog, stale watchdogs cannot change a delivered result**, never a
+  success after a failed flush),
   the strict migration criterion (virgin-only, every cookie + flush,
   rejection/exception/flush/watchdog failures, exactly-once),
   session-slot rollback after a failed open (stale failure cannot clear a
   newer session), and the back-status decision matrix. These catch the
   real error paths A.1–A.5 were about; the controller only *wires* them.
-* `tests/back_close.test.js` (11 cases): the launcher close session —
+* `web/windows.rs` Rust tests drive the real `run_mobile_open_protocol`
+  (7 cases): a scripted plugin half plus the real `SecureStore` wrapped so
+  `profilemig-*` writes can fail — the flag-write failure aborts before any
+  view, a reopen retires only the never-shown profile and recovers, a shown
+  profile is never queued, partial migrations keep the jar and retry once,
+  a second partial fails visibly without opening, the MULTI_PROFILE refusal
+  touches nothing, and an empty/expired jar still records the flag before
+  the view.
+* `tests/back_close.test.js` (13 cases): the launcher close session —
   label survives pending/failed closes (no `finally`-clear), failure
   reason surfaced, no concurrent `close_site`, stale `site-closed` events
-  ignored, retry settles to `closed`.
+  ignored, retry settles to `closed`, and **strict event ownership: an
+  owned session ignores `null`/`undefined`/empty payloads, and a delayed
+  event from a previous session cannot clear the new one**.
 
 **Static/source coverage** (auxiliary only): `tests/android_isolation.test.js`
-(naming, gate ordering, setProfile ordering, migration order, removed
+(naming, gate ordering, setProfile ordering, **the two-phase migrate → flag →
+open ordering and the watchdog-bounded flush awaits**, removed
 machinery, deletion/queue ordering, back/PiP/IPC surface, dependency pin),
 `gaps.test.js` (prepare pipeline incl. the required copies of the split
-files), Rust unit tests in `web/windows.rs` (name determinism/charset/
+files, **CI honesty: the Kotlin test sources must reach the test source set
+and the reported `cargo build` status must be the real one**), Rust unit
+tests in `web/windows.rs` (name determinism/charset/
 uniqueness, strict validator, byte-salvage of a corrupt queue + backup +
-repair, corrupt-generation recovery, `checked_add` refusal, queue
-resolution, round-trip/dedupe/migration flag), `commands.rs`
+repair — **complete tokens only: a multi-digit generation is never truncated
+to a shorter valid-looking name, and a generation beyond `u32` is refused
+instead of cut down** — corrupt-generation recovery, `checked_add` refusal,
+queue resolution, round-trip/dedupe/migration flag), `commands.rs`
 (`profile_removal_for` mapping + serialized outcome names), `android-plugin`
 crate tests (command surface, controller contract, sentinel literals).
 State-machine coverage that needs a real device/provider (actual
@@ -304,6 +365,13 @@ State-machine coverage that needs a real device/provider (actual
   default-profile data untouched after clear/remove; back-button ladder
   (fullscreen → history → launcher → task preserved); PiP handoff while a
   site is open; one-time migration showing the old session on first open;
-  deferred deletion draining on the next start.
+  deferred deletion draining on the next start; **real `CookieManager.flush()`
+  latency and the watchdog paths on a real provider (a deliberately stuck
+  flush: caller answered with a failure, view/session kept, retry works, and
+  the `submitFlush` stuck-worker warning appears in the in-app log); the
+  two-phase open on a real device (migrate → flag → view), including killing
+  the process between phase 1 and the flag write and confirming the next
+  open retires only the never-shown profile; and the Tauri mobile-invoke
+  timeout behaviour for a plugin call whose Kotlin side answered late.**
 * iOS/macOS: out of scope; the iOS path keeps the shared-WebView flow minus
   the removed snapshot machinery and was not touched beyond that.

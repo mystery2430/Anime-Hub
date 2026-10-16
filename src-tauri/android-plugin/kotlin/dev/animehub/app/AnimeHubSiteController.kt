@@ -79,6 +79,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONTokener
 
 /**
@@ -118,6 +119,65 @@ object AnimeHubSiteController {
 
   private val FLUSH_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "AnimeHubSiteFlush").apply { isDaemon = true }
+  }
+
+  /**
+   * When the flush task currently running on [FLUSH_EXECUTOR] started, or 0
+   * while the worker is idle. Single-threaded on purpose: `CookieManager
+   * .flush()` is the blocking provider call, and serialising it keeps the
+   * profile cookie stores from being written concurrently.
+   */
+  private val flushBusySince = AtomicLong(0L)
+
+  /**
+   * How long a running flush may take before a newly queued one is logged as
+   * evidence of a stuck worker.
+   *
+   * A flow watchdog answers the CALLER — it never cancels the blocking
+   * `flush()` underneath, because the provider call offers no cancellation.
+   * So a genuinely stuck flush leaves its task occupying the worker; later
+   * flushes queue behind it and every later await is answered by its own
+   * watchdog. This counter makes that pileup observable in the in-app log
+   * instead of invisible (no unbounded thread spawning to paper over it).
+   */
+  private const val FLUSH_STUCK_WARN_MS = 10_000L
+
+  /**
+   * Run one blocking `flush()` on [FLUSH_EXECUTOR] and deliver its result on
+   * the UI thread. Warns (logcat + in-app log) when a previous flush has
+   * still been running for [FLUSH_STUCK_WARN_MS] or more — the caller has
+   * its watchdog; this is the evidence that the worker itself is stuck.
+   */
+  private fun submitFlush(
+    activity: Activity,
+    tag: String,
+    work: () -> Unit,
+    onDone: (Throwable?) -> Unit,
+  ) {
+    val since = flushBusySince.get()
+    if (since > 0L) {
+      val waited = System.currentTimeMillis() - since
+      if (waited >= FLUSH_STUCK_WARN_MS) {
+        Log.w(LOG_TAG, "flush worker stuck ${waited}ms while queueing '$tag'")
+        AnimeHubDebugLog.add("site", "flush worker stuck ${waited}ms ($tag)")
+      }
+    }
+    try {
+      FLUSH_EXECUTOR.execute {
+        flushBusySince.compareAndSet(0L, System.currentTimeMillis())
+        val error =
+          try {
+            work()
+            null
+          } catch (e: Exception) {
+            e
+          }
+        flushBusySince.set(0L)
+        activity.runOnUiThread { onDone(error) }
+      }
+    } catch (e: Exception) {
+      activity.runOnUiThread { onDone(e) }
+    }
   }
 
   /** UI-thread scheduler for flow watchdogs and the back-status poll. */
@@ -164,56 +224,110 @@ object AnimeHubSiteController {
   // -------------------------------------------------------------------- open
 
   /**
-   * Open `url` in a fresh WebView bound to [profileName].
+   * PHASE 1 of the two-phase open protocol: import the one-time legacy jar
+   * into [profileName] WITHOUT creating the site WebView.
+   *
+   * Why this is a separate command (`site_migrate`) from [open]:
+   * Rust persists `profilemig-<site>` only after a strict migration success,
+   * and only then asks for the view. The ordering is
+   * migrate → durable flag → open, so a profile the user has actually seen
+   * can never exist while the flag is missing — and a missing flag can
+   * therefore never mean "an in-use profile must be rebuilt from the stale
+   * jar". A failed flag write aborts the open BEFORE any view exists: no
+   * orphan WebView, no Rust/Kotlin ownership split (`run_mobile_open_protocol`
+   * in windows.rs).
+   *
+   * Failure modes: [ERR_UNSUPPORTED_MULTI_PROFILE] (feature gap — refuse,
+   * never fall back to the default profile), invalid name, dead Activity,
+   * [ERR_ACTIVE_SITE], and [ERR_MIGRATION_RETRY] for anything short of a
+   * full, flushed import (see [SiteMigrationFlow]) so Rust can retire the
+   * profile name and retry on a fresh generation.
+   */
+  fun migrate(
+    activity: Activity,
+    url: String,
+    profileName: String,
+    cookies: List<String>,
+    onResult: (error: String?) -> Unit,
+  ) {
+    if (!isSupported()) {
+      onResult(ERR_UNSUPPORTED_MULTI_PROFILE)
+      return
+    }
+    if (!profileNameIsValid(profileName)) {
+      onResult("geçersiz profil adı")
+      return
+    }
+    activity.runOnUiThread {
+      if (!liveActivity(activity)) {
+        onResult("Android Activity artık kullanılamıyor")
+        return@runOnUiThread
+      }
+      if (active.hasActive()) {
+        onResult(ERR_ACTIVE_SITE)
+        return@runOnUiThread
+      }
+      if (cookies.isEmpty()) {
+        // No jar (or every cookie in it expired): there is nothing to await
+        // and no profile to create here — [open] binds the view to the name
+        // and the provider materialises it. The flag still becomes durable
+        // before any view exists, exactly like the imported case.
+        onResult(null)
+        return@runOnUiThread
+      }
+      try {
+        migrateCookies(activity, url, profileName, cookies, onResult)
+      } catch (e: Exception) {
+        Log.e(LOG_TAG, "cookie migration failed (${e.javaClass.simpleName})")
+        AnimeHubDebugLog.add("cookie", "migration failed (${e.javaClass.simpleName})")
+        onResult("site çerezleri taşınamadı: ${e.message}")
+      }
+    }
+  }
+
+  /**
+   * PHASE 2: open `url` in a fresh WebView bound to [profileName]. Called
+   * only after phase 1 settled AND Rust persisted the migration flag, so the
+   * view the user sees always belongs to a durably recorded session state.
    *
    * Ordering contract (AndroidX `WebViewCompat.setProfile`):
    * `WebView(context)` → `setProfile` → *then* settings, clients, document
    * start script, hierarchy attach and `loadUrl`. Nothing else touches the
-   * view before `setProfile` returns.
-   *
-   * When [cookies] is non-empty and the profile does not exist yet (first
-   * open after the 0.3.4 migration), the legacy jar is written into the
-   * profile's own cookie manager with a strict success criterion and flushed
-   * to disk before the WebView is even constructed. A failed attempt reports
-   * [ERR_MIGRATION_RETRY] so Rust can retire the profile and retry.
+   * view before `setProfile` returns — and the legacy jar (when one exists)
+   * was written into the profile's own cookie manager and flushed to disk
+   * during [migrate], before this WebView was even constructed, i.e. before
+   * the first navigation.
    */
   fun open(
     activity: Activity,
     url: String,
     profileName: String,
     initScript: String,
-    cookies: List<String>,
-    onResult: (migrated: Boolean, error: String?) -> Unit,
+    onResult: (error: String?) -> Unit,
   ) {
     if (!isSupported()) {
-      onResult(false, ERR_UNSUPPORTED_MULTI_PROFILE)
+      onResult(ERR_UNSUPPORTED_MULTI_PROFILE)
       return
     }
     if (!profileNameIsValid(profileName)) {
-      onResult(false, "geçersiz profil adı")
+      onResult("geçersiz profil adı")
       return
     }
     activity.runOnUiThread {
       if (!liveActivity(activity)) {
-        onResult(false, "Android Activity artık kullanılamıyor")
+        onResult("Android Activity artık kullanılamıyor")
         return@runOnUiThread
       }
       if (active.hasActive()) {
-        onResult(false, ERR_ACTIVE_SITE)
+        onResult(ERR_ACTIVE_SITE)
         return@runOnUiThread
       }
       try {
-        if (cookies.isNotEmpty()) {
-          migrateCookies(activity, url, profileName, cookies) { migrated, error ->
-            if (error != null) onResult(false, error) else buildWebView(activity, url, profileName, initScript, migrated, onResult)
-          }
-        } else {
-          buildWebView(activity, url, profileName, initScript, migrated = false, onResult)
-        }
+        buildWebView(activity, url, profileName, initScript, onResult)
       } catch (e: Exception) {
         Log.e(LOG_TAG, "site open failed (${e.javaClass.simpleName})")
         AnimeHubDebugLog.add("site", "open failed (${e.javaClass.simpleName})")
-        onResult(false, "site açılamadı: ${e.message}")
+        onResult("site açılamadı: ${e.message}")
       }
     }
   }
@@ -230,23 +344,23 @@ object AnimeHubSiteController {
     url: String,
     profileName: String,
     cookies: List<String>,
-    onResult: (migrated: Boolean, error: String?) -> Unit,
+    onResult: (error: String?) -> Unit,
   ) {
     val port = migrationPort(activity, url, profileName)
     SiteMigrationFlow.run(cookies, port) { outcome ->
       when (outcome) {
         is MigrationOutcome.Complete -> {
           AnimeHubDebugLog.add("cookie", "migrated into profile (${outcome.accepted} accepted)")
-          onResult(true, null)
+          onResult(null)
         }
         MigrationOutcome.ProfileAlreadyExists -> {
           AnimeHubDebugLog.add("cookie", "migration refused: profile already exists")
-          onResult(false, "$ERR_MIGRATION_RETRY: profil zaten mevcut")
+          onResult("$ERR_MIGRATION_RETRY: profil zaten mevcut")
         }
         is MigrationOutcome.Failed -> {
           Log.w(LOG_TAG, "cookie migration failed: ${outcome.reason}")
           AnimeHubDebugLog.add("cookie", "migration failed (${outcome.reason})")
-          onResult(false, "$ERR_MIGRATION_RETRY: ${outcome.reason}")
+          onResult("$ERR_MIGRATION_RETRY: ${outcome.reason}")
         }
       }
     }
@@ -276,19 +390,7 @@ object AnimeHubSiteController {
           activity.runOnUiThread { onDone(IllegalStateException("profil cookie yöneticisi yok")) }
           return
         }
-        try {
-          FLUSH_EXECUTOR.execute {
-            val error = try {
-              m.flush()
-              null
-            } catch (e: Exception) {
-              e
-            }
-            activity.runOnUiThread { onDone(error) }
-          }
-        } catch (e: Exception) {
-          activity.runOnUiThread { onDone(e) }
-        }
+        submitFlush(activity, "migration", { m.flush() }, onDone)
       }
 
       override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
@@ -306,8 +408,7 @@ object AnimeHubSiteController {
     url: String,
     profileName: String,
     initScript: String,
-    migrated: Boolean,
-    onResult: (migrated: Boolean, error: String?) -> Unit,
+    onResult: (error: String?) -> Unit,
   ) {
     var webView: WebView? = null
     var attached = false
@@ -365,10 +466,12 @@ object AnimeHubSiteController {
       if (!active.acquire(webView, profileName)) {
         throw IllegalStateException("aktif site görünümü zaten var")
       }
-      AnimeHubDebugLog.add("site", "opened (migrated=$migrated)")
+      // The migration (if any) completed and its flag is durable before this
+      // view exists — phase 2 only builds and navigates.
+      AnimeHubDebugLog.add("site", "opened")
 
       webView.loadUrl(url)
-      onResult(migrated, null)
+      onResult(null)
     } catch (e: Exception) {
       Log.e(LOG_TAG, "site WebView setup failed (${e.javaClass.simpleName})")
       AnimeHubDebugLog.add("site", "setup failed (${e.javaClass.simpleName})")
@@ -391,7 +494,7 @@ object AnimeHubSiteController {
         exitCustomViewIfNeeded()
         launcherWebView?.get()?.let { launcher -> AnimeHubPipController.attach(activity, launcher) }
       }
-      onResult(false, "site açılamadı: ${e.message}")
+      onResult("site açılamadı: ${e.message}")
     }
   }
 
@@ -431,18 +534,14 @@ object AnimeHubSiteController {
               onDone(IllegalStateException("profil çözümlenemedi"))
               return
             }
+            submitFlush(activity, "close", { profile.cookieManager.flush() }, onDone)
+          }
+
+          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
             try {
-              FLUSH_EXECUTOR.execute {
-                val error = try {
-                  profile.cookieManager.flush()
-                  null
-                } catch (e: Exception) {
-                  e
-                }
-                activity.runOnUiThread { onDone(error) }
-              }
-            } catch (e: Exception) {
-              activity.runOnUiThread { onDone(e) }
+              mainHandler.postDelayed({ onTimeout() }, millis)
+            } catch (_: Exception) {
+              // Dead looper ⇒ dead process; nothing to time out.
             }
           }
 
@@ -768,19 +867,7 @@ object AnimeHubSiteController {
               onDone(IllegalStateException("profil yok"))
               return
             }
-            try {
-              FLUSH_EXECUTOR.execute {
-                val error = try {
-                  profile.cookieManager.flush()
-                  null
-                } catch (e: Exception) {
-                  e
-                }
-                activity.runOnUiThread { onDone(error) }
-              }
-            } catch (e: Exception) {
-              activity.runOnUiThread { onDone(e) }
-            }
+            submitFlush(activity, "clear", { profile.cookieManager.flush() }, onDone)
           }
 
           override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
@@ -886,18 +973,10 @@ object AnimeHubSiteController {
         onResult("profil çözümlenemedi: ${e.message}")
         return
       }
-    try {
-      FLUSH_EXECUTOR.execute {
-        try {
-          profile.cookieManager.flush()
-        } catch (e: Exception) {
-          activity.runOnUiThread { onResult("çerez kalıcılığı başarısız: ${e.message}") }
-          return@execute
-        }
-        activity.runOnUiThread { onResult(null) }
-      }
-    } catch (e: Exception) {
-      onResult("çerez kalıcılığı kuyruğa alınamadı: ${e.message}")
+    submitFlush(activity, "sync", { profile.cookieManager.flush() }) { error ->
+      onResult(
+        if (error == null) null else "çerez kalıcılığı başarısız: ${error.message}",
+      )
     }
   }
 

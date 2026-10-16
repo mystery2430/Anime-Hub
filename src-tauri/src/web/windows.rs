@@ -676,11 +676,22 @@ pub fn is_valid_site_profile_name(name: &str) -> bool {
 /// keeps readable `site-…-gN` tokens, and dropping only the unparseable
 /// part preserves the deletions still owed — silently emptying the queue
 /// would strand those names forever (until the orphan sweep at best).
+///
+/// A candidate is ALWAYS the complete token: the maximal ASCII-digit run
+/// after the fixed `site-<32 hex>-g` prefix is taken and only the resulting
+/// full name is validated. Trying growing lengths and accepting the first
+/// hit (an earlier version of this scan) truncated `…-g123` to `…-g1`,
+/// because `…-g1` validates on its own: the wrong profile would be queued
+/// for deletion while the real one stayed out of the queue, and
+/// [`recover_generation_for`] would derive the next generation from the
+/// truncated digits. A digit run that is too long for `u32` (or longer than
+/// the 10-digit shape) now fails the whole token instead of being cut back
+/// to a shorter, "valid-looking" name.
 pub fn scan_valid_profile_names(raw: &[u8]) -> Vec<String> {
     let needle = ANDROID_PROFILE_PREFIX.as_bytes();
-    // A valid name is exactly 5 + 32 + 2 + (1..=10) bytes.
+    // A valid name is at least 5 + 32 + 2 + 1 bytes: `site-`, the hex
+    // digest, `-g` and one generation digit.
     let min_len = 5 + 32 + 2 + 1;
-    let max_len = 5 + 32 + 2 + 10;
     let mut found = Vec::new();
     let mut i = 0;
     while i + needle.len() <= raw.len() {
@@ -688,20 +699,21 @@ pub fn scan_valid_profile_names(raw: &[u8]) -> Vec<String> {
             i += 1;
             continue;
         }
-        let mut matched_end = None;
-        let window_end = (i + max_len).min(raw.len());
-        for end in (i + min_len)..=window_end {
-            if let Ok(candidate) = std::str::from_utf8(&raw[i..end]) {
-                if is_valid_site_profile_name(candidate) {
-                    found.push(candidate.to_string());
-                    matched_end = Some(end);
-                    break;
-                }
-            }
+        if i + min_len > raw.len() {
+            // Only a truncated tail left — no complete name can fit.
+            i += 1;
+            continue;
         }
-        match matched_end {
-            Some(end) => i = end,
-            None => i += 1,
+        let mut end = i + min_len;
+        while end < raw.len() && raw[end].is_ascii_digit() {
+            end += 1;
+        }
+        match std::str::from_utf8(&raw[i..end]) {
+            Some(name) if is_valid_site_profile_name(name) => {
+                found.push(name.to_string());
+                i = end;
+            }
+            _ => i += 1,
         }
     }
     found
@@ -907,14 +919,180 @@ pub fn mark_migration_done(state: &AppState, site_id: &str) -> AppResult<()> {
         .put_secret(&format!("{MIGRATION_FLAG_PREFIX}{site_id}"), b"1")
 }
 
+/// The plugin half of the two-phase open protocol.
+///
+/// Behind a trait so the migrate → durable-flag → open ordering — the part
+/// that decides whether a user-visible profile can ever exist while
+/// `profilemig-<site>` is missing — is host-testable with a scripted plugin
+/// and an injectable [`SecretProvider`]. Production wires it over
+/// [`crate::android_bridge`] (see [`BridgeOpenOps`]).
+pub trait MobileOpenOps {
+    /// Phase 1: import `cookies` into `profile` WITHOUT creating a view.
+    fn migrate(&mut self, url: &str, profile: &str, cookies: &[String]) -> AppResult<()>;
+
+    /// Phase 2: build the site WebView bound to `profile` and navigate.
+    fn open(&mut self, url: &str, profile: &str, init_script: &str) -> AppResult<()>;
+}
+
+/// Production wiring: the two phases over the Android bridge.
+#[cfg(target_os = "android")]
+pub struct BridgeOpenOps;
+
+#[cfg(target_os = "android")]
+impl MobileOpenOps for BridgeOpenOps {
+    fn migrate(&mut self, url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
+        crate::android_bridge::site_migrate(url, profile, cookies)
+    }
+
+    fn open(&mut self, url: &str, profile: &str, init_script: &str) -> AppResult<()> {
+        crate::android_bridge::site_open(url, profile, init_script)
+    }
+}
+
+/// Resolve the profile for `site_id`, run the pending one-time cookie
+/// migration, persist `profilemig-<site_id>` and ONLY THEN open the view.
+/// Returns the profile name that was opened.
+///
+/// WHY THIS ORDERING (the defect this replaces): the previous shape built
+/// the view and migrated inside one `site_open` call and wrote the flag
+/// afterwards, merely logging a failed write. A missing flag then meant
+/// "migration pending" even for a profile the user was already using: the
+/// next open hit Kotlin's `ProfileAlreadyExists`, reported it as
+/// `migration-partial`, and retired THAT healthy profile — the startup drain
+/// deleted its localStorage/IndexedDB and the cookies rolled back to the
+/// stale jar. With the flag durable before phase 2, "flag missing" can only
+/// ever mean "no view has been shown for this migration yet", so retiring
+/// and re-importing is the safe resolution and a shown profile is never
+/// queued.
+///
+/// Contract (proved by the `run_mobile_open_protocol_*` tests):
+///  * migration success = every cookie accepted AND the flush durable —
+///    Kotlin's strict criterion; anything less arrives as the
+///    `migration-partial` sentinel and is retired + retried exactly once on
+///    a fresh generation;
+///  * the legacy jar is never deleted here — it survives every failure so a
+///    retry can re-import it (only clear/remove drops it, with the flag);
+///  * a failed flag write ABORTS the open before phase 2: no view exists, so
+///    the caller never claims `current_site` and Rust/Kotlin ownership
+///    cannot diverge;
+///  * every other error (including the MULTI_PROFILE refusal) propagates
+///    with the same "nothing was opened" guarantee.
+pub fn run_mobile_open_protocol<O: MobileOpenOps>(
+    state: &AppState,
+    site_id: &str,
+    url: &str,
+    init_script: &str,
+    ops: &mut O,
+) -> AppResult<String> {
+    // 1. The profile for this site at its current generation — advanced past
+    //    a queued deletion of that exact stored name (a stale/corrupt
+    //    generation would otherwise hand out a profile whose deletion is
+    //    still in flight) and persisted when advanced, so every later path
+    //    (clear, delete, orphan sweep) derives the same name.
+    let stored_generation = profile_generation(state, site_id)?;
+    let queued = read_pending_profile_deletes(state)?;
+    let (generation, advanced) =
+        resolve_queued_free_generation(site_id, stored_generation, &queued)?;
+    if advanced {
+        state.provider.put_secret(
+            &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
+            generation.to_string().as_bytes(),
+        )?;
+    }
+    let mut profile = android_profile_name(site_id, generation);
+
+    // 2. One-time migration of the pre-profile cookie jar (0.3.4 installs).
+    //    localStorage/IndexedDB snapshots are intentionally NOT imported:
+    //    the dump was lossy and origin-checking it again would revive the
+    //    TOCTOU problems profiles remove. The blobs themselves stay
+    //    untouched until the user clears or deletes the site.
+    let pending_migration = state
+        .provider
+        .get_secret(&format!("{MIGRATION_FLAG_PREFIX}{site_id}"))?
+        .is_none();
+    let mut cookie_headers = Vec::new();
+    if pending_migration {
+        if let Some(bytes) = state.provider.get_secret(&format!("cookies-{site_id}"))? {
+            let jar: CookieJar = serde_json::from_slice(&bytes)?;
+            let now = crate::anilist::now_unix();
+            for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
+                if let Some(cookie) = restore(stored) {
+                    cookie_headers.push(cookie.to_string());
+                }
+            }
+        }
+    }
+
+    // 3. Phase 1 (migrate, no view) → durable flag → phase 2 (the view).
+    //
+    //    A `migration-partial` failure means the virgin-profile import did
+    //    NOT complete (a cookie was rejected, an exception fired, a callback
+    //    or the flush never landed — Kotlin fails instead of faking it).
+    //    Retire THAT profile name (queue + generation bump) and retry
+    //    exactly once on a fresh generation: a half-imported profile must
+    //    never pass as complete, and the legacy snapshot stays untouched
+    //    until the import really lands. A second `migration-partial` fails
+    //    the open with a retryable, visible error — flag and jar intact, so
+    //    the NEXT open starts the whole migration over from a virgin name.
+    if pending_migration {
+        let mut migrate_result = ops.migrate(url, &profile, &cookie_headers);
+        if let Err(AppError::Other(message)) = &migrate_result {
+            if !cookie_headers.is_empty()
+                && message.contains(animehub_android::MIGRATION_RETRY_SENTINEL)
+            {
+                log::warn!(
+                    "profil göçü tamamlanamadı ({site_id})={message}; profil emekliye ayrılıyor"
+                );
+                queue_pending_profile_delete(state, &profile)?;
+                let retry_generation = bump_profile_generation(state, site_id)?;
+                profile = android_profile_name(site_id, retry_generation);
+                migrate_result = ops.migrate(url, &profile, &cookie_headers);
+                if let Err(AppError::Other(retry_message)) = &migrate_result {
+                    if retry_message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) {
+                        // Retire this attempt too and surface a retryable error.
+                        if let Err(e) = queue_pending_profile_delete(state, &profile) {
+                            log::warn!("ikinci göç profili kuyruğa alınamadı: {e}");
+                        }
+                        if let Err(e) = bump_profile_generation(state, site_id) {
+                            log::warn!("göç sonrası nesil artırılamadı: {e}");
+                        }
+                        return Err(AppError::Other(format!(
+                            "site çerezleri profiline taşınamadı: {retry_message}. Çerezler saklandı; sonraki açılışta yeniden denenecek."
+                        )));
+                    }
+                }
+            }
+        }
+        migrate_result?;
+
+        // Durable BEFORE the view exists. A failed write aborts the open on
+        // purpose: continuing would show the user a profile whose migration
+        // state is unrecorded, and the next open would treat that in-use
+        // profile as pending and retire it — the data-loss path this
+        // ordering removes. Nothing was built yet, so the abort leaves no
+        // orphan view and no ownership to unwind; the jar and the (missing)
+        // flag stay exactly as they were and the next open re-imports.
+        mark_migration_done(state, site_id).map_err(|e| {
+            AppError::Other(format!(
+                "site göç durumu kalıcılaştırılamadı ({site_id}): {e}. Site açılmadı; çerezler korundu, sonraki açılışta yeniden denenecek."
+            ))
+        })?;
+    }
+
+    ops.open(url, &profile, init_script)?;
+    Ok(profile)
+}
+
 /// Android: open the site in a fresh native WebView bound to its own profile.
 ///
 /// Runs entirely under `ANDROID_SESSION_LOCK`: the outgoing site WebView is
-/// closed first (its data lives in its profile — nothing is exported), the
-/// one-time 0.3.4 cookie jar is handed to the profile cookie manager before
-/// the first navigation, and only then does the new view cover the launcher.
-/// A `MULTI_PROFILE`-unsupported provider aborts here with
-/// [`AppError::Unsupported`] and no session state is changed.
+/// closed first (its data lives in its profile — nothing is exported), then
+/// [`run_mobile_open_protocol`] resolves the profile name, hands the
+/// one-time 0.3.4 cookie jar to the profile cookie manager, persists
+/// `profilemig-<site>` and ONLY THEN builds the view — so no WebView the
+/// user can see exists while the migration state is not durable. A
+/// `MULTI_PROFILE`-unsupported provider aborts with [`AppError::Unsupported`]
+/// and no session state is changed.
 #[cfg(target_os = "android")]
 fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
     let _session_guard = lock_android_session()?;
@@ -955,105 +1133,20 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         }
     }
 
-    // 2. The profile for this site at its current generation — advanced past
-    //    a queued deletion of that exact stored name (a stale/corrupt
-    //    generation would otherwise hand out a profile whose deletion is
-    //    still in flight) and persisted when advanced, so every later path
-    //    (clear, delete, orphan sweep) derives the same name.
-    let stored_generation = profile_generation(&state, &site.id)?;
-    let queued = read_pending_profile_deletes(&state)?;
-    let (generation, advanced) =
-        resolve_queued_free_generation(&site.id, stored_generation, &queued)?;
-    if advanced {
-        state.provider.put_secret(
-            &format!("{PROFILE_GENERATION_PREFIX}{}", site.id),
-            generation.to_string().as_bytes(),
-        )?;
-    }
-    let profile = android_profile_name(&site.id, generation);
-
-    // 3. One-time migration of the pre-profile cookie jar (0.3.4 installs).
-    //    localStorage/IndexedDB snapshots are intentionally NOT imported: the
-    //    dump was lossy and origin-checking it again would revive the TOCTOU
-    //    problems profiles remove. The blobs themselves stay untouched until
-    //    the user clears or deletes the site.
-    let pending_migration = state
-        .provider
-        .get_secret(&format!("{MIGRATION_FLAG_PREFIX}{}", site.id))?
-        .is_none();
-    let mut cookie_headers = Vec::new();
-    if pending_migration {
-        if let Some(bytes) = state.provider.get_secret(&format!("cookies-{}", site.id))? {
-            let jar: CookieJar = serde_json::from_slice(&bytes)?;
-            let now = crate::anilist::now_unix();
-            for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
-                if let Some(cookie) = restore(stored) {
-                    cookie_headers.push(cookie.to_string());
-                }
-            }
-        }
-    }
-
-    // 4. Create the profiled WebView. Any failure — including the
-    //    MULTI_PROFILE-unsupported refusal — leaves no session behind.
-    //
-    //    A `migration-partial` failure means the virgin-profile import did
-    //    NOT complete (a cookie was rejected, an exception fired, a callback
-    //    or the flush never landed — Kotlin fails instead of faking it).
-    //    Retire THAT profile name (queue + generation bump) and retry
-    //    exactly once on a fresh generation: a half-imported profile must
-    //    never pass as complete, and the legacy snapshot stays untouched
-    //    until the import really lands. A second `migration-partial` fails
-    //    the open with a retryable, visible error — flag and jar intact, so
-    //    the NEXT open starts the whole migration over from a virgin name.
-    let mut open_result =
-        crate::android_bridge::site_open(url.as_str(), &profile, init_script, &cookie_headers);
-    if let Err(AppError::Other(message)) = &open_result {
-        if pending_migration
-            && !cookie_headers.is_empty()
-            && message.contains(animehub_android::MIGRATION_RETRY_SENTINEL)
-        {
-            log::warn!(
-                "profil göçü tamamlanamadı ({})={message}; profil emekliye ayrılıyor",
-                site.id
-            );
-            queue_pending_profile_delete(&state, &profile)?;
-            let retry_generation = bump_profile_generation(&state, &site.id)?;
-            let retry_profile = android_profile_name(&site.id, retry_generation);
-            open_result = crate::android_bridge::site_open(
-                url.as_str(),
-                &retry_profile,
-                init_script,
-                &cookie_headers,
-            );
-            if let Err(AppError::Other(retry_message)) = &open_result {
-                if retry_message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) {
-                    // Retire this attempt too and surface a retryable error.
-                    if let Err(e) = queue_pending_profile_delete(&state, &retry_profile) {
-                        log::warn!("ikinci göç profili kuyruğa alınamadı: {e}");
-                    }
-                    if let Err(e) = bump_profile_generation(&state, &site.id) {
-                        log::warn!("göç sonrası nesil artırılamadı: {e}");
-                    }
-                    return Err(AppError::Other(format!(
-                        "site çerezleri profiline taşınamadı: {retry_message}. Çerezler saklandı; sonraki açılışta yeniden denenecek."
-                    )));
-                }
-            }
-        }
-    }
-    open_result?;
-
-    if pending_migration {
-        // Record the attempt only after a fully successful import: a failed
-        // open must be retried next time, and an existing profile's live
-        // cookies must never be overwritten by a stale snapshot later. With
-        // the strict Kotlin criterion, reaching this line means every cookie
-        // was accepted and the flush completed.
-        if let Err(e) = mark_migration_done(&state, &site.id) {
-            log::warn!("profil göç bayrağı yazılamadı ({}): {e}", site.id);
-        }
-    }
+    // 2. Profile resolution, the one-time cookie migration, the durable
+    //    migration flag and the view itself — `run_mobile_open_protocol`
+    //    owns that ordering (migrate → flag → open), so no view the user can
+    //    see exists while `profilemig-<site>` is missing. Any failure,
+    //    including the MULTI_PROFILE-unsupported refusal, leaves no session
+    //    behind: the view is only built after the flag write succeeded.
+    let opened_profile = run_mobile_open_protocol(
+        &state,
+        &site.id,
+        url.as_str(),
+        init_script,
+        &mut BridgeOpenOps,
+    )?;
+    log::debug!("site profili açıldı ({}): {opened_profile}", site.id);
 
     let label = label_for(&site.id);
     *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
@@ -1539,7 +1632,7 @@ mod tests {
     use crate::secure::store::SecureStore;
     use crate::secure::SecretProvider;
     use crate::sites::blocklist::Blocklist;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn labels_are_unique_per_site_and_filesystem_safe() {
@@ -1734,6 +1827,141 @@ mod tests {
     }
 
     #[test]
+    fn scan_recovers_complete_multi_digit_generations() {
+        // The regression this pins: growing-length candidates used to stop at
+        // the SHORTEST valid prefix, so `-g123` was salvaged as `-g1` — the
+        // wrong profile got queued for deletion while the real one stayed out
+        // of the queue, and generation recovery derived from truncated digits.
+        let hex = "a".repeat(32);
+        for gen in ["g1", "g12", "g123", "g4567", "g4294967295"] {
+            let name = format!("site-{hex}-{gen}");
+            let raw = format!("[{{broken {name},");
+            let found = scan_valid_profile_names(raw.as_bytes());
+            assert_eq!(found, vec![name.clone()], "full name must survive: {gen}");
+            assert!(is_valid_site_profile_name(&found[0]));
+        }
+    }
+
+    #[test]
+    fn scan_never_truncates_a_generation_into_a_shorter_valid_name() {
+        let hex = "b".repeat(32);
+        let name = format!("site-{hex}-g123");
+        let truncated = format!("site-{hex}-g1");
+        let raw = format!("\"{name}\"");
+        let found = scan_valid_profile_names(raw.as_bytes());
+        assert_eq!(found, vec![name]);
+        assert!(
+            !found.contains(&truncated),
+            "the truncated prefix is a DIFFERENT profile and must not be salvaged"
+        );
+        // Repeated reads of the same bytes are deterministic (the queue is
+        // re-salvaged on every read until it is repaired).
+        assert_eq!(found, scan_valid_profile_names(raw.as_bytes()));
+    }
+
+    #[test]
+    fn scan_refuses_generations_beyond_u32_instead_of_cutting_them_down() {
+        let hex = "c".repeat(32);
+        // 4294967296 = u32::MAX + 1: right shape, no representable
+        // generation. Cutting it back to `…-g429496729` would salvage a
+        // name that was never queued.
+        let overflow = format!("site-{hex}-g4294967296");
+        assert!(scan_valid_profile_names(overflow.as_bytes()).is_empty());
+        // Longer than the 10-digit shape the validator allows.
+        let too_long = format!("site-{hex}-g12345678901");
+        assert!(scan_valid_profile_names(too_long.as_bytes()).is_empty());
+        // The largest representable generation is still salvaged in full.
+        let max = format!("site-{hex}-g4294967295");
+        assert_eq!(scan_valid_profile_names(max.as_bytes()), vec![max]);
+    }
+
+    #[test]
+    fn scan_handles_lookalikes_and_token_boundaries_exactly() {
+        let hex = "d".repeat(32);
+        // Shape violations salvage nothing.
+        for bad in [
+            format!("site-{hex}-g"),                   // no generation digits
+            format!("site-{}-g3", "d".repeat(31)),     // short hex digest
+            format!("site-{}-g3", "d".repeat(33)),     // long hex digest
+            format!("site-{}-G3", hex.to_uppercase()), // uppercase hex + G
+            "Default".to_string(),                     // the launcher profile
+            "site-not-hex-g3".to_string(),
+        ] {
+            assert!(
+                scan_valid_profile_names(bad.as_bytes()).is_empty(),
+                "lookalike must not be salvaged: {bad}"
+            );
+        }
+        // A non-digit ends the token: junk after complete digits does not
+        // stop the full name from being salvaged (corrupt neighbours are
+        // exactly what this scan exists for).
+        let with_junk = format!("site-{hex}-g12xyz");
+        assert_eq!(
+            scan_valid_profile_names(with_junk.as_bytes()),
+            vec![format!("site-{hex}-g12")]
+        );
+        // An embedded valid token is salvaged as itself — still never
+        // anything outside the `site-…` namespace.
+        let embedded = format!("xsite-{hex}-g3");
+        assert_eq!(
+            scan_valid_profile_names(embedded.as_bytes()),
+            vec![format!("site-{hex}-g3")]
+        );
+    }
+
+    #[test]
+    fn scan_recovers_every_valid_name_in_broken_json_with_noise() {
+        let a = format!("site-{}-g1", "a".repeat(32));
+        let b = format!("site-{}-g12", "b".repeat(32));
+        let c = format!("site-{}-g123", "c".repeat(32));
+        let raw = format!("{{oops [\"{a}\", garbage, {b} , \"site-short-g1\", tail {c}}}");
+        let found = scan_valid_profile_names(raw.as_bytes());
+        assert_eq!(
+            found,
+            vec![a, b, c],
+            "order preserved; noise and invalid tokens dropped"
+        );
+    }
+
+    #[test]
+    fn salvaged_queue_feeds_generation_recovery_and_collision_resolution() {
+        // End-to-end over the REAL production paths: corrupt queue bytes →
+        // salvaged names → generation recovery → collision resolution.
+        let state = state_with_current_site(None);
+        let site = "user-scan";
+        let gen7 = android_profile_name(site, 7);
+        let gen12 = android_profile_name(site, 12);
+        let raw = format!("[{{oops \"{gen7}\", noise {gen12}");
+        state
+            .provider
+            .put_secret(PENDING_PROFILE_DELETES_KEY, raw.as_bytes())
+            .unwrap();
+
+        // The reader salvages the COMPLETE names — a truncated `…-g1` would
+        // queue a deletion for a profile that was never retired.
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(queued, vec![gen7, gen12.clone()]);
+
+        // A corrupt generation counter recovers from those salvaged names.
+        state
+            .provider
+            .put_secret(&format!("{PROFILE_GENERATION_PREFIX}{site}"), b"broken")
+            .unwrap();
+        assert_eq!(profile_generation(&state, site).unwrap(), 13);
+
+        // Collision resolution never hands out a queued name: stored 12 IS
+        // queued, so the derived generation moves past the queue maximum.
+        let (generation, advanced) = resolve_queued_free_generation(site, 12, &queued).unwrap();
+        assert!(advanced);
+        assert_eq!(generation, 13);
+        let derived = android_profile_name(site, generation);
+        assert!(
+            !queued.contains(&derived),
+            "derived name must not collide with the salvaged queue"
+        );
+    }
+
+    #[test]
     fn recover_pending_profile_deletes_reports_corruption() {
         // Parses but contains junk entries: junk dropped, still corrupt.
         let name_a = format!("site-{}-g1", "f".repeat(32));
@@ -1917,10 +2145,7 @@ mod tests {
         // longer current after the wipe's `current_site` is cleared.
         #[cfg(desktop)]
         {
-            use std::sync::{
-                atomic::{AtomicBool, Ordering},
-                Arc,
-            };
+            use std::sync::atomic::{AtomicBool, Ordering};
             let state = Arc::new(state_with_current_site(Some("s1")));
             let sync_started = Arc::new(AtomicBool::new(false));
             let sync_done = Arc::new(AtomicBool::new(false));
@@ -1988,5 +2213,509 @@ mod tests {
         let uid = user.id.clone();
         reg.remove(&uid).unwrap();
         assert!(reg.get(&uid).is_none(), "user site must be deleted");
+    }
+
+    // ---------------------------------------------------------------------
+    // Two-phase open protocol (migrate → durable flag → view).
+    //
+    // These drive the REAL `run_mobile_open_protocol` over the REAL
+    // `SecureStore`; only the plugin half is scripted (it is Kotlin on a
+    // device) and only the storage WRITE failure is injected — at the real
+    // `SecretProvider` boundary, through a wrapper that delegates every
+    // other operation to the production store.
+    // ---------------------------------------------------------------------
+
+    /// Scripted plugin error, mirroring what `android_bridge` delivers.
+    #[derive(Clone)]
+    enum ScriptErr {
+        Other(String),
+        Unsupported,
+    }
+
+    impl ScriptErr {
+        fn into_app(self) -> AppError {
+            match self {
+                ScriptErr::Other(message) => AppError::Other(message),
+                ScriptErr::Unsupported => {
+                    AppError::Unsupported("sağlayıcı çoklu profili desteklemiyor".into())
+                }
+            }
+        }
+    }
+
+    /// Records every phase call so ordering — not just outcomes — is asserted.
+    struct ScriptedOpenOps {
+        calls: Vec<String>,
+        cookies_seen: Vec<usize>,
+        migrate_results: std::collections::VecDeque<Result<(), ScriptErr>>,
+        open_result: Result<(), ScriptErr>,
+    }
+
+    impl ScriptedOpenOps {
+        fn ok() -> Self {
+            Self {
+                calls: Vec::new(),
+                cookies_seen: Vec::new(),
+                migrate_results: std::collections::VecDeque::new(),
+                open_result: Ok(()),
+            }
+        }
+
+        fn with_migrate(results: Vec<Result<(), ScriptErr>>) -> Self {
+            Self {
+                migrate_results: results.into(),
+                ..Self::ok()
+            }
+        }
+    }
+
+    impl MobileOpenOps for ScriptedOpenOps {
+        fn migrate(&mut self, _url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
+            self.calls.push(format!("migrate:{profile}"));
+            self.cookies_seen.push(cookies.len());
+            match self.migrate_results.pop_front() {
+                None | Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(e.into_app()),
+            }
+        }
+
+        fn open(&mut self, _url: &str, profile: &str, _init_script: &str) -> AppResult<()> {
+            self.calls.push(format!("open:{profile}"));
+            match &self.open_result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.clone().into_app()),
+            }
+        }
+    }
+
+    /// The real [`SecureStore`] with an injectable `profilemig-*` write
+    /// failure — the exact storage-layer fault the protocol must survive
+    /// without ever showing a view.
+    struct FailingFlagStore {
+        inner: SecureStore,
+        fail_flag: Arc<std::sync::atomic::AtomicBool>,
+        flag_writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SecretProvider for FailingFlagStore {
+        fn backend(&self) -> crate::secure::Backend {
+            self.inner.backend()
+        }
+
+        fn load_doc_bytes(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.load_doc_bytes(name)
+        }
+
+        fn save_doc_bytes(&self, name: &str, bytes: &[u8]) -> AppResult<()> {
+            self.inner.save_doc_bytes(name, bytes)
+        }
+
+        fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+            if name.starts_with(MIGRATION_FLAG_PREFIX) {
+                self.flag_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(AppError::Storage("keystore yazılamadı (test)".into()));
+                }
+            }
+            self.inner.put_secret(name, plaintext)
+        }
+
+        fn get_secret(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.get_secret(name)
+        }
+
+        fn delete_secret(&self, name: &str) -> AppResult<()> {
+            self.inner.delete_secret(name)
+        }
+
+        fn wipe_secrets(&self) -> AppResult<usize> {
+            self.inner.wipe_secrets()
+        }
+
+        fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+            self.inner.delete_site_session(site_id)
+        }
+    }
+
+    /// State over a real store whose migration-flag writes can be failed and
+    /// healed from the test.
+    fn failing_flag_state() -> (
+        AppState,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let inner = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = inner.load_registry();
+        let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = FailingFlagStore {
+            inner,
+            fail_flag: fail_flag.clone(),
+            flag_writes: flag_writes.clone(),
+        };
+        let state = AppState {
+            provider: Box::new(provider),
+            registry: Mutex::new(registry),
+            settings: Mutex::new(Settings::default()),
+            blocklist: Mutex::new(Blocklist::default()),
+            oauth_state: Mutex::new(None),
+            startup_warning: Mutex::new(warning),
+            launcher_url: Mutex::new(None),
+            current_site: Mutex::new(None),
+            pip_lock: Mutex::new(()),
+            pip_generation: std::sync::atomic::AtomicU64::new(0),
+        };
+        (state, fail_flag, flag_writes)
+    }
+
+    /// A legacy 0.3.4 jar with two live cookies (one session cookie, one
+    /// with a future expiry) — both must reach phase 1 as headers.
+    fn live_jar_bytes() -> Vec<u8> {
+        let jar = CookieJar {
+            site_id: "jar-site".into(),
+            saved_at: crate::anilist::now_unix(),
+            cookies: vec![
+                crate::web::session::StoredCookie {
+                    name: "session".into(),
+                    value: "abc".into(),
+                    domain: Some(".example.com".into()),
+                    path: Some("/".into()),
+                    expires: None,
+                    secure: true,
+                    http_only: true,
+                    same_site: Some("Lax".into()),
+                },
+                crate::web::session::StoredCookie {
+                    name: "pref".into(),
+                    value: "1".into(),
+                    domain: None,
+                    path: None,
+                    expires: Some(crate::anilist::now_unix() + 3600),
+                    secure: false,
+                    http_only: false,
+                    same_site: None,
+                },
+            ],
+        };
+        serde_json::to_vec(&jar).unwrap()
+    }
+
+    #[test]
+    fn protocol_aborts_before_the_view_when_the_flag_write_fails() {
+        // Flow: migration succeeds, `profilemig-<site>` cannot be persisted.
+        let (state, _fail, flag_writes) = failing_flag_state();
+        let id = "user-flagfail";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::ok();
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("a failed flag write must abort the open");
+        let profile = android_profile_name(id, 0);
+
+        // A visible, retryable error — never the old log-and-continue.
+        assert!(matches!(err, AppError::Other(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("kalıcılaştırılamadı"),
+            "error must say the migration state could not be persisted: {err}"
+        );
+        // The view was NEVER built: phase 1 ran, phase 2 did not. In
+        // production that means no Kotlin WebView exists, so Rust claiming
+        // nothing keeps both sides' ownership identical.
+        assert_eq!(ops.calls, vec![format!("migrate:{profile}")]);
+        assert_eq!(ops.cookies_seen, vec![2], "the whole live jar rode phase 1");
+        assert_eq!(
+            flag_writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one flag write was attempted"
+        );
+        // The jar survived for the retry; the flag is still absent; nothing
+        // was retired and the generation never moved.
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        // The caller only claims the session after Ok — nothing was claimed.
+        assert!(state.current_site.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn protocol_retires_only_a_never_shown_profile_and_recovers_afterwards() {
+        // Flows: (1) migrate ok + flag write fails → no view; (2) reopen with
+        // the flag still missing; (3) the profile created in (1) meets the
+        // stale jar — Kotlin reports it as already existing; (4) the profile
+        // the user was eventually SHOWN is never queued; (6) once the storage
+        // fault heals, later opens proceed consistently.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        let id = "user-reopen";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        // Attempt 1: migration lands, the flag does not → abort before view.
+        let mut ops = ScriptedOpenOps::ok();
+        assert!(run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).is_err());
+        let never_shown = android_profile_name(id, 0);
+        assert_eq!(ops.calls, vec![format!("migrate:{never_shown}")]);
+
+        // Attempt 2 (storage healed): the profile from attempt 1 exists but
+        // was NEVER shown, so Kotlin's `ProfileAlreadyExists` → the retry
+        // sentinel → retire + re-import from the intact jar is the safe
+        // resolution.
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut ops = ScriptedOpenOps::with_migrate(vec![
+            Err(ScriptErr::Other(format!(
+                "{}: profil zaten mevcut",
+                animehub_android::MIGRATION_RETRY_SENTINEL
+            ))),
+            Ok(()),
+        ]);
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        let shown = android_profile_name(id, 1);
+        assert_eq!(opened, shown);
+        assert_eq!(
+            ops.calls,
+            vec![
+                format!("migrate:{never_shown}"),
+                format!("migrate:{shown}"),
+                format!("open:{shown}"),
+            ],
+            "retire → retry on a fresh generation → flag → view"
+        );
+        // Only the never-shown name is queued; the flag became durable in the
+        // same attempt that opened the view; the jar was never deleted.
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![never_shown.clone()]
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+
+        // Attempt 3: the flag is durable → straight to phase 2 on the SAME
+        // profile. The profile the user has seen is never re-migrated from
+        // the stale jar and never queued for deletion.
+        let mut ops = ScriptedOpenOps::ok();
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        assert_eq!(opened, shown);
+        assert_eq!(
+            ops.calls,
+            vec![format!("open:{shown}")],
+            "no migration at all once the flag is durable"
+        );
+        assert!(ops.cookies_seen.is_empty());
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![never_shown],
+            "a shown profile must never be retired"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+    }
+
+    #[test]
+    fn partial_migration_retires_once_retries_and_keeps_the_jar() {
+        // Flow 5: a half-finished migration keeps the legacy jar and retries
+        // safely on a virgin generation within the same open.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-partial";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::with_migrate(vec![
+            Err(ScriptErr::Other(format!(
+                "{}: çerez reddedildi (1/2)",
+                animehub_android::MIGRATION_RETRY_SENTINEL
+            ))),
+            Ok(()),
+        ]);
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        let retry = android_profile_name(id, 1);
+        assert_eq!(opened, retry);
+        assert_eq!(
+            ops.calls,
+            vec![
+                format!("migrate:{}", android_profile_name(id, 0)),
+                format!("migrate:{retry}"),
+                format!("open:{retry}"),
+            ]
+        );
+        // The doomed first name is queued, the jar survives, the flag landed.
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![android_profile_name(id, 0)]
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn second_partial_migration_fails_visibly_without_opening_anything() {
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-twice";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let partial = || -> Result<(), ScriptErr> {
+            Err(ScriptErr::Other(format!(
+                "{}: çerez aktarımı zaman aşımına uğradı",
+                animehub_android::MIGRATION_RETRY_SENTINEL
+            )))
+        };
+        let mut ops = ScriptedOpenOps::with_migrate(vec![partial(), partial()]);
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("two partials must fail the open");
+        let message = err.to_string();
+        assert!(
+            message.contains("taşınamadı") && message.contains("sonraki açılışta"),
+            "retryable, user-visible error: {message}"
+        );
+        // No view, no flag; BOTH doomed names are queued; the jar stays for
+        // the next open, which starts the migration over from a virgin name.
+        assert_eq!(
+            ops.calls,
+            vec![
+                format!("migrate:{}", android_profile_name(id, 0)),
+                format!("migrate:{}", android_profile_name(id, 1)),
+            ]
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.contains(&android_profile_name(id, 0)));
+        assert!(queued.contains(&android_profile_name(id, 1)));
+    }
+
+    #[test]
+    fn unsupported_provider_refuses_without_touching_flag_queue_or_view() {
+        // The MULTI_PROFILE refusal must leave every piece of state exactly
+        // as it was — no flag, no queue entry, no generation move, no view.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-unsupported";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::with_migrate(vec![Err(ScriptErr::Unsupported)]);
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("unsupported must refuse");
+        assert!(matches!(err, AppError::Unsupported(_)), "{err:?}");
+        assert_eq!(
+            ops.calls,
+            vec![format!("migrate:{}", android_profile_name(id, 0))],
+            "phase 2 must never run after a refusal"
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_without_a_jar_still_records_the_flag_before_the_view() {
+        // A fresh install has the flag missing and no jar: phase 1 runs with
+        // an empty cookie list (Kotlin treats that as nothing-to-import),
+        // the flag becomes durable, and only then does the view exist.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-nojar";
+
+        let mut ops = ScriptedOpenOps::ok();
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        let profile = android_profile_name(id, 0);
+        assert_eq!(opened, profile);
+        assert_eq!(
+            ops.calls,
+            vec![format!("migrate:{profile}"), format!("open:{profile}")]
+        );
+        assert_eq!(ops.cookies_seen, vec![0]);
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn expired_jar_cookies_never_ride_the_migration() {
+        // Only live cookies are handed to phase 1 — an expired snapshot must
+        // not be resurrected into a virgin profile.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-expired";
+        let jar = CookieJar {
+            site_id: "jar-site".into(),
+            saved_at: crate::anilist::now_unix(),
+            cookies: vec![crate::web::session::StoredCookie {
+                name: "old".into(),
+                value: "x".into(),
+                domain: None,
+                path: None,
+                expires: Some(crate::anilist::now_unix() - 10),
+                secure: false,
+                http_only: false,
+                same_site: None,
+            }],
+        };
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &serde_json::to_vec(&jar).unwrap())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::ok();
+        run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        assert_eq!(ops.cookies_seen, vec![0], "expired cookies are dropped");
     }
 }

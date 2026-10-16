@@ -63,25 +63,43 @@ pub enum SiteProfileAction {
     Pending,
 }
 
-/// Open `url` in a new site WebView bound to `profile`.
+/// Phase 1 of the two-phase open: import the one-time legacy 0.3.4 cookie
+/// jar into `profile` WITHOUT creating the site WebView.
 ///
-/// Returns `true` when the legacy 0.3.4 cookie jar was imported into the
-/// profile first. Fails with [`AppError::Unsupported`] carrying
+/// Kotlin reports success only when every `setCookie` callback accepted and
+/// the profile flush completed (see `SiteMigrationFlow`), so a success here
+/// is the strict "migration landed" criterion the caller persists
+/// `profilemig-<site>` against. An incomplete import arrives as
+/// [`AppError::Other`] carrying the `migration-partial` sentinel — the
+/// caller retires that profile name and retries on a fresh generation.
+/// Fails with [`AppError::Unsupported`] carrying
 /// [`MULTI_PROFILE_UNSUPPORTED_MSG`] when the provider cannot isolate sites.
 #[cfg(target_os = "android")]
-pub fn site_open(
-    url: &str,
-    profile: &str,
-    init_script: &str,
-    cookies: &[String],
-) -> AppResult<bool> {
+pub fn site_migrate(url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
+    match animehub_android::site_migrate(url.to_string(), profile.to_string(), cookies.to_vec()) {
+        Ok(_) => Ok(()),
+        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
+            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
+        )),
+        Err(e) => Err(AppError::Other(e.to_string())),
+    }
+}
+
+/// Phase 2: open `url` in a new site WebView bound to `profile`.
+///
+/// Carries no cookies: the jar import ran through [`site_migrate`] and its
+/// flag is durable before this call, so a view the user sees can never exist
+/// while the migration state is unrecorded. Fails with
+/// [`AppError::Unsupported`] carrying [`MULTI_PROFILE_UNSUPPORTED_MSG`] when
+/// the provider cannot isolate sites.
+#[cfg(target_os = "android")]
+pub fn site_open(url: &str, profile: &str, init_script: &str) -> AppResult<()> {
     match animehub_android::site_open(
         url.to_string(),
         profile.to_string(),
         init_script.to_string(),
-        cookies.to_vec(),
     ) {
-        Ok(r) => Ok(r.migrated),
+        Ok(_) => Ok(()),
         Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
             MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
         )),
@@ -184,12 +202,14 @@ pub fn keystore_open(_purpose: &str, _sealed: &str) -> AppResult<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn site_open(
-    _url: &str,
-    _profile: &str,
-    _init_script: &str,
-    _cookies: &[String],
-) -> AppResult<bool> {
+pub fn site_migrate(_url: &str, _profile: &str, _cookies: &[String]) -> AppResult<()> {
+    Err(AppError::Unsupported(
+        "Site profilleri yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn site_open(_url: &str, _profile: &str, _init_script: &str) -> AppResult<()> {
     Err(AppError::Unsupported(
         "Site profilleri yalnızca Android'de kullanılabilir".into(),
     ))
@@ -334,9 +354,16 @@ mod tests {
         assert_eq!(keystore_open("p", "x").unwrap_err().code(), "keyring");
         // Site-profile bridges must fail honestly off Android — the removed
         // JSON storage/cookie transfer commands are gone from both sides.
+        // Both phases of the two-phase open refuse on their own.
         let profile = "site-00000000000000000000000000000000-g0";
         assert_eq!(
-            site_open("https://example.com/", profile, "", &[])
+            site_migrate("https://example.com/", profile, &[])
+                .unwrap_err()
+                .code(),
+            "unsupported"
+        );
+        assert_eq!(
+            site_open("https://example.com/", profile, "")
                 .unwrap_err()
                 .code(),
             "unsupported"

@@ -26,9 +26,16 @@ class SiteProfileOpsTest {
     var active = true
     var resolveError: Throwable? = null
     var flushError: Throwable? = null
+
+    /** When true the flush callback never fires — only the watchdog settles. */
+    var flushNeverAnswers = false
+
+    /** The captured flush callback, so a test can deliver it LATE. */
+    var pendingFlush: ((Throwable?) -> Unit)? = null
     var destroyed = 0
     var resolveCalls = 0
     var flushCalls = 0
+    val timeouts = mutableListOf<() -> Unit>()
     val log = mutableListOf<String>()
 
     override fun hasActiveView(): Boolean = active
@@ -43,7 +50,15 @@ class SiteProfileOpsTest {
     override fun flushCookies(profileName: String, onDone: (Throwable?) -> Unit) {
       flushCalls++
       log += "flush:$profileName"
+      if (flushNeverAnswers) {
+        pendingFlush = onDone
+        return
+      }
       onDone(flushError)
+    }
+
+    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+      timeouts += onTimeout
     }
 
     override fun destroyActiveView() {
@@ -118,11 +133,86 @@ class SiteProfileOpsTest {
           onDone(RuntimeException("late duplicate"))
         }
 
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {}
         override fun destroyActiveView() {}
       }
     var count = 0
     SiteCloseFlow.run(port, flush = true) { count++ }
     Assert.assertEquals(1, count)
+  }
+
+  @Test
+  fun `close flush watchdog answers when the callback never arrives`() {
+    // The flush is a blocking provider call on a single-threaded executor:
+    // without a bound, a lost callback hangs the close — and with it the
+    // Rust session lock — forever.
+    val port = FakeClosePort().also { it.flushNeverAnswers = true }
+    var result: String? = null
+    SiteCloseFlow.run(port, flush = true) { result = it }
+    Assert.assertNull("still pending before the watchdog", result)
+    Assert.assertEquals("the flush await must be armed", 1, port.timeouts.size)
+    port.timeouts[0].invoke()
+    Assert.assertTrue("timeout must fail the close: $result", (result ?: "ok") != "ok")
+    Assert.assertTrue("timeout must name durability: $result", result!!.contains("kalıcılığı"))
+    Assert.assertEquals("view must stay open for a retry", 0, port.destroyed)
+    Assert.assertTrue("session ownership must stay claimed", port.active)
+  }
+
+  @Test
+  fun `a late successful flush cannot rescue a timed-out close or destroy the view`() {
+    val port = FakeClosePort().also { it.flushNeverAnswers = true }
+    var results = 0
+    var last: String? = null
+    SiteCloseFlow.run(port, flush = true) { results++; last = it }
+    port.timeouts[0].invoke()
+    Assert.assertEquals(1, results)
+    // The blocked flush finally lands AFTER the watchdog answered. It must
+    // neither flip the delivered failure back to success nor destroy a view
+    // whose ownership was never released (the slot may already belong to a
+    // retried close or a newer open).
+    port.pendingFlush!!.invoke(null)
+    Assert.assertEquals("exactly one result", 1, results)
+    Assert.assertTrue("the timeout failure stands: $last", (last ?: "ok") != "ok")
+    Assert.assertEquals(0, port.destroyed)
+    Assert.assertTrue(port.active)
+    // A late FAILURE callback is equally powerless.
+    port.pendingFlush!!.invoke(RuntimeException("too late"))
+    Assert.assertEquals(1, results)
+    Assert.assertEquals(0, port.destroyed)
+  }
+
+  @Test
+  fun `close flush callback wins the race when it beats the watchdog`() {
+    val port = FakeClosePort()
+    var results = 0
+    var last: String? = "unset"
+    SiteCloseFlow.run(port, flush = true) { results++; last = it }
+    Assert.assertEquals(1, results)
+    Assert.assertNull("callback success stands", last)
+    Assert.assertEquals(1, port.destroyed)
+    // The stale watchdog firing afterwards changes nothing.
+    port.timeouts[0].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertNull(last)
+    Assert.assertEquals("the view is destroyed exactly once", 1, port.destroyed)
+  }
+
+  @Test
+  fun `close can be retried after a timeout because ownership was kept`() {
+    val port = FakeClosePort().also { it.flushNeverAnswers = true }
+    var first: String? = null
+    SiteCloseFlow.run(port, flush = true) { first = it }
+    port.timeouts[0].invoke()
+    Assert.assertTrue((first ?: "ok") != "ok")
+    Assert.assertEquals(0, port.destroyed)
+    // Retry with a provider that answers this time: the view and the slot
+    // were never released, so the second close completes normally.
+    port.flushNeverAnswers = false
+    var second: String? = "unset"
+    SiteCloseFlow.run(port, flush = true) { second = it }
+    Assert.assertNull("retry must succeed: $second", second)
+    Assert.assertEquals(1, port.destroyed)
+    Assert.assertFalse(port.active)
   }
 
   // ---------------------------------------------------------------- clear
@@ -255,6 +345,7 @@ class SiteProfileOpsTest {
       override fun hasActiveView(): Boolean = false
       override fun resolveProfileName(): Result<String> = Result.success("x")
       override fun flushCookies(profileName: String, onDone: (Throwable?) -> Unit) {}
+      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {}
       override fun destroyActiveView() {}
     }) { extra++ }
     Assert.assertEquals(1, extra)
@@ -277,6 +368,65 @@ class SiteProfileOpsTest {
     SiteClearFlow.run(supported = true, port = port) { result = it ?: "ok" }
     Assert.assertNotEquals("ok", result)
     Assert.assertTrue(result.contains("kalıcılığı"))
+  }
+
+  @Test
+  fun `clear final flush watchdog fails the wipe when the callback never arrives`() {
+    val port =
+      object : SiteClearPort {
+        val timeouts = mutableListOf<() -> Unit>()
+        var pendingFlush: ((Throwable?) -> Unit)? = null
+        override fun profileExists(): Boolean = true
+        override fun removeAllCookies(onDone: (Boolean) -> Unit) {
+          onDone(true)
+        }
+
+        override fun deleteAllStorage() {}
+
+        override fun clearGeolocationPermissions(onDone: (Boolean) -> Unit) {
+          onDone(true)
+        }
+
+        override fun flushCookies(onDone: (Throwable?) -> Unit) {
+          // Never answers: only the watchdog can settle the final step.
+          pendingFlush = onDone
+        }
+
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+          timeouts += onTimeout
+        }
+      }
+    var results = 0
+    var last: String? = null
+    SiteClearFlow.run(supported = true, port = port) { results++; last = it }
+    Assert.assertNull("still pending before the flush watchdog", last)
+    Assert.assertEquals(0, results)
+    // Armed watchdogs: cookies step, geo step, final flush — fire the last.
+    Assert.assertEquals(3, port.timeouts.size)
+    port.timeouts[2].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertTrue("timeout must fail the clear: $last", (last ?: "ok") != "ok")
+    Assert.assertTrue("timeout must name durability: $last", last!!.contains("kalıcılığı"))
+    // Rust sees the failure, keeps the encrypted session blobs for a retry,
+    // and never reports a half-finished wipe as success. A late flush
+    // callback (even a successful one) cannot flip that.
+    port.pendingFlush!!.invoke(null)
+    Assert.assertEquals("exactly one result", 1, results)
+    Assert.assertTrue("the timeout failure stands: $last", (last ?: "ok") != "ok")
+  }
+
+  @Test
+  fun `a stale clear watchdog cannot change an already delivered result`() {
+    val port = FakeClearPort()
+    var results = 0
+    var last: String? = "unset"
+    SiteClearFlow.run(supported = true, port = port) { results++; last = it }
+    Assert.assertEquals(1, results)
+    Assert.assertNull("every step answered: success", last)
+    // Fire every armed watchdog after the fact (steps + final flush).
+    port.timeouts.forEach { it.invoke() }
+    Assert.assertEquals("no watchdog may double-report", 1, results)
+    Assert.assertNull("success stands", last)
   }
 
   @Test

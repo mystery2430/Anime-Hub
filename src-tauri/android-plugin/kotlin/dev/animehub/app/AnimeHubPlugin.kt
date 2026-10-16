@@ -270,14 +270,29 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   //
   // Per-site WebViews with androidx.webkit multi-profile (see the header and
   // AnimeHubSiteController). Every command resolves with data or rejects with
-  // a message Rust classifies; `site_open` rejects with the exact sentinel
-  // `unsupported-multi-profile` when the WebView provider cannot isolate
-  // sites — Rust turns that into the user-facing guidance, and the site is
-  // never opened on the shared default profile.
+  // a message Rust classifies. The open is TWO-PHASED: `site_migrate` (the
+  // one-time legacy jar import, no view) and `site_open` (the view). Both
+  // reject with the exact sentinel `unsupported-multi-profile` when the
+  // WebView provider cannot isolate sites — Rust turns that into the
+  // user-facing guidance, and the site is never opened on the shared default
+  // profile. `site_migrate` additionally rejects with `migration-partial: …`
+  // when the strict import criterion was not met, which Rust retires and
+  // retries on a fresh generation.
 
-  /** Open a site WebView bound to `profile`; `cookies` is the one-time 0.3.4 jar import. */
+  /**
+   * PHASE 1 of the two-phase open protocol: import the one-time legacy jar
+   * into `profile` WITHOUT creating the site WebView. Rust persists
+   * `profilemig-<site>` only after this resolves, and only then calls
+   * `site_open` — so no view the user sees can exist while the migration
+   * state is not durable, and a failed flag write aborts the open before any
+   * view is built (no orphan WebView, no split Rust/Kotlin ownership).
+   * Rejects with `migration-partial: …` when the import did not strictly
+   * complete (Rust retires that profile name and retries on a fresh
+   * generation), and with `unsupported-multi-profile` when the provider
+   * cannot isolate sites at all.
+   */
   @Command
-  fun site_open(invoke: Invoke) {
+  fun site_migrate(invoke: Invoke) {
     val args = invoke.getArgs()
     val url = args.getString("url") ?: run {
       invoke.reject("url gerekli"); return
@@ -285,7 +300,6 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val profileName = args.getString("profile") ?: run {
       invoke.reject("profile gerekli"); return
     }
-    val initScript = args.getString("initScript") ?: ""
     val cookies = mutableListOf<String>()
     try {
       args.optJSONArray("cookies")?.let { array ->
@@ -298,13 +312,37 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       return
     }
     withLiveActivity(invoke) {
-      AnimeHubSiteController.open(activity, url, profileName, initScript, cookies) { migrated, error ->
+      AnimeHubSiteController.migrate(activity, url, profileName, cookies) { error ->
         if (error != null) {
           invoke.reject(error)
         } else {
-          val payload = JSObject()
-          payload.put("migrated", migrated)
-          invoke.resolve(payload)
+          invoke.resolve(JSObject().put("ok", true))
+        }
+      }
+    }
+  }
+
+  /**
+   * PHASE 2: open the site WebView bound to `profile`. Takes no cookies —
+   * the one-time jar import runs in [site_migrate] before Rust persists the
+   * migration flag, so this call can never migrate behind the flag's back.
+   */
+  @Command
+  fun site_open(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val url = args.getString("url") ?: run {
+      invoke.reject("url gerekli"); return
+    }
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    val initScript = args.getString("initScript") ?: ""
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.open(activity, url, profileName, initScript) { error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("ok", true))
         }
       }
     }

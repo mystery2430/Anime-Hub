@@ -130,6 +130,52 @@ test("site-closed without an owned id clears (unverifiable payload)", () => {
   h.session.opened("site-a", null);
   assert.equal(h.session.closedByEvent("anything"), true);
   assert.equal(h.session.hasSession(), false);
+  // No owned id at all: there is nothing to match against, so the event
+  // clears — the pre-existing contract for unverifiable payloads.
+  const h2 = harness();
+  h2.session.opened("site-c");
+  assert.equal(h2.session.closedByEvent(null), true);
+  assert.equal(h2.session.hasSession(), false);
+});
+
+test("an owned session ignores empty, null and undefined close payloads", () => {
+  // Ownership is strict: when the session knows its site id, ONLY an exact
+  // match clears it. Every current Rust producer emits the id; this keeps a
+  // future producer that forgets it from silently orphaning an active
+  // session (audit finding C).
+  const h = harness();
+  h.session.opened("site-a", "id-a");
+  for (const payload of [null, undefined, ""]) {
+    assert.equal(
+      h.session.closedByEvent(payload),
+      false,
+      `payload ${JSON.stringify(payload) ?? "undefined"} must not clear an owned session`,
+    );
+    assert.equal(h.session.currentLabel(), "site-a");
+    assert.equal(h.session.hasSession(), true);
+  }
+  // The exact owner id still clears.
+  assert.equal(h.session.closedByEvent("id-a"), true);
+  assert.equal(h.session.currentLabel(), null);
+  assert.equal(h.session.statusString(), "idle");
+});
+
+test("a delayed event from the previous session cannot clear the new one", () => {
+  const h = harness();
+  h.session.opened("site-a", "id-a");
+  h.session.requestClose();
+  h.resolveClose();
+  // While the `id-a` event is still in flight, the user opens site-b.
+  h.session.opened("site-b", "id-b");
+  assert.equal(h.session.closedByEvent("id-a"), false, "stale id must be ignored");
+  assert.equal(h.session.currentLabel(), "site-b");
+  assert.equal(h.session.statusString(), "idle");
+  // An empty payload from the stale producer is ignored just the same.
+  assert.equal(h.session.closedByEvent(null), false);
+  assert.equal(h.session.currentLabel(), "site-b");
+  // The new owner's own event clears.
+  assert.equal(h.session.closedByEvent("id-b"), true);
+  assert.equal(h.session.currentLabel(), null);
 });
 
 test("opened() resets leftover failure state for the next site", () => {

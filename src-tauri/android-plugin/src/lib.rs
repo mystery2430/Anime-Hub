@@ -59,6 +59,7 @@ pub const CMD_KEYSTORE_OPEN: &str = "keystore_open";
 pub const CMD_ENTER_PIP: &str = "enter_pip";
 pub const CMD_SET_PIP_AUTO_ENTER: &str = "set_pip_auto_enter";
 pub const CMD_DEBUG_LOG: &str = "debug_log";
+pub const CMD_SITE_MIGRATE: &str = "site_migrate";
 pub const CMD_SITE_OPEN: &str = "site_open";
 pub const CMD_SITE_CLOSE: &str = "site_close";
 pub const CMD_SITE_PROFILE_DELETE: &str = "site_profile_delete";
@@ -128,9 +129,23 @@ pub fn keystore_open(purpose: String, sealed: String) -> Result<KeystoreResult> 
 // Per-site WebView profile commands (Android only).
 // ---------------------------------------------------------------------------
 
-/// Wire format for `site_open`.
+/// Wire format for `site_migrate` (phase 1 of the two-phase open protocol).
 ///
 /// Intentionally not `Debug`: `cookies` carries the one-time legacy jar.
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SiteMigratePayload {
+    url: String,
+    profile: String,
+    cookies: Vec<String>,
+}
+
+/// Wire format for `site_open` (phase 2: the view only).
+///
+/// No cookies: the one-time jar import runs through [`site_migrate`] before
+/// the caller persists the migration flag, so this call can never migrate
+/// behind that flag's back.
 #[cfg(target_os = "android")]
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,7 +153,6 @@ struct SiteOpenPayload {
     url: String,
     profile: String,
     init_script: String,
-    cookies: Vec<String>,
 }
 
 /// Wire format for `site_close`.
@@ -153,13 +167,6 @@ struct SiteClosePayload {
 #[derive(Serialize)]
 struct SiteProfilePayload {
     profile: String,
-}
-
-/// Kotlin's `{migrated}` reply from `site_open`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SiteOpenResult {
-    /// `true` when the legacy cookie jar was imported into the profile.
-    pub migrated: bool,
 }
 
 /// Kotlin's `{deleted, pending}` reply from `site_profile_delete`.
@@ -201,18 +208,44 @@ pub fn is_migration_retry(error: &Error) -> bool {
     }
 }
 
-/// Open `url` in a new site WebView bound to `profile`.
+/// Phase 1 of the two-phase open: import the one-time legacy jar into
+/// `profile` WITHOUT creating the site WebView.
 ///
-/// `cookies` (the decrypted 0.3.4 jar, as `Set-Cookie` headers) is imported
-/// only by Kotlin when the profile does not exist yet, through the profile's
-/// own cookie manager, and only after the callbacks and `flush()` complete —
-/// i.e. before the first navigation. An empty list skips the migration.
-pub fn site_open(
-    url: String,
-    profile: String,
-    init_script: String,
-    cookies: Vec<String>,
-) -> Result<SiteOpenResult> {
+/// `cookies` is the decrypted 0.3.4 jar as `Set-Cookie` headers. Kotlin
+/// writes them through the profile's own cookie manager and only reports
+/// success when every callback accepted AND `flush()` completed — before the
+/// first navigation, because no navigation happens in this phase at all.
+/// An empty list is a success without touching the provider (nothing to
+/// import). A failure carries [`MIGRATION_RETRY_SENTINEL`] (retire the name,
+/// retry on a fresh generation) or [`MULTI_PROFILE_SENTINEL`] (feature gap).
+///
+/// The caller persists its migration flag only after this resolves, and only
+/// then calls [`site_open`]: a view the user has seen can never exist while
+/// the flag is missing.
+pub fn site_migrate(url: String, profile: String, cookies: Vec<String>) -> Result<OkResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(
+            CMD_SITE_MIGRATE,
+            SiteMigratePayload {
+                url,
+                profile,
+                cookies,
+            },
+        )
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (url, profile, cookies);
+        Err(Error::Unsupported)
+    }
+}
+
+/// Phase 2: open `url` in a new site WebView bound to `profile`.
+///
+/// Takes no cookies — the jar import happened in [`site_migrate`], before
+/// the caller persisted the migration flag.
+pub fn site_open(url: String, profile: String, init_script: String) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
         call_plugin(
@@ -221,13 +254,12 @@ pub fn site_open(
                 url,
                 profile,
                 init_script,
-                cookies,
             },
         )
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (url, profile, init_script, cookies);
+        let _ = (url, profile, init_script);
         Err(Error::Unsupported)
     }
 }
@@ -486,12 +518,20 @@ mod tests {
             ));
             assert!(matches!(enter_pip(16, 9), Err(Error::Unsupported)));
             assert!(matches!(set_pip_auto_enter(true), Err(Error::Unsupported)));
+            // Both phases of the two-phase open fail honestly off Android.
+            assert!(matches!(
+                site_migrate(
+                    "https://example.com/".into(),
+                    "site-00000000000000000000000000000000-g0".into(),
+                    Vec::new(),
+                ),
+                Err(Error::Unsupported)
+            ));
             assert!(matches!(
                 site_open(
                     "https://example.com/".into(),
                     "site-00000000000000000000000000000000-g0".into(),
                     String::new(),
-                    Vec::new(),
                 ),
                 Err(Error::Unsupported)
             ));
@@ -535,6 +575,9 @@ mod tests {
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
         assert_eq!(CMD_DEBUG_LOG, "debug_log");
+        // Two-phase open: phase 1 (jar import, no view) runs BEFORE Rust
+        // persists the migration flag; phase 2 builds the view.
+        assert_eq!(CMD_SITE_MIGRATE, "site_migrate");
         assert_eq!(CMD_SITE_OPEN, "site_open");
         assert_eq!(CMD_SITE_CLOSE, "site_close");
         assert_eq!(CMD_SITE_PROFILE_DELETE, "site_profile_delete");
@@ -629,6 +672,7 @@ mod tests {
             CMD_ENTER_PIP,
             CMD_SET_PIP_AUTO_ENTER,
             CMD_DEBUG_LOG,
+            CMD_SITE_MIGRATE,
             CMD_SITE_OPEN,
             CMD_SITE_CLOSE,
             CMD_SITE_PROFILE_DELETE,
@@ -673,10 +717,18 @@ mod tests {
             )),
             "the sentinel Rust classifies must match the Kotlin constant"
         );
-        // No silent fallback: an unsupported provider must reject, not open.
+        // No silent fallback: an unsupported provider must reject, not open —
+        // in BOTH phases of the two-phase open (migrate and the view).
         assert!(
-            controller.contains("onResult(false, ERR_UNSUPPORTED_MULTI_PROFILE)"),
+            controller.contains("onResult(ERR_UNSUPPORTED_MULTI_PROFILE)"),
             "unsupported providers must fail the open"
+        );
+        assert_eq!(
+            controller
+                .matches("onResult(ERR_UNSUPPORTED_MULTI_PROFILE)")
+                .count(),
+            2,
+            "phase 1 (site_migrate) and phase 2 (site_open) each refuse"
         );
         // Profile assignment before any other WebView API call: the constructor
         // is immediately followed by setProfile.
