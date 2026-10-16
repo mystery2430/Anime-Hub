@@ -219,6 +219,25 @@ object AnimeHubSiteController {
 
   private fun profileNameIsValid(name: String): Boolean = PROFILE_NAME.matches(name)
 
+  /**
+   * Quarantine gate shared by BOTH phases of the two-phase open. Returns the
+   * refusal to report (already logged) or `null` when the profile may be used.
+   *
+   * [SiteOpenGate] blocks a profile whose last in-place wipe timed out on a
+   * provider call that cannot be cancelled — `removeAllCookies`: the deletion
+   * may still be in flight and would land on the new session's cookies. The
+   * open is refused until that wipe is verified, because ignoring a late
+   * callback result does not stop the late mutation. [ProfileQuarantine]
+   * records what is and is not blocked, and why the registry is
+   * process-scoped; the decision itself is pure Kotlin, executed by the CI
+   * unit tests.
+   */
+  private fun quarantineRefusal(profileName: String, phase: String): String? =
+    SiteOpenGate.check(profileName)?.also { refusal ->
+      Log.w(LOG_TAG, "site $phase refused: $refusal")
+      AnimeHubDebugLog.add("site", "$phase refused (quarantined profile)")
+    }
+
   private fun liveActivity(activity: Activity): Boolean = !activity.isFinishing && !activity.isDestroyed
 
   // -------------------------------------------------------------------- open
@@ -238,7 +257,10 @@ object AnimeHubSiteController {
    * in windows.rs).
    *
    * Failure modes: [ERR_UNSUPPORTED_MULTI_PROFILE] (feature gap — refuse,
-   * never fall back to the default profile), invalid name, dead Activity,
+   * never fall back to the default profile), invalid name,
+   * [SiteProfileErrors.QUARANTINED] (an earlier in-place wipe of this profile
+   * timed out on a provider call that cannot be cancelled, so its completion
+   * is unverified — see [ProfileQuarantine]), dead Activity,
    * [ERR_ACTIVE_SITE], and [ERR_MIGRATION_RETRY] for anything short of a
    * full, flushed import (see [SiteMigrationFlow]) so Rust can retire the
    * profile name and retry on a fresh generation.
@@ -256,6 +278,16 @@ object AnimeHubSiteController {
     }
     if (!profileNameIsValid(profileName)) {
       onResult("geçersiz profil adı")
+      return
+    }
+    // Quarantine gate, BEFORE the provider is touched: writing the legacy jar
+    // into a profile whose previous wipe may still be in flight would hand
+    // those cookies to a late `removeAllCookies`. Rust writes its migration
+    // flag only after a success, so refusing here leaves the jar and the flag
+    // exactly as they were.
+    val quarantined = quarantineRefusal(profileName, "migration")
+    if (quarantined != null) {
+      onResult(quarantined)
       return
     }
     activity.runOnUiThread {
@@ -311,6 +343,16 @@ object AnimeHubSiteController {
     }
     if (!profileNameIsValid(profileName)) {
       onResult("geçersiz profil adı")
+      return
+    }
+    // Same quarantine gate as phase 1: a WebView bound to a profile whose
+    // wipe is still unverified could have its fresh cookies deleted by the
+    // provider call that timed out. Nothing is claimed and nothing is built
+    // on this path, so Rust's `current_site` stays empty and the refusal is
+    // simply retryable once the wipe is verified.
+    val quarantined = quarantineRefusal(profileName, "open")
+    if (quarantined != null) {
+      onResult(quarantined)
       return
     }
     activity.runOnUiThread {
@@ -775,10 +817,19 @@ object AnimeHubSiteController {
   /**
    * Clear one site profile in place: profile cookies (`removeAllCookies`
    * with its callback result checked), every stored geolocation permission
-   * (awaited), `WebStorage.deleteAllData()` and a final flush. The sequence,
-   * watchdogs and error aggregation live in [SiteClearFlow]; success is only
-   * reported when every required step completed, so Rust keeps its encrypted
-   * session blobs on any failure and the user can retry.
+   * (awaited, behind a [StepGuard]), `WebStorage.deleteAllData()` and a final
+   * flush. The sequence, watchdogs and error aggregation live in
+   * [SiteClearFlow]; success is only reported when every required step
+   * completed, so Rust keeps its encrypted session blobs on any failure and
+   * the user can retry.
+   *
+   * TIMEOUTS BOUND THE SIDE EFFECTS TOO, not just the answer: the awaited
+   * geolocation wipe claims its step guard before the first `geo.clear`
+   * ([GeolocationWipe]), so a callback that arrives after the watchdog fired
+   * changes nothing on a profile that may already back a new session; and a
+   * `removeAllCookies` timeout — a destructive provider call that cannot be
+   * cancelled — quarantines the profile in [ProfileQuarantine], so
+   * [migrate]/[open] refuse it until the wipe is verified.
    *
    * The profile itself survives, so the next open of the same site starts
    * logged out without a delete/recreate race. HTTP cache and
@@ -833,31 +884,39 @@ object AnimeHubSiteController {
             profile.webStorage.deleteAllData()
           }
 
-          override fun clearGeolocationPermissions(onDone: (Boolean) -> Unit) {
+          override fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit) {
             val profile = cached
             if (profile == null) {
-              onDone(false)
+              if (guard.claim()) onDone(false)
               return
             }
             val geo: GeolocationPermissions = profile.geolocationPermissions
-            try {
-              // `GeolocationPermissions` exposes no removeAll-with-callback;
-              // enumerate the stored origins (awaited), clear each one, and
-              // only then settle the step.
-              geo.getOrigins { origins ->
-                activity.runOnUiThread {
-                  try {
-                    if (origins != null) {
-                      for (origin in origins) geo.clear(origin)
-                    }
-                    onDone(true)
-                  } catch (_: Exception) {
-                    onDone(false)
-                  }
+            // `GeolocationPermissions` exposes no removeAll-with-callback, so
+            // this step awaits `getOrigins` and performs the `clear` calls
+            // itself. That sequencing — including claiming [guard] BEFORE the
+            // first mutation, so a callback that lost to the watchdog clears
+            // nothing — is [GeolocationWipe]: pure production code the CI unit
+            // tests drive against a recording fake. This adapter only supplies
+            // the two provider calls and keeps the answer on the UI thread,
+            // which is also where the watchdog is posted, so claim+mutate is
+            // one serialised block.
+            GeolocationWipe.start(
+              guard,
+              object : GeolocationApi {
+                override fun getOrigins(onResult: (Set<String>?) -> Unit) {
+                  geo.getOrigins { origins -> activity.runOnUiThread { onResult(origins) } }
                 }
+
+                override fun clear(origin: String) {
+                  geo.clear(origin)
+                }
+              },
+            ) { ok ->
+              if (!ok) {
+                Log.w(LOG_TAG, "geolocation wipe incomplete (op ${guard.operationId})")
+                AnimeHubDebugLog.add("site", "geo wipe incomplete (op ${guard.operationId})")
               }
-            } catch (_: Exception) {
-              activity.runOnUiThread { onDone(false) }
+              onDone(ok)
             }
           }
 
@@ -878,7 +937,7 @@ object AnimeHubSiteController {
             }
           }
         }
-      SiteClearFlow.run(isSupported(), port) { error ->
+      SiteClearFlow.run(isSupported(), profileName, port) { error ->
         when (error) {
           null -> AnimeHubDebugLog.add("site", "profile data cleared")
           SiteProfileErrors.UNSUPPORTED -> {
@@ -888,6 +947,13 @@ object AnimeHubSiteController {
           else -> {
             Log.w(LOG_TAG, "profile clear failed: $error")
             AnimeHubDebugLog.add("site", "clear failed (${error.take(60)})")
+            if (ProfileQuarantine.isQuarantined(profileName)) {
+              // A destructive provider call is still unverified: the site is
+              // refused until the wipe is (see SiteOpenGate), so say so here
+              // instead of leaving the user with a bare failure.
+              Log.w(LOG_TAG, "profile quarantined until the wipe is verified: $profileName")
+              AnimeHubDebugLog.add("site", "profile quarantined (unverified wipe)")
+            }
           }
         }
         onResult(error)
@@ -914,6 +980,10 @@ object AnimeHubSiteController {
    *
    * Rejects (hard failure — the caller must NOT drop its record) for invalid
    * names, an active WebView on that profile, or unexpected exceptions.
+   *
+   * A deletion the provider accepted (or an absent profile) also lifts any
+   * [ProfileQuarantine] block on the name: retiring it removes the reason for
+   * the block, while a *deferred* deletion keeps it.
    */
   fun deleteProfileData(profileName: String, onResult: (deleted: Boolean, pending: Boolean, error: String?) -> Unit) {
     if (!profileNameIsValid(profileName)) {
@@ -935,6 +1005,12 @@ object AnimeHubSiteController {
     // process (AwBrowserContextStore::Delete returns in-use).
     try {
       val deleted = ProfileStore.getInstance().deleteProfile(profileName)
+      // A deletion the provider did NOT refuse retires this name for good:
+      // Rust bumps the site's generation and never hands the name out again,
+      // so no new session can ever sit on it — which is the whole reason a
+      // quarantine block exists. Lift it here (the deferred branch below keeps
+      // the block: the profile still exists and could be reopened).
+      ProfileQuarantine.release(profileName)
       AnimeHubDebugLog.add("site", if (deleted) "profile deleted" else "profile absent")
       onResult(deleted, false, null)
     } catch (_: IllegalStateException) {

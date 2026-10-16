@@ -16,9 +16,22 @@
 package dev.animehub.app
 
 import org.junit.Assert
+import org.junit.Before
 import org.junit.Test
 
 class SiteProfileOpsTest {
+
+  /**
+   * A name shaped exactly like Rust's `android_profile_name` output, so the
+   * quarantine registry is exercised with a realistic key.
+   */
+  private val profile = "site-00000000000000000000000000000000-g7"
+
+  /** [ProfileQuarantine] is process-global: every test starts from empty. */
+  @Before
+  fun resetQuarantine() {
+    ProfileQuarantine.reset()
+  }
 
   // ---------------------------------------------------------------- close
 
@@ -217,15 +230,63 @@ class SiteProfileOpsTest {
 
   // ---------------------------------------------------------------- clear
 
+  /**
+   * Recording stand-in for `profile.geolocationPermissions`: it counts the
+   * `clear` calls the PRODUCTION [GeolocationWipe] triggers and keeps the
+   * origins a session currently holds, so "the late callback changed the
+   * data" is measurable instead of inferred from an `onDone` count.
+   */
+  private class FakeGeolocationApi(
+    var origins: Set<String>? = setOf("https://a.example", "https://b.example"),
+    var hold: Boolean = false,
+    var throwOnGet: Boolean = false,
+    var clearThrows: Boolean = false,
+  ) : GeolocationApi {
+    val cleared = mutableListOf<String>()
+    var getOriginsCalls = 0
+
+    /** Always captured, so a test can deliver the same callback again/late. */
+    var pending: ((Set<String>?) -> Unit)? = null
+
+    override fun getOrigins(onResult: (Set<String>?) -> Unit) {
+      getOriginsCalls++
+      if (throwOnGet) throw IllegalStateException("provider boom")
+      pending = onResult
+      if (!hold) onResult(origins)
+    }
+
+    override fun clear(origin: String) {
+      cleared += origin
+      if (clearThrows) throw IllegalStateException("clear boom")
+      origins = (origins ?: emptySet()) - origin
+    }
+
+    /** Deliver the captured enumeration callback (again, or after a timeout). */
+    fun deliver(with: Set<String>? = origins) {
+      pending!!.invoke(with)
+    }
+  }
+
   private class FakeClearPort(
     var exists: Boolean = true,
     var cookiesOk: Boolean = true,
     var geoOk: Boolean = true,
     var storageThrows: Boolean = false,
     var flushError: Throwable? = null,
+    /** The cookie wipe never answers: only its watchdog can settle the step. */
+    var cookiesNeverAnswer: Boolean = false,
+    /** The final flush never answers: only its watchdog can settle the wipe. */
+    var flushNeverAnswers: Boolean = false,
+    /** The geolocation enumeration is held so a test can deliver it LATE. */
+    geoHoldsCallback: Boolean = false,
+    val geo: FakeGeolocationApi = FakeGeolocationApi(hold = geoHoldsCallback),
   ) : SiteClearPort {
     val log = mutableListOf<String>()
     var timeouts = mutableListOf<() -> Unit>()
+
+    /** The captured cookie callback, for late/duplicate delivery. */
+    var pendingCookies: ((Boolean) -> Unit)? = null
+    var pendingFlush: ((Throwable?) -> Unit)? = null
 
     override fun profileExists(): Boolean {
       log += "exists"
@@ -234,6 +295,10 @@ class SiteProfileOpsTest {
 
     override fun removeAllCookies(onDone: (Boolean) -> Unit) {
       log += "cookies"
+      if (cookiesNeverAnswer) {
+        pendingCookies = onDone
+        return
+      }
       onDone(cookiesOk)
     }
 
@@ -242,13 +307,22 @@ class SiteProfileOpsTest {
       if (storageThrows) throw IllegalStateException("storage boom")
     }
 
-    override fun clearGeolocationPermissions(onDone: (Boolean) -> Unit) {
+    /**
+     * The real adapter delegates to [GeolocationWipe] over the profile's
+     * `GeolocationPermissions`; this fake does exactly the same over
+     * [FakeGeolocationApi], so the ordering under test is production code.
+     */
+    override fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit) {
       log += "geo"
-      onDone(geoOk)
+      GeolocationWipe.start(guard, geo) { ok -> onDone(ok && geoOk) }
     }
 
     override fun flushCookies(onDone: (Throwable?) -> Unit) {
       log += "flush"
+      if (flushNeverAnswers) {
+        pendingFlush = onDone
+        return
+      }
       onDone(flushError)
     }
 
@@ -261,7 +335,7 @@ class SiteProfileOpsTest {
   fun `clear on an unsupported provider refuses instead of faking success`() {
     val port = FakeClearPort()
     var result = "unset"
-    SiteClearFlow.run(supported = false, port = port) { result = it ?: "ok" }
+    SiteClearFlow.run(supported = false, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertEquals(SiteProfileErrors.UNSUPPORTED, result)
     Assert.assertTrue("no port operation may run", port.log.isEmpty())
   }
@@ -270,7 +344,7 @@ class SiteProfileOpsTest {
   fun `clear of an absent profile is already-clean success`() {
     val port = FakeClearPort(exists = false)
     var result = "unset"
-    SiteClearFlow.run(supported = true, port = port) { result = it ?: "ok" }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertEquals("ok", result)
     Assert.assertEquals(listOf("exists"), port.log)
   }
@@ -279,7 +353,7 @@ class SiteProfileOpsTest {
   fun `clear success runs every step in order`() {
     val port = FakeClearPort()
     var result = "unset"
-    SiteClearFlow.run(supported = true, port = port) { result = it ?: "ok" }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertEquals("ok", result)
     Assert.assertEquals(listOf("exists", "cookies", "geo", "storage", "flush"), port.log)
   }
@@ -288,7 +362,7 @@ class SiteProfileOpsTest {
   fun `cookie callback failure fails the clear but still attempts the rest`() {
     val port = FakeClearPort(cookiesOk = false)
     var result = "unset"
-    SiteClearFlow.run(supported = true, port = port) { result = it ?: "ok" }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertNotEquals("ok", result)
     Assert.assertTrue("storage must still run: ${port.log}", port.log.contains("storage"))
     Assert.assertTrue("flush must still run: ${port.log}", port.log.contains("flush"))
@@ -298,7 +372,7 @@ class SiteProfileOpsTest {
   fun `geolocation callback failure fails the clear`() {
     val port = FakeClearPort(geoOk = false)
     var result = "unset"
-    SiteClearFlow.run(supported = true, port = port) { result = it ?: "ok" }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertNotEquals("ok", result)
     Assert.assertTrue(result.contains("geolocation"))
   }
@@ -319,7 +393,7 @@ class SiteProfileOpsTest {
           log += "storage"
         }
 
-        override fun clearGeolocationPermissions(onDone: (Boolean) -> Unit) {
+        override fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit) {
           log += "geo-armed"
           // Callback never fires — only the watchdog can settle the step.
         }
@@ -334,7 +408,7 @@ class SiteProfileOpsTest {
         }
       }
     var last: String? = null
-    SiteClearFlow.run(supported = true, port = port) { last = it }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it }
     Assert.assertNull("still pending before the watchdog", last)
     port.scheduled!!.invoke()
     Assert.assertTrue("timeout must fail the clear", (last ?: "ok") != "ok")
@@ -355,7 +429,7 @@ class SiteProfileOpsTest {
   fun `storage failure fails the clear but the flush still runs`() {
     val port = FakeClearPort(storageThrows = true)
     var result = "unset"
-    SiteClearFlow.run(supported = true, port = port) { result = it ?: "ok" }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertNotEquals("ok", result)
     Assert.assertTrue(result.contains("deposu"))
     Assert.assertTrue(port.log.contains("flush"))
@@ -365,7 +439,7 @@ class SiteProfileOpsTest {
   fun `final flush failure is never reported as success`() {
     val port = FakeClearPort(flushError = RuntimeException("io error"))
     var result = "unset"
-    SiteClearFlow.run(supported = true, port = port) { result = it ?: "ok" }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertNotEquals("ok", result)
     Assert.assertTrue(result.contains("kalıcılığı"))
   }
@@ -383,7 +457,7 @@ class SiteProfileOpsTest {
 
         override fun deleteAllStorage() {}
 
-        override fun clearGeolocationPermissions(onDone: (Boolean) -> Unit) {
+        override fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit) {
           onDone(true)
         }
 
@@ -398,7 +472,7 @@ class SiteProfileOpsTest {
       }
     var results = 0
     var last: String? = null
-    SiteClearFlow.run(supported = true, port = port) { results++; last = it }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
     Assert.assertNull("still pending before the flush watchdog", last)
     Assert.assertEquals(0, results)
     // Armed watchdogs: cookies step, geo step, final flush — fire the last.
@@ -420,7 +494,7 @@ class SiteProfileOpsTest {
     val port = FakeClearPort()
     var results = 0
     var last: String? = "unset"
-    SiteClearFlow.run(supported = true, port = port) { results++; last = it }
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
     Assert.assertEquals(1, results)
     Assert.assertNull("every step answered: success", last)
     // Fire every armed watchdog after the fact (steps + final flush).
@@ -443,7 +517,7 @@ class SiteProfileOpsTest {
 
         override fun deleteAllStorage() {}
 
-        override fun clearGeolocationPermissions(onDone: (Boolean) -> Unit) {
+        override fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit) {
           onDone(true)
           onDone(false)
         }
@@ -455,12 +529,360 @@ class SiteProfileOpsTest {
 
         override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {}
       }
-    SiteClearFlow.run(supported = true, port = port) {
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) {
       count++
       last = it
     }
     Assert.assertEquals(1, count)
     Assert.assertNull("duplicate failure must not overwrite the first success", last)
+  }
+
+  // ------------------------------------------- timeout side-effect races
+  //
+  // A watchdog bounds the ANSWER a flow gives its caller. These tests are
+  // about the DATA: a step that timed out must not let its late callback
+  // mutate a profile that may already back a new session. They measure the
+  // `geo.clear` calls the production GeolocationWipe triggers and the
+  // quarantine the ungated `removeAllCookies` timeout must raise — never an
+  // `onDone` count alone.
+
+  @Test
+  fun `geolocation permissions are cleared when the callback beats the watchdog`() {
+    val port = FakeClearPort()
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
+    Assert.assertEquals("ok", result)
+    // The real side effect happened, once per stored origin, in the awaited step.
+    Assert.assertEquals(
+      listOf("https://a.example", "https://b.example"),
+      port.geo.cleared,
+    )
+    Assert.assertEquals(1, port.geo.getOriginsCalls)
+    // A verified wipe leaves the profile usable: no block, gate says open.
+    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a geolocation callback that lost to the watchdog performs no clear at all`() {
+    val port = FakeClearPort(geoHoldsCallback = true)
+    var results = 0
+    var last: String? = null
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
+    Assert.assertNull("pending until the geo watchdog fires", last)
+    // Armed so far: cookies(0) answered, geolocation(1) is held. The final
+    // flush watchdog(2) only exists once this step settles.
+    Assert.assertEquals(2, port.timeouts.size)
+    port.timeouts[1].invoke()
+    Assert.assertEquals("the flush watchdog is armed after the geo step", 3, port.timeouts.size)
+    Assert.assertEquals(1, results)
+    Assert.assertTrue("timeout must fail the wipe: $last", (last ?: "ok") != "ok")
+    Assert.assertTrue(last!!.contains("geolocation"))
+    // NOW the provider answers. The mutation window is closed, so the wipe
+    // that timed out must not touch the profile it gave up on.
+    port.geo.deliver(setOf("https://a.example", "https://b.example"))
+    Assert.assertEquals(
+      "a timed-out step must trigger zero geo.clear calls",
+      emptyList<String>(),
+      port.geo.cleared,
+    )
+    Assert.assertEquals("the delivered failure stands", 1, results)
+    Assert.assertTrue("a late callback cannot re-report", (last ?: "ok") != "ok")
+    // Nothing is in flight (getOrigins is read-only, the clears were refused),
+    // so this step quarantines nothing — the gate stays open by proof, not luck.
+    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a stale geolocation callback cannot change a reopened session permissions`() {
+    val port = FakeClearPort(geoHoldsCallback = true)
+    var last: String? = null
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it }
+    port.timeouts[1].invoke()
+    Assert.assertTrue("the wipe failed: $last", (last ?: "ok") != "ok")
+    // The user reopens the SAME profile name (allowed: the geo step is
+    // provably side-effect-free) and the new session grants a permission.
+    Assert.assertNull("reopen is allowed after a gated timeout", SiteOpenGate.check(profile))
+    val granted = mutableSetOf("https://new-session.example")
+    port.geo.origins = granted
+    // The old callback finally lands, mid-new-session.
+    port.geo.deliver(setOf("https://new-session.example"))
+    Assert.assertEquals("the stale callback must clear nothing", emptyList<String>(), port.geo.cleared)
+    Assert.assertEquals(
+      "the new session keeps its permission",
+      setOf("https://new-session.example"),
+      granted,
+    )
+  }
+
+  @Test
+  fun `a duplicated geolocation callback repeats neither the clears nor the result`() {
+    val port = FakeClearPort()
+    var results = 0
+    var last = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) {
+      results++
+      last = it ?: "ok"
+    }
+    Assert.assertEquals("ok", last)
+    Assert.assertEquals(2, port.geo.cleared.size)
+    // Same enumeration callback delivered again (a provider double-fire).
+    port.geo.deliver(setOf("https://a.example", "https://b.example"))
+    port.geo.deliver(setOf("https://a.example"))
+    Assert.assertEquals("no second wipe", 2, port.geo.cleared.size)
+    Assert.assertEquals("exactly one result", 1, results)
+    Assert.assertEquals("the first result stands", "ok", last)
+  }
+
+  @Test
+  fun `a port that claimed the guard but reported late still loses to the watchdog`() {
+    // The documented cross-thread interleaving: the port won the mutation
+    // window and then stalled, so the watchdog settles the step first. The
+    // result is reported exactly once and in the conservative direction
+    // (failure → Rust keeps the blobs → idempotent retry), and the late
+    // success cannot flip it.
+    val port =
+      object : SiteClearPort {
+        val timeouts = mutableListOf<() -> Unit>()
+        var report: ((Boolean) -> Unit)? = null
+
+        override fun profileExists(): Boolean = true
+
+        override fun removeAllCookies(onDone: (Boolean) -> Unit) {
+          onDone(true)
+        }
+
+        override fun deleteAllStorage() {}
+
+        override fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit) {
+          report = onDone
+          guard.claim() // wins the mutation window, then never reports
+        }
+
+        override fun flushCookies(onDone: (Throwable?) -> Unit) {
+          onDone(null)
+        }
+
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+          timeouts += onTimeout
+        }
+      }
+    var results = 0
+    var last: String? = null
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
+    Assert.assertNull("pending: the geo step never reported", last)
+    port.timeouts[1].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertTrue("the watchdog settled it: $last", last!!.contains("geolocation"))
+    port.report!!.invoke(true)
+    Assert.assertEquals("exactly one result", 1, results)
+    Assert.assertTrue("the late success cannot flip it: $last", (last ?: "ok") != "ok")
+    Assert.assertFalse(
+      "a gated step quarantines nothing",
+      ProfileQuarantine.isQuarantined(profile),
+    )
+  }
+
+  @Test
+  fun `an unverifiable cookie wipe quarantines the profile and refuses a new session`() {
+    val port = FakeClearPort(cookiesNeverAnswer = true)
+    var results = 0
+    var last: String? = null
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
+    Assert.assertNull("pending until the cookie watchdog fires", last)
+    port.timeouts[0].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertTrue("timeout must fail the wipe: $last", (last ?: "ok") != "ok")
+    Assert.assertTrue(last!!.contains("çerez"))
+    // `removeAllCookies` cannot be cancelled and its completion is unverified:
+    // it may still delete cookies AFTER this failure, so the profile must not
+    // back a new session yet.
+    Assert.assertTrue(ProfileQuarantine.isQuarantined(profile))
+    val refusal = SiteOpenGate.check(profile)
+    Assert.assertNotNull("the open must be refused", refusal)
+    Assert.assertTrue(refusal!!.startsWith(SiteProfileErrors.QUARANTINED))
+    Assert.assertTrue(refusal.contains(SiteClearFlow.COOKIE_UNVERIFIED_REASON))
+    // Recovery: a retry whose every step answers verifies the wipe and lifts
+    // the block, so the same site can be opened again.
+    val retry = FakeClearPort()
+    var retryResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = retry) {
+      retryResult = it ?: "ok"
+    }
+    Assert.assertEquals("ok", retryResult)
+    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertNull("the gate reopens after a verified wipe", SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `the cookie callback answering after its timeout lifts the quarantine without re-reporting`() {
+    val port = FakeClearPort(cookiesNeverAnswer = true)
+    var results = 0
+    var last: String? = null
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
+    port.timeouts[0].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertTrue(ProfileQuarantine.isQuarantined(profile))
+    // The provider finally answers: the deletion is no longer in flight, so
+    // the reason for the block is gone — but the failure already delivered to
+    // Rust stands (it keeps the encrypted blobs for the retry).
+    port.pendingCookies!!.invoke(true)
+    Assert.assertFalse("nothing is in flight any more", ProfileQuarantine.isQuarantined(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+    Assert.assertEquals("no second result", 1, results)
+    Assert.assertTrue("the timeout failure stands: $last", (last ?: "ok") != "ok")
+    // A duplicate late answer changes nothing either.
+    port.pendingCookies!!.invoke(false)
+    Assert.assertEquals(1, results)
+    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+  }
+
+  @Test
+  fun `a cookie wipe that ANSWERED false fails the clear without quarantining`() {
+    val port = FakeClearPort(cookiesOk = false)
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
+    Assert.assertNotEquals("ok", result)
+    // The provider answered, so nothing is in flight: the quarantine is for
+    // UNVERIFIED destructive operations only, not for every failure.
+    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertNull("retry and reopen stay available", SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a final flush timeout fails the wipe but quarantines nothing`() {
+    val port = FakeClearPort(flushNeverAnswers = true)
+    var results = 0
+    var last: String? = null
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
+    Assert.assertNull("pending until the flush watchdog fires", last)
+    Assert.assertEquals(3, port.timeouts.size)
+    port.timeouts[2].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertTrue("durability failure: $last", last!!.contains("kalıcılığı"))
+    // flush() only persists the store that already exists: a late one cannot
+    // delete or grant data a new session created, so no block is raised.
+    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+    // A late successful flush cannot flip the delivered failure either.
+    port.pendingFlush!!.invoke(null)
+    Assert.assertEquals(1, results)
+    Assert.assertTrue((last ?: "ok") != "ok")
+  }
+
+  @Test
+  fun `an absent profile is already clean and lifts a quarantine on the name`() {
+    ProfileQuarantine.quarantine(profile, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
+    val port = FakeClearPort(exists = false)
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
+    Assert.assertEquals("ok", result)
+    Assert.assertEquals(listOf("exists"), port.log)
+    Assert.assertFalse("the profile is gone: nothing can mutate it", ProfileQuarantine.isQuarantined(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `an unsupported provider neither clears nor quarantines`() {
+    val port = FakeClearPort()
+    var result = "unset"
+    SiteClearFlow.run(supported = false, profileName = profile, port = port) { result = it ?: "ok" }
+    Assert.assertEquals(SiteProfileErrors.UNSUPPORTED, result)
+    Assert.assertTrue(port.log.isEmpty())
+    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+  }
+
+  // ------------------------------------------------- guard / wipe units
+
+  @Test
+  fun `a step guard admits exactly one winner and stays closed afterwards`() {
+    val guard = StepGuards.create()
+    Assert.assertTrue(guard.open)
+    Assert.assertTrue("the first claim wins", guard.claim())
+    Assert.assertFalse(guard.open)
+    Assert.assertFalse("every later claim loses", guard.claim())
+    Assert.assertFalse(guard.claim())
+    Assert.assertNotEquals(
+      "operation ids are unique per step",
+      guard.operationId,
+      StepGuards.create().operationId,
+    )
+  }
+
+  @Test
+  fun `GeolocationWipe does not even enumerate once its step is settled`() {
+    val guard = StepGuards.create()
+    guard.claim() // the watchdog already won before the port armed the step
+    val api = FakeGeolocationApi()
+    var results = 0
+    GeolocationWipe.start(guard, api) { results++ }
+    Assert.assertEquals("no provider call at all", 0, api.getOriginsCalls)
+    Assert.assertEquals(0, results)
+    Assert.assertEquals(emptyList<String>(), api.cleared)
+  }
+
+  @Test
+  fun `GeolocationWipe reports a failure when the provider refuses to enumerate`() {
+    val api = FakeGeolocationApi(throwOnGet = true)
+    var results = 0
+    var last = true
+    GeolocationWipe.start(StepGuards.create(), api) { ok -> results++; last = ok }
+    Assert.assertEquals("the claim winner always reports", 1, results)
+    Assert.assertFalse(last)
+    Assert.assertEquals(emptyList<String>(), api.cleared)
+  }
+
+  @Test
+  fun `GeolocationWipe reports false when a clear throws and never reports twice`() {
+    val api = FakeGeolocationApi(clearThrows = true)
+    var results = 0
+    var last = true
+    val guard = StepGuards.create()
+    GeolocationWipe.start(guard, api) { ok -> results++; last = ok }
+    Assert.assertEquals(1, results)
+    Assert.assertFalse(last)
+    Assert.assertEquals("it attempted the first origin only", 1, api.cleared.size)
+    // A duplicate delivery after that is inert.
+    api.deliver(setOf("https://a.example"))
+    Assert.assertEquals(1, results)
+    Assert.assertEquals(1, api.cleared.size)
+  }
+
+  @Test
+  fun `GeolocationWipe succeeds with no stored origins and clears nothing`() {
+    val api = FakeGeolocationApi(origins = emptySet())
+    var results = 0
+    var last = false
+    GeolocationWipe.start(StepGuards.create(), api) { ok -> results++; last = ok }
+    Assert.assertEquals(1, results)
+    Assert.assertTrue("nothing stored is a success", last)
+    Assert.assertEquals(emptyList<String>(), api.cleared)
+  }
+
+  @Test
+  fun `GeolocationWipe tolerates a null origin set from the provider`() {
+    val api = FakeGeolocationApi(origins = null)
+    var last = false
+    GeolocationWipe.start(StepGuards.create(), api) { last = it }
+    Assert.assertTrue(last)
+    Assert.assertEquals(emptyList<String>(), api.cleared)
+  }
+
+  @Test
+  fun `quarantine blocks only the recorded profile name`() {
+    val other = "site-11111111111111111111111111111111-g0"
+    ProfileQuarantine.quarantine(profile, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
+    Assert.assertTrue(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertFalse("another site is unaffected", ProfileQuarantine.isQuarantined(other))
+    Assert.assertNull(SiteOpenGate.check(other))
+    Assert.assertEquals(setOf(profile), ProfileQuarantine.names())
+    Assert.assertEquals(
+      SiteClearFlow.COOKIE_UNVERIFIED_REASON,
+      ProfileQuarantine.release(profile),
+    )
+    Assert.assertNull(ProfileQuarantine.release(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
   }
 
   // ------------------------------------------------------------ migration

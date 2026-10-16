@@ -480,6 +480,85 @@ test("every awaited flush is watchdog-bounded, in close and clear alike", () => 
   assert.match(read("docs/android-storage-isolation.md"), /FLUSH_TIMEOUT_MS/);
 });
 
+test("a timed-out wipe cannot mutate the profile behind a new session", () => {
+  // Static/contract half of the guard: the BEHAVIOUR (zero `geo.clear` calls
+  // after a watchdog, the quarantine gate, the late-answer release) is proven
+  // by SiteProfileOpsTest, which drives the production GeolocationWipe and
+  // SiteClearFlow with a recording provider fake. This test pins the wiring
+  // that makes those guarantees reach the real adapter.
+  const ops = read(
+    "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt",
+  );
+
+  // The awaited geolocation step receives a validity token, and the pure
+  // production wipe claims it BEFORE the first mutation.
+  assert.match(
+    ops,
+    /fun clearGeolocationPermissions\(guard: StepGuard, onDone: \(Boolean\) -> Unit\)/,
+  );
+  const wipeAt = ops.indexOf("object GeolocationWipe");
+  assert.ok(wipeAt > 0, "the wipe sequencing must be pure, CI-executed code");
+  const wipe = ops.slice(wipeAt, ops.indexOf("\n}\n", wipeAt));
+  const claim = wipe.indexOf("guard.claim()");
+  const mutate = wipe.indexOf("api.clear(origin)");
+  assert.ok(claim > 0, "the wipe must claim the step guard");
+  assert.ok(mutate > claim, "the claim must precede the mutation");
+  assert.match(wipe, /if \(!guard\.claim\(\)\) return@getOrigins/);
+  assert.match(ops, /interface StepGuard/);
+  assert.match(ops, /fun claim\(\): Boolean/);
+
+  // The real adapter delegates instead of clearing origins inline.
+  assert.match(controllerKt, /GeolocationWipe\.start\(/);
+  assert.doesNotMatch(controllerKt, /for \(origin in origins\) geo\.clear\(origin\)/);
+  assert.match(
+    controllerKt,
+    /SiteClearFlow\.run\(isSupported\(\), profileName, port\)/,
+    "the flow needs the name to quarantine the right profile",
+  );
+
+  // The destructive call that CANNOT be gated quarantines the profile, and
+  // BOTH open phases consult the gate before touching the provider.
+  assert.match(ops, /object ProfileQuarantine/);
+  assert.match(ops, /object SiteOpenGate/);
+  assert.match(
+    ops,
+    /ProfileQuarantine\.quarantine\(profileName, COOKIE_UNVERIFIED_REASON\)/,
+  );
+  assert.match(ops, /ProfileQuarantine\.release\(profileName\)/);
+  for (const entry of ["fun migrate(", "fun open("]) {
+    const at = controllerKt.indexOf(entry);
+    assert.ok(at > 0, `${entry} missing`);
+    const body = controllerKt.slice(at, controllerKt.indexOf("activity.runOnUiThread", at));
+    assert.match(
+      body,
+      /quarantineRefusal\(profileName, /,
+      `${entry} must refuse a quarantined profile before any provider call`,
+    );
+  }
+  // A deletion the provider accepted retires the name and lifts the block.
+  const deleteAt = controllerKt.indexOf("fun deleteProfileData");
+  const deleteBody = controllerKt.slice(deleteAt, controllerKt.indexOf("\n  }\n", deleteAt));
+  assert.match(deleteBody, /ProfileQuarantine\.release\(profileName\)/);
+
+  // Rust maps the sentinel onto guidance instead of showing it raw, and keeps
+  // it distinct from the migration-retry retirement path.
+  assert.match(
+    pluginLibRs,
+    /pub const QUARANTINE_SENTINEL: &str = "profile-quarantined"/,
+  );
+  assert.match(pluginLibRs, /pub fn is_profile_quarantined\(/);
+  assert.match(bridgeRs, /pub const PROFILE_QUARANTINED_MSG: &str = "/);
+  assert.match(
+    bridgeRs,
+    /AppError::Quarantined\(PROFILE_QUARANTINED_MSG\.to_string\(\)\)/,
+  );
+  assert.equal(
+    (bridgeRs.match(/\.map_err\(classify_site_open_error\)/g) || []).length,
+    2,
+    "both open phases classify their refusals the same way",
+  );
+});
+
 test("all blocking flushes share ONE worker, with stuck detection not new threads", () => {
   // Every AWAITED flush (migration, close, clear, the periodic sync) routes
   // through submitFlush — the single place that answers a caller and can

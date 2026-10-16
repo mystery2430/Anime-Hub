@@ -975,6 +975,13 @@ impl MobileOpenOps for BridgeOpenOps {
 ///  * a failed flag write ABORTS the open before phase 2: no view exists, so
 ///    the caller never claims `current_site` and Rust/Kotlin ownership
 ///    cannot diverge;
+///  * a `profile-quarantined` refusal — Kotlin's block on a profile whose
+///    last in-place wipe timed out on a provider call it cannot cancel, so a
+///    late `removeAllCookies` may still land on a reopened session —
+///    propagates in EITHER phase with the same "nothing was opened" guarantee
+///    and is deliberately not the `migration-partial` retirement path: the
+///    profile is the user's live one, so the fix is to verify the wipe (retry
+///    it, or remove the site), never to delete the name and re-import the jar;
 ///  * every other error (including the MULTI_PROFILE refusal) propagates
 ///    with the same "nothing was opened" guarantee.
 pub fn run_mobile_open_protocol<O: MobileOpenOps>(
@@ -2232,6 +2239,9 @@ mod tests {
     enum ScriptErr {
         Other(String),
         Unsupported,
+        /// What `classify_site_open_error` makes of Kotlin's
+        /// `profile-quarantined` refusal: the guidance message, typed.
+        Quarantined(String),
     }
 
     impl ScriptErr {
@@ -2241,6 +2251,7 @@ mod tests {
                 ScriptErr::Unsupported => {
                     AppError::Unsupported("sağlayıcı çoklu profili desteklemiyor".into())
                 }
+                ScriptErr::Quarantined(message) => AppError::Quarantined(message),
             }
         }
     }
@@ -2662,6 +2673,115 @@ mod tests {
             .is_none());
         assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
         assert_eq!(profile_generation(&state, id).unwrap(), 0);
+    }
+
+    #[test]
+    fn quarantine_refusal_never_retires_the_profile_or_writes_the_flag() {
+        // Kotlin refuses BOTH open phases for a profile whose last in-place
+        // wipe timed out on `removeAllCookies` — a destructive provider call
+        // that cannot be cancelled, so it may still delete cookies a reopened
+        // session creates (see `ProfileQuarantine` / `SiteOpenGate`). That
+        // refusal must be propagated as-is: it is NOT `migration-partial`, so
+        // it must not trigger the retire-and-reimport path (which would delete
+        // the user's live profile and rebuild it from the stale jar), and it
+        // must not persist the flag or claim a session.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-quarantined";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+        // Scripted exactly as production delivers it: Kotlin's sentinel has
+        // already been classified by `android_bridge::classify_site_open_error`
+        // (host-tested there) into the typed guidance error.
+        let quarantine = || -> ScriptErr {
+            ScriptErr::Quarantined(crate::android_bridge::PROFILE_QUARANTINED_MSG.to_string())
+        };
+        let classified = crate::android_bridge::classify_site_open_error(
+            animehub_android::Error::Bridge(format!(
+                "{}: çerez temizliği zaman aşımına uğradı, işlem doğrulanamadı",
+                animehub_android::QUARANTINE_SENTINEL
+            )),
+        );
+        assert!(
+            matches!(classified, AppError::Quarantined(_)),
+            "the sentinel must classify to the typed refusal: {classified:?}"
+        );
+        assert_eq!(
+            classified.to_string(),
+            crate::android_bridge::PROFILE_QUARANTINED_MSG
+        );
+
+        // Phase 1 refusal (pending migration): no retry, no view, no flag.
+        let mut ops = ScriptedOpenOps::with_migrate(vec![Err(quarantine())]);
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("a quarantined profile must not be migrated into");
+        let profile = android_profile_name(id, 0);
+        assert!(matches!(err, AppError::Quarantined(_)), "{err:?}");
+        assert!(
+            !err.to_string()
+                .contains(animehub_android::QUARANTINE_SENTINEL),
+            "the user reads the guidance, never the raw sentinel: {err}"
+        );
+        assert!(
+            !animehub_android::is_migration_retry(&animehub_android::Error::Bridge(format!(
+                "{}: çerez temizliği zaman aşımına uğradı",
+                animehub_android::QUARANTINE_SENTINEL
+            ))),
+            "a quarantine refusal must never be read as a migration retry"
+        );
+        assert_eq!(
+            ops.calls,
+            vec![format!("migrate:{profile}")],
+            "exactly one attempt: no retirement, no second generation, no view"
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state.current_site.lock().unwrap().is_none());
+
+        // Phase 2 refusal (flag already durable, the common reopen): the view
+        // is not built, the session is not claimed and nothing is retired —
+        // the user retries the wipe instead of losing the profile.
+        mark_migration_done(&state, id).unwrap();
+        let mut ops2 = ScriptedOpenOps {
+            open_result: Err(quarantine()),
+            ..ScriptedOpenOps::ok()
+        };
+        let err2 = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops2)
+            .expect_err("a quarantined profile must not be opened");
+        assert_eq!(
+            ops2.calls,
+            vec![format!("open:{profile}")],
+            "no migration is re-run once the flag is durable"
+        );
+        assert!(matches!(err2, AppError::Quarantined(_)), "{err2:?}");
+        assert_eq!(
+            err2.to_string(),
+            crate::android_bridge::PROFILE_QUARANTINED_MSG,
+            "the refusal is explained, not forwarded raw"
+        );
+        assert!(state.current_site.lock().unwrap().is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        assert!(
+            state
+                .provider
+                .get_secret(&format!("profilemig-{id}"))
+                .unwrap()
+                .is_some(),
+            "the durable flag is untouched by a refused open"
+        );
     }
 
     #[test]

@@ -229,12 +229,59 @@ remove, no legacy data remains (`delete_site_session` also drops the
   and returned. A watchdog that fires before its callback records a timeout
   error, so Rust keeps its encrypted session blobs and the wipe stays
   retryable; a callback arriving *after* the watchdog is ignored and can
-  never flip the delivered failure back to success. **Not covered:** HTTP
+  never flip the delivered failure back to success — and, per the next
+  bullet, it cannot mutate the profile either. **Not covered:** HTTP
   cache and service-worker registrations —
   no profile-scoped API clears them without a delete/recreate of the whole
   profile (deleting the profile *does* remove them; in-place clear keeps
   the profile). Documented rather than approximated with a
   default-profile-affecting call.
+* **A timeout bounds the SIDE EFFECT too, not only the answer.** A
+  once-latch decides who *reports*; it cannot un-run a mutation. Two
+  mechanisms close that gap, one per kind of awaited step
+  (`SiteProfileOps.kt`, both executed by the CI unit tests):
+  * *Gated steps — validity token.* The geolocation wipe is the only step
+    whose mutation the app performs itself (because `GeolocationPermissions`
+    has no removeAll-with-callback, it awaits `getOrigins` and then calls
+    `clear` per origin). That sequencing now lives in the pure
+    `GeolocationWipe`, which claims a `StepGuard` **before** the first
+    `clear`: the flow's watchdog closes the same guard when it fires, so a
+    callback that arrives late performs **zero** `clear` calls and reports
+    nothing. Each step carries an `operationId` for the in-app log, so a
+    stale callback can be tied to the step that owned it. Claim and mutation
+    run on the UI thread — where the watchdog is posted as well — and the
+    guard is a CAS, so the race is decided atomically either way.
+  * *Ungated steps — profile quarantine.* `removeAllCookies` is a destructive
+    provider call issued **before** the await, with no cancellation API: when
+    its watchdog fires, the deletion may still be in flight and can complete
+    *after* the wipe was reported failed — deleting cookies that belong to a
+    session which reopened the same profile name (a fresh login, or the
+    one-time jar import). Ignoring the late callback result does not prevent
+    that, so opening the profile immediately is **not** provably safe. The
+    flow therefore records the name in `ProfileQuarantine`, and both phases
+    of the two-phase open consult `SiteOpenGate` before touching the
+    provider: Kotlin rejects with the `profile-quarantined` sentinel, Rust
+    maps it to `AppError::Quarantined` with user-facing guidance (never the
+    raw token) and propagates it without retiring the profile or persisting
+    the migration flag.
+  * *What is deliberately NOT quarantined:* the geolocation step (gated, so a
+    late callback provably changes nothing); `WebStorage.deleteAllData()`
+    (synchronous — it returned or threw, so the outcome is verified); the
+    final `flush()` (it only persists the cookie store that already exists,
+    so a late flush cannot delete or grant anything a new session created —
+    worst case it durably writes that session's own cookies, which its own
+    close flush would do anyway; it still fails the wipe).
+  * *Recovery, and why the registry is process-scoped:* the block is lifted by
+    the provider finally answering (the operation is then no longer in
+    flight), by a retry whose every step is verified, by a deletion the
+    provider accepted (the name is retired and its generation bumped, so it
+    is never handed out again), or by a process restart — the late callbacks
+    this defends against belong to this process, so persisting the block
+    would lock a site out across restarts for a hazard that no longer exists.
+    A deferred (in-use) deletion keeps the block.
+  * The migration flow faces the same late-write hazard and answers it
+    differently, by **retiring** the name (queue + generation bump): a virgin
+    import profile is disposable, a profile the user clears in place is not.
 * The default profile and the launcher's data are never part of any of these
   paths.
 
@@ -296,7 +343,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
 
 **Behavioural coverage (mocks/injected callbacks, no new dependencies):**
 
-* `SiteProfileOpsTest.kt` (36 cases, executed by the CI Gradle unit-test
+* `SiteProfileOpsTest.kt` (54 cases, executed by the CI Gradle unit-test
   step against the real sequencing code in `SiteProfileOps.kt`): close
   durability (flush failure keeps the view, resolve failure is an error,
   exactly-once completion, **flush watchdog on a lost callback, a late
@@ -312,14 +359,37 @@ remove, no legacy data remains (`delete_site_session` also drops the
   session-slot rollback after a failed open (stale failure cannot clear a
   newer session), and the back-status decision matrix. These catch the
   real error paths A.1–A.5 were about; the controller only *wires* them.
+* **Timeout side-effect races** (18 of those cases) are measured as data, not
+  as callback counts: the fake records every `clear` the production
+  `GeolocationWipe` triggers and the origins a session currently holds. They
+  cover the callback beating the watchdog (permissions really cleared, no
+  block), the watchdog winning and the callback landing late (**zero**
+  `clear` calls, one result), a stale callback arriving after the site was
+  reopened on the same profile name (the new session's granted permission
+  survives), a duplicated delivery (no repeated wipe, no repeated result), a
+  port that claimed the guard but reported late (the watchdog's conservative
+  failure stands), the `removeAllCookies` timeout → quarantine → refused open
+  → verified retry reopening, the late cookie answer lifting the block
+  without re-reporting, an answered-false cookie step failing *without*
+  quarantining, a final-flush timeout failing without quarantining, the
+  absent-profile and unsupported-provider paths, and `StepGuard` /
+  `GeolocationWipe` / `ProfileQuarantine` / `SiteOpenGate` unit behaviour.
 * `web/windows.rs` Rust tests drive the real `run_mobile_open_protocol`
-  (7 cases): a scripted plugin half plus the real `SecureStore` wrapped so
+  (8 cases): a scripted plugin half plus the real `SecureStore` wrapped so
   `profilemig-*` writes can fail — the flag-write failure aborts before any
   view, a reopen retires only the never-shown profile and recovers, a shown
   profile is never queued, partial migrations keep the jar and retry once,
   a second partial fails visibly without opening, the MULTI_PROFILE refusal
-  touches nothing, and an empty/expired jar still records the flag before
-  the view.
+  touches nothing, an empty/expired jar still records the flag before the
+  view, and a `profile-quarantined` refusal in EITHER phase propagates
+  without retiring the profile, bumping the generation, queueing a deletion
+  or writing the flag (it is not the `migration-partial` path).
+* `android_bridge.rs` classifies open refusals host-side
+  (`classify_site_open_error`): MULTI_PROFILE → its guidance,
+  `profile-quarantined` → `AppError::Quarantined` with the recovery message
+  and never the raw sentinel, anything else unchanged; the plugin crate pins
+  both sentinel literals against the Kotlin source and asserts the two
+  sentinels stay disjoint.
 * `tests/back_close.test.js` (13 cases): the launcher close session —
   label survives pending/failed closes (no `finally`-clear), failure
   reason surfaced, no concurrent `close_site`, stale `site-closed` events
@@ -352,7 +422,11 @@ State-machine coverage that needs a real device/provider (actual
   the same generated project the APK uses — real flow code, fake ports — so
   the close/clear/migration error paths above are *executed* on every run,
   and the same step type-checks the production `AnimeHubSiteController.kt`
-  left in the source set. `tests/back_close.test.js` runs with `npm test`.
+  left in the source set. The late-callback races are measured as DATA, not
+  as callback counts: the test fake records every `clear` the production
+  `GeolocationWipe` triggers and the origins a session holds, so "the stale
+  callback changed the new session's permissions" is a failing assertion
+  rather than an argument. `tests/back_close.test.js` runs with `npm test`.
   This is still not a device: provider-specific behaviour (real
   `ProfileStore`/Chromium timing, MULTI_PROFILE absent) is untested here.
 * **Compiled, not device-tested.** The CI "Android compile (aarch64)" job
@@ -371,7 +445,15 @@ State-machine coverage that needs a real device/provider (actual
   the `submitFlush` stuck-worker warning appears in the in-app log); the
   two-phase open on a real device (migrate → flag → view), including killing
   the process between phase 1 and the flag write and confirming the next
-  open retires only the never-shown profile; and the Tauri mobile-invoke
-  timeout behaviour for a plugin call whose Kotlin side answered late.**
+  open retires only the never-shown profile; the Tauri mobile-invoke
+  timeout behaviour for a plugin call whose Kotlin side answered late; and
+  the timeout side-effect races on a real provider — a slow `getOrigins`
+  answering after the 10 s watchdog (confirm in the site's own UI that a
+  permission granted by the reopened session was NOT revoked, and that the
+  in-app log shows the stale `operationId`), a slow `removeAllCookies`
+  (confirm the reopen is refused with the quarantine guidance, that the
+  refusal lifts once the wipe is retried and verified, and that no cookie of
+  the new session disappears), and a killed process during a quarantined
+  state (confirm the block is gone after restart and the site opens).**
 * iOS/macOS: out of scope; the iOS path keeps the shared-WebView flow minus
   the removed snapshot machinery and was not touched beyond that.

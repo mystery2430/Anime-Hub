@@ -21,12 +21,24 @@
 // every port callback back on the Android UI thread before it reaches a flow.
 // Flows guard their completion with once-latches, so a late/duplicate
 // callback can never produce a second result — or a success after a failure.
+//
+// A once-latch bounds the RESULT only, not the DATA. A step whose mutation
+// the port performs itself after an await (the geolocation wipe) therefore
+// also runs behind a [StepGuard] that the flow's watchdog closes: a callback
+// which lost the race provably performs no `clear` at all. Steps whose
+// mutation is the provider's own and cannot be cancelled (a native
+// `removeAllCookies` already in flight when the watchdog fired) are handled
+// by [ProfileQuarantine] instead — the profile is refused for a new session
+// until that wipe is verified, because ignoring the late result would still
+// leave the late mutation to land on the new session's data.
 
 package dev.animehub.app
 
 import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -46,6 +58,16 @@ object SiteProfileErrors {
    * underlying cause while still recognising the sentinel.
    */
   const val MIGRATION_RETRY: String = "migration-partial"
+
+  /**
+   * A previous in-place wipe of this profile timed out on a destructive
+   * provider call that cannot be cancelled, so its completion is UNVERIFIED:
+   * the operation may still mutate the profile after the flow gave up. Kotlin
+   * refuses to open the profile for a new session until the wipe is verified
+   * (see [ProfileQuarantine]). Message format `profile-quarantined: <reason>`;
+   * Rust maps the sentinel onto user-facing guidance instead of showing it raw.
+   */
+  const val QUARANTINED: String = "profile-quarantined"
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +232,209 @@ object SiteCloseFlow {
 }
 
 // ---------------------------------------------------------------------------
+// Awaited steps: validity token, gated geolocation wipe, quarantine
+// ---------------------------------------------------------------------------
+
+/**
+ * Validity token for ONE awaited step: the cancellation flag a port must
+ * consult before it mutates profile data.
+ *
+ * WHY A RESULT LATCH IS NOT ENOUGH: a flow's `AtomicBoolean` decides who
+ * *reports* — it cannot un-run a side effect. The awaited geolocation wipe
+ * enumerates origins asynchronously and performs the `clear` calls itself, so
+ * a callback arriving after the watchdog fired used to wipe permissions
+ * belonging to whatever session the profile backs by then. [claim] turns that
+ * into a single winner for the DATA as well as for the result.
+ */
+interface StepGuard {
+  /**
+   * Correlation id for the in-app debug log ("operation id"): a device log
+   * line about a stale callback can be tied to the step that owned it.
+   */
+  val operationId: Long
+
+  /**
+   * Atomically win this step. Returns `true` for EXACTLY ONE caller — the
+   * flow's watchdog or the port's callback — and `false` for every later one.
+   *
+   * Contract for ports that mutate: claim FIRST, mutate only on `true`, and
+   * report the result in the same serialised block. A caller that got `false`
+   * must return without touching provider state and without reporting — the
+   * winner's outcome already stands.
+   */
+  fun claim(): Boolean
+
+  /** Diagnostics only; never a check-then-act substitute for [claim]. */
+  val open: Boolean
+}
+
+/** Creates [StepGuard]s with process-unique, monotonic [StepGuard.operationId]s. */
+object StepGuards {
+  private val counter = AtomicLong(0)
+
+  fun create(): StepGuard = Guard(counter.incrementAndGet())
+
+  private class Guard(override val operationId: Long) : StepGuard {
+    private val claimed = AtomicBoolean(false)
+
+    override fun claim(): Boolean = claimed.compareAndSet(false, true)
+
+    override val open: Boolean
+      get() = !claimed.get()
+  }
+}
+
+/**
+ * The two provider calls the geolocation wipe needs. The real implementation
+ * is `profile.geolocationPermissions` (`android.webkit.GeolocationPermissions`);
+ * tests implement it over a recording fake, so the side effect the production
+ * adapter triggers is measurable in CI.
+ */
+interface GeolocationApi {
+  /** `getOrigins { … }` — asynchronous and read-only; may answer late or never. */
+  fun getOrigins(onResult: (Set<String>?) -> Unit)
+
+  /** `clear(origin)` — THE mutation this step exists to gate. */
+  fun clear(origin: String)
+}
+
+/**
+ * Production sequencing of the awaited geolocation wipe, extracted from the
+ * controller adapter so CI executes the ordering it must guarantee:
+ * await `getOrigins` → **[StepGuard.claim]** → only then `clear` each origin →
+ * report.
+ *
+ * `GeolocationPermissions` has no removeAll-with-callback, which is why this
+ * step awaits at all — and awaiting is exactly what makes the mutation
+ * cancellable by us: unlike a native `removeAllCookies`, the `clear` calls
+ * have not happened yet when the watchdog fires, so refusing them is a real
+ * cancellation rather than a shrug. A callback that lost the claim performs
+ * ZERO `clear` calls and reports nothing, which keeps a timed-out wipe from
+ * revoking permissions a newer session on the same profile just granted.
+ *
+ * Threading: the controller delivers [GeolocationApi.getOrigins]' callback on
+ * the UI thread and posts the watchdog to the UI thread as well, so claim and
+ * mutate are one serialised block; the CAS keeps the guarantee even if a port
+ * ever answered from another thread.
+ *
+ * The claim winner always reports (the `clear` loop is wrapped), so a won
+ * step can never strand the flow; if `getOrigins` itself throws, the step is
+ * claimed and reported as a failure immediately.
+ */
+object GeolocationWipe {
+  fun start(guard: StepGuard, api: GeolocationApi, onDone: (Boolean) -> Unit) {
+    if (!guard.open) return // Already settled before we even armed: nothing to do.
+    val started =
+      try {
+        api.getOrigins { origins ->
+          if (!guard.claim()) return@getOrigins // Watchdog won: no side effect, no result.
+          onDone(clearOrigins(api, origins))
+        }
+        true
+      } catch (_: Throwable) {
+        false
+      }
+    if (!started && guard.claim()) onDone(false)
+  }
+
+  private fun clearOrigins(api: GeolocationApi, origins: Set<String>?): Boolean =
+    try {
+      if (origins != null) {
+        for (origin in origins) api.clear(origin)
+      }
+      true
+    } catch (_: Throwable) {
+      false
+    }
+}
+
+/**
+ * Process-scoped registry of profiles whose in-place wipe timed out on a
+ * destructive provider call that could NOT be cancelled or gated, so its
+ * completion is unverified and it may still mutate the profile later.
+ *
+ * WHY A NEW SESSION MUST NOT OPEN ON SUCH A PROFILE (the proof this object
+ * exists for): the watchdog answers the CALLER — it never stops the provider
+ * operation underneath. `CookieManager.removeAllCookies` offers no
+ * cancellation, so after a timeout the deletion may still be in flight and
+ * can complete *after* the site was reopened, silently removing the new
+ * session's cookies (a fresh login, or the one-time jar import). Ignoring the
+ * late callback result does not help: the data change happens regardless.
+ * Refusing the open until the operation is known to have finished is the only
+ * safe resolution, and it is recoverable — the user retries the wipe (which
+ * verifies it) or removes the site (which retires the name).
+ *
+ * WHAT IS AND IS NOT QUARANTINED:
+ *  * `removeAllCookies` timeout → QUARANTINED (ungated destructive, unverified).
+ *  * geolocation timeout → NOT quarantined: the mutation is ours and gated by
+ *    [StepGuard]/[GeolocationWipe], so a late callback provably clears
+ *    nothing; `getOrigins` is read-only.
+ *  * `WebStorage.deleteAllData()` → synchronous: it returned or threw, so the
+ *    outcome is verified by construction.
+ *  * final `flush()` timeout → NOT quarantined: `flush()` only persists the
+ *    cookie store that already exists, so a late flush cannot delete or grant
+ *    anything a new session created (worst case it durably writes that
+ *    session's own cookies, which its own close flush would do anyway). It
+ *    still fails the wipe, so Rust keeps the encrypted blobs for a retry.
+ *
+ * WHY IN-MEMORY IS THE RIGHT SCOPE: the hazard is a late callback in THIS
+ * process. Those callbacks belong to the app's browser process — a restart
+ * destroys them, and the registry starts empty by construction. Persisting
+ * the quarantine would lock the user out of a site across restarts for a
+ * hazard that no longer exists. (The migration flow faces the same late-write
+ * problem and answers it differently, by RETIRING the name — see
+ * [SiteMigrationFlow]: a virgin import profile is disposable, a profile the
+ * user clears in place is not.)
+ *
+ * LIFTED BY: a fully verified clear of the same profile, the native callback
+ * finally answering (the operation is then no longer in flight — [SiteClearFlow]
+ * reports that as a late answer), a confirmed profile deletion (the name is
+ * retired and its generation bumped, so it is never reopened), or a restart.
+ */
+object ProfileQuarantine {
+  private val reasons = ConcurrentHashMap<String, String>()
+
+  /** Block [profileName] from backing a new session, recording why. */
+  fun quarantine(profileName: String, reason: String) {
+    reasons[profileName] = reason
+  }
+
+  /** The recorded reason, or `null` when the profile may be used. */
+  fun reasonFor(profileName: String): String? = reasons[profileName]
+
+  fun isQuarantined(profileName: String): Boolean = reasons.containsKey(profileName)
+
+  /** Lifts the block; returns the reason that was recorded, if any. */
+  fun release(profileName: String): String? = reasons.remove(profileName)
+
+  /** Every blocked name (diagnostics/tests). */
+  fun names(): Set<String> = reasons.keys.toSet()
+
+  /** Forget every entry — test isolation and Activity teardown. */
+  fun reset() {
+    reasons.clear()
+  }
+}
+
+/**
+ * The open-time half of the quarantine: BOTH phases of the two-phase open
+ * consult it before they touch the provider, so a profile with an unverified
+ * wipe in flight is never bound to a WebView and never receives the one-time
+ * jar import.
+ */
+object SiteOpenGate {
+  /**
+   * `null` when [profileName] may be opened; otherwise the refusal carrying
+   * [SiteProfileErrors.QUARANTINED] plus the recorded reason, which Rust
+   * classifies into user-facing guidance.
+   */
+  fun check(profileName: String): String? =
+    ProfileQuarantine.reasonFor(profileName)?.let { reason ->
+      "${SiteProfileErrors.QUARANTINED}: $reason"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Clear: verified, retryable, aggregate-error wipe of ONE site profile
 // ---------------------------------------------------------------------------
 
@@ -218,7 +443,17 @@ interface SiteClearPort {
   /** `ProfileStore.getProfile(name) != null` (false = already clean). */
   fun profileExists(): Boolean
 
-  /** `removeAllCookies { ok -> … }`; [Boolean] is the callback's result. */
+  /**
+   * `removeAllCookies { ok -> … }`; [Boolean] is the callback's result.
+   *
+   * NO [StepGuard] here on purpose: this mutation is the provider's own, is
+   * issued before the await and offers no cancellation, so there is nothing a
+   * port could gate. A timeout therefore leaves the operation possibly in
+   * flight, which [SiteClearFlow] answers with [ProfileQuarantine] rather
+   * than by pretending the late callback was the whole problem. The port MUST
+   * still deliver [onDone] whenever the provider answers — late or not — so
+   * the flow can learn that the operation finished and lift the block.
+   */
   fun removeAllCookies(onDone: (Boolean) -> Unit)
 
   /** `WebStorage.deleteAllData()`; throw = failure. */
@@ -227,10 +462,15 @@ interface SiteClearPort {
   /**
    * Clear every stored geolocation permission of the profile and call
    * [onDone] with whether that completed. (`GeolocationPermissions` has no
-   * removeAll-with-callback: the flow awaits `getOrigins` and clears each
-   * origin; `onDone` fires only after that chain settled.)
+   * removeAll-with-callback: the step awaits `getOrigins` and clears each
+   * origin; [onDone] fires only after that chain settled.)
+   *
+   * [guard] MUST be claimed before the first `clear` — delegate to
+   * [GeolocationWipe], which is the production sequencing: a callback that
+   * lost to the watchdog then performs no side effect on a profile that may
+   * already back a new session, and reports nothing.
    */
-  fun clearGeolocationPermissions(onDone: (Boolean) -> Unit)
+  fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit)
 
   /** Blocking `flush()`, off the caller thread; `null` = durable. */
   fun flushCookies(onDone: (Throwable?) -> Unit)
@@ -248,12 +488,19 @@ interface SiteClearPort {
  *  * every awaited callback is actually awaited (with a watchdog —
  *    [STEP_TIMEOUT_MS] per step, [FLUSH_TIMEOUT_MS] for the final durability
  *    flush), and the result is reported exactly once;
+ *  * a step that timed out also loses its SIDE EFFECTS: the geolocation wipe
+ *    runs behind a [StepGuard] the watchdog closes, so its late callback
+ *    performs no `clear` on a profile that may by then back a new session,
+ *    and the one destructive call that cannot be gated (`removeAllCookies`)
+ *    puts the profile in [ProfileQuarantine] until it is verified — the flow
+ *    never claims a wipe it could not watch finish;
  *  * failures are aggregated: every step is still attempted so one broken
  *    callback cannot mask the rest, and ANY failure (including the final
  *    `flush`) fails the whole call — Rust then keeps the encrypted session
  *    blobs and the user can retry;
  *  * every step is idempotent, so a half-finished attempt followed by a
- *    retry is safe.
+ *    retry is safe, and a fully verified success lifts any quarantine on
+ *    [profileName] so the site can be opened again.
  *
  * Out of scope (documented in docs/android-storage-isolation.md): HTTP cache
  * and service-worker registrations — no profile-scoped API clears those;
@@ -265,10 +512,26 @@ object SiteClearFlow {
   /** Bound for the final durability flush (see [SiteCloseFlow]). */
   const val FLUSH_TIMEOUT_MS: Long = 15_000
 
-  fun run(supported: Boolean, port: SiteClearPort, onDone: (String?) -> Unit) {
+  /** Reason recorded when the cookie wipe's completion cannot be verified. */
+  const val COOKIE_UNVERIFIED_REASON: String =
+    "çerez temizliği zaman aşımına uğradı, işlem doğrulanamadı"
+
+  fun run(
+    supported: Boolean,
+    profileName: String,
+    port: SiteClearPort,
+    onDone: (String?) -> Unit,
+  ) {
     val once = AtomicBoolean(false)
     fun done(error: String?) {
-      if (once.compareAndSet(false, true)) onDone(error)
+      if (once.compareAndSet(false, true)) {
+        if (error == null) {
+          // Fully verified wipe: every destructive step answered, nothing is
+          // in flight, so the profile may back a new session again.
+          ProfileQuarantine.release(profileName)
+        }
+        onDone(error)
+      }
     }
     if (!supported) {
       done(SiteProfileErrors.UNSUPPORTED)
@@ -289,23 +552,84 @@ object SiteClearFlow {
       if (firstError == null) firstError = message
     }
 
-    // Awaited step helper: settles exactly once via callback OR watchdog.
-    fun awaited(stepName: String, timeoutMessage: String, arm: ((Boolean) -> Unit) -> Unit, next: (Boolean) -> Unit) {
+    /**
+     * Awaited step helper: the callback and the watchdog race and EXACTLY ONE
+     * of them settles the result ([next] runs at most once).
+     *
+     * The watchdog closes [StepGuard] first, so a port that mutates behind the
+     * guard (the geolocation wipe) provably performs no side effect after this
+     * point — that is the difference between "the late result was ignored" and
+     * "the late mutation was prevented". [onTimeout] then records what the
+     * timeout leaves unverified, and [onLateAnswer] runs when the provider
+     * answers anyway after losing the race: the result stands, but the flow
+     * learns the operation finished.
+     *
+     * THE UI-THREAD RACE, explicitly: the controller posts the watchdog with
+     * `mainHandler.postDelayed` and delivers every provider callback with
+     * `runOnUiThread`, so both sides run on the UI thread and cannot
+     * interleave — claim, mutate and report happen inside one serialised task.
+     * Should a port ever answer from another thread, the two CAS operations
+     * still leave one winner for the data and one for the result; the only
+     * mixed outcome is a port that claimed the guard but reported *after* the
+     * watchdog settled, which is answered with the watchdog's failure. That is
+     * the conservative direction: the wipe is reported incomplete, Rust keeps
+     * the encrypted blobs and the user retries — every step is idempotent, so
+     * a retry over an already-applied mutation is harmless.
+     */
+    fun awaited(
+      stepName: String,
+      timeoutMessage: String,
+      onTimeout: () -> Unit = {},
+      onLateAnswer: () -> Unit = {},
+      arm: (StepGuard, (Boolean) -> Unit) -> Unit,
+      next: (Boolean) -> Unit,
+    ) {
       val settled = AtomicBoolean(false)
+      val guard = StepGuards.create()
       port.scheduleTimeout(STEP_TIMEOUT_MS) {
+        // Close the mutation window before deciding the result: a callback
+        // racing this watchdog on another thread must see the guard shut even
+        // if it arrives between the two atomic steps.
+        guard.claim()
         if (settled.compareAndSet(false, true)) {
           record("$stepName: $timeoutMessage")
+          onTimeout()
           next(false)
         }
       }
-      arm { ok ->
-        if (settled.compareAndSet(false, true)) next(ok)
+      arm(guard) { ok ->
+        if (settled.compareAndSet(false, true)) next(ok) else onLateAnswer()
       }
     }
 
-    awaited("çerez temizliği", "zaman aşımı", { cb -> port.removeAllCookies(cb) }) { cookiesOk ->
+    awaited(
+      "çerez temizliği",
+      "zaman aşımı",
+      onTimeout = {
+        // Ungated AND unverified: `removeAllCookies` was issued before the
+        // await, offers no cancellation, and may still delete cookies after
+        // this flow reported failure — including cookies a reopened session
+        // just created. Ignoring the late callback result would not stop
+        // that, so the profile is blocked until the wipe is verified.
+        ProfileQuarantine.quarantine(profileName, COOKIE_UNVERIFIED_REASON)
+      },
+      onLateAnswer = {
+        // The provider answered after losing the race: the operation is
+        // finished, nothing is in flight any more, so the block is lifted.
+        // The delivered failure stands — a late answer never re-reports.
+        ProfileQuarantine.release(profileName)
+      },
+      arm = { _, cb -> port.removeAllCookies(cb) },
+    ) { cookiesOk ->
       if (!cookiesOk) record("çerezler temizlenemedi")
-      awaited("geolocation izin temizliği", "zaman aşımı", { cb -> port.clearGeolocationPermissions(cb) }) { geoOk ->
+      // No quarantine here: this step's mutation is ours and gated by the
+      // [StepGuard] the watchdog closes, so a late callback provably clears
+      // nothing (GeolocationWipe) and `getOrigins` is read-only.
+      awaited(
+        "geolocation izin temizliği",
+        "zaman aşımı",
+        arm = { guard, cb -> port.clearGeolocationPermissions(guard, cb) },
+      ) { geoOk ->
         if (!geoOk) record("geolocation izinleri temizlenemedi")
         runCatching { port.deleteAllStorage() }.getOrElse { e ->
           record("site deposu temizlenemedi: ${e.message}")
@@ -316,7 +640,10 @@ object SiteClearFlow {
         // records itself as the aggregate failure, so Rust sees an error,
         // keeps the encrypted session blobs for a retry and never reports a
         // half-finished clear as success. A late flush callback cannot flip
-        // that delivered failure back to success.
+        // that delivered failure back to success. A flush timeout also
+        // quarantines nothing: `flush()` only persists the cookie store that
+        // already exists, so a late one cannot delete or grant anything a new
+        // session created (see [ProfileQuarantine] for the full argument).
         val flushSettled = AtomicBoolean(false)
         port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
           if (flushSettled.compareAndSet(false, true)) {

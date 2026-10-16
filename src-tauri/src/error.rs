@@ -53,6 +53,16 @@ pub enum AppError {
     #[error("{0}")]
     Unsupported(String),
 
+    /// A site profile the platform side refuses to open because its last
+    /// in-place wipe timed out on a provider call that cannot be cancelled,
+    /// so the wipe is UNVERIFIED and may still be mutating the profile (see
+    /// `ProfileQuarantine` in the Kotlin flows). Transient by design — the
+    /// message names the recovery step and is shown to the user as-is, which
+    /// is why it is not folded into [`AppError::Other`]'s "unexpected error"
+    /// wording.
+    #[error("{0}")]
+    Quarantined(String),
+
     /// A tile photo the user attached. The message is already safe to show.
     #[error("{0}")]
     Icon(String),
@@ -85,6 +95,7 @@ impl AppError {
             AppError::Network(_) => "network",
             AppError::Other(_) => "other",
             AppError::Unsupported(_) => "unsupported",
+            AppError::Quarantined(_) => "quarantined",
             AppError::Icon(_) => "icon",
         }
     }

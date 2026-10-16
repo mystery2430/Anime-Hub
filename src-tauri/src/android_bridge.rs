@@ -47,6 +47,44 @@ pub fn keystore_open(purpose: &str, sealed: &str) -> AppResult<Vec<u8>> {
 /// reintroduce the cross-site data mixing this feature removes.
 pub const MULTI_PROFILE_UNSUPPORTED_MSG: &str = "Bu cihazın WebView sağlayıcısı çoklu profil (MULTI_PROFILE) desteği sunmuyor; site verileri izole edilemediği için site açılamadı. Android System WebView veya Google Chrome'u güncelleyin; güncelleme sonrası da devam ederse bu cihaz bu özelliği desteklemiyor olabilir.";
 
+/// User-facing explanation when Kotlin refuses a *quarantined* profile: its
+/// last in-place wipe timed out on `removeAllCookies`, a destructive provider
+/// call that offers no cancellation, so its completion is unverified and it
+/// may still delete cookies belonging to a session that reopens the same
+/// profile. The recovery step is part of the message: this is a retryable
+/// state, not a dead end.
+pub const PROFILE_QUARANTINED_MSG: &str = "Bu sitenin verileri temizlenirken çerez silme işlemi zaman aşımına uğradı ve tamamlanıp tamamlanmadığı doğrulanamadı. İşlem arka planda hâlâ sürüyor olabileceği için site, temizlik doğrulanana kadar açılmadı: açılsaydı yeni oturumun çerezleri silinebilirdi. Site verilerini yeniden temizlemeyi deneyin; sonuç değişmezse siteyi kaldırıp yeniden ekleyin. Kayıtlı oturum verileriniz korunuyor.";
+
+/// Map a Kotlin refusal from the two-phase open onto a user-facing error.
+///
+/// Host-compiled (and host-tested) on the plugin crate's error type alone —
+/// deciding what the user reads needs no Android runtime:
+///
+///  * `unsupported-multi-profile` → [`AppError::Unsupported`] carrying
+///    [`MULTI_PROFILE_UNSUPPORTED_MSG`]: a feature gap, never retried on the
+///    shared default profile;
+///  * `profile-quarantined` → [`AppError::Quarantined`] carrying
+///    [`PROFILE_QUARANTINED_MSG`]: the sentinel is an internal contract
+///    between Kotlin and Rust, so the user gets the explanation and the
+///    recovery step instead of the raw token (and not `Other`'s "unexpected
+///    error" wording either — this refusal is designed, transient and
+///    retryable);
+///  * anything else → the bridge message unchanged (the frontend renders
+///    `to_string()` directly).
+///
+/// A quarantine is deliberately NOT routed through the `migration-partial`
+/// retirement path: the profile is the user's live one, and the answer is to
+/// verify the wipe — not to delete the name and re-import the legacy jar.
+pub fn classify_site_open_error(error: animehub_android::Error) -> AppError {
+    if animehub_android::is_unsupported_multi_profile(&error) {
+        AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string())
+    } else if animehub_android::is_profile_quarantined(&error) {
+        AppError::Quarantined(PROFILE_QUARANTINED_MSG.to_string())
+    } else {
+        AppError::Other(error.to_string())
+    }
+}
+
 /// What happened to a profile deletion request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteProfileAction {
@@ -73,16 +111,14 @@ pub enum SiteProfileAction {
 /// [`AppError::Other`] carrying the `migration-partial` sentinel — the
 /// caller retires that profile name and retries on a fresh generation.
 /// Fails with [`AppError::Unsupported`] carrying
-/// [`MULTI_PROFILE_UNSUPPORTED_MSG`] when the provider cannot isolate sites.
+/// [`MULTI_PROFILE_UNSUPPORTED_MSG`] when the provider cannot isolate sites,
+/// and with [`PROFILE_QUARANTINED_MSG`] when the target profile's last
+/// in-place wipe is still unverified — in that case no cookie is written into
+/// the profile and the caller never persists its migration flag.
 #[cfg(target_os = "android")]
 pub fn site_migrate(url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
-    match animehub_android::site_migrate(url.to_string(), profile.to_string(), cookies.to_vec()) {
-        Ok(_) => Ok(()),
-        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
-            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
-        )),
-        Err(e) => Err(AppError::Other(e.to_string())),
-    }
+    animehub_android::site_migrate(url.to_string(), profile.to_string(), cookies.to_vec())
+        .map_err(classify_site_open_error)
 }
 
 /// Phase 2: open `url` in a new site WebView bound to `profile`.
@@ -91,20 +127,18 @@ pub fn site_migrate(url: &str, profile: &str, cookies: &[String]) -> AppResult<(
 /// flag is durable before this call, so a view the user sees can never exist
 /// while the migration state is unrecorded. Fails with
 /// [`AppError::Unsupported`] carrying [`MULTI_PROFILE_UNSUPPORTED_MSG`] when
-/// the provider cannot isolate sites.
+/// the provider cannot isolate sites, and with [`PROFILE_QUARANTINED_MSG`]
+/// when Kotlin refuses to bind a WebView to a profile whose last wipe timed
+/// out on a provider call it cannot cancel. Both refusals build nothing, so
+/// the caller claims no session and the refusal is simply retryable.
 #[cfg(target_os = "android")]
 pub fn site_open(url: &str, profile: &str, init_script: &str) -> AppResult<()> {
-    match animehub_android::site_open(
+    animehub_android::site_open(
         url.to_string(),
         profile.to_string(),
         init_script.to_string(),
-    ) {
-        Ok(_) => Ok(()),
-        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
-            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
-        )),
-        Err(e) => Err(AppError::Other(e.to_string())),
-    }
+    )
+    .map_err(classify_site_open_error)
 }
 
 /// Close the active site WebView (flushing its profile cookies unless
@@ -343,6 +377,58 @@ mod tests {
     fn clamp_bounds_extreme_ratios() {
         assert_eq!(clamp_aspect(1, 100), (100, 239), "too tall");
         assert_eq!(clamp_aspect(100, 1), (239, 100), "too wide");
+    }
+
+    #[test]
+    fn open_refusals_are_classified_into_user_facing_errors() {
+        // The mapping is host-compiled, so every platform proves what the user
+        // reads when Kotlin refuses an open — including the quarantine, whose
+        // whole point is that a raw sentinel must never reach the UI.
+        let unsupported = classify_site_open_error(animehub_android::Error::Bridge(
+            animehub_android::MULTI_PROFILE_SENTINEL.to_string(),
+        ));
+        assert_eq!(unsupported.code(), "unsupported");
+        assert_eq!(unsupported.to_string(), MULTI_PROFILE_UNSUPPORTED_MSG);
+
+        let quarantined = classify_site_open_error(animehub_android::Error::Bridge(format!(
+            "{}: {}",
+            animehub_android::QUARANTINE_SENTINEL,
+            "çerez temizliği zaman aşımına uğradı, işlem doğrulanamadı"
+        )));
+        assert_eq!(
+            quarantined.code(),
+            "quarantined",
+            "a designed refusal is neither 'other' nor 'unsupported'"
+        );
+        assert_eq!(quarantined.to_string(), PROFILE_QUARANTINED_MSG);
+        assert!(
+            !quarantined
+                .to_string()
+                .contains(animehub_android::QUARANTINE_SENTINEL),
+            "the internal sentinel must not be shown to the user"
+        );
+        assert!(
+            quarantined.to_string().contains("yeniden temizlemeyi"),
+            "the message must name the recovery step"
+        );
+
+        // Anything else passes through unchanged (the bridge's own prefix
+        // included), so no Kotlin detail is lost for unclassified failures.
+        let other = classify_site_open_error(animehub_android::Error::Bridge(
+            "site açılamadı: patladı".to_string(),
+        ));
+        assert_eq!(other.code(), "other");
+        assert!(other.to_string().contains("patladı"), "{other}");
+
+        // A migration retry is NOT a quarantine: it must keep its own meaning
+        // (retire the profile name and re-import), so it stays unclassified
+        // here and is handled by the open protocol instead.
+        let retry = classify_site_open_error(animehub_android::Error::Bridge(format!(
+            "{}: profil zaten mevcut",
+            animehub_android::MIGRATION_RETRY_SENTINEL
+        )));
+        assert_eq!(retry.code(), "other");
+        assert!(retry.to_string().contains("migration-partial"), "{retry}");
     }
 
     #[cfg(not(target_os = "android"))]

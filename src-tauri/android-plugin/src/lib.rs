@@ -81,6 +81,20 @@ pub const MULTI_PROFILE_SENTINEL: &str = "unsupported-multi-profile";
 /// as success or as an already-migrated state.
 pub const MIGRATION_RETRY_SENTINEL: &str = "migration-partial";
 
+/// Kotlin's `SiteProfileErrors.QUARANTINED`. A bridge error containing this
+/// string means the profile's last in-place wipe timed out on a destructive
+/// provider call that CANNOT be cancelled (`removeAllCookies`), so its
+/// completion is unverified: the deletion may still land after the wipe was
+/// reported failed, on data belonging to a session that reopened the same
+/// profile. Kotlin refuses both open phases for that name until the wipe is
+/// verified (a retry that completes, or a deletion that retires the name), so
+/// callers surface guidance instead of retrying the open behind the gate.
+///
+/// Deliberately distinct from [`MIGRATION_RETRY_SENTINEL`]: a quarantine is
+/// NOT a request to retire the profile and re-import the legacy jar — the
+/// profile is the user's live one and the wipe simply has to be verified.
+pub const QUARANTINE_SENTINEL: &str = "profile-quarantined";
+
 /// Alias under which the Kotlin side is registered.
 pub const PLUGIN_ALIAS: &str = "animehub-android";
 
@@ -208,6 +222,17 @@ pub fn is_migration_retry(error: &Error) -> bool {
     }
 }
 
+/// See [`QUARANTINE_SENTINEL`]: the profile's last in-place wipe could not be
+/// verified, so Kotlin refuses to open it until it is. Distinct from
+/// [`is_migration_retry`] — neither sentinel contains the other, so a
+/// quarantine refusal can never trigger the retire-and-reimport path.
+pub fn is_profile_quarantined(error: &Error) -> bool {
+    match error {
+        Error::Bridge(message) => message.contains(QUARANTINE_SENTINEL),
+        _ => false,
+    }
+}
+
 /// Phase 1 of the two-phase open: import the one-time legacy jar into
 /// `profile` WITHOUT creating the site WebView.
 ///
@@ -217,7 +242,9 @@ pub fn is_migration_retry(error: &Error) -> bool {
 /// first navigation, because no navigation happens in this phase at all.
 /// An empty list is a success without touching the provider (nothing to
 /// import). A failure carries [`MIGRATION_RETRY_SENTINEL`] (retire the name,
-/// retry on a fresh generation) or [`MULTI_PROFILE_SENTINEL`] (feature gap).
+/// retry on a fresh generation), [`MULTI_PROFILE_SENTINEL`] (feature gap) or
+/// [`QUARANTINE_SENTINEL`] (this profile's last wipe is unverified, so the
+/// jar is not written into it and the flag is not persisted).
 ///
 /// The caller persists its migration flag only after this resolves, and only
 /// then calls [`site_open`]: a view the user has seen can never exist while
@@ -244,7 +271,10 @@ pub fn site_migrate(url: String, profile: String, cookies: Vec<String>) -> Resul
 /// Phase 2: open `url` in a new site WebView bound to `profile`.
 ///
 /// Takes no cookies — the jar import happened in [`site_migrate`], before
-/// the caller persisted the migration flag.
+/// the caller persisted the migration flag. A failure may carry
+/// [`QUARANTINE_SENTINEL`]: Kotlin refuses to bind a WebView to a profile
+/// whose last in-place wipe is still unverified, because the provider call
+/// that timed out cannot be cancelled and may still mutate it.
 pub fn site_open(url: String, profile: String, init_script: String) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
@@ -586,12 +616,94 @@ mod tests {
         assert_eq!(CMD_SITE_PROFILE_NAMES, "site_profile_names");
         assert_eq!(MULTI_PROFILE_SENTINEL, "unsupported-multi-profile");
         assert_eq!(MIGRATION_RETRY_SENTINEL, "migration-partial");
+        assert_eq!(QUARANTINE_SENTINEL, "profile-quarantined");
         // The classifier must key off exactly the const Kotlin produces.
         assert!(is_migration_retry(&Error::Bridge(
             "migration-partial: çerez reddedildi (1/2)".into()
         )));
         assert!(!is_migration_retry(&Error::Bridge("something else".into())));
+        assert!(is_profile_quarantined(&Error::Bridge(
+            "profile-quarantined: çerez temizliği zaman aşımına uğradı, işlem doğrulanamadı".into()
+        )));
+        assert!(!is_profile_quarantined(&Error::Bridge(
+            "something else".into()
+        )));
+        // The two sentinels must stay disjoint: a quarantine refusal must
+        // never trigger the retire-and-reimport path (which would delete the
+        // user's live profile and rebuild it from the stale jar), and a
+        // migration retry must never be read as a quarantine.
+        assert!(
+            !is_migration_retry(&Error::Bridge(format!(
+                "{QUARANTINE_SENTINEL}: çerez temizliği zaman aşımına uğradı"
+            ))),
+            "a quarantine refusal is not a migration retry"
+        );
+        assert!(
+            !is_profile_quarantined(&Error::Bridge(format!(
+                "{MIGRATION_RETRY_SENTINEL}: profil zaten mevcut"
+            ))),
+            "a migration retry is not a quarantine"
+        );
         assert_eq!(PLUGIN_ALIAS, "animehub-android");
+    }
+
+    #[test]
+    fn kotlin_pins_the_late_callback_guard_and_quarantine_contract() {
+        let ops = include_str!("../kotlin/dev/animehub/app/SiteProfileOps.kt");
+        let controller = include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
+        // The literal Rust classifies is the one Kotlin produces.
+        assert!(
+            ops.contains(&format!(
+                "const val QUARANTINED: String = \"{QUARANTINE_SENTINEL}\""
+            )),
+            "the quarantine sentinel must match the Kotlin constant"
+        );
+        // The awaited geolocation wipe is GATED: the guard is claimed before
+        // the first mutation, and a callback that lost to the watchdog clears
+        // nothing and reports nothing.
+        assert!(
+            ops.contains(
+                "fun clearGeolocationPermissions(guard: StepGuard, onDone: (Boolean) -> Unit)"
+            ),
+            "the clear port must hand the step guard to the geolocation wipe"
+        );
+        assert!(
+            ops.contains("if (!guard.claim()) return@getOrigins"),
+            "a late callback must be refused BEFORE any geo.clear runs"
+        );
+        assert!(
+            ops.contains("for (origin in origins) api.clear(origin)"),
+            "the mutation must sit behind the claim, in the pure wipe"
+        );
+        // The destructive call that CANNOT be gated raises the block instead.
+        assert!(
+            ops.contains("ProfileQuarantine.quarantine(profileName, COOKIE_UNVERIFIED_REASON)"),
+            "an unverified removeAllCookies must quarantine the profile"
+        );
+        assert!(
+            ops.contains("ProfileQuarantine.release(profileName)"),
+            "a verified wipe (or a late answer) must lift the block"
+        );
+        // Both open phases consult the gate before touching the provider, and
+        // the real adapter delegates the sequencing to the pure wipe instead
+        // of clearing origins inline.
+        assert_eq!(
+            controller.matches("quarantineRefusal(profileName,").count(),
+            2,
+            "phase 1 (site_migrate) and phase 2 (site_open) each refuse"
+        );
+        assert!(
+            controller.contains("GeolocationWipe.start("),
+            "the adapter must run the production wipe sequencing"
+        );
+        assert!(
+            !controller.contains("for (origin in origins) geo.clear(origin)"),
+            "ungated inline geolocation clears must not come back"
+        );
+        assert!(
+            controller.contains("SiteClearFlow.run(isSupported(), profileName, port)"),
+            "the flow needs the profile name to quarantine the right profile"
+        );
     }
 
     #[test]
