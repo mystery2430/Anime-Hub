@@ -708,7 +708,7 @@ pub fn scan_valid_profile_names(raw: &[u8]) -> Vec<String> {
         while end < raw.len() && raw[end].is_ascii_digit() {
             end += 1;
         }
-        match std::str::from_utf8(&raw[i..end]) {
+        match std::str::from_utf8(&raw[i..end]).ok() {
             Some(name) if is_valid_site_profile_name(name) => {
                 found.push(name.to_string());
                 i = end;
@@ -1016,7 +1016,9 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
             let jar: CookieJar = serde_json::from_slice(&bytes)?;
             let now = crate::anilist::now_unix();
             for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
-                if let Some(cookie) = restore(stored) {
+                // Qualified: the `restore` import is `#[cfg(mobile)]`, and
+                // this protocol body is host-compiled (and host-tested).
+                if let Some(cookie) = crate::web::session::restore(stored) {
                     cookie_headers.push(cookie.to_string());
                 }
             }
@@ -2298,7 +2300,7 @@ mod tests {
     }
 
     impl SecretProvider for FailingFlagStore {
-        fn backend(&self) -> crate::secure::Backend {
+        fn backend(&self) -> crate::secure::master_key::Backend {
             self.inner.backend()
         }
 
