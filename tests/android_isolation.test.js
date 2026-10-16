@@ -353,7 +353,24 @@ test("clear_site_data clears profiles in place and sweeps orphans, never the lau
   const clearAt = commandsRs.indexOf("pub async fn clear_site_data");
   assert.ok(clearAt > 0);
   const body = commandsRs.slice(clearAt, commandsRs.indexOf("\n}\n", clearAt));
-  assert.match(body, /site_clear_data\(&profile\)/, "per-site profile clear");
+  assert.match(
+    body,
+    /windows::run_mobile_clear_protocol\(&state, id, \|profile\| \{/,
+    "the per-site wipe runs through the host-tested clear protocol",
+  );
+  assert.match(body, /site_clear_data\(profile\)/, "per-site profile clear");
+  // The session drop lives INSIDE that protocol (wipe first, blobs second) on
+  // Android, and stays a direct call everywhere else — so a successful wipe can
+  // never skip `delete_site_session`.
+  assert.match(
+    body,
+    /#\[cfg\(not\(target_os = "android"\)\)\]\s+state\.provider\.delete_site_session\(id\)\?;/,
+  );
+  assert.match(
+    windowsRs,
+    /clear_profile\(&profile\)\?;\s+state\.provider\.delete_site_session\(site_id\)\?;/,
+    "wipe the profile first, then drop the encrypted blobs",
+  );
   // Close-without-flush precedes the wipes for the active site.
   assert.ok(body.indexOf("close_site_window_for_clear_locked") < body.indexOf("site_clear_data"));
   // Orphan sweep (is_all) addresses only our namespace and never owned names.
@@ -596,6 +613,63 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
     2,
     "both open phases classify their refusals the same way",
   );
+});
+
+test("the cookie step reads a TYPED delivery: an empty jar succeeds, an unreachable store does not", () => {
+  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  // Chromium's `removeAllCookies` callback reports whether ANY cookie was
+  // deleted, so `false` over an empty jar is a successful wipe — and `false`
+  // from a store that could not be reached is an error. One boolean cannot say
+  // both, so the port carries a type and exactly one pure function reads it.
+  assert.match(ops, /sealed interface CookieWipe/);
+  assert.match(ops, /data class Answered\(val deleted: Boolean\) : CookieWipe/);
+  assert.match(ops, /data class Failed\(val reason: String\) : CookieWipe/);
+  assert.match(ops, /fun removeAllCookies\(onDone: \(CookieWipe\) -> Unit\)/);
+  assert.match(ops, /fun cookiesCleared\(\): Boolean\?/);
+  assert.doesNotMatch(
+    ops,
+    /fun removeAllCookies\(onDone: \(Boolean\) -> Unit\)/,
+    "the boolean-shaped cookie port must not come back",
+  );
+  assert.match(
+    ops,
+    /fun interpretCookieWipe\(wipe: CookieWipe, cookiesCleared: \(\) -> Boolean\?\): CookieStep/,
+  );
+  // An empty jar is a success; cookies still present, or a store whose emptiness
+  // cannot be read, are failures — never a silent success.
+  const interpAt = ops.indexOf("fun interpretCookieWipe(");
+  const interp = ops.slice(interpAt, ops.indexOf("\n  }\n", interpAt));
+  assert.match(interp, /if \(wipe\.deleted\)/);
+  assert.match(interp, /true -> CookieStep\(true, null\)/);
+  assert.match(interp, /false -> CookieStep\(false, COOKIE_STILL_PRESENT_REASON\)/);
+  assert.match(interp, /null -> CookieStep\(false, COOKIE_STATE_UNKNOWN_REASON\)/);
+  assert.match(interp, /is CookieWipe\.Failed -> CookieStep\(false,/);
+  // The emptiness probe is the tie-breaker for `deleted == false` ONLY, so it
+  // never races a deletion that just completed.
+  assert.ok(
+    interp.indexOf("wipe.deleted") < interp.indexOf("cookiesCleared()"),
+    "the probe runs inside the indeterminate branch",
+  );
+  // The adapter hands the raw answer through and keeps real errors typed.
+  assert.match(controllerKt, /onDone\(CookieWipe\.Answered\(deleted == true\)\)/);
+  assert.match(controllerKt, /onDone\(CookieWipe\.Failed\(/);
+  assert.doesNotMatch(
+    controllerKt,
+    /onDone\(ok == true\)/,
+    "the adapter must not collapse the provider answer into a success boolean",
+  );
+  assert.match(controllerKt, /override fun cookiesCleared\(\): Boolean\?/);
+  assert.match(
+    controllerKt,
+    /runCatching \{ !profile\.cookieManager\.hasCookies\(\) \}\.getOrNull\(\)/,
+    "the probe reads the profile's own store and stays indeterminate on a throw",
+  );
+  // Round 6 is untouched by this: the timeout still registers its own operation.
+  assert.match(
+    ops,
+    /ProfileQuarantine\.quarantine\(profileName, guard\.operationId, COOKIE_UNVERIFIED_REASON\)/,
+  );
+  assert.match(ops, /ProfileQuarantine\.settle\(profileName, guard\.operationId\)/);
 });
 
 test("all blocking flushes share ONE worker, with stuck detection not new threads", () => {

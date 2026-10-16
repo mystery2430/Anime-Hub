@@ -193,7 +193,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
 | --- | --- | --- | --- |
 | Built-in site "remove" | — | **kept** (builtin → hide) | hidden |
 | User site remove | closed first, no flush | `ProfileStore.deleteProfile` attempted | removed last; a hard failure keeps the tile |
-| Clear one site | closed first, no flush | cleared **in place**: profile cookies (`removeAllCookies` + flush), `WebStorage.deleteAllData()`, geolocation permissions | untouched |
+| Clear one site | closed first, no flush | cleared **in place**: profile cookies (`removeAllCookies`, its delivery read as a typed `CookieWipe` — an empty jar answering "deleted nothing" is a success — plus the final flush), `WebStorage.deleteAllData()`, geolocation permissions | untouched |
 | Clear all | active site closed | same in-place clear per registered site + orphan sweep over `ProfileStore.getAllProfileNames()`, restricted to `site-*` names not owned by the current registry | untouched |
 | App teardown | view destroyed, profile flushed | — | — |
 
@@ -219,7 +219,8 @@ remove, no legacy data remains (`delete_site_session` also drops the
     exception, **or any incomplete clear step**: no success is reported and
     no record/session blob is dropped.
 * **Clear coverage (what a success really means):** profile cookies
-  (`removeAllCookies` with the callback result checked), every stored
+  (`removeAllCookies`, its delivery interpreted by TYPE — see the cookie-step
+  bullet below), every stored
   geolocation permission (enumerated via `getOrigins` and awaited —
   `GeolocationPermissions` has no removeAll-with-callback), then
   `WebStorage.deleteAllData()` (Web Storage + Web SQL), then a final
@@ -236,6 +237,33 @@ remove, no legacy data remains (`delete_site_session` also drops the
   profile (deleting the profile *does* remove them; in-place clear keeps
   the profile). Documented rather than approximated with a
   default-profile-affecting call.
+* **The cookie step is read as a typed delivery, not as a boolean.**
+  Chromium's contract for `removeAllCookies(callback)` is that the callback
+  receives whether **any cookies were deleted** — an outcome report, not an
+  error flag. An already-empty jar therefore answers `false` for a wipe that
+  fully succeeded, and the old shape (`onDone(ok == true)` in the adapter,
+  `!ok` = failure in the flow) read that as a broken clear: the wipe was
+  reported failed, Rust kept the encrypted session blobs and never reached
+  `delete_site_session`, so a site the user had already cleaned could not drop
+  its stored jar and its `profilemig-*` flag. The port now carries
+  `CookieWipe`:
+  * `Answered(deleted = true)` → success, and the emptiness probe is **not**
+    consulted (nothing races a deletion that just completed);
+  * `Answered(deleted = false)` → INDETERMINATE, decided by
+    `SiteClearPort.cookiesCleared()` (the adapter reads the profile's own
+    `CookieManager.hasCookies()`, the only store-wide probe the platform
+    offers — `getCookie(url)` needs an origin this path deliberately does not
+    carry): provably empty → success; cookies still present → failure;
+    `null` (unreadable) → failure. Claiming a wipe we cannot see is the
+    dangerous direction, a retryable failure is not;
+  * `Failed(reason)` → failure, verbatim in the aggregate error: no profile
+    access at that step, or the provider threw, so the call never reached the
+    store. This is the case the boolean shape confused with an empty jar, and
+    it is never turned into a success. Nothing was issued, so nothing is in
+    flight and no quarantine record is created.
+  The decision lives in one pure function (`SiteClearFlow.interpretCookieWipe`)
+  executed by the CI unit tests; the adapter only supplies the typed delivery
+  and the probe.
 * **A timeout bounds the SIDE EFFECT too, not only the answer.** A
   once-latch decides who *reports*; it cannot un-run a mutation. Two
   mechanisms close that gap, one per kind of awaited step
@@ -380,7 +408,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
 
 **Behavioural coverage (mocks/injected callbacks, no new dependencies):**
 
-* `SiteProfileOpsTest.kt` (60 cases, executed by the CI Gradle unit-test
+* `SiteProfileOpsTest.kt` (67 cases, executed by the CI Gradle unit-test
   step against the real sequencing code in `SiteProfileOps.kt`): close
   durability (flush failure keeps the view, resolve failure is an error,
   exactly-once completion, **flush watchdog on a lost callback, a late
@@ -390,13 +418,19 @@ remove, no legacy data remains (`delete_site_session` also drops the
   cookie/geo/storage/flush failures each fail the clear while later steps
   still run, geolocation watchdog on a lost callback, **final-flush
   watchdog, stale watchdogs cannot change a delivered result**, never a
-  success after a failed flush),
+  success after a failed flush, and **the typed cookie delivery**: an
+  `Answered(false)` over a non-empty jar fails with the precise reason, over an
+  **empty** jar it is a verified success that runs every step in order and
+  leaves the gate open, over an unreadable store it stays a failure, a
+  `Failed(…)` (no profile access / provider threw) is reported verbatim and
+  never consults the probe, a confirmed deletion never consults it either, and
+  `interpretCookieWipe`'s whole decision table is pinned as a pure function),
   the strict migration criterion (virgin-only, every cookie + flush,
   rejection/exception/flush/watchdog failures, exactly-once),
   session-slot rollback after a failed open (stale failure cannot clear a
   newer session), and the back-status decision matrix. These catch the
   real error paths A.1–A.5 were about; the controller only *wires* them.
-* **Timeout side-effect races** (24 of those cases) are measured as data, not
+* **Timeout side-effect races** (26 of those cases) are measured as data, not
   as callback counts: the fake records every `clear` the production
   `GeolocationWipe` triggers and the origins a session currently holds. They
   cover the callback beating the watchdog (permissions really cleared, no
@@ -416,14 +450,22 @@ remove, no legacy data remains (`delete_site_session` also drops the
   operation stays outstanding, one result), a retired name whose bumped
   generation is never blocked and never touched by the old operation, the
   absent-profile path verifying without erasing pending work, the late cookie
-  answer closing its record without re-reporting, an answered-false cookie
+  answer closing its record without re-reporting, a **late `Answered(false)`**
+  after its watchdog (own record closed, delivered timeout failure unchanged,
+  no second report, verification still stale), an **empty-jar success that must
+  not lift an older outstanding deletion**, an answered-false cookie
   step failing *without* blocking, a final-flush timeout failing without
   blocking, the unsupported-provider path, and `StepGuard` / `GeolocationWipe`
   / `ProfileQuarantine` / `SiteOpenGate` unit behaviour (including the
   per-operation ledger: duplicate/unknown settles refused, `verified` never
   clearing an outstanding operation, `retire` being the only drop).
 * `web/windows.rs` Rust tests drive the real `run_mobile_open_protocol`
-  (8 cases): a scripted plugin half plus the real `SecureStore` wrapped so
+  (8 cases) and the real `run_mobile_clear_protocol` (4 cases: a successful
+  wipe — including Kotlin's "empty jar" success — reaches
+  `delete_site_session` exactly once and drops jar + migration flag, the
+  generation counter survives it, a failed wipe propagates and skips the
+  session drop so the retry keeps its jar, and only this site's
+  current-generation profile name is ever addressed): a scripted plugin half plus the real `SecureStore` wrapped so
   `profilemig-*` writes can fail — the flag-write failure aborts before any
   view, a reopen retires only the never-shown profile and recovers, a shown
   profile is never queued, partial migrations keep the jar and retry once,
@@ -510,7 +552,11 @@ State-machine coverage that needs a real device/provider (actual
   after the second one succeeded (confirm the site stays closed until then,
   that the in-app log reports the pending count, and that the first late
   deletion does not remove a cookie the second clear's session created)**,
-  and a killed process while one or more deletions are outstanding (confirm
-  the ledger is gone after restart and the site opens).**
+  a killed process while one or more deletions are outstanding (confirm the
+  ledger is gone after restart and the site opens), and **clearing an
+  already-clean profile** (the provider answers "no cookies deleted" over an
+  empty jar: confirm the clear reports success, the site's stored session jar
+  and its `profilemig-*` flag are gone, `profilegen-*` survives, and a site
+  whose cookie store cannot be read still reports a retryable failure).**
 * iOS/macOS: out of scope; the iOS path keeps the shared-WebView flow minus
   the removed snapshot machinery and was not touched beyond that.

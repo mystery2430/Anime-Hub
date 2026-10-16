@@ -1095,6 +1095,47 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
     Ok(profile)
 }
 
+/// Android half of one site's clear: wipe the profile in place, then drop the
+/// encrypted session blobs — in that order, and never skipping the second half.
+///
+/// Host-compiled and host-tested: the platform call is injected as
+/// `clear_profile` (the same trick [`MobileOpenOps`] uses for the open
+/// protocol), so `cargo test --all` proves the ordering on all three host OSes
+/// instead of leaving it to the aarch64 compile alone.
+///
+/// Contract (proved by the `mobile_clear_protocol_*` tests):
+///  * the profile is wiped FIRST: if that fails, the error propagates and
+///    `delete_site_session` is never reached, so the encrypted jar survives and
+///    the user can retry — a kept jar next to a half-wiped profile is
+///    recoverable, the reverse is not;
+///  * on success `delete_site_session` is NOT optional. The jar and the
+///    `profilemig-<site>` flag go together, because a jar kept next to a wiped
+///    profile would be re-imported into the next virgin profile and resurrect
+///    exactly the cookies the user asked to erase. Kotlin's "the provider
+///    deleted nothing because the jar was already empty" success lands here
+///    too, so an already-clean profile still drops its blobs — the shape that
+///    used to fail the whole clear and strand the jar;
+///  * `profilegen-<site>` deliberately survives (see
+///    `SecureStore::delete_site_session`): the generation counter must outlive
+///    the session so a restored registry can never re-open a profile name whose
+///    on-disk deletion is still pending;
+///  * the name handed to `clear_profile` is derived from the site id at its
+///    CURRENT generation — never from the URL or the display name.
+pub fn run_mobile_clear_protocol<C>(
+    state: &AppState,
+    site_id: &str,
+    clear_profile: C,
+) -> AppResult<()>
+where
+    C: FnOnce(&str) -> AppResult<()>,
+{
+    let generation = profile_generation(state, site_id)?;
+    let profile = android_profile_name(site_id, generation);
+    clear_profile(&profile)?;
+    state.provider.delete_site_session(site_id)?;
+    Ok(())
+}
+
 /// Android: open the site in a fresh native WebView bound to its own profile.
 ///
 /// Runs entirely under `ANDROID_SESSION_LOCK`: the outgoing site WebView is
@@ -2785,6 +2826,215 @@ mod tests {
                 .is_some(),
             "the durable flag is untouched by a refused open"
         );
+    }
+
+    /// The real [`SecureStore`] with a counted `delete_site_session`, so the
+    /// clear protocol can be proved to REACH the session drop on success and to
+    /// SKIP it on a failed wipe (not merely to leave the right bytes behind).
+    struct CountingSessionStore {
+        inner: SecureStore,
+        session_deletes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SecretProvider for CountingSessionStore {
+        fn backend(&self) -> crate::secure::master_key::Backend {
+            self.inner.backend()
+        }
+
+        fn load_doc_bytes(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.load_doc_bytes(name)
+        }
+
+        fn save_doc_bytes(&self, name: &str, bytes: &[u8]) -> AppResult<()> {
+            self.inner.save_doc_bytes(name, bytes)
+        }
+
+        fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+            self.inner.put_secret(name, plaintext)
+        }
+
+        fn get_secret(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.get_secret(name)
+        }
+
+        fn delete_secret(&self, name: &str) -> AppResult<()> {
+            self.inner.delete_secret(name)
+        }
+
+        fn wipe_secrets(&self) -> AppResult<usize> {
+            self.inner.wipe_secrets()
+        }
+
+        fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+            self.session_deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.delete_site_session(site_id)
+        }
+    }
+
+    /// State over a real store whose `delete_site_session` calls are counted.
+    fn counting_session_state() -> (AppState, Arc<std::sync::atomic::AtomicUsize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let inner = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = inner.load_registry();
+        let session_deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = CountingSessionStore {
+            inner,
+            session_deletes: session_deletes.clone(),
+        };
+        let state = AppState {
+            provider: Box::new(provider),
+            registry: Mutex::new(registry),
+            settings: Mutex::new(Settings::default()),
+            blocklist: Mutex::new(Blocklist::default()),
+            oauth_state: Mutex::new(None),
+            startup_warning: Mutex::new(warning),
+            launcher_url: Mutex::new(None),
+            current_site: Mutex::new(None),
+            pip_lock: Mutex::new(()),
+            pip_generation: std::sync::atomic::AtomicU64::new(0),
+        };
+        (state, session_deletes)
+    }
+
+    fn stored(state: &AppState, name: &str) -> bool {
+        state.provider.get_secret(name).unwrap().is_some()
+    }
+
+    /// A site whose profile is already clean: Kotlin reports success (its
+    /// cookie step saw an empty jar), so the session drop MUST still happen.
+    /// This is the shape that used to fail the whole clear — the provider
+    /// answered "no cookies deleted" for an empty jar, Rust saw an error and
+    /// returned before `delete_site_session`, stranding the encrypted jar and
+    /// the migration flag next to a profile that no longer held any cookies.
+    #[test]
+    fn mobile_clear_protocol_drops_the_session_after_a_successful_wipe() {
+        let (state, session_deletes) = counting_session_state();
+        let id = "user-clean";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), b"legacy-jar")
+            .unwrap();
+        mark_migration_done(&state, id).unwrap();
+        assert!(stored(&state, &format!("cookies-{id}")));
+        assert!(stored(&state, &format!("profilemig-{id}")));
+
+        let mut wiped: Vec<String> = Vec::new();
+        run_mobile_clear_protocol(&state, id, |profile| {
+            wiped.push(profile.to_string());
+            Ok(())
+        })
+        .expect("a successful in-place wipe is not an error");
+
+        assert_eq!(
+            wiped,
+            vec![android_profile_name(id, 0)],
+            "the wipe gets this site's profile name at its current generation"
+        );
+        assert_eq!(
+            session_deletes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "delete_site_session must be reached exactly once on success"
+        );
+        assert!(
+            !stored(&state, &format!("cookies-{id}")),
+            "the encrypted jar goes with the wiped profile"
+        );
+        assert!(
+            !stored(&state, &format!("profilemig-{id}")),
+            "and so does the one-time migration flag, so a wiped jar is never re-imported"
+        );
+    }
+
+    /// The generation counter must SURVIVE the session drop: it is what keeps a
+    /// restored registry from re-opening a profile name whose on-disk deletion
+    /// may still be pending.
+    #[test]
+    fn mobile_clear_protocol_keeps_the_generation_counter() {
+        let (state, _) = counting_session_state();
+        let id = "user-generation";
+        assert_eq!(bump_profile_generation(&state, id).unwrap(), 1);
+        assert_eq!(bump_profile_generation(&state, id).unwrap(), 2);
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), b"jar")
+            .unwrap();
+
+        let mut wiped: Vec<String> = Vec::new();
+        run_mobile_clear_protocol(&state, id, |profile| {
+            wiped.push(profile.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(wiped, vec![android_profile_name(id, 2)]);
+        assert!(!stored(&state, &format!("cookies-{id}")));
+        assert_eq!(
+            profile_generation(&state, id).unwrap(),
+            2,
+            "profilegen outlives the session it belonged to"
+        );
+    }
+
+    /// A failed wipe must propagate and leave the blobs ALONE: the retry needs
+    /// the jar, and a half-wiped profile must never be reported as cleared.
+    #[test]
+    fn mobile_clear_protocol_skips_the_session_drop_when_the_wipe_fails() {
+        let (state, session_deletes) = counting_session_state();
+        let id = "user-failed";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), b"legacy-jar")
+            .unwrap();
+        mark_migration_done(&state, id).unwrap();
+
+        let err = run_mobile_clear_protocol(&state, id, |_| {
+            Err(AppError::Other(
+                "çerez deposuna erişilemedi: store gone".into(),
+            ))
+        })
+        .expect_err("a failed wipe must not look like a clear");
+        assert!(
+            err.to_string().contains("çerez deposuna erişilemedi"),
+            "{err}"
+        );
+        assert_eq!(
+            session_deletes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "delete_site_session must NOT run after a failed wipe"
+        );
+        assert!(
+            stored(&state, &format!("cookies-{id}")),
+            "the jar survives for the retry"
+        );
+        assert!(
+            stored(&state, &format!("profilemig-{id}")),
+            "the flag survives too: the profile was not wiped, so nothing may be re-imported over it"
+        );
+    }
+
+    /// The profile name is derived from the site id only, at the generation the
+    /// store knows — never from a URL, a display name or a caller-supplied name.
+    #[test]
+    fn mobile_clear_protocol_addresses_only_this_sites_profile() {
+        let (state, _) = counting_session_state();
+        let id = "user-namespace";
+        bump_profile_generation(&state, id).unwrap();
+
+        let mut wiped: Vec<String> = Vec::new();
+        run_mobile_clear_protocol(&state, id, |profile| {
+            wiped.push(profile.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        let name = &wiped[0];
+        assert!(is_valid_site_profile_name(name), "{name}");
+        assert!(name.starts_with(ANDROID_PROFILE_PREFIX), "{name}");
+        assert_eq!(name, &android_profile_name(id, 1));
+        assert_ne!(name, &android_profile_name("another-site", 1));
+        assert_ne!(name, "Default");
     }
 
     #[test]

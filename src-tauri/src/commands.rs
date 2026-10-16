@@ -699,10 +699,16 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
         // failure aborts so the caller never sees a false success.
         #[cfg(target_os = "android")]
         {
-            let generation = windows::profile_generation(&state, id)?;
-            let profile = windows::android_profile_name(id, generation);
-            crate::android_bridge::site_clear_data(&profile)?;
+            // Profile first, encrypted blobs second, as one host-tested
+            // protocol: a wipe failure keeps the jar for a retry, and a success
+            // always reaches `delete_site_session` — including Kotlin's "the
+            // provider deleted nothing because the jar was already empty"
+            // success, which used to fail the whole clear and strand the jar.
+            windows::run_mobile_clear_protocol(&state, id, |profile| {
+                crate::android_bridge::site_clear_data(profile)
+            })?;
         }
+        #[cfg(not(target_os = "android"))]
         state.provider.delete_site_session(id)?;
         n += 1;
     }

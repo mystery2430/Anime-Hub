@@ -817,10 +817,12 @@ object AnimeHubSiteController {
   // ----------------------------------------------------------- profile data
 
   /**
-   * Clear one site profile in place: profile cookies (`removeAllCookies`
-   * with its callback result checked), every stored geolocation permission
-   * (awaited, behind a [StepGuard]), `WebStorage.deleteAllData()` and a final
-   * flush. The sequence, watchdogs and error aggregation live in
+   * Clear one site profile in place: profile cookies (`removeAllCookies`, its
+   * delivery interpreted as a [CookieWipe] — the provider's boolean says
+   * whether anything was deleted, so an already-empty jar is a SUCCESS and
+   * only an unreachable store is a failure), every stored geolocation
+   * permission (awaited, behind a [StepGuard]), `WebStorage.deleteAllData()`
+   * and a final flush. The sequence, watchdogs and error aggregation live in
    * [SiteClearFlow]; success is only reported when every required step
    * completed, so Rust keeps its encrypted session blobs on any failure and
    * the user can retry.
@@ -866,19 +868,45 @@ object AnimeHubSiteController {
             return true
           }
 
-          override fun removeAllCookies(onDone: (Boolean) -> Unit) {
+          override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
             val profile = cached
             if (profile == null) {
-              onDone(false)
+              // A real error, NOT "nothing to delete": [profileExists] ran
+              // before this step, so losing the profile here means it vanished
+              // underneath the wipe. Handing the flow `Answered(false)` would
+              // let an unreachable store be read as a clean one.
+              onDone(CookieWipe.Failed("profil bu adımda erişilebilir değil"))
               return
             }
             try {
-              profile.cookieManager.removeAllCookies { ok ->
-                activity.runOnUiThread { onDone(ok == true) }
+              profile.cookieManager.removeAllCookies { deleted ->
+                // `deleted` is Chromium's "were ANY cookies deleted" — an
+                // outcome report, not an error flag: an already-empty jar
+                // answers false for a wipe that fully succeeded. Pass the raw
+                // answer through; [SiteClearFlow.interpretCookieWipe] decides,
+                // with [cookiesCleared] as the tie-breaker.
+                activity.runOnUiThread { onDone(CookieWipe.Answered(deleted == true)) }
               }
-            } catch (_: Exception) {
-              activity.runOnUiThread { onDone(false) }
+            } catch (e: Exception) {
+              activity.runOnUiThread {
+                onDone(CookieWipe.Failed("${e.javaClass.simpleName}: ${e.message}"))
+              }
             }
+          }
+
+          override fun cookiesCleared(): Boolean? {
+            val profile = cached ?: return null
+            // The only store-wide emptiness probe the platform offers:
+            // `getCookie(url)` needs an origin and this path deliberately does
+            // not carry the site URL. Read-only and synchronous, and consulted
+            // ONLY when the provider said it deleted nothing — so it reads a
+            // stable store instead of racing the wipe it verifies. Anything
+            // unexpected (no profile, a throw) is `null` = indeterminate,
+            // which the flow reports as a retryable failure, never as success.
+            // Conservative in the other direction too: session cookies the
+            // provider counts but did not delete make this `false`, i.e. a
+            // visible failure the user can retry, not a silent claim.
+            return runCatching { !profile.cookieManager.hasCookies() }.getOrNull()
           }
 
           override fun deleteAllStorage() {

@@ -575,13 +575,44 @@ object SiteOpenGate {
 // Clear: verified, retryable, aggregate-error wipe of ONE site profile
 // ---------------------------------------------------------------------------
 
+/**
+ * What one `removeAllCookies` delivery actually says.
+ *
+ * WHY NOT A [Boolean]: Chromium's contract for `removeAllCookies(callback)` is
+ * that the callback receives whether **any cookies were deleted** — an outcome
+ * report, not an error flag. An already-empty jar therefore answers `false`
+ * for a wipe that fully succeeded, while a provider that could not be reached
+ * at all produced `false` too in the old shape. Collapsing the two made "clear
+ * site data" on a clean profile fail the whole wipe: Rust then kept the
+ * encrypted session blobs and never reached `delete_site_session`, so a site
+ * the user had already cleaned could not have its stored jar dropped.
+ *
+ * The real cases are now distinguishable by TYPE, and exactly one place
+ * interprets them ([SiteClearFlow.interpretCookieWipe]):
+ *  * [Answered] — the provider ran and reported; [Answered.deleted] is its raw
+ *    boolean, `false` included (which may simply mean "there was nothing");
+ *  * [Failed] — the call never reached the cookie store (no profile access at
+ *    this step, or the provider threw). That is an ERROR and is never read as
+ *    "nothing to delete", so a genuine failure cannot become a success.
+ */
+sealed interface CookieWipe {
+  /** The provider answered; [deleted] is its raw "were any cookies removed". */
+  data class Answered(val deleted: Boolean) : CookieWipe
+
+  /** The call itself failed; [reason] is aggregated into the reported error. */
+  data class Failed(val reason: String) : CookieWipe
+}
+
+/** One cookie step's verdict: [ok], plus the reason to aggregate when not. */
+data class CookieStep(val ok: Boolean, val error: String?)
+
 /** Operations [SiteClearFlow] sequences for an in-place profile wipe. */
 interface SiteClearPort {
   /** `ProfileStore.getProfile(name) != null` (false = already clean). */
   fun profileExists(): Boolean
 
   /**
-   * `removeAllCookies { ok -> … }`; [Boolean] is the callback's result.
+   * `removeAllCookies { … }`, delivered as a typed [CookieWipe].
    *
    * NO [StepGuard] here on purpose: this mutation is the provider's own, is
    * issued before the await and offers no cancellation, so there is nothing a
@@ -592,8 +623,30 @@ interface SiteClearPort {
    * the flow can close THAT operation's record: it is the only evidence that
    * the deletion is no longer in flight, and no other attempt may substitute
    * for it.
+   *
+   * The provider's boolean is passed through as [CookieWipe.Answered] —
+   * `false` included, which per Chromium means "no cookies were deleted" (an
+   * empty jar answers that way for a fully successful wipe) and NOT "the call
+   * failed". Anything that stopped the call from reaching the store (no
+   * profile access at this step, a thrown exception) MUST arrive as
+   * [CookieWipe.Failed] instead: the flow can only tell a clean profile from a
+   * broken provider by that type, and it never turns [CookieWipe.Failed] into
+   * a success.
    */
-  fun removeAllCookies(onDone: (Boolean) -> Unit)
+  fun removeAllCookies(onDone: (CookieWipe) -> Unit)
+
+  /**
+   * Whether the profile's cookie jar is provably empty: `true` empty, `false`
+   * cookies still present, `null` when the answer cannot be obtained at all
+   * (no profile access, the provider threw).
+   *
+   * Consulted only after a [CookieWipe.Answered] with `deleted == false` —
+   * i.e. when nothing was just deleted — so it reads a stable store instead of
+   * racing the wipe it is checking. Synchronous on purpose: an indeterminate
+   * answer must not be awaited into a guess, and `null` is a retryable failure
+   * in the flow, never a silent success.
+   */
+  fun cookiesCleared(): Boolean?
 
   /** `WebStorage.deleteAllData()`; throw = failure. */
   fun deleteAllStorage()
@@ -633,6 +686,11 @@ interface SiteClearPort {
  *    and the one destructive call that cannot be gated (`removeAllCookies`)
  *    is registered in [ProfileQuarantine] **under its own operation id** —
  *    the flow never claims a wipe it could not watch finish;
+ *  * the cookie step is judged from a TYPED delivery ([CookieWipe]) because
+ *    the provider's boolean only says whether anything was deleted: an
+ *    already-empty jar answers `false` for a fully successful wipe (see
+ *    [interpretCookieWipe]), while a call that never reached the store arrives
+ *    as [CookieWipe.Failed] and stays a failure;
  *  * failures are aggregated: every step is still attempted so one broken
  *    callback cannot mask the rest, and ANY failure (including the final
  *    `flush`) fails the whole call — Rust then keeps the encrypted session
@@ -657,6 +715,54 @@ object SiteClearFlow {
   /** Reason recorded when the cookie wipe's completion cannot be verified. */
   const val COOKIE_UNVERIFIED_REASON: String =
     "çerez temizliği zaman aşımına uğradı, işlem doğrulanamadı"
+
+  /** The provider deleted nothing and the profile still holds cookies. */
+  const val COOKIE_STILL_PRESENT_REASON: String =
+    "sağlayıcı hiçbir çerez silmediğini bildirdi ve profilde hâlâ çerez var"
+
+  /** The provider deleted nothing and emptiness could not be established. */
+  const val COOKIE_STATE_UNKNOWN_REASON: String =
+    "sağlayıcı hiçbir çerez silmediğini bildirdi, çerez deposunun boş olduğu doğrulanamadı"
+
+  /** Prefix for a cookie call that never reached the store. */
+  const val COOKIE_ACCESS_FAILED_PREFIX: String = "çerez deposuna erişilemedi"
+
+  /**
+   * Decide one cookie step from its TYPED delivery — pure, CI-tested, and the
+   * only place the provider's boolean is interpreted:
+   *
+   *  * [CookieWipe.Answered] with `deleted == true` → success: the store
+   *    reported removals;
+   *  * `deleted == false` → INDETERMINATE, not a failure. Ask the store
+   *    itself: provably empty ([SiteClearPort.cookiesCleared] == `true`) means
+   *    there was nothing to delete, so the wipe succeeded — the
+   *    already-clean-profile case that used to fail the whole clear and leave
+   *    the encrypted session jar behind. Cookies still present is a real
+   *    failure, and so is a store whose emptiness cannot be read: the
+   *    dangerous direction is claiming a wipe we cannot see, never reporting
+   *    one more failure the user can retry;
+   *  * [CookieWipe.Failed] → failure carrying the provider's reason. Never a
+   *    success: an unreachable store deleted nothing, and this is the case the
+   *    old boolean shape silently confused with an empty jar.
+   *
+   * The emptiness probe runs ONLY in the `deleted == false` branch, so it
+   * never races the deletion it would otherwise be checking: nothing was just
+   * removed and the store state is stable.
+   */
+  fun interpretCookieWipe(wipe: CookieWipe, cookiesCleared: () -> Boolean?): CookieStep =
+    when (wipe) {
+      is CookieWipe.Answered ->
+        if (wipe.deleted) {
+          CookieStep(true, null)
+        } else {
+          when (cookiesCleared()) {
+            true -> CookieStep(true, null)
+            false -> CookieStep(false, COOKIE_STILL_PRESENT_REASON)
+            null -> CookieStep(false, COOKIE_STATE_UNKNOWN_REASON)
+          }
+        }
+      is CookieWipe.Failed -> CookieStep(false, "$COOKIE_ACCESS_FAILED_PREFIX: ${wipe.reason}")
+    }
 
   fun run(
     supported: Boolean,
@@ -748,6 +854,8 @@ object SiteClearFlow {
       }
     }
 
+    // Reason from the typed cookie delivery, for the aggregate error below.
+    var cookieError: String? = null
     awaited(
       "çerez temizliği",
       "zaman aşımı",
@@ -769,9 +877,20 @@ object SiteClearFlow {
         // postdates the last settle). A duplicate answer closes nothing.
         ProfileQuarantine.settle(profileName, guard.operationId)
       },
-      arm = { _, cb -> port.removeAllCookies(cb) },
+      arm = { _, cb ->
+        port.removeAllCookies { wipe ->
+          // The provider's boolean is NOT an error flag (see
+          // [interpretCookieWipe]): decide the step from the typed delivery
+          // and keep the precise reason for the aggregate below. Written
+          // before [cb], so the once-latch's CAS publishes it to whichever
+          // thread runs [next].
+          val step = interpretCookieWipe(wipe) { port.cookiesCleared() }
+          cookieError = step.error
+          cb(step.ok)
+        }
+      },
     ) { cookiesOk ->
-      if (!cookiesOk) record("çerezler temizlenemedi")
+      if (!cookiesOk) record(cookieError ?: "çerezler temizlenemedi")
       // No quarantine here: this step's mutation is ours and gated by the
       // [StepGuard] the watchdog closes, so a late callback provably clears
       // nothing (GeolocationWipe) and `getOrigins` is read-only.

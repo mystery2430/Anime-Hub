@@ -269,7 +269,16 @@ class SiteProfileOpsTest {
 
   private class FakeClearPort(
     var exists: Boolean = true,
+    /** The provider's raw answer: were ANY cookies deleted. */
     var cookiesOk: Boolean = true,
+    /**
+     * The emptiness probe ([SiteClearPort.cookiesCleared]). Defaults to "the
+     * jar still holds cookies", so an `Answered(false)` delivery stays a
+     * failure unless a test pins the profile as genuinely empty.
+     */
+    var cookieJarEmpty: Boolean? = false,
+    /** The call never reaches the store — a real error, not `Answered(false)`. */
+    var cookiesFailWith: String? = null,
     var geoOk: Boolean = true,
     var storageThrows: Boolean = false,
     var flushError: Throwable? = null,
@@ -285,21 +294,33 @@ class SiteProfileOpsTest {
     var timeouts = mutableListOf<() -> Unit>()
 
     /** The captured cookie callback, for late/duplicate delivery. */
-    var pendingCookies: ((Boolean) -> Unit)? = null
+    var pendingCookies: ((CookieWipe) -> Unit)? = null
     var pendingFlush: ((Throwable?) -> Unit)? = null
+
+    /** How often the flow consulted the emptiness probe (it must not race). */
+    var emptinessChecks = 0
 
     override fun profileExists(): Boolean {
       log += "exists"
       return exists
     }
 
-    override fun removeAllCookies(onDone: (Boolean) -> Unit) {
+    override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
       log += "cookies"
       if (cookiesNeverAnswer) {
         pendingCookies = onDone
         return
       }
-      onDone(cookiesOk)
+      cookiesFailWith?.let {
+        onDone(CookieWipe.Failed(it))
+        return
+      }
+      onDone(CookieWipe.Answered(cookiesOk))
+    }
+
+    override fun cookiesCleared(): Boolean? {
+      emptinessChecks++
+      return cookieJarEmpty
     }
 
     override fun deleteAllStorage() {
@@ -360,12 +381,15 @@ class SiteProfileOpsTest {
 
   @Test
   fun `cookie callback failure fails the clear but still attempts the rest`() {
-    val port = FakeClearPort(cookiesOk = false)
+    // The provider deleted NOTHING and the jar still holds cookies: a real
+    // failure, reported with the precise reason, and every later step still runs.
+    val port = FakeClearPort(cookiesOk = false, cookieJarEmpty = false)
     var result = "unset"
     SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
-    Assert.assertNotEquals("ok", result)
+    Assert.assertEquals(SiteClearFlow.COOKIE_STILL_PRESENT_REASON, result)
     Assert.assertTrue("storage must still run: ${port.log}", port.log.contains("storage"))
     Assert.assertTrue("flush must still run: ${port.log}", port.log.contains("flush"))
+    Assert.assertEquals("the emptiness probe decides this step exactly once", 1, port.emptinessChecks)
   }
 
   @Test
@@ -385,9 +409,11 @@ class SiteProfileOpsTest {
         var scheduled: (() -> Unit)? = null
         var results = 0
         override fun profileExists(): Boolean = true
-        override fun removeAllCookies(onDone: (Boolean) -> Unit) {
-          onDone(true)
+        override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
+          onDone(CookieWipe.Answered(true))
         }
+
+        override fun cookiesCleared(): Boolean? = false
 
         override fun deleteAllStorage() {
           log += "storage"
@@ -451,9 +477,11 @@ class SiteProfileOpsTest {
         val timeouts = mutableListOf<() -> Unit>()
         var pendingFlush: ((Throwable?) -> Unit)? = null
         override fun profileExists(): Boolean = true
-        override fun removeAllCookies(onDone: (Boolean) -> Unit) {
-          onDone(true)
+        override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
+          onDone(CookieWipe.Answered(true))
         }
+
+        override fun cookiesCleared(): Boolean? = false
 
         override fun deleteAllStorage() {}
 
@@ -510,10 +538,15 @@ class SiteProfileOpsTest {
     val port =
       object : SiteClearPort {
         override fun profileExists(): Boolean = true
-        override fun removeAllCookies(onDone: (Boolean) -> Unit) {
-          onDone(true)
-          onDone(false)
+        override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
+          onDone(CookieWipe.Answered(true))
+          // A duplicate delivery with the OPPOSITE raw answer: the latch must
+          // discard it, so neither the verdict nor the emptiness probe of this
+          // second delivery may reach the reported result.
+          onDone(CookieWipe.Answered(false))
         }
+
+        override fun cookiesCleared(): Boolean? = false
 
         override fun deleteAllStorage() {}
 
@@ -649,9 +682,11 @@ class SiteProfileOpsTest {
 
         override fun profileExists(): Boolean = true
 
-        override fun removeAllCookies(onDone: (Boolean) -> Unit) {
-          onDone(true)
+        override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
+          onDone(CookieWipe.Answered(true))
         }
+
+        override fun cookiesCleared(): Boolean? = false
 
         override fun deleteAllStorage() {}
 
@@ -757,7 +792,7 @@ class SiteProfileOpsTest {
     Assert.assertEquals(2, both.size)
 
     // A's callback arrives while B is still outstanding.
-    a.pendingCookies!!.invoke(true)
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true))
     val left = ProfileQuarantine.pendingOperations(profile)
     Assert.assertEquals("A closed exactly one record", 1, left.size)
     Assert.assertEquals("and it was A's, not B's", both[1], left[0])
@@ -768,7 +803,7 @@ class SiteProfileOpsTest {
     Assert.assertNotNull(SiteOpenGate.check(profile))
 
     // Only B's own answer closes B; then the verification is still stale.
-    b.pendingCookies!!.invoke(true)
+    b.pendingCookies!!.invoke(CookieWipe.Answered(true))
     Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
     Assert.assertTrue("nothing outstanding, but nothing verified since", ProfileQuarantine.isBlocked(profile))
     Assert.assertTrue(
@@ -794,7 +829,7 @@ class SiteProfileOpsTest {
     SiteClearFlow.run(supported = true, profileName = profile, port = b) {}
     Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
 
-    a.pendingCookies!!.invoke(true)
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true))
     // A's answer closes A's record, and that is all it may conclude: the last
     // verification (B) happened BEFORE the last destructive operation settled,
     // so the profile's state has not been verified since it became observable.
@@ -828,10 +863,10 @@ class SiteProfileOpsTest {
     Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
 
     // Callbacks land out of order: C, then A, then B.
-    ports[2].pendingCookies!!.invoke(true)
+    ports[2].pendingCookies!!.invoke(CookieWipe.Answered(true))
     Assert.assertEquals(2, ProfileQuarantine.pendingOperations(profile).size)
     Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
-    ports[0].pendingCookies!!.invoke(false)
+    ports[0].pendingCookies!!.invoke(CookieWipe.Answered(false))
     Assert.assertEquals(1, ProfileQuarantine.pendingOperations(profile).size)
     Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
 
@@ -843,7 +878,7 @@ class SiteProfileOpsTest {
       ProfileQuarantine.isBlocked(profile),
     )
 
-    ports[1].pendingCookies!!.invoke(true)
+    ports[1].pendingCookies!!.invoke(CookieWipe.Answered(true))
     Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
     Assert.assertTrue(
       "the verification predates the last settle",
@@ -869,9 +904,9 @@ class SiteProfileOpsTest {
     val both = ProfileQuarantine.pendingOperations(profile)
     Assert.assertEquals(2, both.size)
 
-    a.pendingCookies!!.invoke(true) // A settles
-    a.pendingCookies!!.invoke(true) // duplicate delivery of the SAME callback
-    a.pendingCookies!!.invoke(false)
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true)) // A settles
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true)) // duplicate delivery of the SAME callback
+    a.pendingCookies!!.invoke(CookieWipe.Answered(false))
     Assert.assertEquals("A reported exactly once", 1, aResults)
     Assert.assertEquals(
       "the duplicate closed nothing — B is still outstanding",
@@ -883,6 +918,90 @@ class SiteProfileOpsTest {
     Assert.assertFalse(ProfileQuarantine.settle(profile, both[0]))
     Assert.assertFalse(ProfileQuarantine.settle(profile, 999_999L))
     Assert.assertEquals(listOf(both[1]), ProfileQuarantine.pendingOperations(profile))
+  }
+
+  @Test
+  fun `a FALSE callback arriving after its timeout closes only its own record`() {
+    // Round 6 ownership, round 7 answer shape: the provider finally reports
+    // "no cookies were deleted" for an operation whose watchdog already fired.
+    val a = FakeClearPort(cookiesNeverAnswer = true, cookieJarEmpty = false)
+    var results = 0
+    var last: String? = null
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) { results++; last = it }
+    a.timeouts[0].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertTrue(last!!.contains("zaman aşımı"))
+    val delivered = last!!
+    val outstanding = ProfileQuarantine.pendingOperations(profile)
+    Assert.assertEquals(1, outstanding.size)
+
+    a.pendingCookies!!.invoke(CookieWipe.Answered(false))
+    // Its OWN record is closed and nothing else happens: no second report, and
+    // the late verdict (a non-empty jar) cannot overwrite the delivered timeout
+    // failure either.
+    Assert.assertEquals("no second result", 1, results)
+    Assert.assertEquals("the timeout failure stands unchanged", delivered, last)
+    Assert.assertTrue(
+      "the late answer did not re-report its own verdict",
+      !delivered.contains(SiteClearFlow.COOKIE_STILL_PRESENT_REASON),
+    )
+    Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
+    Assert.assertTrue(
+      "closing the last record still leaves the verification stale",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    Assert.assertTrue(
+      SiteOpenGate.check(profile)!!.contains(ProfileQuarantine.STALE_VERIFICATION_REASON),
+    )
+    // A duplicate delivery of the same callback closes nothing a second time.
+    a.pendingCookies!!.invoke(CookieWipe.Answered(false))
+    Assert.assertEquals(1, results)
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    Assert.assertEquals(
+      "still nobody else's record to close",
+      emptyList<Long>(),
+      ProfileQuarantine.pendingOperations(profile),
+    )
+  }
+
+  @Test
+  fun `an empty-jar success cannot lift an older outstanding deletion`() {
+    // A times out; B then succeeds *because its jar was already empty* — the
+    // round-7 success path. That success must not open the profile while A's
+    // native deletion is still in flight.
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) {}
+    a.timeouts[0].invoke()
+    val outstanding = ProfileQuarantine.pendingOperations(profile)
+    Assert.assertEquals(1, outstanding.size)
+
+    val b = FakeClearPort(cookiesOk = false, cookieJarEmpty = true)
+    var bResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = b) { bResult = it ?: "ok" }
+    Assert.assertEquals("B is a verified success over an empty jar", "ok", bResult)
+    Assert.assertTrue(
+      "B's success must not erase A's outstanding operation",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    Assert.assertEquals(outstanding, ProfileQuarantine.pendingOperations(profile))
+    Assert.assertNotNull("the site stays closed", SiteOpenGate.check(profile))
+
+    // A's provider call turns out to have failed outright: the operation is no
+    // longer in flight, so its record closes — but the verification (B) still
+    // predates that settle.
+    a.pendingCookies!!.invoke(CookieWipe.Failed("IllegalStateException: store gone"))
+    Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    Assert.assertTrue(
+      SiteOpenGate.check(profile)!!.contains(ProfileQuarantine.STALE_VERIFICATION_REASON),
+    )
+    // One more verified wipe after the last settle is what reopens the site.
+    val c = FakeClearPort(cookiesOk = false, cookieJarEmpty = true)
+    var cResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = c) { cResult = it ?: "ok" }
+    Assert.assertEquals("ok", cResult)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
   }
 
   @Test
@@ -907,7 +1026,7 @@ class SiteProfileOpsTest {
     Assert.assertEquals("retiring twice drops nothing", 0, ProfileQuarantine.retire(profile))
 
     // A's callback landing after retirement cannot touch the new generation.
-    a.pendingCookies!!.invoke(true)
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true))
     Assert.assertNull(SiteOpenGate.check(nextGeneration))
     Assert.assertFalse(ProfileQuarantine.isBlocked(nextGeneration))
     Assert.assertTrue(ProfileQuarantine.pendingOperations(nextGeneration).isEmpty())
@@ -935,7 +1054,7 @@ class SiteProfileOpsTest {
     // verification predates the settle, so the block stays until a wipe is
     // verified after it. The delivered failure stands either way (Rust keeps
     // the encrypted blobs for the retry).
-    port.pendingCookies!!.invoke(true)
+    port.pendingCookies!!.invoke(CookieWipe.Answered(true))
     Assert.assertTrue(
       "nothing outstanding any more",
       ProfileQuarantine.pendingOperations(profile).isEmpty(),
@@ -944,7 +1063,7 @@ class SiteProfileOpsTest {
     Assert.assertEquals("no second result", 1, results)
     Assert.assertTrue("the timeout failure stands: $last", (last ?: "ok") != "ok")
     // A duplicate late answer changes nothing either.
-    port.pendingCookies!!.invoke(false)
+    port.pendingCookies!!.invoke(CookieWipe.Answered(false))
     Assert.assertEquals(1, results)
     Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
     // One verified wipe after the settle reopens the site.
@@ -959,15 +1078,127 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `a cookie wipe that ANSWERED false fails the clear without quarantining`() {
-    val port = FakeClearPort(cookiesOk = false)
+  fun `a cookie wipe that ANSWERED false over a non-empty jar fails without blocking`() {
+    val port = FakeClearPort(cookiesOk = false, cookieJarEmpty = false)
     var result = "unset"
     SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertNotEquals("ok", result)
-    // The provider answered, so nothing is in flight: the quarantine is for
+    Assert.assertTrue(result.contains("hâlâ çerez var"))
+    // The provider answered, so nothing is in flight: the block is for
     // UNVERIFIED destructive operations only, not for every failure.
     Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
     Assert.assertNull("retry and reopen stay available", SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a cookie wipe that ANSWERED false over an EMPTY jar is a verified success`() {
+    // Chromium's `removeAllCookies` callback reports whether ANY cookie was
+    // deleted, so an already-clean profile answers false for a wipe that fully
+    // succeeded. Reading that as an error failed the whole clear: Rust kept the
+    // encrypted session blobs and `delete_site_session` was never reached, so a
+    // site the user had already cleaned could not drop its stored jar.
+    val port = FakeClearPort(cookiesOk = false, cookieJarEmpty = true)
+    var results = 0
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) {
+      results++
+      result = it ?: "ok"
+    }
+    Assert.assertEquals("an empty jar is a clean profile", "ok", result)
+    Assert.assertEquals(1, results)
+    Assert.assertEquals(
+      "every step still ran in order",
+      listOf("exists", "cookies", "geo", "storage", "flush"),
+      port.log,
+    )
+    Assert.assertEquals("the emptiness probe is the tie-breaker, once", 1, port.emptinessChecks)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull("a verified success may back a new session", SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a cookie wipe whose emptiness cannot be read stays a failure`() {
+    // Indeterminate must never be laundered into success: claiming a wipe we
+    // cannot see is the dangerous direction, a retryable failure is not.
+    val port = FakeClearPort(cookiesOk = false, cookieJarEmpty = null)
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
+    Assert.assertEquals(SiteClearFlow.COOKIE_STATE_UNKNOWN_REASON, result)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a cookie call that never reached the store is an error, never a clean profile`() {
+    // No profile access at this step, or the provider threw: the call did not
+    // reach the cookie store, so NOTHING was deleted. This is the case the old
+    // boolean shape confused with an empty jar — it must stay a failure, must
+    // not consult the emptiness probe, and must not be reported as success.
+    val port = FakeClearPort(cookiesFailWith = "profil bu adımda erişilebilir değil")
+    var results = 0
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) {
+      results++
+      result = it ?: "ok"
+    }
+    Assert.assertEquals(1, results)
+    Assert.assertTrue("the access failure is reported verbatim: $result", result.startsWith(SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX))
+    Assert.assertTrue(result.contains("profil bu adımda erişilebilir değil"))
+    Assert.assertEquals("no probe: the failure type already decided it", 0, port.emptinessChecks)
+    Assert.assertTrue("later steps are still attempted", port.log.contains("storage"))
+    // Nothing was issued, so nothing is in flight: no block, and the profile
+    // stays retryable/reopenable.
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a deletion the provider confirmed never consults the emptiness probe`() {
+    val port = FakeClearPort(cookiesOk = true)
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
+    Assert.assertEquals("ok", result)
+    Assert.assertEquals(
+      "no probe call, so nothing races a deletion that just completed",
+      0,
+      port.emptinessChecks,
+    )
+  }
+
+  @Test
+  fun `interpretCookieWipe decides every delivery shape exactly once`() {
+    // Pure decision table of the production interpreter.
+    var probes = 0
+    fun probe(value: Boolean?): () -> Boolean? = { probes++; value }
+
+    Assert.assertEquals(
+      CookieStep(true, null),
+      SiteClearFlow.interpretCookieWipe(CookieWipe.Answered(true), probe(true)),
+    )
+    Assert.assertEquals("a confirmed deletion needs no probe", 0, probes)
+
+    Assert.assertEquals(
+      CookieStep(true, null),
+      SiteClearFlow.interpretCookieWipe(CookieWipe.Answered(false), probe(true)),
+    )
+    Assert.assertEquals(
+      CookieStep(false, SiteClearFlow.COOKIE_STILL_PRESENT_REASON),
+      SiteClearFlow.interpretCookieWipe(CookieWipe.Answered(false), probe(false)),
+    )
+    Assert.assertEquals(
+      CookieStep(false, SiteClearFlow.COOKIE_STATE_UNKNOWN_REASON),
+      SiteClearFlow.interpretCookieWipe(CookieWipe.Answered(false), probe(null)),
+    )
+    Assert.assertEquals("only the indeterminate answers probe", 3, probes)
+
+    val failed =
+      SiteClearFlow.interpretCookieWipe(CookieWipe.Failed("IllegalStateException: null"), probe(true))
+    Assert.assertFalse(failed.ok)
+    Assert.assertEquals(
+      "${SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX}: IllegalStateException: null",
+      failed.error,
+    )
+    Assert.assertEquals("a typed failure never probes", 3, probes)
   }
 
   @Test
@@ -1013,7 +1244,7 @@ class SiteProfileOpsTest {
     Assert.assertEquals(1, ProfileQuarantine.pendingOperations(profile).size)
     Assert.assertNotNull(SiteOpenGate.check(profile))
     // Once that operation settles, the absent-profile verification is stale...
-    a.pendingCookies!!.invoke(true)
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true))
     Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
     // ...and one more verified pass (still absent) reopens the name.
     val retry = FakeClearPort(exists = false)

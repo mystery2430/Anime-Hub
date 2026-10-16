@@ -753,6 +753,76 @@ mod tests {
     }
 
     #[test]
+    fn kotlin_pins_the_typed_cookie_wipe_contract() {
+        let ops = include_str!("../kotlin/dev/animehub/app/SiteProfileOps.kt");
+        let controller = include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
+        // Chromium's `removeAllCookies` callback reports whether ANY cookie was
+        // deleted — an outcome, not an error flag. An already-empty jar answers
+        // `false` for a wipe that fully succeeded, while a store that could not
+        // be reached also produced `false` in the old boolean shape: clearing a
+        // clean profile then failed the whole clear and Rust never reached
+        // `delete_site_session`. The port therefore carries a TYPE, and one pure
+        // function interprets it.
+        for marker in [
+            "sealed interface CookieWipe",
+            "data class Answered(val deleted: Boolean) : CookieWipe",
+            "data class Failed(val reason: String) : CookieWipe",
+            "data class CookieStep(val ok: Boolean, val error: String?)",
+            "fun removeAllCookies(onDone: (CookieWipe) -> Unit)",
+            "fun cookiesCleared(): Boolean?",
+            "fun interpretCookieWipe(wipe: CookieWipe, cookiesCleared: () -> Boolean?): CookieStep",
+            "COOKIE_STILL_PRESENT_REASON",
+            "COOKIE_STATE_UNKNOWN_REASON",
+            "COOKIE_ACCESS_FAILED_PREFIX",
+            // An empty jar is a success; leftovers and an unreadable store are
+            // failures — indeterminate is never laundered into success.
+            "true -> CookieStep(true, null)",
+            "false -> CookieStep(false, COOKIE_STILL_PRESENT_REASON)",
+            "null -> CookieStep(false, COOKIE_STATE_UNKNOWN_REASON)",
+            "is CookieWipe.Failed -> CookieStep(false,",
+        ] {
+            assert!(ops.contains(marker), "the cookie step must keep: {marker}");
+        }
+        assert!(
+            !ops.contains("fun removeAllCookies(onDone: (Boolean) -> Unit)"),
+            "the boolean-shaped cookie port must not come back"
+        );
+        // The adapter passes the raw answer through and keeps real errors typed.
+        assert!(
+            controller.contains("onDone(CookieWipe.Answered(deleted == true))"),
+            "the provider's raw answer must reach the flow uninterpreted"
+        );
+        assert!(
+            controller.contains("onDone(CookieWipe.Failed("),
+            "an unreachable store must arrive as a typed failure, not as false"
+        );
+        assert!(
+            !controller.contains("onDone(ok == true)"),
+            "the adapter must not collapse the answer into a success boolean"
+        );
+        assert!(
+            controller.contains("override fun cookiesCleared(): Boolean?"),
+            "the adapter must expose the emptiness probe"
+        );
+        assert!(
+            controller.contains("runCatching { !profile.cookieManager.hasCookies() }.getOrNull()"),
+            "the probe reads the profile's own store and stays indeterminate on a throw"
+        );
+        // Round 6 must survive this change: the timeout still registers its own
+        // operation and a late callback still closes only that record.
+        assert!(
+            ops.contains(
+                "ProfileQuarantine.quarantine(profileName, guard.operationId, COOKIE_UNVERIFIED_REASON)"
+            ),
+            "a cookie timeout still owns its quarantine record"
+        );
+        assert!(
+            ops.contains("ProfileQuarantine.settle(profileName, guard.operationId)"),
+            "a late cookie answer still closes only its own record"
+        );
+    }
+
+    #[test]
     fn kotlin_pip_controller_template_is_wired_for_controlled_entry() {
         // Template, not a generated file: `scripts/android_prepare.py` fills
         // the JS in and copies it into the Android project.
