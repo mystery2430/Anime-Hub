@@ -43,12 +43,15 @@ use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
 use crate::web::dns::{classify_host, DnsClass};
-// `CookieJar`/`restore` back the iOS jar swap and the one-time Android
-// profile migration; `capture` (qualified at its single call site, so this
+// `CookieJar` backs the iOS jar swap and the one-time Android profile
+// migration; `restore` is used only by the iOS import path (`import_cookies`),
+// so it carries exactly that gate — Android's host-compiled migration
+// protocol calls it fully qualified, and an ungated `#[cfg(mobile)]` import
+// would be dead there. `capture` (qualified at its single call site, so this
 // import group keeps the exact shape rustfmt approved before) serves the
-// desktop/iOS export path. Android site cookies live in their profile and
-// are never snapshotted.
-#[cfg(mobile)]
+// desktop/iOS export path. Android site cookies live in their profile and are
+// never snapshotted.
+#[cfg(all(mobile, not(target_os = "android")))]
 use crate::web::session::restore;
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
@@ -1023,8 +1026,8 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
             let jar: CookieJar = serde_json::from_slice(&bytes)?;
             let now = crate::anilist::now_unix();
             for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
-                // Qualified: the `restore` import is `#[cfg(mobile)]`, and
-                // this protocol body is host-compiled (and host-tested).
+                // Qualified: the `restore` import is iOS-only, and this
+                // protocol body is host-compiled (and host-tested).
                 if let Some(cookie) = crate::web::session::restore(stored) {
                     cookie_headers.push(cookie.to_string());
                 }

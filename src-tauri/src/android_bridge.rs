@@ -118,6 +118,7 @@ pub enum SiteProfileAction {
 #[cfg(target_os = "android")]
 pub fn site_migrate(url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
     animehub_android::site_migrate(url.to_string(), profile.to_string(), cookies.to_vec())
+        .map(|_| ())
         .map_err(classify_site_open_error)
 }
 
@@ -138,6 +139,7 @@ pub fn site_open(url: &str, profile: &str, init_script: &str) -> AppResult<()> {
         profile.to_string(),
         init_script.to_string(),
     )
+    .map(|_| ())
     .map_err(classify_site_open_error)
 }
 
