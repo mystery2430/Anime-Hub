@@ -223,14 +223,16 @@ object AnimeHubSiteController {
    * Quarantine gate shared by BOTH phases of the two-phase open. Returns the
    * refusal to report (already logged) or `null` when the profile may be used.
    *
-   * [SiteOpenGate] blocks a profile whose last in-place wipe timed out on a
-   * provider call that cannot be cancelled — `removeAllCookies`: the deletion
-   * may still be in flight and would land on the new session's cookies. The
-   * open is refused until that wipe is verified, because ignoring a late
-   * callback result does not stop the late mutation. [ProfileQuarantine]
-   * records what is and is not blocked, and why the registry is
-   * process-scoped; the decision itself is pure Kotlin, executed by the CI
-   * unit tests.
+   * [SiteOpenGate] blocks a profile with ANY destructive provider call still
+   * outstanding — `removeAllCookies` timeouts, which cannot be cancelled: the
+   * deletion may still be in flight and would land on the new session's
+   * cookies. The open is refused until every such operation has settled AND a
+   * wipe was verified after the last of them, because ignoring a late callback
+   * result does not stop the late mutation — and because a later attempt's
+   * success says nothing about an earlier attempt's deletion. [ProfileQuarantine]
+   * records the per-operation ownership ledger and why it is process-scoped;
+   * the decision itself is pure Kotlin, executed by the CI unit tests. This
+   * refusal is identical in both phases: [migrate] and [open] call this.
    */
   private fun quarantineRefusal(profileName: String, phase: String): String? =
     SiteOpenGate.check(profileName)?.also { refusal ->
@@ -947,12 +949,14 @@ object AnimeHubSiteController {
           else -> {
             Log.w(LOG_TAG, "profile clear failed: $error")
             AnimeHubDebugLog.add("site", "clear failed (${error.take(60)})")
-            if (ProfileQuarantine.isQuarantined(profileName)) {
-              // A destructive provider call is still unverified: the site is
-              // refused until the wipe is (see SiteOpenGate), so say so here
-              // instead of leaving the user with a bare failure.
-              Log.w(LOG_TAG, "profile quarantined until the wipe is verified: $profileName")
-              AnimeHubDebugLog.add("site", "profile quarantined (unverified wipe)")
+            if (ProfileQuarantine.isBlocked(profileName)) {
+              // A destructive provider call is still outstanding (or the last
+              // verification predates it): the site is refused until that is
+              // resolved (see SiteOpenGate), so say so here instead of leaving
+              // the user with a bare failure.
+              val pending = ProfileQuarantine.pendingOperations(profileName).size
+              Log.w(LOG_TAG, "profile blocked until its wipe is verified: $profileName ($pending pending)")
+              AnimeHubDebugLog.add("site", "profile blocked (unverified wipe, $pending pending)")
             }
           }
         }
@@ -981,9 +985,10 @@ object AnimeHubSiteController {
    * Rejects (hard failure — the caller must NOT drop its record) for invalid
    * names, an active WebView on that profile, or unexpected exceptions.
    *
-   * A deletion the provider accepted (or an absent profile) also lifts any
-   * [ProfileQuarantine] block on the name: retiring it removes the reason for
-   * the block, while a *deferred* deletion keeps it.
+   * A deletion the provider accepted (or an absent profile) RETIRES the name
+   * in [ProfileQuarantine] — dropping its outstanding-operation ledger too,
+   * since Rust bumps the generation and the name is never handed out again —
+   * while a *deferred* deletion keeps every record.
    */
   fun deleteProfileData(profileName: String, onResult: (deleted: Boolean, pending: Boolean, error: String?) -> Unit) {
     if (!profileNameIsValid(profileName)) {
@@ -1008,9 +1013,15 @@ object AnimeHubSiteController {
       // A deletion the provider did NOT refuse retires this name for good:
       // Rust bumps the site's generation and never hands the name out again,
       // so no new session can ever sit on it — which is the whole reason a
-      // quarantine block exists. Lift it here (the deferred branch below keeps
-      // the block: the profile still exists and could be reopened).
-      ProfileQuarantine.release(profileName)
+      // quarantine block exists. Drop the name's ledger here, including any
+      // operation still outstanding: those callbacks can only land on a
+      // profile no session will ever use, and the NEW generation starts
+      // unblocked. The deferred branch below keeps every record, because the
+      // profile still exists and could be reopened under the same name.
+      val dropped = ProfileQuarantine.retire(profileName)
+      if (dropped > 0) {
+        AnimeHubDebugLog.add("site", "profile retired ($dropped pending wipe op(s) dropped)")
+      }
       AnimeHubDebugLog.add("site", if (deleted) "profile deleted" else "profile absent")
       onResult(deleted, false, null)
     } catch (_: IllegalStateException) {

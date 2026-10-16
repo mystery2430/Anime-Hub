@@ -516,15 +516,40 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
     "the flow needs the name to quarantine the right profile",
   );
 
-  // The destructive call that CANNOT be gated quarantines the profile, and
-  // BOTH open phases consult the gate before touching the provider.
+  // The destructive call that CANNOT be gated is registered under its OWN
+  // operation id, and BOTH open phases consult the gate before any provider call.
   assert.match(ops, /object ProfileQuarantine/);
   assert.match(ops, /object SiteOpenGate/);
   assert.match(
     ops,
-    /ProfileQuarantine\.quarantine\(profileName, COOKIE_UNVERIFIED_REASON\)/,
+    /ProfileQuarantine\.quarantine\(profileName, guard\.operationId, COOKIE_UNVERIFIED_REASON\)/,
+    "an unverified removeAllCookies must register its own operation",
   );
-  assert.match(ops, /ProfileQuarantine\.release\(profileName\)/);
+  assert.match(
+    ops,
+    /ProfileQuarantine\.settle\(profileName, guard\.operationId\)/,
+    "a late callback may close only the operation it belongs to",
+  );
+  assert.match(
+    ops,
+    /ProfileQuarantine\.verified\(profileName\)/,
+    "a verified wipe records a verification instead of releasing the name",
+  );
+  // A blanket release/reset would erase other operations' records.
+  assert.doesNotMatch(ops, /ProfileQuarantine\.release\(/);
+  assert.doesNotMatch(ops, /ProfileQuarantine\.reset\(\)/);
+  assert.doesNotMatch(controllerKt, /ProfileQuarantine\.(release|reset)\(/);
+  // Ownership ledger: reopenability is a proven end state, not a counter.
+  assert.match(ops, /val pending = LinkedHashMap<Long, String>\(\)/);
+  assert.match(ops, /STALE_VERIFICATION_REASON/);
+  assert.match(ops, /fun settle\(profileName: String, operationId: Long\): Boolean/);
+  assert.match(ops, /fun retire\(profileName: String\): Int/);
+  assert.match(ops, /fun pendingOperations\(profileName: String\): List<Long>/);
+  assert.match(
+    ops,
+    /if \(state\.verifiedAt < state\.lastSettledAt\) return STALE_VERIFICATION_REASON/,
+    "the last verification must postdate the last settled operation",
+  );
   for (const entry of ["fun migrate(", "fun open("]) {
     const at = controllerKt.indexOf(entry);
     assert.ok(at > 0, `${entry} missing`);
@@ -532,13 +557,27 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
     assert.match(
       body,
       /quarantineRefusal\(profileName, /,
-      `${entry} must refuse a quarantined profile before any provider call`,
+      `${entry} must refuse a blocked profile before any provider call`,
+    );
+    assert.match(
+      body,
+      /SiteOpenGate\.check|quarantineRefusal\(/,
+      `${entry} must consult the same gate`,
     );
   }
-  // A deletion the provider accepted retires the name and lifts the block.
+  // A deletion the provider accepted retires the name for good (generation
+  // bumped), which is the ONLY path that may drop outstanding records.
   const deleteAt = controllerKt.indexOf("fun deleteProfileData");
   const deleteBody = controllerKt.slice(deleteAt, controllerKt.indexOf("\n  }\n", deleteAt));
-  assert.match(deleteBody, /ProfileQuarantine\.release\(profileName\)/);
+  assert.match(deleteBody, /ProfileQuarantine\.retire\(profileName\)/);
+  assert.match(controllerKt, /ProfileQuarantine\.isBlocked\(profileName\)/);
+  const gateAt = ops.indexOf("object SiteOpenGate");
+  const gate = ops.slice(gateAt, ops.indexOf("\n}\n", gateAt));
+  assert.match(
+    gate,
+    /ProfileQuarantine\.reasonFor\(profileName\)/,
+    "one gate reads the ledger, and both open phases call that gate",
+  );
 
   // Rust maps the sentinel onto guidance instead of showing it raw, and keeps
   // it distinct from the migration-retry retirement path.

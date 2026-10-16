@@ -349,9 +349,8 @@ object GeolocationWipe {
 }
 
 /**
- * Process-scoped registry of profiles whose in-place wipe timed out on a
- * destructive provider call that could NOT be cancelled or gated, so its
- * completion is unverified and it may still mutate the profile later.
+ * Process-scoped registry of the destructive provider operations whose
+ * completion could NOT be verified, keyed per profile name AND per operation.
  *
  * WHY A NEW SESSION MUST NOT OPEN ON SUCH A PROFILE (the proof this object
  * exists for): the watchdog answers the CALLER — it never stops the provider
@@ -361,66 +360,204 @@ object GeolocationWipe {
  * session's cookies (a fresh login, or the one-time jar import). Ignoring the
  * late callback result does not help: the data change happens regardless.
  * Refusing the open until the operation is known to have finished is the only
- * safe resolution, and it is recoverable — the user retries the wipe (which
- * verifies it) or removes the site (which retires the name).
+ * safe resolution, and it is recoverable.
  *
- * WHAT IS AND IS NOT QUARANTINED:
- *  * `removeAllCookies` timeout → QUARANTINED (ungated destructive, unverified).
- *  * geolocation timeout → NOT quarantined: the mutation is ours and gated by
+ * WHY ONE `name -> reason` RECORD IS NOT ENOUGH: the block has an OWNER. With
+ * a single record per name, two races reopen a profile that is still unsafe:
+ *  1. clear A's cookie wipe times out (block raised); clear B then runs and
+ *     every step answers, so B's success "releases" the name — while A's
+ *     native deletion is *still outstanding* and lands on the session that
+ *     now opens the profile;
+ *  2. A and B both time out; A's late callback "releases" the name even
+ *     though B's deletion is still in flight.
+ * So every timed-out destructive call is tracked by its own [StepGuard]
+ * operation id, a late callback closes ONLY its own record, and a verified
+ * wipe never erases somebody else's outstanding operation.
+ *
+ * THE BLOCK CONDITION (and the final-verification proof): a profile is
+ * blocked while
+ *  * at least one destructive operation is still outstanding ([pending]), OR
+ *  * the newest fully verified wipe happened BEFORE the last outstanding
+ *    operation settled ([State.verifiedAt] < [State.lastSettledAt]).
+ * The second clause is what makes a late answer unable to declare the profile
+ * safe on its own: closing the last outstanding operation moves the clock
+ * forward, so any verification recorded earlier is stale by construction and
+ * the site stays closed until a wipe is verified *after* the last destructive
+ * operation settled. A counter alone would not be enough — clearing a counter
+ * says nothing about whether the state was verified after the last settle.
+ *
+ * WHAT IS AND IS NOT TRACKED:
+ *  * `removeAllCookies` timeout → tracked (ungated destructive, unverified).
+ *  * geolocation timeout → NOT tracked: the mutation is ours and gated by
  *    [StepGuard]/[GeolocationWipe], so a late callback provably clears
  *    nothing; `getOrigins` is read-only.
  *  * `WebStorage.deleteAllData()` → synchronous: it returned or threw, so the
  *    outcome is verified by construction.
- *  * final `flush()` timeout → NOT quarantined: `flush()` only persists the
- *    cookie store that already exists, so a late flush cannot delete or grant
+ *  * final `flush()` timeout → NOT tracked: `flush()` only persists the cookie
+ *    store that already exists, so a late flush cannot delete or grant
  *    anything a new session created (worst case it durably writes that
  *    session's own cookies, which its own close flush would do anyway). It
  *    still fails the wipe, so Rust keeps the encrypted blobs for a retry.
  *
+ * RETIREMENT (verified deletion + generation bump): when the provider accepts
+ * a deletion — or reports the profile absent — the name is retired for good:
+ * Rust bumps the site's generation and `resolve_queued_free_generation` never
+ * hands that name out again, so no session can ever sit on it and its
+ * outstanding operations become unreachable. [retire] therefore drops the
+ * whole record set for that name, and the *new* generation starts unblocked.
+ * A **deferred** deletion (Chromium refuses: profile in use) keeps every
+ * record, because the profile still exists and could be reopened.
+ *
  * WHY IN-MEMORY IS THE RIGHT SCOPE: the hazard is a late callback in THIS
  * process. Those callbacks belong to the app's browser process — a restart
- * destroys them, and the registry starts empty by construction. Persisting
- * the quarantine would lock the user out of a site across restarts for a
- * hazard that no longer exists. (The migration flow faces the same late-write
- * problem and answers it differently, by RETIRING the name — see
- * [SiteMigrationFlow]: a virgin import profile is disposable, a profile the
- * user clears in place is not.)
+ * destroys them, and the registry starts empty by construction. Persisting it
+ * would lock the user out of a site across restarts for a hazard that no
+ * longer exists. (The migration flow faces the same late-write problem and
+ * answers it by RETIRING the name — see [SiteMigrationFlow]: a virgin import
+ * profile is disposable, a profile the user clears in place is not.)
  *
- * LIFTED BY: a fully verified clear of the same profile, the native callback
- * finally answering (the operation is then no longer in flight — [SiteClearFlow]
- * reports that as a late answer), a confirmed profile deletion (the name is
- * retired and its generation bumped, so it is never reopened), or a restart.
+ * Production never calls [reset] (test isolation only) and there is no blanket
+ * "release this name" any more: the only ways a block disappears are the
+ * [settle] of every outstanding operation followed by a [verified] wipe, or
+ * [retire] of a name that is gone for good.
  */
 object ProfileQuarantine {
-  private val reasons = ConcurrentHashMap<String, String>()
+  /**
+   * Reported when nothing is outstanding but the last verified wipe predates
+   * the last settled operation — i.e. the profile has not been re-verified
+   * since it became safe to look at again.
+   */
+  const val STALE_VERIFICATION_REASON: String =
+    "son doğrulama, bekleyen son çerez silme işlemi sonuçlanmadan önce yapıldı"
 
-  /** Block [profileName] from backing a new session, recording why. */
-  fun quarantine(profileName: String, reason: String) {
-    reasons[profileName] = reason
+  /** Per-profile ownership ledger. All access is serialised by the monitor. */
+  private class State {
+    /** Outstanding unverified destructive operations: operation id → reason. */
+    val pending = LinkedHashMap<Long, String>()
+
+    /** Clock value when the last outstanding operation settled. */
+    var lastSettledAt = 0L
+
+    /** Clock value when a fully verified wipe last completed. */
+    var verifiedAt = 0L
   }
 
-  /** The recorded reason, or `null` when the profile may be used. */
-  fun reasonFor(profileName: String): String? = reasons[profileName]
+  private val states = HashMap<String, State>()
 
-  fun isQuarantined(profileName: String): Boolean = reasons.containsKey(profileName)
+  /**
+   * Monotonic ordering source. It only ever has to answer "did the
+   * verification happen after the last settle?", so a wall clock (which can
+   * jump) is deliberately not used.
+   */
+  private val clock = AtomicLong(0)
 
-  /** Lifts the block; returns the reason that was recorded, if any. */
-  fun release(profileName: String): String? = reasons.remove(profileName)
+  private fun stateOf(profileName: String): State =
+    states.getOrPut(profileName) { State() }
 
-  /** Every blocked name (diagnostics/tests). */
-  fun names(): Set<String> = reasons.keys.toSet()
+  private fun pruneIfOpen(profileName: String, state: State) {
+    if (state.pending.isEmpty() && state.verifiedAt >= state.lastSettledAt) {
+      states.remove(profileName)
+    }
+  }
 
-  /** Forget every entry — test isolation and Activity teardown. */
+  /**
+   * Record that the destructive operation [operationId] on [profileName]
+   * timed out and is therefore still outstanding. Only the watchdog of THAT
+   * operation calls this, so a timeout can never register somebody else's id.
+   */
+  @Synchronized
+  fun quarantine(profileName: String, operationId: Long, reason: String) {
+    stateOf(profileName).pending[operationId] = reason
+  }
+
+  /**
+   * Close [operationId]'s own record: its provider callback finally answered,
+   * so that operation is no longer in flight.
+   *
+   * Returns `false` for an id this profile does not have outstanding — an
+   * unknown operation or a **duplicate callback**, which must not advance the
+   * clock, must not close another operation's record and must not lift
+   * anything. Returning `true` does NOT mean the profile is usable: see the
+   * block condition above.
+   */
+  @Synchronized
+  fun settle(profileName: String, operationId: Long): Boolean {
+    val state = states[profileName] ?: return false
+    if (state.pending.remove(operationId) == null) return false
+    state.lastSettledAt = clock.incrementAndGet()
+    return true
+  }
+
+  /**
+   * Record that a wipe of [profileName] completed with **every** step
+   * verified. This never removes an outstanding operation of an earlier
+   * attempt: with one still pending the profile stays blocked, because that
+   * deletion can yet land on the session a "successful" reopen would create.
+   */
+  @Synchronized
+  fun verified(profileName: String) {
+    val state = stateOf(profileName)
+    state.verifiedAt = clock.incrementAndGet()
+    pruneIfOpen(profileName, state)
+  }
+
+  /**
+   * Drop every record for a name that is retired for good (a deletion the
+   * provider accepted, or an absent profile): Rust bumps the generation, so
+   * the name is never handed out again and its outstanding operations cannot
+   * reach a new session. Returns how many were dropped. A *deferred* deletion
+   * must not call this.
+   */
+  @Synchronized
+  fun retire(profileName: String): Int {
+    val dropped = states.remove(profileName)?.pending?.size ?: 0
+    return dropped
+  }
+
+  /** Why [profileName] is blocked, or `null` when it may back a new session. */
+  @Synchronized
+  fun reasonFor(profileName: String): String? {
+    val state = states[profileName] ?: return null
+    if (state.pending.isNotEmpty()) {
+      val first = state.pending.values.first()
+      val extra = state.pending.size - 1
+      return if (extra == 0) first else "$first (+$extra bekleyen işlem daha)"
+    }
+    if (state.verifiedAt < state.lastSettledAt) return STALE_VERIFICATION_REASON
+    return null
+  }
+
+  @Synchronized
+  fun isBlocked(profileName: String): Boolean = reasonFor(profileName) != null
+
+  /** Outstanding operation ids for [profileName] (diagnostics and tests). */
+  @Synchronized
+  fun pendingOperations(profileName: String): List<Long> =
+    states[profileName]?.pending?.keys?.toList() ?: emptyList()
+
+  /** Every currently blocked name (diagnostics/tests). */
+  @Synchronized
+  fun names(): Set<String> = states.keys.filter { reasonFor(it) != null }.toSet()
+
+  /**
+   * Forget every record. TEST ISOLATION ONLY: no production path may call it,
+   * because dropping other operations' records is exactly the unsafety the
+   * per-operation ledger exists to prevent. Production uses [settle] (own
+   * record), [verified] (own attempt) and [retire] (a name retired for good).
+   */
+  @Synchronized
   fun reset() {
-    reasons.clear()
+    states.clear()
   }
 }
 
 /**
  * The open-time half of the quarantine: BOTH phases of the two-phase open
- * consult it before they touch the provider, so a profile with an unverified
- * wipe in flight is never bound to a WebView and never receives the one-time
- * jar import.
+ * (`site_migrate` and `site_open`) consult this SAME check before they touch
+ * the provider, so a profile with an outstanding destructive operation is
+ * never bound to a WebView and never receives the one-time jar import. One
+ * function, two call sites — a guarantee that existed on only one phase would
+ * let the jar import write cookies straight into an in-flight deletion.
  */
 object SiteOpenGate {
   /**
@@ -452,7 +589,9 @@ interface SiteClearPort {
    * flight, which [SiteClearFlow] answers with [ProfileQuarantine] rather
    * than by pretending the late callback was the whole problem. The port MUST
    * still deliver [onDone] whenever the provider answers — late or not — so
-   * the flow can learn that the operation finished and lift the block.
+   * the flow can close THAT operation's record: it is the only evidence that
+   * the deletion is no longer in flight, and no other attempt may substitute
+   * for it.
    */
   fun removeAllCookies(onDone: (Boolean) -> Unit)
 
@@ -492,15 +631,18 @@ interface SiteClearPort {
  *    runs behind a [StepGuard] the watchdog closes, so its late callback
  *    performs no `clear` on a profile that may by then back a new session,
  *    and the one destructive call that cannot be gated (`removeAllCookies`)
- *    puts the profile in [ProfileQuarantine] until it is verified — the flow
- *    never claims a wipe it could not watch finish;
+ *    is registered in [ProfileQuarantine] **under its own operation id** —
+ *    the flow never claims a wipe it could not watch finish;
  *  * failures are aggregated: every step is still attempted so one broken
  *    callback cannot mask the rest, and ANY failure (including the final
  *    `flush`) fails the whole call — Rust then keeps the encrypted session
  *    blobs and the user can retry;
  *  * every step is idempotent, so a half-finished attempt followed by a
- *    retry is safe, and a fully verified success lifts any quarantine on
- *    [profileName] so the site can be opened again.
+ *    retry is safe. A fully verified success records [ProfileQuarantine.verified]
+ *    for [profileName] — it does NOT erase an earlier attempt's still
+ *    outstanding operation, so the site reopens only once every destructive
+ *    call this process issued for that profile has settled AND a wipe was
+ *    verified after the last of them settled.
  *
  * Out of scope (documented in docs/android-storage-isolation.md): HTTP cache
  * and service-worker registrations — no profile-scoped API clears those;
@@ -526,9 +668,11 @@ object SiteClearFlow {
     fun done(error: String?) {
       if (once.compareAndSet(false, true)) {
         if (error == null) {
-          // Fully verified wipe: every destructive step answered, nothing is
-          // in flight, so the profile may back a new session again.
-          ProfileQuarantine.release(profileName)
+          // Fully verified wipe: every step of THIS attempt answered. That is
+          // recorded as a verification, not as a release — an earlier attempt's
+          // timed-out `removeAllCookies` may still be outstanding, and its
+          // record belongs to that operation alone (see ProfileQuarantine).
+          ProfileQuarantine.verified(profileName)
         }
         onDone(error)
       }
@@ -579,8 +723,8 @@ object SiteClearFlow {
     fun awaited(
       stepName: String,
       timeoutMessage: String,
-      onTimeout: () -> Unit = {},
-      onLateAnswer: () -> Unit = {},
+      onTimeout: (StepGuard) -> Unit = {},
+      onLateAnswer: (StepGuard) -> Unit = {},
       arm: (StepGuard, (Boolean) -> Unit) -> Unit,
       next: (Boolean) -> Unit,
     ) {
@@ -593,31 +737,37 @@ object SiteClearFlow {
         guard.claim()
         if (settled.compareAndSet(false, true)) {
           record("$stepName: $timeoutMessage")
-          onTimeout()
+          // The hook receives THIS step's guard, so anything it registers is
+          // owned by this operation id and nothing else's.
+          onTimeout(guard)
           next(false)
         }
       }
       arm(guard) { ok ->
-        if (settled.compareAndSet(false, true)) next(ok) else onLateAnswer()
+        if (settled.compareAndSet(false, true)) next(ok) else onLateAnswer(guard)
       }
     }
 
     awaited(
       "çerez temizliği",
       "zaman aşımı",
-      onTimeout = {
+      onTimeout = { guard ->
         // Ungated AND unverified: `removeAllCookies` was issued before the
         // await, offers no cancellation, and may still delete cookies after
         // this flow reported failure — including cookies a reopened session
         // just created. Ignoring the late callback result would not stop
-        // that, so the profile is blocked until the wipe is verified.
-        ProfileQuarantine.quarantine(profileName, COOKIE_UNVERIFIED_REASON)
+        // that, so THIS operation is registered as outstanding under its own
+        // id: another attempt's success cannot clear it, and only its own
+        // callback can.
+        ProfileQuarantine.quarantine(profileName, guard.operationId, COOKIE_UNVERIFIED_REASON)
       },
-      onLateAnswer = {
-        // The provider answered after losing the race: the operation is
-        // finished, nothing is in flight any more, so the block is lifted.
-        // The delivered failure stands — a late answer never re-reports.
-        ProfileQuarantine.release(profileName)
+      onLateAnswer = { guard ->
+        // The provider answered after losing the race, so this operation is no
+        // longer in flight — and that is all this callback may conclude. It
+        // closes its OWN record; whether the profile is usable again is the
+        // registry's condition (nothing outstanding AND a verification that
+        // postdates the last settle). A duplicate answer closes nothing.
+        ProfileQuarantine.settle(profileName, guard.operationId)
       },
       arm = { _, cb -> port.removeAllCookies(cb) },
     ) { cookiesOk ->

@@ -559,7 +559,7 @@ class SiteProfileOpsTest {
     )
     Assert.assertEquals(1, port.geo.getOriginsCalls)
     // A verified wipe leaves the profile usable: no block, gate says open.
-    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
     Assert.assertNull(SiteOpenGate.check(profile))
   }
 
@@ -590,7 +590,7 @@ class SiteProfileOpsTest {
     Assert.assertTrue("a late callback cannot re-report", (last ?: "ok") != "ok")
     // Nothing is in flight (getOrigins is read-only, the clears were refused),
     // so this step quarantines nothing — the gate stays open by proof, not luck.
-    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
     Assert.assertNull(SiteOpenGate.check(profile))
   }
 
@@ -680,12 +680,12 @@ class SiteProfileOpsTest {
     Assert.assertTrue("the late success cannot flip it: $last", (last ?: "ok") != "ok")
     Assert.assertFalse(
       "a gated step quarantines nothing",
-      ProfileQuarantine.isQuarantined(profile),
+      ProfileQuarantine.isBlocked(profile),
     )
   }
 
   @Test
-  fun `an unverifiable cookie wipe quarantines the profile and refuses a new session`() {
+  fun `an unverifiable cookie wipe blocks the profile and refuses a new session`() {
     val port = FakeClearPort(cookiesNeverAnswer = true)
     var results = 0
     var last: String? = null
@@ -697,45 +697,265 @@ class SiteProfileOpsTest {
     Assert.assertTrue(last!!.contains("çerez"))
     // `removeAllCookies` cannot be cancelled and its completion is unverified:
     // it may still delete cookies AFTER this failure, so the profile must not
-    // back a new session yet.
-    Assert.assertTrue(ProfileQuarantine.isQuarantined(profile))
+    // back a new session yet. The block is owned by THIS operation's id, not
+    // by a name-wide flag another attempt could clear.
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    Assert.assertEquals(
+      "exactly one outstanding operation",
+      1,
+      ProfileQuarantine.pendingOperations(profile).size,
+    )
     val refusal = SiteOpenGate.check(profile)
     Assert.assertNotNull("the open must be refused", refusal)
     Assert.assertTrue(refusal!!.startsWith(SiteProfileErrors.QUARANTINED))
     Assert.assertTrue(refusal.contains(SiteClearFlow.COOKIE_UNVERIFIED_REASON))
-    // Recovery: a retry whose every step answers verifies the wipe and lifts
-    // the block, so the same site can be opened again.
-    val retry = FakeClearPort()
-    var retryResult = "unset"
-    SiteClearFlow.run(supported = true, profileName = profile, port = retry) {
-      retryResult = it ?: "ok"
-    }
-    Assert.assertEquals("ok", retryResult)
-    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
-    Assert.assertNull("the gate reopens after a verified wipe", SiteOpenGate.check(profile))
+    // Nothing here may assume the native call finished: it is still captured
+    // and undelivered, which is the state every recovery test below starts from.
+    Assert.assertNotNull("the provider operation is still outstanding", port.pendingCookies)
   }
 
   @Test
-  fun `the cookie callback answering after its timeout lifts the quarantine without re-reporting`() {
+  fun `a verified retry cannot lift the block while an older wipe is still outstanding`() {
+    // Clear A: the cookie wipe times out and its callback never arrives.
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) {}
+    a.timeouts[0].invoke()
+    val outstanding = ProfileQuarantine.pendingOperations(profile)
+    Assert.assertEquals(1, outstanding.size)
+
+    // Clear B succeeds: every step answers, so B is fully verified. Under the
+    // old single-record registry that success "released" the name while A's
+    // native deletion was still in flight — and it then landed on the session
+    // that reopened the profile. It must not.
+    val b = FakeClearPort()
+    var bResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = b) { bResult = it ?: "ok" }
+    Assert.assertEquals("B itself is a verified wipe", "ok", bResult)
+    Assert.assertTrue(
+      "B's success must not erase A's outstanding operation",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    Assert.assertEquals(
+      "A's record is untouched",
+      outstanding,
+      ProfileQuarantine.pendingOperations(profile),
+    )
+    Assert.assertNotNull("the site must stay closed", SiteOpenGate.check(profile))
+    Assert.assertNotNull("A's callback is STILL undelivered", a.pendingCookies)
+  }
+
+  @Test
+  fun `a late answer closes only its own operation while another is outstanding`() {
+    // A and B both time out: two independent destructive operations in flight.
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) {}
+    a.timeouts[0].invoke()
+    val b = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = b) {}
+    b.timeouts[0].invoke()
+    val both = ProfileQuarantine.pendingOperations(profile)
+    Assert.assertEquals(2, both.size)
+
+    // A's callback arrives while B is still outstanding.
+    a.pendingCookies!!.invoke(true)
+    val left = ProfileQuarantine.pendingOperations(profile)
+    Assert.assertEquals("A closed exactly one record", 1, left.size)
+    Assert.assertEquals("and it was A's, not B's", both[1], left[0])
+    Assert.assertTrue(
+      "B is still in flight, so the profile stays blocked",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    Assert.assertNotNull(SiteOpenGate.check(profile))
+
+    // Only B's own answer closes B; then the verification is still stale.
+    b.pendingCookies!!.invoke(true)
+    Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
+    Assert.assertTrue("nothing outstanding, but nothing verified since", ProfileQuarantine.isBlocked(profile))
+    Assert.assertTrue(
+      SiteOpenGate.check(profile)!!.contains(ProfileQuarantine.STALE_VERIFICATION_REASON),
+    )
+    // A wipe verified AFTER the last settle is what reopens the profile.
+    val c = FakeClearPort()
+    var cResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = c) { cResult = it ?: "ok" }
+    Assert.assertEquals("ok", cResult)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a late answer arriving after a verified clear does not declare the profile safe`() {
+    // A times out; B is verified while A is outstanding; only THEN does A's
+    // native deletion finally complete.
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) {}
+    a.timeouts[0].invoke()
+    val b = FakeClearPort()
+    SiteClearFlow.run(supported = true, profileName = profile, port = b) {}
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+
+    a.pendingCookies!!.invoke(true)
+    // A's answer closes A's record, and that is all it may conclude: the last
+    // verification (B) happened BEFORE the last destructive operation settled,
+    // so the profile's state has not been verified since it became observable.
+    Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
+    Assert.assertTrue(
+      "a late answer alone cannot make the reopen safe",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    Assert.assertTrue(
+      SiteOpenGate.check(profile)!!.contains(ProfileQuarantine.STALE_VERIFICATION_REASON),
+    )
+    // Final state check: a wipe verified after the last settle reopens it.
+    val c = FakeClearPort()
+    var cResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = c) { cResult = it ?: "ok" }
+    Assert.assertEquals("ok", cResult)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull("reliable end state: openable", SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `three outstanding operations lift the block only when all settled and re-verified`() {
+    val ports =
+      List(3) { FakeClearPort(cookiesNeverAnswer = true) }.also { list ->
+        list.forEach { port ->
+          SiteClearFlow.run(supported = true, profileName = profile, port = port) {}
+          port.timeouts[0].invoke()
+        }
+      }
+    Assert.assertEquals(3, ProfileQuarantine.pendingOperations(profile).size)
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+
+    // Callbacks land out of order: C, then A, then B.
+    ports[2].pendingCookies!!.invoke(true)
+    Assert.assertEquals(2, ProfileQuarantine.pendingOperations(profile).size)
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    ports[0].pendingCookies!!.invoke(false)
+    Assert.assertEquals(1, ProfileQuarantine.pendingOperations(profile).size)
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+
+    // A fully verified wipe in the middle changes nothing: one op outstanding.
+    val mid = FakeClearPort()
+    SiteClearFlow.run(supported = true, profileName = profile, port = mid) {}
+    Assert.assertTrue(
+      "a verified wipe cannot erase an outstanding operation",
+      ProfileQuarantine.isBlocked(profile),
+    )
+
+    ports[1].pendingCookies!!.invoke(true)
+    Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
+    Assert.assertTrue(
+      "the verification predates the last settle",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    val last = FakeClearPort()
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = last) { result = it ?: "ok" }
+    Assert.assertEquals("ok", result)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a duplicated cookie callback closes its record once and lifts nothing else`() {
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    var aResults = 0
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) { aResults++ }
+    a.timeouts[0].invoke()
+    val b = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = b) {}
+    b.timeouts[0].invoke()
+    val both = ProfileQuarantine.pendingOperations(profile)
+    Assert.assertEquals(2, both.size)
+
+    a.pendingCookies!!.invoke(true) // A settles
+    a.pendingCookies!!.invoke(true) // duplicate delivery of the SAME callback
+    a.pendingCookies!!.invoke(false)
+    Assert.assertEquals("A reported exactly once", 1, aResults)
+    Assert.assertEquals(
+      "the duplicate closed nothing — B is still outstanding",
+      listOf(both[1]),
+      ProfileQuarantine.pendingOperations(profile),
+    )
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    // And at the registry level a duplicate/unknown settle is refused outright.
+    Assert.assertFalse(ProfileQuarantine.settle(profile, both[0]))
+    Assert.assertFalse(ProfileQuarantine.settle(profile, 999_999L))
+    Assert.assertEquals(listOf(both[1]), ProfileQuarantine.pendingOperations(profile))
+  }
+
+  @Test
+  fun `a retired profile name never blocks its new generation`() {
+    // A times out on the current generation.
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) {}
+    a.timeouts[0].invoke()
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    val nextGeneration = "site-00000000000000000000000000000000-g8"
+    Assert.assertNull(
+      "the bumped generation is a different name and was never blocked",
+      SiteOpenGate.check(nextGeneration),
+    )
+
+    // The provider accepts the deletion (or reports the profile absent): the
+    // controller retires the name, Rust bumps the generation and never hands
+    // the old name out again, so its outstanding operation cannot reach a
+    // session — dropping the ledger is the defined behaviour.
+    Assert.assertEquals(1, ProfileQuarantine.retire(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertEquals("retiring twice drops nothing", 0, ProfileQuarantine.retire(profile))
+
+    // A's callback landing after retirement cannot touch the new generation.
+    a.pendingCookies!!.invoke(true)
+    Assert.assertNull(SiteOpenGate.check(nextGeneration))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(nextGeneration))
+    Assert.assertTrue(ProfileQuarantine.pendingOperations(nextGeneration).isEmpty())
+    // The new generation opens and clears normally.
+    val fresh = FakeClearPort()
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = nextGeneration, port = fresh) {
+      result = it ?: "ok"
+    }
+    Assert.assertEquals("ok", result)
+    Assert.assertNull(SiteOpenGate.check(nextGeneration))
+  }
+
+  @Test
+  fun `the cookie callback answering after its timeout closes its record without re-reporting`() {
     val port = FakeClearPort(cookiesNeverAnswer = true)
     var results = 0
     var last: String? = null
     SiteClearFlow.run(supported = true, profileName = profile, port = port) { results++; last = it }
     port.timeouts[0].invoke()
     Assert.assertEquals(1, results)
-    Assert.assertTrue(ProfileQuarantine.isQuarantined(profile))
-    // The provider finally answers: the deletion is no longer in flight, so
-    // the reason for the block is gone — but the failure already delivered to
-    // Rust stands (it keeps the encrypted blobs for the retry).
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    // The provider finally answers, so this operation is no longer in flight —
+    // but that alone does not certify the profile's end state: the last
+    // verification predates the settle, so the block stays until a wipe is
+    // verified after it. The delivered failure stands either way (Rust keeps
+    // the encrypted blobs for the retry).
     port.pendingCookies!!.invoke(true)
-    Assert.assertFalse("nothing is in flight any more", ProfileQuarantine.isQuarantined(profile))
-    Assert.assertNull(SiteOpenGate.check(profile))
+    Assert.assertTrue(
+      "nothing outstanding any more",
+      ProfileQuarantine.pendingOperations(profile).isEmpty(),
+    )
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
     Assert.assertEquals("no second result", 1, results)
     Assert.assertTrue("the timeout failure stands: $last", (last ?: "ok") != "ok")
     // A duplicate late answer changes nothing either.
     port.pendingCookies!!.invoke(false)
     Assert.assertEquals(1, results)
-    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertTrue(ProfileQuarantine.pendingOperations(profile).isEmpty())
+    // One verified wipe after the settle reopens the site.
+    val retry = FakeClearPort()
+    var retryResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = retry) {
+      retryResult = it ?: "ok"
+    }
+    Assert.assertEquals("ok", retryResult)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull("the gate reopens after a verified wipe", SiteOpenGate.check(profile))
   }
 
   @Test
@@ -746,7 +966,7 @@ class SiteProfileOpsTest {
     Assert.assertNotEquals("ok", result)
     // The provider answered, so nothing is in flight: the quarantine is for
     // UNVERIFIED destructive operations only, not for every failure.
-    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
     Assert.assertNull("retry and reopen stay available", SiteOpenGate.check(profile))
   }
 
@@ -763,7 +983,7 @@ class SiteProfileOpsTest {
     Assert.assertTrue("durability failure: $last", last!!.contains("kalıcılığı"))
     // flush() only persists the store that already exists: a late one cannot
     // delete or grant data a new session created, so no block is raised.
-    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
     Assert.assertNull(SiteOpenGate.check(profile))
     // A late successful flush cannot flip the delivered failure either.
     port.pendingFlush!!.invoke(null)
@@ -772,14 +992,37 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `an absent profile is already clean and lifts a quarantine on the name`() {
-    ProfileQuarantine.quarantine(profile, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
+  fun `an absent profile is already clean and verifies the name without erasing pending work`() {
+    // An earlier attempt left a destructive operation outstanding.
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) {}
+    a.timeouts[0].invoke()
+    Assert.assertEquals(1, ProfileQuarantine.pendingOperations(profile).size)
+
+    // The profile no longer exists, so the attempt succeeds without touching
+    // the store — and it records a verification, NOT a blanket release.
     val port = FakeClearPort(exists = false)
     var result = "unset"
     SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertEquals("ok", result)
     Assert.assertEquals(listOf("exists"), port.log)
-    Assert.assertFalse("the profile is gone: nothing can mutate it", ProfileQuarantine.isQuarantined(profile))
+    Assert.assertTrue(
+      "an outstanding operation of an earlier attempt survives this success",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    Assert.assertEquals(1, ProfileQuarantine.pendingOperations(profile).size)
+    Assert.assertNotNull(SiteOpenGate.check(profile))
+    // Once that operation settles, the absent-profile verification is stale...
+    a.pendingCookies!!.invoke(true)
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    // ...and one more verified pass (still absent) reopens the name.
+    val retry = FakeClearPort(exists = false)
+    var retryResult = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = retry) {
+      retryResult = it ?: "ok"
+    }
+    Assert.assertEquals("ok", retryResult)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
     Assert.assertNull(SiteOpenGate.check(profile))
   }
 
@@ -790,7 +1033,7 @@ class SiteProfileOpsTest {
     SiteClearFlow.run(supported = false, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertEquals(SiteProfileErrors.UNSUPPORTED, result)
     Assert.assertTrue(port.log.isEmpty())
-    Assert.assertFalse(ProfileQuarantine.isQuarantined(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
   }
 
   // ------------------------------------------------- guard / wipe units
@@ -870,19 +1113,60 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `quarantine blocks only the recorded profile name`() {
+  fun `the quarantine ledger is per profile name and per operation`() {
     val other = "site-11111111111111111111111111111111-g0"
-    ProfileQuarantine.quarantine(profile, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
-    Assert.assertTrue(ProfileQuarantine.isQuarantined(profile))
-    Assert.assertFalse("another site is unaffected", ProfileQuarantine.isQuarantined(other))
+    ProfileQuarantine.quarantine(profile, 11L, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
+    ProfileQuarantine.quarantine(profile, 12L, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    Assert.assertFalse("another site is unaffected", ProfileQuarantine.isBlocked(other))
     Assert.assertNull(SiteOpenGate.check(other))
     Assert.assertEquals(setOf(profile), ProfileQuarantine.names())
-    Assert.assertEquals(
-      SiteClearFlow.COOKIE_UNVERIFIED_REASON,
-      ProfileQuarantine.release(profile),
+    Assert.assertEquals(listOf(11L, 12L), ProfileQuarantine.pendingOperations(profile))
+    Assert.assertTrue(
+      "the refusal names every outstanding operation",
+      SiteOpenGate.check(profile)!!.contains("+1 bekleyen işlem daha"),
     )
-    Assert.assertNull(ProfileQuarantine.release(profile))
-    Assert.assertNull(SiteOpenGate.check(profile))
+    // settle is per-operation and refuses unknown or already-closed ids.
+    Assert.assertTrue(ProfileQuarantine.settle(profile, 11L))
+    Assert.assertFalse("a duplicate close is refused", ProfileQuarantine.settle(profile, 11L))
+    Assert.assertFalse("an unknown id closes nothing", ProfileQuarantine.settle(profile, 99L))
+    Assert.assertFalse("another name closes nothing", ProfileQuarantine.settle(other, 12L))
+    Assert.assertEquals(listOf(12L), ProfileQuarantine.pendingOperations(profile))
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    // While an operation is outstanding its own reason is what gets reported.
+    Assert.assertTrue(
+      ProfileQuarantine.reasonFor(profile)!!.contains(SiteClearFlow.COOKIE_UNVERIFIED_REASON),
+    )
+    Assert.assertTrue(ProfileQuarantine.settle(profile, 12L))
+    Assert.assertTrue(
+      "no verification postdates the last settle",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    // With nothing outstanding the refusal says why the end state is unproven.
+    Assert.assertTrue(
+      ProfileQuarantine.reasonFor(profile)!!.contains(ProfileQuarantine.STALE_VERIFICATION_REASON),
+    )
+    // A verification after the last settle opens the profile, ledger included.
+    ProfileQuarantine.verified(profile)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertTrue(
+      "an openable profile keeps no ledger",
+      ProfileQuarantine.pendingOperations(profile).isEmpty(),
+    )
+    Assert.assertTrue("names() lists only blocked profiles", ProfileQuarantine.names().isEmpty())
+    // verified() alone never erases somebody else's outstanding operation.
+    ProfileQuarantine.quarantine(profile, 14L, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
+    ProfileQuarantine.verified(profile)
+    Assert.assertTrue(
+      "a verified wipe does not clear an outstanding operation",
+      ProfileQuarantine.isBlocked(profile),
+    )
+    Assert.assertEquals(listOf(14L), ProfileQuarantine.pendingOperations(profile))
+    // retire() is the only way outstanding records are dropped: a name Rust
+    // retired for good (accepted deletion, generation bumped).
+    Assert.assertEquals(1, ProfileQuarantine.retire(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertEquals("retiring an unknown name drops nothing", 0, ProfileQuarantine.retire(profile))
   }
 
   // ------------------------------------------------------------ migration

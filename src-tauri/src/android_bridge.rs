@@ -47,13 +47,16 @@ pub fn keystore_open(purpose: &str, sealed: &str) -> AppResult<Vec<u8>> {
 /// reintroduce the cross-site data mixing this feature removes.
 pub const MULTI_PROFILE_UNSUPPORTED_MSG: &str = "Bu cihazın WebView sağlayıcısı çoklu profil (MULTI_PROFILE) desteği sunmuyor; site verileri izole edilemediği için site açılamadı. Android System WebView veya Google Chrome'u güncelleyin; güncelleme sonrası da devam ederse bu cihaz bu özelliği desteklemiyor olabilir.";
 
-/// User-facing explanation when Kotlin refuses a *quarantined* profile: its
-/// last in-place wipe timed out on `removeAllCookies`, a destructive provider
-/// call that offers no cancellation, so its completion is unverified and it
-/// may still delete cookies belonging to a session that reopens the same
-/// profile. The recovery step is part of the message: this is a retryable
+/// User-facing explanation when Kotlin refuses a *quarantined* profile: an
+/// in-place wipe timed out on `removeAllCookies`, a destructive provider call
+/// that offers no cancellation, so its completion is unverified and it may
+/// still delete cookies belonging to a session that reopens the same profile.
+/// Kotlin tracks each such deletion as its OWN outstanding operation, so the
+/// refusal can outlive the attempt that reported it — a later successful clear
+/// does not reopen the site while an earlier deletion is still in flight, and
+/// the message says so. The recovery step is part of it: this is a retryable
 /// state, not a dead end.
-pub const PROFILE_QUARANTINED_MSG: &str = "Bu sitenin verileri temizlenirken çerez silme işlemi zaman aşımına uğradı ve tamamlanıp tamamlanmadığı doğrulanamadı. İşlem arka planda hâlâ sürüyor olabileceği için site, temizlik doğrulanana kadar açılmadı: açılsaydı yeni oturumun çerezleri silinebilirdi. Site verilerini yeniden temizlemeyi deneyin; sonuç değişmezse siteyi kaldırıp yeniden ekleyin. Kayıtlı oturum verileriniz korunuyor.";
+pub const PROFILE_QUARANTINED_MSG: &str = "Bu sitenin verileri temizlenirken çerez silme işlemi zaman aşımına uğradı ve tamamlanıp tamamlanmadığı doğrulanamadı. İşlem arka planda hâlâ sürüyor olabileceği için site, bekleyen tüm silme işlemleri sonuçlanıp temizlik doğrulanana kadar açılmadı: açılsaydı yeni oturumun çerezleri silinebilirdi. Sonradan yapılan başarılı bir temizlik, daha önce zaman aşımına uğrayan silme işlemini beklemekten vazgeçirmez. Site verilerini yeniden temizlemeyi deneyin; sonuç değişmezse siteyi kaldırıp yeniden ekleyin. Kayıtlı oturum verileriniz korunuyor.";
 
 /// Map a Kotlin refusal from the two-phase open onto a user-facing error.
 ///
@@ -413,6 +416,38 @@ mod tests {
             quarantined.to_string().contains("yeniden temizlemeyi"),
             "the message must name the recovery step"
         );
+        assert!(
+            quarantined.to_string().contains("vazgeçirmez"),
+            "the message must say a later successful clear does not lift the wait"
+        );
+
+        // Every wording the Kotlin ledger can produce must classify the same
+        // way: several outstanding operations, and a verification that
+        // predates the last settle (a later clear succeeded while an earlier
+        // deletion was still in flight). The user gets guidance, never the raw
+        // Kotlin text and never the sentinel.
+        for reason in [
+            "çerez temizliği zaman aşımına uğradı, işlem doğrulanamadı (+2 bekleyen işlem daha)",
+            "son doğrulama, bekleyen son çerez silme işlemi sonuçlanmadan önce yapıldı",
+        ] {
+            let refusal = classify_site_open_error(animehub_android::Error::Bridge(format!(
+                "{}: {}",
+                animehub_android::QUARANTINE_SENTINEL,
+                reason
+            )));
+            assert_eq!(refusal.code(), "quarantined", "reason: {reason}");
+            assert_eq!(
+                refusal.to_string(),
+                PROFILE_QUARANTINED_MSG,
+                "reason: {reason}"
+            );
+            assert!(
+                !refusal
+                    .to_string()
+                    .contains(animehub_android::QUARANTINE_SENTINEL),
+                "reason: {reason}"
+            );
+        }
 
         // Anything else passes through unchanged (the bridge's own prefix
         // included), so no Kotlin detail is lost for unclassified failures.

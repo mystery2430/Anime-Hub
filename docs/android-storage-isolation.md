@@ -251,19 +251,55 @@ remove, no legacy data remains (`delete_site_session` also drops the
     stale callback can be tied to the step that owned it. Claim and mutation
     run on the UI thread — where the watchdog is posted as well — and the
     guard is a CAS, so the race is decided atomically either way.
-  * *Ungated steps — profile quarantine.* `removeAllCookies` is a destructive
-    provider call issued **before** the await, with no cancellation API: when
-    its watchdog fires, the deletion may still be in flight and can complete
-    *after* the wipe was reported failed — deleting cookies that belong to a
-    session which reopened the same profile name (a fresh login, or the
-    one-time jar import). Ignoring the late callback result does not prevent
-    that, so opening the profile immediately is **not** provably safe. The
-    flow therefore records the name in `ProfileQuarantine`, and both phases
+  * *Ungated steps — per-operation profile quarantine.* `removeAllCookies` is
+    a destructive provider call issued **before** the await, with no
+    cancellation API: when its watchdog fires, the deletion may still be in
+    flight and can complete *after* the wipe was reported failed — deleting
+    cookies that belong to a session which reopened the same profile name (a
+    fresh login, or the one-time jar import). Ignoring the late callback
+    result does not prevent that, so opening the profile immediately is
+    **not** provably safe. The flow therefore registers **that operation** in
+    `ProfileQuarantine` under its step guard's `operationId`, and both phases
     of the two-phase open consult `SiteOpenGate` before touching the
     provider: Kotlin rejects with the `profile-quarantined` sentinel, Rust
     maps it to `AppError::Quarantined` with user-facing guidance (never the
     raw token) and propagates it without retiring the profile or persisting
     the migration flag.
+  * *Why ownership is per operation, not per profile name.* A name-wide
+    blocked/not-blocked flag is not enough: clear **A** times out, clear **B**
+    then runs with every step answering, and B's success would lift the block
+    that A's still-outstanding deletion is the reason for — the profile opens
+    and A's late callback wipes the new session's cookies. The ledger keeps,
+    per profile name, the outstanding operation ids with their reasons plus
+    two stamps of a monotonic clock (not wall time, which can jump): when the
+    last outstanding operation settled, and when a wipe was last fully
+    verified. A profile is openable **only** when nothing is outstanding *and*
+    the last verification postdates the last settle — so the reopen is
+    justified by a final state observed *after* the last destructive operation
+    finished, never by a counter merely reaching zero. Consequences, each
+    covered by a deterministic Kotlin test running the real flow:
+      * a late callback closes **its own** record and nothing else —
+        `settle(name, operationId)` returns `false` for an unknown or
+        already-closed id, so a provider that delivers the same callback twice
+        cannot close somebody else's operation;
+      * a verified clear records `verified(name)`; it never erases another
+        attempt's outstanding operation, and no production path calls a
+        blanket `release(name)` or `reset()`;
+      * settling advances the clock, which *invalidates* any earlier
+        verification: a late answer arriving after a successful clear cannot
+        declare the reopen safe by itself — it leaves the outstanding set
+        empty but keeps the "verification predates the last settle" refusal
+        standing until one more verified wipe runs.
+  * *Verified deletion + generation bump.* When the provider **accepts** a
+    profile deletion (or reports the profile absent), Rust retires the name
+    and bumps the site's generation, so that exact profile name is never
+    handed out again: a deletion still outstanding for it can only land on a
+    profile no session will ever use. That is the single path allowed to drop
+    a name's whole ledger — `retire(name)`, called by the controller on the
+    accepted/absent branch only. A **deferred** deletion (profile in use)
+    keeps every record, because the same name can still be reopened. The new
+    generation is a different string and starts unblocked, so an old
+    operation cannot mutate the new profile's data.
   * *What is deliberately NOT quarantined:* the geolocation step (gated, so a
     late callback provably changes nothing); `WebStorage.deleteAllData()`
     (synchronous — it returned or threw, so the outcome is verified); the
@@ -271,14 +307,15 @@ remove, no legacy data remains (`delete_site_session` also drops the
     so a late flush cannot delete or grant anything a new session created —
     worst case it durably writes that session's own cookies, which its own
     close flush would do anyway; it still fails the wipe).
-  * *Recovery, and why the registry is process-scoped:* the block is lifted by
-    the provider finally answering (the operation is then no longer in
-    flight), by a retry whose every step is verified, by a deletion the
-    provider accepted (the name is retired and its generation bumped, so it
-    is never handed out again), or by a process restart — the late callbacks
-    this defends against belong to this process, so persisting the block
-    would lock a site out across restarts for a hazard that no longer exists.
-    A deferred (in-use) deletion keeps the block.
+  * *Recovery, and why the registry is process-scoped:* the outstanding set
+    shrinks only when the provider answers *that* operation; the block lifts
+    only once a wipe has also been verified after the last settle — a retry
+    whose every step answers, an absent profile, or a deletion the provider
+    accepted (which retires the name and bumps its generation) — or on a
+    process restart: the late callbacks this defends against belong to this
+    process, so persisting the ledger would lock a site out across restarts
+    for a hazard that no longer exists. A deferred (in-use) deletion keeps the
+    block, and so does an in-flight operation from any earlier attempt.
   * The migration flow faces the same late-write hazard and answers it
     differently, by **retiring** the name (queue + generation bump): a virgin
     import profile is disposable, a profile the user clears in place is not.
@@ -343,7 +380,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
 
 **Behavioural coverage (mocks/injected callbacks, no new dependencies):**
 
-* `SiteProfileOpsTest.kt` (54 cases, executed by the CI Gradle unit-test
+* `SiteProfileOpsTest.kt` (60 cases, executed by the CI Gradle unit-test
   step against the real sequencing code in `SiteProfileOps.kt`): close
   durability (flush failure keeps the view, resolve failure is an error,
   exactly-once completion, **flush watchdog on a lost callback, a late
@@ -359,7 +396,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
   session-slot rollback after a failed open (stale failure cannot clear a
   newer session), and the back-status decision matrix. These catch the
   real error paths A.1–A.5 were about; the controller only *wires* them.
-* **Timeout side-effect races** (18 of those cases) are measured as data, not
+* **Timeout side-effect races** (24 of those cases) are measured as data, not
   as callback counts: the fake records every `clear` the production
   `GeolocationWipe` triggers and the origins a session currently holds. They
   cover the callback beating the watchdog (permissions really cleared, no
@@ -368,12 +405,23 @@ remove, no legacy data remains (`delete_site_session` also drops the
   reopened on the same profile name (the new session's granted permission
   survives), a duplicated delivery (no repeated wipe, no repeated result), a
   port that claimed the guard but reported late (the watchdog's conservative
-  failure stands), the `removeAllCookies` timeout → quarantine → refused open
-  → verified retry reopening, the late cookie answer lifting the block
-  without re-reporting, an answered-false cookie step failing *without*
-  quarantining, a final-flush timeout failing without quarantining, the
-  absent-profile and unsupported-provider paths, and `StepGuard` /
-  `GeolocationWipe` / `ProfileQuarantine` / `SiteOpenGate` unit behaviour.
+  failure stands), the `removeAllCookies` timeout → per-operation block →
+  refused open, a verified retry that must **not** lift that block while the
+  earlier deletion is still outstanding, two independent timeouts whose late
+  answers each close only their own record, a late answer arriving *after* a
+  verified clear (it empties the outstanding set but the verification is then
+  stale, so one more verified wipe is what reopens the site), three
+  outstanding operations settling out of order with a verified wipe in the
+  middle, a callback delivered three times (its record closes once, another
+  operation stays outstanding, one result), a retired name whose bumped
+  generation is never blocked and never touched by the old operation, the
+  absent-profile path verifying without erasing pending work, the late cookie
+  answer closing its record without re-reporting, an answered-false cookie
+  step failing *without* blocking, a final-flush timeout failing without
+  blocking, the unsupported-provider path, and `StepGuard` / `GeolocationWipe`
+  / `ProfileQuarantine` / `SiteOpenGate` unit behaviour (including the
+  per-operation ledger: duplicate/unknown settles refused, `verified` never
+  clearing an outstanding operation, `retire` being the only drop).
 * `web/windows.rs` Rust tests drive the real `run_mobile_open_protocol`
   (8 cases): a scripted plugin half plus the real `SecureStore` wrapped so
   `profilemig-*` writes can fail — the flag-write failure aborts before any
@@ -387,9 +435,13 @@ remove, no legacy data remains (`delete_site_session` also drops the
 * `android_bridge.rs` classifies open refusals host-side
   (`classify_site_open_error`): MULTI_PROFILE → its guidance,
   `profile-quarantined` → `AppError::Quarantined` with the recovery message
-  and never the raw sentinel, anything else unchanged; the plugin crate pins
-  both sentinel literals against the Kotlin source and asserts the two
-  sentinels stay disjoint.
+  and never the raw sentinel — for **every** wording the Kotlin ledger can
+  emit (one outstanding operation, several of them, and a verification that
+  predates the last settle) — anything else unchanged; the plugin crate pins
+  both sentinel literals against the Kotlin source, asserts the two sentinels
+  stay disjoint, and pins the ownership ledger (per-operation `quarantine`,
+  `settle`, `verified`, `retire`, the stale-verification condition, and the
+  absence of any blanket `release`/`reset` in production Kotlin).
 * `tests/back_close.test.js` (13 cases): the launcher close session —
   label survives pending/failed closes (no `finally`-clear), failure
   reason surfaced, no concurrent `close_site`, stale `site-closed` events
@@ -452,8 +504,13 @@ State-machine coverage that needs a real device/provider (actual
   permission granted by the reopened session was NOT revoked, and that the
   in-app log shows the stale `operationId`), a slow `removeAllCookies`
   (confirm the reopen is refused with the quarantine guidance, that the
-  refusal lifts once the wipe is retried and verified, and that no cookie of
-  the new session disappears), and a killed process during a quarantined
-  state (confirm the block is gone after restart and the site opens).**
+  refusal lifts only after every outstanding deletion has settled AND a
+  further wipe was verified, and that no cookie of the new session
+  disappears), **two overlapping clears where the first deletion answers only
+  after the second one succeeded (confirm the site stays closed until then,
+  that the in-app log reports the pending count, and that the first late
+  deletion does not remove a cookie the second clear's session created)**,
+  and a killed process while one or more deletions are outstanding (confirm
+  the ledger is gone after restart and the site opens).**
 * iOS/macOS: out of scope; the iOS path keeps the shared-WebView flow minus
   the removed snapshot machinery and was not touched beyond that.

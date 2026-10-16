@@ -675,15 +675,61 @@ mod tests {
             ops.contains("for (origin in origins) api.clear(origin)"),
             "the mutation must sit behind the claim, in the pure wipe"
         );
-        // The destructive call that CANNOT be gated raises the block instead.
+        // The destructive call that CANNOT be gated is registered instead —
+        // under its OWN operation id, so no later attempt can clear it.
         assert!(
-            ops.contains("ProfileQuarantine.quarantine(profileName, COOKIE_UNVERIFIED_REASON)"),
-            "an unverified removeAllCookies must quarantine the profile"
+            ops.contains("fun quarantine(profileName: String, operationId: Long, reason: String)"),
+            "the registry must be per destructive operation, not per profile name"
         );
         assert!(
-            ops.contains("ProfileQuarantine.release(profileName)"),
-            "a verified wipe (or a late answer) must lift the block"
+            ops.contains(
+                "ProfileQuarantine.quarantine(profileName, guard.operationId, COOKIE_UNVERIFIED_REASON)"
+            ),
+            "an unverified removeAllCookies must register its own operation"
         );
+        assert!(
+            ops.contains("ProfileQuarantine.settle(profileName, guard.operationId)"),
+            "a late callback may close ONLY the operation it belongs to"
+        );
+        assert!(
+            ops.contains("ProfileQuarantine.verified(profileName)"),
+            "a verified wipe records a verification; it must not release the name"
+        );
+        // A blanket release/reset would erase other operations' records, which
+        // is exactly the race the per-operation ledger exists to prevent.
+        assert!(
+            !ops.contains("ProfileQuarantine.release("),
+            "the blanket release API must not come back"
+        );
+        assert!(
+            !ops.contains("ProfileQuarantine.reset()")
+                && !controller.contains("ProfileQuarantine.reset()"),
+            "production Kotlin must never reset the ledger"
+        );
+        assert!(
+            controller.contains("ProfileQuarantine.retire(profileName)"),
+            "an accepted deletion (or absent profile) retires the name for good"
+        );
+        assert!(
+            controller.contains("ProfileQuarantine.isBlocked(profileName)"),
+            "the clear result must report the block through the new predicate"
+        );
+        // Reopenability is a PROVEN end state: nothing outstanding, and a
+        // verification newer than the last settle.
+        for marker in [
+            "val pending = LinkedHashMap<Long, String>()",
+            "STALE_VERIFICATION_REASON",
+            "fun isBlocked(profileName: String): Boolean",
+            "fun pendingOperations(profileName: String): List<Long>",
+            "if (state.verifiedAt < state.lastSettledAt) return STALE_VERIFICATION_REASON",
+            "fun settle(profileName: String, operationId: Long): Boolean",
+            "fun retire(profileName: String): Int",
+        ] {
+            assert!(
+                ops.contains(marker),
+                "the quarantine ledger must keep: {marker}"
+            );
+        }
         // Both open phases consult the gate before touching the provider, and
         // the real adapter delegates the sequencing to the pure wipe instead
         // of clearing origins inline.
