@@ -69,15 +69,70 @@ test("CI android job builds and uploads an installable debug APK", () => {
   assert.match(yml, /actions\/upload-artifact@v7/);
 });
 
-test("opening an Android site no longer shows the storage-isolation toast", () => {
+test("CI Kotlin step copies its test sources and reports the real cargo status", () => {
+  const yml = read(join(ROOT, ".github/workflows/ci.yml"));
+  // Both behaviour-test sources must reach the Gradle test source set, and a
+  // failed copy has to fail the step: `--tests "dev.animehub.app.*Test"`
+  // passes when ANY matching class exists, so a silently missing
+  // SiteProfileOpsTest.kt would shrink the suite to the policy test while
+  // the job stayed green.
+  for (const name of [
+    "SiteNavigationPolicyTest.kt",
+    "SiteProfileOpsTest.kt",
+    "SiteWebViewSettingsTest.kt",
+  ]) {
+    const at = yml.indexOf(
+      `cp src-tauri/android-plugin/kotlin/dev/animehub/app/${name}`,
+    );
+    assert.ok(at > 0, `${name} must be copied into the test source set`);
+    const line = yml.slice(at, yml.indexOf("\n", at));
+    assert.match(line, /\|\| \{/, `${name}: a failed copy must fail the step`);
+    assert.equal(line.includes("|| true"), false, `${name}: never masked`);
+  }
+  // The shared navigation-policy vectors are a test RESOURCE: the Kotlin suite
+  // loads navigation-policy.tsv from the classpath and the Rust suite includes
+  // the same file, so a missing copy must fail the step, not shrink the suite.
+  const fixtureAt = yml.indexOf("cp tests/fixtures/navigation-policy.tsv");
+  assert.ok(fixtureAt > 0, "the shared vectors must reach the test resources");
+  const fixtureLine = yml.slice(fixtureAt, yml.indexOf("\n", fixtureAt));
+  assert.match(fixtureLine, /src\/test\/resources/, "must land in the test resources");
+  assert.match(fixtureLine, /\|\| \{/, "a failed fixture copy must fail the step");
+  assert.equal(fixtureLine.includes("|| true"), false, "fixture copy never masked");
+
+  // The tauri-gradle generation build stays non-gating on purpose (the real
+  // gates are the Gradle exit code and the APK step), but the status it
+  // prints must come from cargo itself: `$?` after `|| true` is always 0 and
+  // made a failed generation look green in the log.
+  const cargoAt = yml.indexOf(
+    "cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android",
+  );
+  assert.ok(cargoAt > 0, "the tauri-gradle generation build is missing");
+  const cargoLine = yml.slice(cargoAt, yml.indexOf("\n", cargoAt));
+  assert.equal(cargoLine.includes("|| true"), false, "cargo status must not be masked");
+  const statusAt = yml.indexOf("cargo_status=$?", cargoAt);
+  assert.ok(statusAt > cargoAt, "the status is captured right after the build");
+  assert.match(yml, /set \+e/, "the step stays non-gating via set +e, not via masking");
+  // The real gates keep failing the job on their own.
+  assert.match(yml, /BUILD SUCCESSFUL" \/tmp\/kotlin-test\.log \|\| \{ echo "::error::BUILD SUCCESSFUL not found"; exit 1; \}/);
+  assert.match(yml, /exit \$status/);
+});
+
+test("the obsolete Android storage-isolation warning is gone from the UI", () => {
   const ui = read(join(ROOT, "src/main.js"));
   const start = ui.indexOf("async function openSite(tile)");
-  const end = ui.indexOf("/** Ask the backend to close", start);
+  const end = ui.indexOf("export async function backToLauncher", start);
   assert.ok(start >= 0 && end > start, "openSite function should be present");
   const openSite = ui.slice(start, end);
   assert.equal(openSite.includes("opened.isolated"), false);
   assert.equal(openSite.includes("şifreli blob'lara aktarılır"), false);
-  assert.match(ui, /aynı kaynaklı localStorage\/IndexedDB yalıtımı henüz çözülmedi/);
+  // Android now isolates per site through WebView profiles, so the old
+  // "same-origin isolation not yet solved" claim must not reappear anywhere,
+  // and the flag that surfaced it was removed with the claim.
+  assert.equal(
+    ui.includes("aynı kaynaklı localStorage/IndexedDB yalıtımı henüz çözülmedi"),
+    false,
+  );
+  assert.equal(ui.includes("androidIsolationNote"), false);
 });
 
 // The file `tauri android init` writes (crates/tauri-cli/templates/mobile/
@@ -114,6 +169,22 @@ function fakeGen(packageName, baseClass) {
 </manifest>
 `,
   );
+  // Root build.gradle.kts as `tauri android init` (CLI 2.11) writes it —
+  // kotlin-gradle-plugin 1.9.25 is the pin android_prepare must align.
+  writeFileSync(
+    join(gen, "build.gradle.kts"),
+    `buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.11.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25")
+    }
+}
+`,
+  );
   writeFileSync(
     join(gen, "app/build.gradle.kts"),
     `plugins {
@@ -141,6 +212,34 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     const kt = read(join(gen, "app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt"));
     assert.match(kt, /^package dev\.animehub\.app$/m);
     assert.match(kt, /fun keystore_seal/);
+    // The site-profile controller is required: AnimeHubPlugin's site_*
+    // commands have no other implementation.
+    const siteController = read(
+      join(gen, "app/src/main/java/dev/animehub/app/AnimeHubSiteController.kt"),
+    );
+    assert.match(siteController, /^package dev\.animehub\.app$/m);
+    assert.match(siteController, /object AnimeHubSiteController/);
+    assert.match(siteController, /WebViewFeature\.MULTI_PROFILE/);
+    // Reproducible androidx.webkit pin (multi-profile needs it; the fakeGen
+    // template ships no webkit line, so this also covers the append path).
+    const gradleFile = read(join(gen, "app/build.gradle.kts"));
+    assert.match(gradleFile, /implementation\("androidx\.webkit:webkit:1\.16\.0"\)/);
+    assert.equal(gradleFile.includes("webkit:1.14.0"), false);
+    assert.equal(gradleFile.split("androidx.webkit:webkit:").length, 1 + 1, "exactly one webkit dep");
+    // ...and the compiler-side half of the same contract: the generated
+    // project's Kotlin Gradle plugin is raised to the kotlin-stdlib family
+    // webkit 1.16.0 resolves (2.1.20), so the compiler reading the classpath
+    // is the same Kotlin that wrote it. Without this, CI fails with
+    // "Module was compiled with an incompatible version of Kotlin".
+    const rootGradle = read(join(gen, "build.gradle.kts"));
+    assert.match(rootGradle, /classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:2\.1\.20"\)/);
+    assert.equal(rootGradle.includes("kotlin-gradle-plugin:1.9.25"), false);
+    assert.equal(
+      rootGradle.split("kotlin-gradle-plugin:").length,
+      1 + 1,
+      "exactly one kotlin-gradle-plugin classpath",
+    );
+
     // IpPolicy.kt – saf IP mantigi, APK ve test ortak kullanir
     const ipPolicy = read(join(gen, "app/src/main/java/dev/animehub/app/IpPolicy.kt"));
     assert.match(ipPolicy, /^package dev\.animehub\.app$/m);
@@ -182,9 +281,17 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     assert.match(activity, /override fun onPictureInPictureRequested\(\): Boolean/);
     assert.match(activity, /override fun onUserLeaveHint\(\)/);
     assert.match(activity, /onPictureInPictureModeChanged\(/);
-    // WryActivity.onPause() pauses the WebView; PiP must keep it rendering.
+    // WryActivity.onPause() pauses the launcher WebView; the site view
+    // follows the Activity lifecycle, and PiP keeps rendering.
     assert.match(activity, /override fun onPause\(\)/);
     assert.match(activity, /keepRenderingInPip\(/);
+    assert.match(activity, /override fun onResume\(\)/);
+    assert.match(activity, /AnimeHubSiteController\.onPause\(this\)/);
+    assert.match(activity, /AnimeHubSiteController\.onResume\(this\)/);
+    // Site view torn down (profile flushed) before PiP unbind on destroy.
+    const destroyAt = activity.indexOf("AnimeHubSiteController.destroy(this)");
+    const detachAt = activity.indexOf("AnimeHubPipController.detach(this)");
+    assert.ok(destroyAt > 0 && destroyAt < detachAt);
     // A finished Activity leaves Tauri's per-process state stale: end the process.
     assert.match(activity, /if \(isFinishing\) \{/);
     assert.match(activity, /android\.os\.Process\.killProcess\(android\.os\.Process\.myPid\(\)\)/);
@@ -211,6 +318,9 @@ test("android_prepare copies the bridge and patches PiP exactly once", () => {
     // signing block injected exactly once (marker pair, not duplicated)
     const gradle2 = read(join(gen, "app/build.gradle.kts"));
     assert.equal(gradle2.split("AnimeHub release signing").length - 1, 2);
+    const rootGradle2 = read(join(gen, "build.gradle.kts"));
+    assert.equal(rootGradle2.split("kotlin-gradle-plugin:").length, 1 + 1, "KGP pin idempotent");
+    assert.match(rootGradle2, /kotlin-gradle-plugin:2\.1\.20/);
   } finally {
     rmSync(gen, { recursive: true, force: true });
   }
@@ -353,8 +463,20 @@ test("Android navigation policy: numeric IPv4 spellings and documentation ranges
   const ktPolicy = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/IpPolicy.kt"));
   const ktSite = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicy.kt"));
   const kt = ktPlugin + "\n" + ktPolicy + "\n" + ktSite;
-  assert.match(kt, /NUMERIC_LABEL = Regex\("""\(0x\[0-9a-f\]\*\|\[0-9\]\+\)""", RegexOption\.IGNORE_CASE\)/);
-  assert.match(kt, /if \(NUMERIC_LABEL\.matches\(bare\.substringAfterLast\('\.'\)\)\) \{/);
+  // Numeric host forms now go through the WHATWG IPv4 parser in IpPolicy, the
+  // same algorithm the desktop `url` crate runs: `010.0.0.1` is 8.0.0.1 (public)
+  // while `0177.0.0.1` is 127.0.0.1 (loopback). A regex on the last label cannot
+  // express that, and Android's Uri does not normalise hosts for us.
+  assert.match(ktPolicy, /fun parseIpv4\(host: String\): String\?/);
+  assert.match(ktPolicy, /fun endsInANumber\(host: String\): Boolean/);
+  assert.match(ktSite, /if \(IpPolicy\.endsInANumber\(bare\)\) \{/);
+  assert.match(ktSite, /val canonical = IpPolicy\.parseIpv4\(bare\) \?: return false/);
+  assert.equal(/NUMERIC_LABEL/.test(kt), false, "the old last-label regex must be gone");
+  // ... and the Rust side uses the same parser instead of its own rule.
+  const rs = read(join(ROOT, "src-tauri/src/sites/url_policy.rs"));
+  assert.match(rs, /fn ends_in_a_number\(host: &str\) -> bool/);
+  // (clippy: `bare` is already a &str, so no extra reference)
+  assert.match(rs, /if ends_in_a_number\(bare\)/);
   // Documentation ranges, as Rust url_policy::is_public_ip rejects them – now in IpPolicy.kt
   assert.match(kt, /\(a == 198 && b == 51 && c == 100\)/);
   assert.match(kt, /\(a == 203 && b == 0 && c == 113\)/);
@@ -396,14 +518,22 @@ test("Android IPC is limited to the launcher origins and main frame, never a sit
 test("Android in-app log: one shared buffer, no site URLs or hosts in any line", () => {
   const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
   const pip = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
-  // The buffer lives in the copied plugin file, not in a new file android_prepare.py would skip.
-  assert.match(kt, /^object AnimeHubDebugLog \{/m);
+  const debugLog = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubDebugLog.kt"));
+  const controller = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubSiteController.kt"));
+  const prepare = read(join(ROOT, "scripts/android_prepare.py"));
+  // The buffer moved to its own file so the CI unit test compiles it — and
+  // android_prepare.py must copy that file or the APK would not build.
+  assert.match(debugLog, /^object AnimeHubDebugLog \{/m);
+  assert.equal(/^object AnimeHubDebugLog \{/m.test(kt), false, "buffer no longer in the plugin file");
+  assert.match(prepare, /"AnimeHubDebugLog"/, "the split buffer file must be copied");
   assert.doesNotMatch(pip, /object AnimeHubPipLog/);
+  // The @Command entry point stays on the plugin class (Tauri dispatches
+  // commands through the registered instance's methods only).
   assert.match(kt, /@Command\s+fun debug_log\(/);
   const rs = read(join(ROOT, "src-tauri/android-plugin/src/lib.rs"));
   assert.match(rs, /CMD_DEBUG_LOG: &str = "debug_log"/);
   // Every add() call: no URL, host, path or uri object in the message.
-  const calls = [...(kt + pip).matchAll(/AnimeHubDebugLog\.add\(([^\n]*)\)/g)].map((m) => m[1]);
+  const calls = [...(kt + pip + controller + debugLog).matchAll(/AnimeHubDebugLog\.add\(([^\n]*)\)/g)].map((m) => m[1]);
   assert.ok(calls.length >= 8, `expected the log calls, found ${calls.length}`);
   for (const args of calls) {
     assert.doesNotMatch(args, /\.host\b|\burl\b|\.path\b|\bhost\b|\buri\b(?!\.scheme\b)|\bbody\b/i, args);
@@ -517,4 +647,91 @@ test("Android-only settings are marked and hidden by platform in main.js", () =>
   assert.match(main, /async function applyPlatformVisibility\(\)/);
   assert.match(main, /node\.dataset\.platform === "android" && isAndroid/);
   assert.match(main, /await applyPlatformVisibility\(\);\n\s*const s = await call\("get_settings"\)/);
+});
+
+test("CI keeps no workflow-wide token, no PR-comment dump and no masked prep failure", () => {
+  const yml = read(join(ROOT, ".github/workflows/ci.yml"));
+  // Negative assertions run against the file with full-line comments stripped:
+  // this workflow explains (in comments) exactly what it no longer does, and a
+  // comment mentioning `pull-requests: write` must not satisfy the check.
+  const code = yml
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+
+  // AH-09 / AH-P6: a build-and-test workflow needs no write token. Exporting
+  // `github.token` to every step of every job meant a compromised build step on
+  // a fork PR held a token that could comment on (and with pull-requests:write,
+  // edit around) the pull request.
+  assert.equal(
+    /GH_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}/.test(code),
+    false,
+    "no workflow-level GH_TOKEN",
+  );
+  assert.equal(/pull-requests:\s*write/.test(code), false, "no pull-requests: write");
+  assert.match(yml, /permissions:\n  contents: read/, "least privilege stays explicit");
+  // The release workflows set their own step-scoped token; this one must not.
+  assert.equal(/\bgh pr comment\b/.test(code), false, "no PR-comment dump");
+  assert.equal(code.includes("DEBUG123"), false, "the debug dump marker is gone");
+  assert.match(code, /GITHUB_STEP_SUMMARY/, "diagnostics go to the step summary");
+
+  // A mandatory prep step must keep its own exit code: `| head ... || true`
+  // reported head's status, so a failed android_prepare.py looked green and the
+  // APK step built without the Tauri plugin sources.
+  assert.equal(
+    /python3 scripts\/android_prepare\.py[^\n]*\|\s*head[^\n]*\|\|\s*true/.test(code),
+    false,
+    "android_prepare.py must not be piped into a masked head",
+  );
+  assert.match(code, /prepare_status=\$\?/, "python's own status is captured");
+  assert.match(code, /exit "\$prepare_status"/, "and it fails the step");
+  // The Gradle verdict still wins when both fail: the test result is reported
+  // before the restore status is checked.
+  const testVerdict = code.indexOf("if [ $status -ne 0 ]; then");
+  const prepVerdict = code.indexOf('if [ "$prepare_status" -ne 0 ]; then');
+  assert.ok(testVerdict > 0, "the Gradle verdict is still checked");
+  assert.ok(prepVerdict > testVerdict, "test failure is reported first");
+
+  // No sandbox-only absolute path may survive into a runner script.
+  assert.equal(code.includes("/home/user/"), false, "runner scripts must use relative paths");
+
+  // ... and nothing is skipped to make the job green.
+  assert.equal(/continue-on-error:\s*true/.test(code), false, "no continue-on-error");
+});
+
+test("CI restores the Kotlin sources it moved out, from a path that exists", () => {
+  const yml = read(join(ROOT, ".github/workflows/ci.yml"));
+  const code = yml
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+
+  // The unit-test step cd's into the generated project for Gradle. Everything
+  // after that uses repo-relative paths, so it has to come back: the restore
+  // used to run from src-tauri/gen/android, where the MainActivity path does not
+  // exist and android_prepare.py cannot even be opened (exit 2), and `| head
+  // || true` hid both.
+  const cdIn = code.indexOf("cd src-tauri/gen/android");
+  const cdBack = code.indexOf('cd "$GITHUB_WORKSPACE"');
+  assert.ok(cdIn > 0, "the Gradle cd is missing");
+  assert.ok(cdBack > cdIn, "the step must return to the workspace root");
+  const prepareAt = code.indexOf("prepare_status=$?");
+  assert.ok(prepareAt > cdBack, "android_prepare.py must run from the workspace root");
+
+  // The APK step re-runs prepare through an absolute path and verifies the
+  // plugin sources are really in the generated source set. This is the last
+  // place it can be fixed: an APK built without AnimeHubPlugin.kt compiles and
+  // links fine, and only fails at runtime on a device.
+  const apkAt = code.indexOf("- name: Build installable debug APK");
+  assert.ok(apkAt > 0, "the APK step is missing");
+  const apkStep = code.slice(apkAt, code.indexOf("- name:", apkAt + 10));
+  assert.match(apkStep, /python3 "\$GITHUB_WORKSPACE\/scripts\/android_prepare\.py"/);
+  assert.match(apkStep, /for required in AnimeHubPlugin /);
+  assert.match(apkStep, /is missing from the generated source set/);
+  assert.match(apkStep, /exit 1/, "a missing source must fail the step");
+  assert.equal(
+    /android_prepare\.py[^\n]*\|\|\s*true/.test(apkStep),
+    false,
+    "the APK-step prepare must never be masked",
+  );
 });

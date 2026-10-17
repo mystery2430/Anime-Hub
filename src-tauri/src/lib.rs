@@ -51,8 +51,6 @@ pub fn run() {
             commands::open_site,
             commands::close_site,
             commands::clear_site_data,
-            commands::get_site_cookies,
-            commands::set_site_cookies,
             commands::get_settings,
             commands::update_settings,
             commands::reset_blocklist,
@@ -215,6 +213,48 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         pip_generation: AtomicU64::new(0),
     });
 
+    // Android: finish deferred profile deletions before the frontend can
+    // open anything (see `drain_pending_profile_deletes`). A throwaway
+    // thread, like the PiP startup apply: the Kotlin bridge may not answer
+    // in the first moments of the process, so failures are retried a few
+    // times and then left for the next start — the queue never loses an
+    // entry because of a slow boot.
+    #[cfg(target_os = "android")]
+    {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+            for attempt in 0..8 {
+                let stop = match handle.try_state::<AppState>() {
+                    Some(state) => match crate::web::windows::lock_android_session() {
+                        Ok(_guard) => match drain_pending_profile_deletes(&state) {
+                            Ok(done) => done,
+                            Err(e) => {
+                                // Storage failure: retrying now would fail the
+                                // same way; the queue stays for the next start.
+                                log::error!("ertelenen profil silmeleri okunamadı: {e}");
+                                true
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("ertelenen profil silmeleri kilitlenemedi: {e}");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if stop {
+                    return;
+                }
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+            log::warn!(
+                "ertelenen profil silmeleri bu açılışta işlenemedi; sonraki açılışta yeniden denenecek"
+            );
+        });
+    }
+
     // Route the OAuth redirect into the login command on every platform.
     //
     // On desktop the scheme is not registered by the OS installer, so do it
@@ -246,7 +286,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle().clone();
     app.deep_link().on_open_url(move |event| {
         for url in event.urls() {
-            if url.scheme() != OAUTH_SCHEME || url.host_str() != Some("anilist") {
+            // Exact registered redirect only; see `is_registered_mobile_callback`.
+            if !is_registered_mobile_callback(url.as_ref()) {
+                log::warn!(
+                    "kayıtlı olmayan deep-link yok sayıldı (şema: {})",
+                    url.scheme()
+                );
                 continue;
             }
             let handle = handle.clone();
@@ -269,6 +314,73 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Drain the deferred Android profile-deletion queue for one round.
+///
+/// Returns `Ok(true)` when the queue needs no further attempts this process
+/// (emptied, or the remainder only awaits a later start), `Ok(false)` when
+/// the plugin bridge was not ready yet and the caller should retry.
+///
+/// Chromium refuses to delete a profile that is loaded in the current
+/// process (`AwBrowserContextStore::Delete` returns in-use), and a provider
+/// without `MULTI_PROFILE` cannot delete at all — both outcomes were queued
+/// by `remove_site` instead of being reported as a success. Draining runs at
+/// startup *before* any site can open, so a queued name can never be
+/// re-created while its on-disk deletion is still pending. A name that still
+/// refuses to delete stays queued; the "clear all" orphan sweep in
+/// `clear_site_data` is the second safety net.
+#[cfg(target_os = "android")]
+fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult<bool> {
+    use crate::android_bridge::SiteProfileAction;
+    use crate::web::windows as w;
+    let pending = w::read_pending_profile_deletes(state)?;
+    if pending.is_empty() {
+        return Ok(true);
+    }
+    log::info!("ertelenen profil silmeleri deneniyor: {}", pending.len());
+    for name in &pending {
+        match crate::android_bridge::site_profile_delete(name) {
+            Ok(SiteProfileAction::Deleted) | Ok(SiteProfileAction::Absent) => {
+                // Durable queue removal FIRST, then the quarantine ledger — the
+                // same order `run_mobile_delete_protocol` keeps for the direct
+                // path. A retire failure must not undo the fact that the
+                // deletion landed, so it is logged: keeping the ledger only
+                // blocks a name nothing can derive any more.
+                w::forget_pending_profile_delete(state, name)?;
+                match crate::android_bridge::site_profile_retire(name) {
+                    Ok(dropped) if dropped > 0 => log::info!(
+                        "ertelenen profil karantinası emekliye ayrıldı ({dropped} bekleyen kayıt)"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("ertelenen profil karantinası emekliye ayrılamadı ({name}): {e}")
+                    }
+                }
+                log::info!("ertelenen profil verisi silindi");
+            }
+            Ok(SiteProfileAction::Pending) => {
+                // Still in use or still unsupported: keep it queued for a
+                // later start. Never reported to the user as deleted.
+                log::warn!("ertelenen profil silme bir kez daha ertelendi");
+            }
+            Err(crate::error::AppError::Unsupported(_)) => {
+                // The provider has no profile API on this device: nothing
+                // will delete here until it does. Keep the name queued (so a
+                // later provider update can drain it) and continue — a
+                // feature gap must not abort the remaining names or be
+                // reported as success.
+                log::warn!(
+                    "ertelenen profil silme atlandı: sağlayıcı profilleri desteklemiyor ({name})"
+                );
+            }
+            Err(e) => {
+                log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Choose the secret backend for this platform.
 fn build_provider(config_dir: &std::path::Path) -> AppResult<Box<dyn SecretProvider>> {
     #[cfg(target_os = "android")]
@@ -285,7 +397,39 @@ fn build_provider(config_dir: &std::path::Path) -> AppResult<Box<dyn SecretProvi
 
 /// Full callback URL for the mobile OAuth redirect.
 pub fn mobile_callback_url(query: &str) -> String {
-    format!("{OAUTH_SCHEME}://{OAUTH_CALLBACK_PATH}?{query}")
+    format!("{}?{query}", mobile_redirect_uri())
+}
+
+/// The exact redirect URI the mobile deep link is registered for.
+///
+/// Built from the same constants that build the callback URL, so the value the
+/// OAuth parser compares against and the value the OS intent filter matches
+/// cannot drift apart. It must stay equal to `plugins.deep-link.mobile` in
+/// `tauri.conf.json` (`scheme: animehub`, `host: anilist`,
+/// `pathPrefix: /callback`) — `tests/security.test.js` pins that.
+pub fn mobile_redirect_uri() -> String {
+    format!("{OAUTH_SCHEME}://{OAUTH_CALLBACK_PATH}")
+}
+
+/// True when `raw` is the registered mobile redirect URI (optionally with a
+/// query), and nothing else.
+///
+/// WHY A SEPARATE FUNCTION: the deep-link closure can only run on a device, so
+/// its decision is extracted here where host tests can exercise it. The old
+/// filter compared scheme and host only, which let `animehub://anilist/other`
+/// or `animehub://anilist/callback/extra` reach the login command; the command
+/// now rejects those too (`anilist::parse_callback`), but an intent that is not
+/// ours should not start a token exchange at all.
+pub fn is_registered_mobile_callback(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Ok(expected) = url::Url::parse(&mobile_redirect_uri()) else {
+        return false;
+    };
+    url.scheme() == expected.scheme()
+        && url.host_str() == expected.host_str()
+        && url.path() == expected.path()
 }
 
 #[cfg(test)]
@@ -296,10 +440,82 @@ mod tests {
     fn callback_url_uses_the_registered_scheme() {
         let u = mobile_callback_url("code=abc&state=s1");
         assert_eq!(u, "animehub://anilist/callback?code=abc&state=s1");
-        // Must be parseable by the same parser the command uses.
-        let (code, state) = crate::anilist::parse_callback(&u).unwrap();
+        // Must be parseable by the same parser the command uses, against the
+        // same redirect URI the command will pass in.
+        let (code, state) = crate::anilist::parse_callback(&u, &mobile_redirect_uri()).unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "s1");
+    }
+
+    #[test]
+    fn mobile_intent_filter_accepts_only_the_registered_redirect() {
+        assert!(is_registered_mobile_callback(&mobile_redirect_uri()));
+        assert!(is_registered_mobile_callback(&mobile_callback_url(
+            "code=a&state=b"
+        )));
+        assert!(is_registered_mobile_callback(
+            "ANIMEHUB://anilist/callback?code=a&state=b"
+        ));
+
+        // A hijacked or merely similar intent must not reach the login command.
+        for raw in [
+            "animehub://evil/callback?code=a&state=b",
+            "animehub://anilist/other?code=a&state=b",
+            "animehub://anilist/callback/extra?code=a&state=b",
+            "animehub://anilist?code=a&state=b",
+            "animehub:/anilist/callback?code=a&state=b",
+            "https://anilist/callback?code=a&state=b",
+            "http://127.0.0.1:17395/callback?code=a&state=b",
+            "",
+            "not a url",
+            "//anilist/callback?code=a&state=b",
+        ] {
+            assert!(!is_registered_mobile_callback(raw), "{raw} kabul edildi");
+        }
+    }
+
+    #[test]
+    fn registered_mobile_redirect_matches_the_deep_link_config() {
+        // The runtime intent filter and `tauri.conf.json` must describe the same
+        // redirect, or the OS hands the callback to nobody.
+        let conf = include_str!("../tauri.conf.json");
+        let conf: serde_json::Value = serde_json::from_str(conf).expect("tauri.conf.json");
+        let mobile = &conf["plugins"]["deep-link"]["mobile"];
+        let entries = mobile.as_array().expect("mobile deep-link listesi");
+        // In tauri.conf.json both `scheme` and `pathPrefix` are LISTS
+        // (`"scheme": ["animehub"]`, `"pathPrefix": ["/callback"]`), which is
+        // what the generated Android intent filter is built from. Reading them
+        // as strings silently matched nothing.
+        let entry = entries
+            .iter()
+            .find(|e| {
+                e["scheme"].as_array().is_some_and(|list| {
+                    list.iter()
+                        .any(|scheme| scheme.as_str() == Some(OAUTH_SCHEME))
+                })
+            })
+            .expect("animehub şeması kayıtlı olmalı");
+        let uri = mobile_redirect_uri();
+        assert!(uri.starts_with(&format!("{OAUTH_SCHEME}://")), "{uri}");
+        let host = entry["host"]
+            .as_str()
+            .expect("deep-link host'u bir dize olmalı");
+        assert!(uri.contains(host), "{uri} config host'u içermeli: {host}");
+        let prefixes: Vec<&str> = entry["pathPrefix"]
+            .as_array()
+            .expect("pathPrefix bir liste olmalı")
+            .iter()
+            .filter_map(|prefix| prefix.as_str())
+            .collect();
+        assert!(!prefixes.is_empty(), "pathPrefix listesi boş");
+        assert!(
+            prefixes.iter().any(|prefix| uri.ends_with(prefix)),
+            "{uri} config pathPrefix değerlerinden biriyle bitmeli: {prefixes:?}"
+        );
+        // ... and the OAuth parser agrees with the intent filter.
+        let callback = mobile_callback_url("code=a&state=b");
+        assert!(crate::anilist::parse_callback(&callback, &uri).is_ok());
+        assert!(crate::anilist::parse_callback(&callback, "animehub://evil/callback").is_err());
     }
 
     #[test]
@@ -337,5 +553,97 @@ mod tests {
         let p2 = build_provider(dir.path()).unwrap();
         let (reg, _) = p2.load_registry();
         assert!(reg.sites.iter().any(|s| s.name == "Kalıcı"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC surface
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn frontend_sources() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../src")),
+        &mut out,
+    );
+    out
+}
+
+#[cfg(test)]
+mod ipc_surface_tests {
+    /// Commands that must stay OFF the invoke surface.
+    ///
+    /// Both were reachable from any page in the launcher WebView and took the
+    /// site id / whole jar from the caller, i.e. they let the frontend read or
+    /// overwrite every site's encrypted cookie jar with no site ownership,
+    /// profile-generation or quarantine check in the path. Nothing in `src/`,
+    /// the mobile plugin or any other Rust path called them (the 0.3.4 jar
+    /// import lives inside `web::windows`), so they are gone rather than
+    /// gated.
+    #[test]
+    fn raw_cookie_jar_commands_are_gone_from_the_ipc_surface() {
+        let handlers = include_str!("lib.rs");
+        let commands = include_str!("commands.rs");
+        let mut checked = 0usize;
+
+        for prefix in ["get", "set"] {
+            // Built at runtime on purpose: writing the literal name in this
+            // test would make `contains` match the assertion itself.
+            let name = format!("{prefix}_site_cookies");
+            checked += 1;
+
+            let registration = format!("commands::{name}");
+            assert!(
+                !handlers.contains(&registration),
+                "{name} hâlâ invoke_handler'da kayıtlı"
+            );
+            let definition = format!("pub fn {name}");
+            assert!(
+                !commands.contains(&definition),
+                "{name} hâlâ bir komut olarak tanımlı"
+            );
+            let frontend = crate::frontend_sources();
+            assert!(!frontend.is_empty(), "frontend kaynakları bulunamadı");
+            for path in frontend {
+                let text = std::fs::read_to_string(&path).expect("kaynak okunabilmeli");
+                assert!(
+                    !text.contains(&name),
+                    "{} {name} komutuna başvuruyor (çağrı, alias, ne olursa)",
+                    path.display()
+                );
+            }
+        }
+        assert_eq!(checked, 2, "iki komut da denetlenmeli");
+    }
+
+    /// The jar itself is still used where it belongs: the 0.3.4 import and the
+    /// mobile open/clear/delete protocols read and write it directly through
+    /// the storage provider.
+    #[test]
+    fn cookie_jar_storage_keys_still_have_a_production_user() {
+        let windows = include_str!("web/windows.rs");
+        // Built at runtime so this assertion does not match its own text.
+        let needle = format!("cookies-{}", "{");
+        assert!(
+            windows.contains(&needle),
+            "web/windows.rs site çerez anahtarını üretmeli"
+        );
+        let jar = include_str!("web/session.rs");
+        assert!(jar.contains("pub struct CookieJar"), "CookieJar durmalı");
     }
 }

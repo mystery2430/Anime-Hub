@@ -196,48 +196,165 @@ pub fn oauth_error_message(code: &str) -> &'static str {
 ///
 /// Accepts both the loopback (`http://127.0.0.1:PORT/callback?code=…`) and
 /// custom-scheme (`animehub://anilist/callback?code=…`) forms so the same code
-/// serves desktop and Android.
-pub fn parse_callback(raw: &str) -> AppResult<(String, String)> {
+/// Split a callback URL into `(code, state)`, accepting ONLY the exact redirect
+/// URI the pending login was started with.
+///
+/// WHY "exact" AND NOT "is it loopback?": the old check accepted any
+/// `http://localhost:ANY_PORT/ANY_PATH` and, for the custom scheme, any
+/// `animehub://ANY_HOST/ANY_PATH`. A registered deep-link scheme can be claimed
+/// by another installed app, and a loopback port/path that is not ours is not
+/// our listener — so the callback has to match the configured redirect URI
+/// (scheme, host, port and path) before its `code` is worth anything. Anything
+/// else is rejected, and a repeated `code`/`state` parameter is rejected too:
+/// one callback carries exactly one of each.
+///
+/// This does NOT and cannot fix custom-scheme hijacking on Android (another app
+/// registering `animehub://anilist/callback` still receives the OS intent) —
+/// see `docs/` and the PR description; that needs provider-side PKCE or an
+/// app-link/asset-statement flow, and AniList's documented flow offers neither.
+pub fn parse_callback(raw: &str, expected_redirect: &str) -> AppResult<(String, String)> {
     let url =
         url::Url::parse(raw).map_err(|_| AppError::AniList("geçersiz dönüş adresi".into()))?;
+    let expected = url::Url::parse(expected_redirect)
+        .map_err(|_| AppError::AniList("yapılandırılmış dönüş adresi geçersiz".into()))?;
 
+    if url.scheme() != expected.scheme() {
+        return Err(AppError::AniList(format!(
+            "beklenmeyen dönüş şeması: {}",
+            url.scheme()
+        )));
+    }
+    let host = url.host_str().unwrap_or_default();
+    let expected_host = expected.host_str().unwrap_or_default();
     match url.scheme() {
-        "http" => {
-            let host = url.host_str().unwrap_or_default();
-            if host != "127.0.0.1" && host != "localhost" {
+        "http" | "https" => {
+            // Loopback only — and only OUR loopback endpoint.
+            if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
                 return Err(AppError::AniList(
                     "OAuth dönüşü yalnızca yerel adresten kabul edilir".into(),
                 ));
             }
+            if host != expected_host {
+                return Err(AppError::AniList(
+                    "dönüş adresinin host'u beklenenden farklı".into(),
+                ));
+            }
+            if url.port_or_known_default() != expected.port_or_known_default() {
+                return Err(AppError::AniList(
+                    "dönüş adresinin port'u beklenenden farklı".into(),
+                ));
+            }
         }
-        "animehub" => {}
+        // The custom scheme is registered with an exact host and path prefix
+        // (`animehub://anilist/callback` in tauri.conf.json), so accept nothing
+        // else: `animehub://evil/...` must not be able to carry a code here.
+        "animehub" => {
+            if host != expected_host {
+                return Err(AppError::AniList(
+                    "dönüş adresinin host'u beklenenden farklı".into(),
+                ));
+            }
+        }
         other => {
             return Err(AppError::AniList(format!(
                 "beklenmeyen dönüş şeması: {other}"
             )))
         }
     }
+    if url.path() != expected.path() {
+        return Err(AppError::AniList(
+            "dönüş adresinin yolu beklenenden farklı".into(),
+        ));
+    }
 
     // An error response (user denied consent) comes back as ?error=…
     let mut code = None;
     let mut state = None;
     let mut oauth_error = None;
+    let mut duplicated: Option<&str> = None;
     for (k, v) in url.query_pairs() {
         match k.as_ref() {
-            "code" => code = Some(v.to_string()),
-            "state" => state = Some(v.to_string()),
+            "code" => {
+                if code.replace(v.to_string()).is_some() {
+                    duplicated = Some("code");
+                }
+            }
+            "state" => {
+                if state.replace(v.to_string()).is_some() {
+                    duplicated = Some("state");
+                }
+            }
             "error" => oauth_error = Some(v.to_string()),
             _ => {}
         }
+    }
+    if let Some(field) = duplicated {
+        return Err(AppError::AniList(format!(
+            "dönüş adresinde birden fazla {field} parametresi var"
+        )));
     }
 
     if let Some(e) = oauth_error {
         return Err(AppError::AniList(oauth_error_message(&e).to_string()));
     }
 
-    let code = code.ok_or_else(|| AppError::AniList("dönüş adresinde kod yok".into()))?;
-    let state = state.ok_or_else(|| AppError::AniList("dönüş adresinde state yok".into()))?;
+    // Present-but-empty (`?code=&state=`) counts as absent: an empty state would
+    // otherwise compare equal to an empty pending slot.
+    let code = code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| AppError::AniList("dönüş adresinde kod yok".into()))?;
+    let state = state
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| AppError::AniList("dönüş adresinde state yok".into()))?;
     Ok((code, state))
+}
+
+/// What the single-use OAuth state slot decided about one callback.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PendingState {
+    /// No login was pending at all.
+    None,
+    /// The state matched and the attempt is now CONSUMED (the slot is empty).
+    Consumed(String),
+    /// A login is pending but this state does not match it. The genuine attempt
+    /// is deliberately left in place, so a bogus or replayed callback cannot
+    /// destroy a real login.
+    Mismatched,
+}
+
+/// Consume the pending OAuth attempt **if and only if** the returned state
+/// matches, atomically under the slot's lock.
+///
+/// WHY CONSUME-BEFORE-EXCHANGE: the old handler cloned the pending state,
+/// compared it, exchanged the code and only then cleared the slot — so two
+/// callbacks carrying the same state (a retry, a replayed deep link, or the
+/// loopback listener and the OS intent arriving together) both passed the check
+/// and raced two token exchanges and two token writes. Taking the value while
+/// still holding the lock makes the attempt single-use: the loser finds no
+/// pending session and is refused, and a *mismatched* state never consumes
+/// anything, so a stray callback cannot burn a legitimate login.
+pub fn take_pending_state(
+    slot: &std::sync::Mutex<Option<String>>,
+    returned_state: &str,
+) -> AppResult<PendingState> {
+    let mut guard = slot
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+    Ok(match guard.as_deref() {
+        // No pending session — including a slot that somehow holds an empty
+        // state, which must never compare equal to anything.
+        None | Some("") => PendingState::None,
+        Some(expected) => {
+            if state_matches(expected, returned_state) {
+                match guard.take() {
+                    Some(taken) => PendingState::Consumed(taken),
+                    None => PendingState::None,
+                }
+            } else {
+                PendingState::Mismatched
+            }
+        }
+    })
 }
 
 /// Constant-time comparison of the returned `state`.
@@ -939,40 +1056,154 @@ impl LoopbackListener {
         &self.redirect_uri
     }
 
-    /// Wait for the single redirect request. Returns the raw request target.
+    /// Wait for the redirect request. Returns the raw request target.
+    ///
+    /// The listener survives anything else that shows up on the port: a
+    /// speculative browser preconnect, a favicon probe, a fragmented request
+    /// line, a silent or oversized client. Each of those is answered and closed,
+    /// and the wait continues until the real callback arrives or `timeout`
+    /// expires. It used to accept exactly ONE connection and read it with a
+    /// single `read`, so the first unrelated socket — or a request line that
+    /// arrived in two segments — consumed the whole authorisation.
     pub async fn wait_for_callback(&self, timeout: std::time::Duration) -> AppResult<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(AppError::AniList(
+                    "yetkilendirme zaman aşımına uğradı".into(),
+                ));
+            }
+            match tokio::time::timeout(remaining, self.accept_one()).await {
+                Ok(Ok(Accepted::Callback(target))) => return Ok(target),
+                Ok(Ok(Accepted::Ignored)) => continue,
+                Ok(Err(e)) => {
+                    return Err(AppError::AniList(format!("geri çağırma dinlenemedi: {e}")));
+                }
+                Err(_) => {
+                    return Err(AppError::AniList(
+                        "yetkilendirme zaman aşımına uğradı".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The path the registered redirect URI points at (`/callback`).
+    fn callback_path(&self) -> String {
+        url::Url::parse(&self.redirect_uri)
+            .map(|url| url.path().to_string())
+            .unwrap_or_else(|_| "/callback".to_string())
+    }
+
+    /// Handle one connection: read the header block within a bounded budget,
+    /// answer it, and say whether it was the callback.
+    async fn accept_one(&self) -> AppResult<Accepted> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let accept = async {
-            let (mut sock, _peer) = self.listener.accept().await?;
-            let mut buf = vec![0u8; 4096];
-            let n = sock.read(&mut buf).await?;
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+        let (mut sock, _peer) = self.listener.accept().await?;
 
-            let body = CALLBACK_HTML;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.flush().await;
-            Ok::<String, std::io::Error>(req)
+        // Incremental, bounded, time-bounded. One `read` is not guaranteed to
+        // carry the whole request line, and a truncated target used to fail an
+        // otherwise valid authorisation; an unbounded read would let any local
+        // process make us buffer forever.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut complete = false;
+        let read_deadline = tokio::time::Instant::now() + CONNECTION_READ_BUDGET;
+        while buf.len() < MAX_REQUEST_BYTES {
+            let remaining = read_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sock.read(&mut chunk)).await {
+                Ok(Ok(0)) => break, // peer closed without finishing
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                        complete = true;
+                        break;
+                    }
+                }
+                // A slow or broken client loses its connection, not the flow.
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        let oversized = !complete && buf.len() >= MAX_REQUEST_BYTES;
+
+        let req = String::from_utf8_lossy(&buf);
+        let mut parts = req.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("");
+        // Only the registered redirect path counts, so a probe cannot consume
+        // the authorisation and the completion page is still only ever served
+        // for the real callback.
+        let is_callback = complete
+            && !oversized
+            && method == "GET"
+            && target.split('?').next().unwrap_or("") == self.callback_path();
+
+        let (status, body) = if is_callback {
+            ("200 OK", CALLBACK_HTML)
+        } else if oversized {
+            ("413 Payload Too Large", "")
+        } else {
+            ("404 Not Found", "")
         };
+        let resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.flush().await;
+        if !complete {
+            // The peer is still sending (a flood, or a client that never
+            // finished its headers). Drain briefly and discard so the close is
+            // a FIN rather than a RST — a reset would throw our own answer away
+            // on the client side. Bounded by the budget, never by the peer.
+            let drain_deadline = tokio::time::Instant::now() + RESPONSE_DRAIN_BUDGET;
+            loop {
+                let remaining =
+                    drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, sock.read(&mut chunk)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(_)) => continue,
+                }
+            }
+        }
+        let _ = sock.shutdown().await;
 
-        let req = tokio::time::timeout(timeout, accept)
-            .await
-            .map_err(|_| AppError::AniList("yetkilendirme zaman aşımına uğradı".into()))??;
-
-        // "GET /callback?code=…&state=… HTTP/1.1"
-        let target = req
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| AppError::AniList("geçersiz istek".into()))?
-            .to_string();
-        Ok(target)
+        Ok(if is_callback {
+            Accepted::Callback(target.to_string())
+        } else {
+            Accepted::Ignored
+        })
     }
+}
+
+/// Hard cap on one request's header block. A browser OAuth callback is a few
+/// hundred bytes; anything larger is not our request and is never buffered
+/// further.
+const MAX_REQUEST_BYTES: usize = 8 * 1024;
+
+/// Per-connection budget for the header block, so one silent client cannot
+/// consume the whole authorisation window.
+const CONNECTION_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Budget for discarding what a refused peer is still sending, so our answer
+/// reaches it instead of being lost to a reset.
+const RESPONSE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What one accepted connection turned out to be.
+enum Accepted {
+    /// The OAuth redirect, as the raw request target (`/callback?code=…`).
+    Callback(String),
+    /// Anything else: answered, closed, and the wait continues.
+    Ignored,
 }
 
 /// Static completion page. Contains no reflected input.
@@ -996,6 +1227,14 @@ pub fn zeroize_secret(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The desktop loopback redirect the deep-link/loopback flow starts with
+    /// (`DEFAULT_REDIRECT_URI`).
+    const LOOPBACK: &str = "http://127.0.0.1:17395/callback";
+    /// The registered Android custom-scheme redirect (tauri.conf.json
+    /// `plugins.deep-link.mobile`).
+    const SCHEME: &str = "animehub://anilist/callback";
 
     #[test]
     fn viewer_stats_folds_statuses_into_hero_numbers() {
@@ -1086,40 +1325,198 @@ mod tests {
 
     #[test]
     fn parse_callback_extracts_code_and_state() {
-        let (code, state) =
-            parse_callback("http://127.0.0.1:17395/callback?code=abc&state=s1").unwrap();
+        let (code, state) = parse_callback(
+            "http://127.0.0.1:17395/callback?code=abc&state=s1",
+            LOOPBACK,
+        )
+        .unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "s1");
     }
 
     #[test]
     fn parse_callback_accepts_custom_scheme() {
-        let (code, _) = parse_callback("animehub://anilist/callback?code=abc&state=s1").unwrap();
+        let (code, _) =
+            parse_callback("animehub://anilist/callback?code=abc&state=s1", SCHEME).unwrap();
         assert_eq!(code, "abc");
     }
 
     #[test]
     fn parse_callback_rejects_remote_http_hosts() {
-        let err = parse_callback("http://evil.example/callback?code=abc&state=s1").unwrap_err();
+        let err =
+            parse_callback("http://evil.example/callback?code=abc&state=s1", LOOPBACK).unwrap_err();
         assert_eq!(err.code(), "anilist");
+        assert!(err.to_string().contains("yerel adresten"), "{err}");
     }
 
     #[test]
     fn parse_callback_rejects_unknown_scheme() {
-        assert!(parse_callback("https://anilist.co/cb?code=a&state=b").is_err());
+        assert!(parse_callback("https://anilist.co/cb?code=a&state=b", LOOPBACK).is_err());
+        assert!(parse_callback("ftp://127.0.0.1/callback?code=a&state=b", LOOPBACK).is_err());
+        // The configured redirect is the desktop loopback one: the same path on
+        // a remote https origin is not it, either way round.
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=a&state=b", SCHEME).is_err());
     }
 
     #[test]
     fn parse_callback_surfaces_oauth_error() {
-        let err =
-            parse_callback("http://127.0.0.1:1/callback?error=access_denied&state=s").unwrap_err();
+        let err = parse_callback(
+            "http://127.0.0.1:17395/callback?error=access_denied&state=s",
+            LOOPBACK,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reddedildi"), "{err}");
+        // ... and on the registered custom scheme too.
+        let err = parse_callback(
+            "animehub://anilist/callback?error=access_denied&state=s",
+            SCHEME,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("reddedildi"), "{err}");
     }
 
     #[test]
     fn parse_callback_requires_both_fields() {
-        assert!(parse_callback("http://127.0.0.1:1/callback?code=a").is_err());
-        assert!(parse_callback("http://127.0.0.1:1/callback?state=b").is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=a", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?state=b", LOOPBACK).is_err());
+        assert!(parse_callback(SCHEME, SCHEME).is_err());
+    }
+
+    // ---- the exact-redirect-URI requirement (AH-07 / AH-G1 / AH-G4 / AH-G5 / AH-G11) ----
+
+    #[test]
+    fn parse_callback_rejects_a_different_loopback_port_or_path() {
+        // Same scheme, same loopback host — but not OUR endpoint. The old
+        // parser accepted any loopback port and any path, which is a bigger
+        // target than the listener that started the flow.
+        let wrong_port = "http://127.0.0.1:17396/callback?code=abc&state=s1";
+        assert!(parse_callback(wrong_port, LOOPBACK).is_err());
+        let wrong_path = "http://127.0.0.1:17395/other?code=abc&state=s1";
+        let err = parse_callback(wrong_path, LOOPBACK).unwrap_err();
+        assert!(err.to_string().contains("yolu beklenenden"), "{err}");
+        // The default port is not our 17395 either.
+        assert!(parse_callback("http://127.0.0.1/callback?code=a&state=b", LOOPBACK).is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_a_different_loopback_host_form() {
+        // localhost and [::1] are loopback, but they are not the configured
+        // host, and the OS resolves each of them independently — an attacker
+        // controlling one must not satisfy the other's login.
+        assert!(
+            parse_callback("http://localhost:17395/callback?code=a&state=b", LOOPBACK).is_err()
+        );
+        assert!(parse_callback("http://[::1]:17395/callback?code=a&state=b", LOOPBACK).is_err());
+        // A non-loopback host that merely contains the loopback name is out too.
+        assert!(parse_callback(
+            "http://127.0.0.1.evil.example:17395/callback?code=a&state=b",
+            LOOPBACK
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_a_hijacked_custom_scheme() {
+        // Another app can register `animehub://`; only OUR host+path pair is a
+        // callback for the flow this build started.
+        let err = parse_callback("animehub://evil/callback?code=abc&state=s1", SCHEME).unwrap_err();
+        assert!(err.to_string().contains("host'u beklenenden"), "{err}");
+        assert!(parse_callback("animehub://anilist/other?code=abc&state=s1", SCHEME).is_err());
+        assert!(parse_callback("ANIMEHUB://anilist/callback?code=abc&state=s1", SCHEME).is_ok());
+    }
+
+    #[test]
+    fn parse_callback_rejects_present_but_empty_fields() {
+        // A partial or hand-built request (`?code=&state=`) must fail rather
+        // than hand out an empty code/state pair.
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=&state=", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=a&state=", LOOPBACK).is_err());
+        assert!(parse_callback("animehub://anilist/callback?code=&state=s", SCHEME).is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_a_truncated_request_target() {
+        // What a half-read or mangled callback looks like in practice.
+        assert!(parse_callback("", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395", LOOPBACK).is_err());
+        assert!(parse_callback("/callback?code=a&state=b", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?", LOOPBACK).is_err());
+        assert!(
+            parse_callback("http://127.0.0.1:17395/callback#code=a&state=b", LOOPBACK).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_callback_rejects_duplicated_code_or_state() {
+        // One callback carries exactly one code and one state. A repeated
+        // parameter is how a relayed or hand-built callback smuggles in a
+        // value the first check did not see.
+        let dup_code = "http://127.0.0.1:17395/callback?code=good&code=bad&state=s1";
+        let err = parse_callback(dup_code, LOOPBACK).unwrap_err();
+        assert!(err.to_string().contains("birden fazla code"), "{err}");
+        let dup_state = "http://127.0.0.1:17395/callback?code=a&state=s1&state=s2";
+        let err = parse_callback(dup_state, LOOPBACK).unwrap_err();
+        assert!(err.to_string().contains("birden fazla state"), "{err}");
+        // Unknown parameters stay ignored, as before.
+        let extra = "http://127.0.0.1:17395/callback?code=a&state=s1&scope=user";
+        assert!(parse_callback(extra, LOOPBACK).is_ok());
+    }
+
+    #[test]
+    fn parse_callback_refuses_a_broken_configured_redirect() {
+        // A nonsensical ANILIST_REDIRECT_URI must fail closed rather than
+        // silently widening the check.
+        assert!(parse_callback(LOOPBACK, "not a uri").is_err());
+    }
+
+    #[test]
+    fn take_pending_state_is_single_use_and_only_consumes_on_a_match() {
+        let slot: Mutex<Option<String>> = Mutex::new(Some("st4te".to_string()));
+
+        // A bogus callback does NOT burn the genuine attempt...
+        assert_eq!(
+            take_pending_state(&slot, "nope").unwrap(),
+            PendingState::Mismatched
+        );
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("st4te"));
+        // ... and neither does a malformed one.
+        assert_eq!(
+            take_pending_state(&slot, "").unwrap(),
+            PendingState::Mismatched
+        );
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("st4te"));
+
+        // The matching callback consumes it exactly once.
+        assert_eq!(
+            take_pending_state(&slot, "st4te").unwrap(),
+            PendingState::Consumed("st4te".to_string())
+        );
+        assert!(slot.lock().unwrap().is_none());
+        // A replay of the same callback now finds no pending session instead of
+        // racing a second token exchange.
+        assert_eq!(
+            take_pending_state(&slot, "st4te").unwrap(),
+            PendingState::None
+        );
+    }
+
+    #[test]
+    fn take_pending_state_never_matches_an_empty_slot() {
+        let slot: Mutex<Option<String>> = Mutex::new(Some(String::new()));
+        assert_eq!(take_pending_state(&slot, "").unwrap(), PendingState::None);
+        assert_eq!(
+            take_pending_state(&slot, "st4te").unwrap(),
+            PendingState::None
+        );
+    }
+
+    #[test]
+    fn take_pending_state_reports_no_pending_session() {
+        let slot: Mutex<Option<String>> = Mutex::new(None);
+        assert_eq!(
+            take_pending_state(&slot, "anything").unwrap(),
+            PendingState::None
+        );
     }
 
     #[test]
@@ -1384,9 +1781,186 @@ mod tests {
         let target = handle.await.unwrap().expect("callback");
         assert_eq!(target, "/callback?code=abc123&state=st4te");
 
-        let (code, state) = parse_callback(&absolute_callback(&uri, &target).unwrap()).unwrap();
+        let (code, state) =
+            parse_callback(&absolute_callback(&uri, &target).unwrap(), &uri).unwrap();
         assert_eq!(code, "abc123");
         assert_eq!(state, "st4te");
+    }
+
+    /// Send `request` to the listener and return the response it answers with.
+    async fn exchange(port: u16, request: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // A refused/oversized request may close the socket mid-write; the
+        // answer, not the write, is what the test asserts.
+        let _ = sock.write_all(request).await;
+        let mut resp = Vec::new();
+        let _ = sock.read_to_end(&mut resp).await;
+        String::from_utf8_lossy(&resp).to_string()
+    }
+
+    fn listener_port(uri: &str) -> u16 {
+        uri.rsplit(':')
+            .next()
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_ignores_unrelated_requests_and_keeps_waiting() {
+        // A speculative preconnect, a favicon probe or any local process used to
+        // consume the ONE accept the listener performed, so the real browser
+        // callback then had nobody listening and the login failed.
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(5)).await },
+            );
+
+        let probe = exchange(
+            port,
+            b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(probe.starts_with("HTTP/1.1 404"), "probe answer: {probe}");
+        let root = exchange(port, b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        assert!(root.starts_with("HTTP/1.1 404"), "root answer: {root}");
+        // A POST to the callback path is not the redirect either.
+        let post = exchange(
+            port,
+            b"POST /callback?code=x&state=y HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(post.starts_with("HTTP/1.1 404"), "post answer: {post}");
+
+        // The real callback still lands.
+        let real = exchange(
+            port,
+            b"GET /callback?code=abc123&state=st4te HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(
+            real.starts_with("HTTP/1.1 200 OK"),
+            "callback answer: {real}"
+        );
+        assert!(!real.contains("abc123"), "callback reflected user input");
+        let target = handle.await.unwrap().expect("callback");
+        assert_eq!(target, "/callback?code=abc123&state=st4te");
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_reassembles_a_fragmented_request_line() {
+        // One `read` is not guaranteed to deliver the whole request line; a
+        // truncated target used to fail an otherwise valid authorisation.
+        use tokio::io::AsyncWriteExt as _;
+
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(5)).await },
+            );
+
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        sock.write_all(b"GET /call").await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sock.write_all(b"back?code=frag&state=s1 HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .await
+            .unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sock.write_all(b"\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+
+        let target = handle.await.unwrap().expect("callback");
+        assert_eq!(target, "/callback?code=frag&state=s1");
+        let (code, state) =
+            parse_callback(&absolute_callback(&uri, &target).unwrap(), &uri).unwrap();
+        assert_eq!(code, "frag");
+        assert_eq!(state, "s1");
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_refuses_an_oversized_header_block() {
+        // Bounded: a local process must not be able to make the listener buffer
+        // without limit, and the refusal must not end the authorisation.
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(8)).await },
+            );
+
+        let mut flood = b"GET /callback HTTP/1.1\r\nX-Pad: ".to_vec();
+        flood.extend(std::iter::repeat(b'a').take(MAX_REQUEST_BYTES + 4096));
+        let answer = exchange(port, &flood).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 413"),
+            "oversized answer: {}",
+            answer.chars().take(40).collect::<String>()
+        );
+
+        let real = exchange(
+            port,
+            b"GET /callback?code=after&state=flood HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(
+            real.starts_with("HTTP/1.1 200 OK"),
+            "callback answer: {real}"
+        );
+        assert_eq!(
+            handle.await.unwrap().expect("callback"),
+            "/callback?code=after&state=flood"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_drops_a_silent_client_and_still_finishes() {
+        // A connection that sends nothing is abandoned after its own budget
+        // instead of holding the whole authorisation window.
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(8)).await },
+            );
+
+        let silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // Held open, never written to: it must be dropped once its budget runs
+        // out, and the real callback must still be accepted afterwards.
+        tokio::time::sleep(CONNECTION_READ_BUDGET + std::time::Duration::from_millis(200)).await;
+        drop(silent);
+
+        let real = exchange(
+            port,
+            b"GET /callback?code=late&state=quiet HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(
+            real.starts_with("HTTP/1.1 200 OK"),
+            "callback answer: {real}"
+        );
+        assert_eq!(
+            handle.await.unwrap().expect("callback"),
+            "/callback?code=late&state=quiet"
+        );
     }
 
     #[tokio::test]

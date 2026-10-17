@@ -8,17 +8,22 @@
 //! so cookies, localStorage, IndexedDB and cache never cross between sites.
 //!
 //! ## Android
-//! The system WebView has **no** per-profile data directory API, so a
-//! directory-per-site partition is impossible. Instead we partition by
-//! *swapping the cookie jar*: on opening a site we export the previous site's
-//! cookies into its encrypted blob, wipe the live jar, and restore the target
-//! site's cookies. Login state (which is cookie-borne on every site in scope)
-//! is therefore isolated.
-//!
-//! **Documented limitation:** on Android, `localStorage` / IndexedDB / cache
-//! are shared between sites because the platform offers no way to partition
-//! them. Sites that keep auth state in `localStorage` would leak it. This is
-//! surfaced in the About screen rather than hidden.
+//! The launcher keeps Tauri/Wry's single WebView on the **default** profile.
+//! Sites open in a *separate* native WebView above it, bound to their own
+//! persistent androidx.webkit profile (`WebViewCompat.setProfile`, assigned
+//! before any other WebView API call and before the first navigation), so
+//! cookies, localStorage, IndexedDB and cache are partitioned per `site_id` —
+//! including between two sites that share an origin. The legacy cookie-jar
+//! swap and the JSON localStorage/IndexedDB snapshot export/import are gone:
+//! profiles persist by themselves, the dump was never a security boundary,
+//! and re-injecting it would revive the origin TOCTOU it had. One migration
+//! remains: the 0.3.4 encrypted cookie jar is imported once into a *virgin*
+//! profile's own `CookieManager` before that profile's first navigation.
+//! Providers without `WebViewFeature.MULTI_PROFILE` refuse the open outright —
+//! there is no silent fallback to the shared profile. Profile names derive
+//! from the registered `site_id` only (see `web/windows.rs`:
+//! `android_profile_name`), never from the URL or display name. See
+//! `docs/android-storage-isolation.md`.
 
 use crate::error::AppError;
 use crate::sites::blocklist::Blocklist;
@@ -424,7 +429,7 @@ pub fn ensure_profile_dir(
     Ok(dir)
 }
 
-/// Which site a session belongs to, for the cookie-swap path.
+/// Which site a session belongs to (ownership checks for open/close/wipe).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     pub site_id: String,
@@ -988,5 +993,58 @@ mod tests {
         assert_ne!(profile_dir_name("a"), profile_dir_name("b"));
         assert!(!profile_dir_name("a/b").contains('/'));
         assert!(!profile_dir_name("").contains('/'));
+    }
+
+    /// AH-P2: `WebViewCompat.addDocumentStartJavaScript(webView, initScript,
+    /// setOf("*"))` runs this script for EVERY origin the site WebView loads,
+    /// including cross-origin player domains and third-party frames. That is
+    /// only acceptable because the script carries no capability and no secret —
+    /// a site WebView has no Tauri IPC bridge at all, and the PiP controller's
+    /// functions are called BY the native side, never the other way round.
+    /// Narrowing the origin set would break cross-origin players (very common
+    /// for anime sites) and the popup guard on ad-driven redirects, so the
+    /// requirement is that the payload stays inert, which this pins.
+    #[test]
+    fn init_script_is_inert_enough_to_run_for_every_origin() {
+        let cfg = InjectedConfig {
+            block_popups: true,
+            hide_selectors: vec![".ad-container".to_string(), "#popup".to_string()],
+            pip_controller: true,
+        };
+        let script = build_init_script(&cfg);
+        let lowered = script.to_lowercase();
+
+        // Nothing a page could turn into a credential, a request or a redirect.
+        for needle in [
+            "token",
+            "secret",
+            "cookie",
+            "authorization",
+            "bearer",
+            "client_id",
+            "http:",
+            "client_secret",
+            "accesstoken",
+        ] {
+            assert!(
+                !lowered.contains(needle),
+                "init script must stay inert, but mentions {needle}"
+            );
+        }
+        // The injected payload is exactly the three display settings.
+        for key in ["blockPopups", "hideSelectors", "pipController"] {
+            assert!(script.contains(key), "payload lost {key}");
+        }
+        // The site URL, the profile name and any per-site value are not in it.
+        assert!(
+            !lowered.contains("openani"),
+            "no site identity in the script"
+        );
+        assert!(
+            !lowered.contains("profile"),
+            "no profile name in the script"
+        );
+        // And the escape hatch stays: no `</script>` can appear in the payload.
+        assert!(!script.contains("</script>"));
     }
 }

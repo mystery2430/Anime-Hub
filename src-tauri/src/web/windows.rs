@@ -19,24 +19,43 @@
 //! that scheme is intercepted natively below and turned into a close action.
 //!
 //! ## Android
-//! The system WebView has no per-profile data-directory API. The app swaps
-//! provider cookie jars through Android's shared `CookieManager`; per-provider
-//! same-origin `localStorage` / IndexedDB isolation is not yet guaranteed.
-//! Best-effort encrypted export/import hooks exist for those stores, but they
-//! are not a security boundary and IndexedDB fidelity is incomplete.
+//! The launcher keeps Tauri's single WebView (the **default** profile). Every
+//! site opens in a separate native `WebView` above it, bound — before any
+//! other WebView API call and before the first navigation — to its own
+//! persistent androidx.webkit `Profile` via `WebViewCompat.setProfile`. The
+//! profile name derives from the registered `site_id` (SHA-256 slice plus a
+//! persistent generation counter), never from the URL or display name, so
+//! same-origin sites get separate localStorage/IndexedDB/cookie jars and the
+//! launcher's default profile is never used for site data.
+//!
+//! The old JSON cookie/storage snapshot machinery is gone: profiles persist
+//! on their own, so there is nothing to export/import, and the lossy
+//! localStorage/IndexedDB dump is no longer part of the product. The one
+//! migration kept is a one-time import of the pre-profile encrypted cookie
+//! jar into the target profile's own `CookieManager`, before that profile's
+//! first navigation. When the WebView provider lacks
+//! `WebViewFeature.MULTI_PROFILE`, the open fails with a user-facing error —
+//! never a silent fallback to the shared profile. See
+//! `docs/android-storage-isolation.md`.
 
 use crate::commands::{AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
 use crate::web::dns::{classify_host, DnsClass};
-// `capture`/`CookieJar` back the shared export path (mobile jar swap and
-// desktop child-webview snapshot); `restore` only serves the mobile import.
-#[cfg(mobile)]
+// `CookieJar` backs the iOS jar swap and the one-time Android profile
+// migration; `restore` is used only by the iOS import path (`import_cookies`),
+// so it carries exactly that gate — Android's host-compiled migration
+// protocol calls it fully qualified, and an ungated `#[cfg(mobile)]` import
+// would be dead there. `capture` (qualified at its single call site, so this
+// import group keeps the exact shape rustfmt approved before) serves the
+// desktop/iOS export path. Android site cookies live in their profile and are
+// never snapshotted.
+#[cfg(all(mobile, not(target_os = "android")))]
 use crate::web::session::restore;
-use crate::web::session::{capture, profile_dir_name, CookieJar};
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
+use crate::web::session::{profile_dir_name, CookieJar};
 use tauri::{AppHandle, Emitter, Manager};
 #[cfg(desktop)]
 use tauri::{LogicalPosition, PhysicalPosition, Position, Size, WebviewUrl};
@@ -56,13 +75,14 @@ pub const LAUNCHER_TITLE: &str = "AnimeHub";
 const CLOSE_SCHEME: &str = "animehub";
 const CLOSE_HOST: &str = "close-site";
 
-/// Android shares one CookieManager and one WebView across all providers.
-/// Serialize site swaps, close-time snapshots, and background syncs so a sync
-/// cannot store the next provider's cookies under the previous provider id.
+/// Android: one site WebView at a time over the launcher.
+/// Serialize open/close/wipe/flush and the deferred-profile-deletion drain so
+/// a sync tick can never flush a profile between a wipe's close and its
+/// delete, and a second open cannot race the first one's profile handover.
 #[cfg(target_os = "android")]
 static ANDROID_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Lock Android's shared provider session while reading/swapping its state.
+/// Lock Android's site-session lifecycle while reading/mutating it.
 #[cfg(target_os = "android")]
 pub fn lock_android_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
     ANDROID_SESSION_LOCK
@@ -110,12 +130,6 @@ const SESSION_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Safety valve: a sync thread ends itself after this long even if the
 /// ownership checks somehow never fire.
 const SESSION_SYNC_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
-
-/// Android storage dumps are much heavier than a cookie read (a full
-/// IndexedDB scan on the page), so they run every Nth cookie tick rather than
-/// every tick.
-#[cfg(mobile)]
-const STORAGE_SYNC_EVERY_N_TICKS: u32 = 10;
 
 /// Window/webview label used for a site session.
 pub fn label_for(site_id: &str) -> String {
@@ -496,36 +510,63 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
     });
 }
 
-/// Mobile variant: cookies every tick, and localStorage/IndexedDB every
-/// [`STORAGE_SYNC_EVERY_N_TICKS`] ticks.
+/// Android variant: durability flush of the active site profile.
 ///
-/// Android can kill the process without ever running the close path, so the
-/// blobs must stay fresh while the session lives. Every write is guarded by
-/// both session ownership and a loaded-origin check: storage reads only make
-/// sense while the site's own page is the loaded document, and skipping the
-/// tick otherwise costs nothing.
-#[cfg(mobile)]
-fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: String) {
+/// The site's cookies live in its own profile, which the WebView provider
+/// persists by itself; this tick only forces `Profile.getCookieManager()
+/// .flush()` so an Android process kill (which never runs the close path)
+/// cannot lose the last seconds of cookie writes. Ownership is re-checked
+/// under `ANDROID_SESSION_LOCK` like every other writer, so a stale thread
+/// can never flush after another site took over — and never touches the
+/// launcher's default profile.
+#[cfg(target_os = "android")]
+fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: String) {
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
-            return;
-        };
-        let mut tick: u32 = 0;
         loop {
             std::thread::sleep(SESSION_SYNC_INTERVAL);
             if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
                 log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
                 return;
             }
-            #[cfg(target_os = "android")]
-            let _session_guard = match lock_android_session() {
+            let _guard = match lock_android_session() {
                 Ok(guard) => guard,
                 Err(e) => {
                     log::error!("Android oturum eşitlemesi kilitlenemedi: {e}");
                     return;
                 }
             };
+            {
+                let state = app.state::<AppState>();
+                if !session_is_current(&state, &site_id) {
+                    return;
+                }
+            }
+            if let Err(e) = crate::android_bridge::site_flush() {
+                log::warn!("dönemsel profil çerez eşitlemesi başarısız ({site_id}): {e}");
+            }
+        }
+    });
+}
+
+/// Non-Android mobile (iOS) variant: cookies every tick.
+///
+/// Cookies still ride the encrypted jar on iOS; localStorage/IndexedDB
+/// snapshots were removed everywhere with the JSON transfer machinery — the
+/// old dump was lossy and not a security boundary.
+#[cfg(all(mobile, not(target_os = "android")))]
+fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: String) {
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
+            return;
+        };
+        loop {
+            std::thread::sleep(SESSION_SYNC_INTERVAL);
+            if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
+                log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
+                return;
+            }
             {
                 let state = app.state::<AppState>();
                 if !session_is_current(&state, &site_id) {
@@ -539,35 +580,676 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
             if !loaded {
                 continue;
             }
-            tick = tick.wrapping_add(1);
             if let Err(e) = export_cookies(&window, &site_id, &host) {
                 log::warn!("dönemsel çerez eşitlemesi başarısız ({site_id}): {e}");
-            }
-            if tick % STORAGE_SYNC_EVERY_N_TICKS == 0 {
-                export_site_storage(&app, &site_id);
             }
         }
     });
 }
 
 // ---------------------------------------------------------------------------
-// Mobile: a single shared WebView. Android swaps provider cookie jars; true
-// same-origin localStorage/IndexedDB provider isolation remains unresolved.
+// Mobile: Android opens a separate profiled WebView per site; iOS keeps the
+// shared-WebView flow without the removed JSON storage snapshots.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "android")]
-fn provider_cookie_url(host: &str) -> AppResult<Url> {
-    Url::parse(&format!("https://{host}/"))
-        .map_err(|_| AppError::Other("aktif provider adresi oluşturulamadı".into()))
+/// Prefix shared with Kotlin's `AnimeHubSiteController` name validator: a
+/// profile name must match `site-[0-9a-f]{32}-g<generation>` exactly. Kotlin
+/// refuses anything else, which is what keeps a stray caller from ever
+/// addressing the `Default` profile (the launcher's own data).
+pub const ANDROID_PROFILE_PREFIX: &str = "site-";
+
+/// Secret key holding the persistent generation counter for a site's Android
+/// profile name. Kept (not deleted with the session) so even a registry
+/// restored from an old backup can never re-open a profile name whose
+/// on-disk deletion is still pending.
+const PROFILE_GENERATION_PREFIX: &str = "profilegen-";
+
+/// Secret key marking that the site's pre-profile cookie jar has been
+/// handed to its WebView profile. Written ONLY after the import fully
+/// completed (every cookie accepted and flushed); a failed attempt is never
+/// recorded — instead the virgin profile name is retired (queued + generation
+/// bump) and the migration retries on a fresh generation. Deleted together
+/// with the session data in `delete_site_session`, so a cleared site never
+/// re-imports the wiped jar.
+const MIGRATION_FLAG_PREFIX: &str = "profilemig-";
+
+/// Secret key holding a JSON list of profile names whose deletion could not
+/// run synchronously (loaded in the process that tried, or the provider was
+/// temporarily without the API). Drained at the next process start, before
+/// any site WebView can open.
+pub const PENDING_PROFILE_DELETES_KEY: &str = "android-pending-profile-deletes";
+
+/// Secret key where the RAW bytes of a corrupt pending-delete list are
+/// kept before the working copy is salvaged/overwritten — the names inside
+/// are the only record of on-disk profile data still awaiting deletion.
+pub const CORRUPT_QUEUE_BACKUP_KEY: &str = "android-pending-profile-deletes-corrupt";
+
+/// Deterministic Android WebView profile name for a site.
+///
+/// `site-<first 32 hex chars of SHA-256(site_id)>-g<generation>`:
+///
+/// * derived from the **registered site id only** — never the URL or the
+///   display name, so a rename/re-URL cannot point two sites at one profile
+///   and a hostile site name cannot influence the profile namespace;
+/// * 128 bits of digest make collisions between different ids negligible,
+///   which is what "each site id gets a different profile" needs;
+/// * a conservative `[a-z0-9-]` charset the WebView provider accepts
+///   anywhere;
+/// * the generation suffix distinguishes a re-created profile for the same
+///   site id from a name whose previous deletion may still be running
+///   asynchronously on disk.
+pub fn android_profile_name(site_id: &str, generation: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(site_id.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("{ANDROID_PROFILE_PREFIX}{}-g{generation}", &digest[..32])
 }
 
-#[cfg(mobile)]
-fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
-    let window = app
-        .get_webview_window(LAUNCHER_LABEL)
-        .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
+/// Strict shape of a provider-namespace profile name — the same rule Kotlin
+/// enforces before it will touch delete/clear:
+/// `site-<32 lowercase hex chars>-g<1..10 digits>` with the generation
+/// parsing as `u32`. Never loosened: the Default profile and arbitrary
+/// provider names must stay unreachable even for a corrupted queue entry.
+pub fn is_valid_site_profile_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(ANDROID_PROFILE_PREFIX) else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    // hex digest (32) + "-g" + digits (1..=10)
+    if bytes.len() < 35 || bytes[32] != b'-' || bytes[33] != b'g' {
+        return false;
+    }
+    if !bytes[..32]
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
+        return false;
+    }
+    let digits = &rest[34..];
+    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    digits.parse::<u32>().is_ok()
+}
 
-    #[cfg(target_os = "android")]
+/// Salvage every valid profile name out of raw (possibly corrupt) bytes.
+///
+/// The scan is byte-level on purpose: even a structurally broken JSON file
+/// keeps readable `site-…-gN` tokens, and dropping only the unparseable
+/// part preserves the deletions still owed — silently emptying the queue
+/// would strand those names forever (until the orphan sweep at best).
+///
+/// A candidate is ALWAYS the complete token: the maximal ASCII-digit run
+/// after the fixed `site-<32 hex>-g` prefix is taken and only the resulting
+/// full name is validated. Trying growing lengths and accepting the first
+/// hit (an earlier version of this scan) truncated `…-g123` to `…-g1`,
+/// because `…-g1` validates on its own: the wrong profile would be queued
+/// for deletion while the real one stayed out of the queue, and
+/// [`recover_generation_for`] would derive the next generation from the
+/// truncated digits. A digit run that is too long for `u32` (or longer than
+/// the 10-digit shape) now fails the whole token instead of being cut back
+/// to a shorter, "valid-looking" name.
+pub fn scan_valid_profile_names(raw: &[u8]) -> Vec<String> {
+    let needle = ANDROID_PROFILE_PREFIX.as_bytes();
+    // A valid name is at least 5 + 32 + 2 + 1 bytes: `site-`, the hex
+    // digest, `-g` and one generation digit.
+    let min_len = 5 + 32 + 2 + 1;
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= raw.len() {
+        if &raw[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        if i + min_len > raw.len() {
+            // Only a truncated tail left — no complete name can fit.
+            i += 1;
+            continue;
+        }
+        let mut end = i + min_len;
+        while end < raw.len() && raw[end].is_ascii_digit() {
+            end += 1;
+        }
+        match std::str::from_utf8(&raw[i..end]).ok() {
+            Some(name) if is_valid_site_profile_name(name) => {
+                found.push(name.to_string());
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    found
+}
+
+/// Pure recovery rule for the pending-delete queue. A JSON list that parses
+/// keeps only structurally valid names (corrupt if any were dropped); a
+/// broken document is salvaged name-by-name from the raw bytes (always
+/// corrupt). Returns `(names, was_corrupt)`.
+pub fn recover_pending_profile_deletes(raw: &[u8]) -> (Vec<String>, bool) {
+    match serde_json::from_slice::<Vec<String>>(raw) {
+        Ok(list) => {
+            let total = list.len();
+            let kept: Vec<String> = list
+                .into_iter()
+                .filter(|name| is_valid_site_profile_name(name))
+                .collect();
+            let dropped = total - kept.len();
+            if dropped > 0 {
+                log::warn!("bekleyen profil silme listesinden {dropped} geçersiz ad çıkarıldı");
+            }
+            (kept, dropped > 0)
+        }
+        Err(e) => {
+            let salvaged = scan_valid_profile_names(raw);
+            log::warn!(
+                "bekleyen profil silme listesi bozuk ({e}); {} ad ham kopyadan kurtarıldı",
+                salvaged.len()
+            );
+            (salvaged, true)
+        }
+    }
+}
+
+/// Pure recovery rule for a corrupt generation counter: take the highest
+/// generation queued for THIS site plus one (0 with an empty queue), so a
+/// name whose deletion is still pending is never handed out again.
+/// Reusing generation 0 blindly could recreate data Chromium is about to
+/// delete; a queued `u32::MAX` has no next value and must refuse.
+pub fn recover_generation_for(site_id: &str, queued: &[String]) -> AppResult<u32> {
+    let prefix = queued_site_profile_prefix(site_id);
+    let max_queued = queued
+        .iter()
+        .filter_map(|name| {
+            name.strip_prefix(&prefix)
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .max();
+    match max_queued {
+        Some(u32::MAX) => Err(AppError::Storage(format!(
+            "bekleyen profil silme nesli taştı ({site_id})"
+        ))),
+        Some(max) => Ok(max + 1),
+        None => Ok(0),
+    }
+}
+
+/// `site-<hash(site_id)>-g` — the fixed prefix shared by all generations of
+/// one site's profile names (used for queue matching).
+fn queued_site_profile_prefix(site_id: &str) -> String {
+    let sample = android_profile_name(site_id, 0);
+    sample
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .to_string()
+}
+
+/// The persisted generation for `site_id` (0 when never bumped).
+///
+/// A corrupt value is recovered from the pending-delete queue instead of
+/// silently becoming 0 — the old fallback could re-open a name whose
+/// on-disk deletion was still queued — and the recovered value is persisted
+/// so every later path sees the same truth.
+pub fn profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
+    let key = format!("{PROFILE_GENERATION_PREFIX}{site_id}");
+    let Some(bytes) = state.provider.get_secret(&key)? else {
+        return Ok(0);
+    };
+    match std::str::from_utf8(&bytes)
+        .ok()
+        .map(|s| s.trim().parse::<u32>())
+    {
+        Some(Ok(generation)) => Ok(generation),
+        _ => {
+            log::warn!("profil nesli bozuk, kuyruktan geri yükleniyor ({site_id})");
+            let queued = read_pending_profile_deletes(state)?;
+            let recovered = recover_generation_for(site_id, &queued)?;
+            state
+                .provider
+                .put_secret(&key, recovered.to_string().as_bytes())?;
+            Ok(recovered)
+        }
+    }
+}
+
+/// Advance the generation after a delete of the *current* name was accepted
+/// or queued, so the next open of this site id derives a fresh name and can
+/// never collide with a deletion still finishing on disk.
+///
+/// `checked_add` — at `u32::MAX` the name space is exhausted. The old
+/// `saturating_add` would have pinned the counter and reused the exact name
+/// whose deletion was just queued, forever.
+pub fn bump_profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
+    let current = profile_generation(state, site_id)?;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| AppError::Storage(format!("profil nesli taştı ({site_id})")))?;
+    state.provider.put_secret(
+        &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
+        next.to_string().as_bytes(),
+    )?;
+    Ok(next)
+}
+
+/// Advance the stored generation past a queued deletion of *this* stored
+/// name, if one exists (pure). The bumped value is `max_queued + 1` for this
+/// site, which by construction is not in the queue, so exactly one step is
+/// needed. `(generation, was_advanced)`.
+pub fn resolve_queued_free_generation(
+    site_id: &str,
+    stored: u32,
+    queued: &[String],
+) -> AppResult<(u32, bool)> {
+    let stored_name = android_profile_name(site_id, stored);
+    if !queued.iter().any(|name| name == &stored_name) {
+        return Ok((stored, false));
+    }
+    let prefix = queued_site_profile_prefix(site_id);
+    let max_queued = queued
+        .iter()
+        .filter_map(|name| {
+            name.strip_prefix(&prefix)
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .max()
+        .unwrap_or(stored);
+    let next = max_queued
+        .checked_add(1)
+        .ok_or_else(|| AppError::Storage(format!("bekleyen profil nesli taştı ({site_id})")))?;
+    Ok((next, true))
+}
+
+/// Read the deferred profile-deletion queue.
+///
+/// A corrupt list is never treated as empty: valid names are salvaged from
+/// the raw bytes, the original bytes are backed up under
+/// [`CORRUPT_QUEUE_BACKUP_KEY`], and the working copy is repaired in place.
+/// Dropping the queue silently would strand those profile deletions (best
+/// case the orphan sweep collects them — worst case a re-open races a
+/// deletion nobody recorded any more).
+pub fn read_pending_profile_deletes(state: &AppState) -> AppResult<Vec<String>> {
+    let Some(bytes) = state.provider.get_secret(PENDING_PROFILE_DELETES_KEY)? else {
+        return Ok(Vec::new());
+    };
+    let (list, corrupt) = recover_pending_profile_deletes(&bytes);
+    if corrupt {
+        // Best effort both ways: a failed backup or repair only means the
+        // salvage repeats on the next read; never block open behind it.
+        if let Err(e) = state.provider.put_secret(CORRUPT_QUEUE_BACKUP_KEY, &bytes) {
+            log::warn!("bozuk silme kuyruğu yedeği yazılamadı: {e}");
+        }
+        match serde_json::to_vec(&list) {
+            Ok(repaired) => {
+                if let Err(e) = state
+                    .provider
+                    .put_secret(PENDING_PROFILE_DELETES_KEY, &repaired)
+                {
+                    log::warn!("bozuk silme kuyruğu onarılamadı: {e}");
+                }
+            }
+            Err(e) => log::warn!("bozuk silme kuyruğu yeniden yazılamadı: {e}"),
+        }
+    }
+    Ok(list)
+}
+
+/// Queue a profile name for deletion at the next process start (deduped).
+pub fn queue_pending_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
+    let mut list = read_pending_profile_deletes(state)?;
+    if list.iter().any(|existing| existing == name) {
+        return Ok(());
+    }
+    list.push(name.to_string());
+    let bytes = serde_json::to_vec(&list)?;
+    state
+        .provider
+        .put_secret(PENDING_PROFILE_DELETES_KEY, &bytes)
+}
+
+/// Drop a name from the deferred deletion queue once it is gone.
+pub fn forget_pending_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
+    let list = read_pending_profile_deletes(state)?;
+    let kept: Vec<String> = list.into_iter().filter(|n| n != name).collect();
+    let bytes = serde_json::to_vec(&kept)?;
+    state
+        .provider
+        .put_secret(PENDING_PROFILE_DELETES_KEY, &bytes)
+}
+
+/// Re-exported for the startup drain in `lib.rs`.
+pub fn mark_migration_done(state: &AppState, site_id: &str) -> AppResult<()> {
+    state
+        .provider
+        .put_secret(&format!("{MIGRATION_FLAG_PREFIX}{site_id}"), b"1")
+}
+
+/// The plugin half of the two-phase open protocol.
+///
+/// Behind a trait so the migrate → durable-flag → open ordering — the part
+/// that decides whether a user-visible profile can ever exist while
+/// `profilemig-<site>` is missing — is host-testable with a scripted plugin
+/// and an injectable [`SecretProvider`]. Production wires it over
+/// [`crate::android_bridge`] (see [`BridgeOpenOps`]).
+pub trait MobileOpenOps {
+    /// Phase 1: import `cookies` into `profile` WITHOUT creating a view.
+    fn migrate(&mut self, url: &str, profile: &str, cookies: &[String]) -> AppResult<()>;
+
+    /// Phase 2: build the site WebView bound to `profile` and navigate.
+    fn open(&mut self, url: &str, profile: &str, init_script: &str) -> AppResult<()>;
+}
+
+/// Production wiring: the two phases over the Android bridge.
+#[cfg(target_os = "android")]
+pub struct BridgeOpenOps;
+
+#[cfg(target_os = "android")]
+impl MobileOpenOps for BridgeOpenOps {
+    fn migrate(&mut self, url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
+        crate::android_bridge::site_migrate(url, profile, cookies)
+    }
+
+    fn open(&mut self, url: &str, profile: &str, init_script: &str) -> AppResult<()> {
+        crate::android_bridge::site_open(url, profile, init_script)
+    }
+}
+
+/// Resolve the profile for `site_id`, run the pending one-time cookie
+/// migration, persist `profilemig-<site_id>` and ONLY THEN open the view.
+/// Returns the profile name that was opened.
+///
+/// WHY THIS ORDERING (the defect this replaces): the previous shape built
+/// the view and migrated inside one `site_open` call and wrote the flag
+/// afterwards, merely logging a failed write. A missing flag then meant
+/// "migration pending" even for a profile the user was already using: the
+/// next open hit Kotlin's `ProfileAlreadyExists`, reported it as
+/// `migration-partial`, and retired THAT healthy profile — the startup drain
+/// deleted its localStorage/IndexedDB and the cookies rolled back to the
+/// stale jar. With the flag durable before phase 2, "flag missing" can only
+/// ever mean "no view has been shown for this migration yet", so retiring
+/// and re-importing is the safe resolution and a shown profile is never
+/// queued.
+///
+/// Contract (proved by the `run_mobile_open_protocol_*` tests):
+///  * migration success = every cookie accepted AND the flush durable —
+///    Kotlin's strict criterion; anything less arrives as the
+///    `migration-partial` sentinel and is retired + retried exactly once on
+///    a fresh generation;
+///  * the legacy jar is never deleted here — it survives every failure so a
+///    retry can re-import it (only clear/remove drops it, with the flag);
+///  * a failed flag write ABORTS the open before phase 2: no view exists, so
+///    the caller never claims `current_site` and Rust/Kotlin ownership
+///    cannot diverge;
+///  * a `profile-quarantined` refusal — Kotlin's block on a profile whose
+///    last in-place wipe timed out on a provider call it cannot cancel, so a
+///    late `removeAllCookies` may still land on a reopened session —
+///    propagates in EITHER phase with the same "nothing was opened" guarantee
+///    and is deliberately not the `migration-partial` retirement path: the
+///    profile is the user's live one, so the fix is to verify the wipe (retry
+///    it, or remove the site), never to delete the name and re-import the jar;
+///  * every other error (including the MULTI_PROFILE refusal) propagates
+///    with the same "nothing was opened" guarantee.
+pub fn run_mobile_open_protocol<O: MobileOpenOps>(
+    state: &AppState,
+    site_id: &str,
+    url: &str,
+    init_script: &str,
+    ops: &mut O,
+) -> AppResult<String> {
+    // 1. The profile for this site at its current generation — advanced past
+    //    a queued deletion of that exact stored name (a stale/corrupt
+    //    generation would otherwise hand out a profile whose deletion is
+    //    still in flight) and persisted when advanced, so every later path
+    //    (clear, delete, orphan sweep) derives the same name.
+    let stored_generation = profile_generation(state, site_id)?;
+    let queued = read_pending_profile_deletes(state)?;
+    let (generation, advanced) =
+        resolve_queued_free_generation(site_id, stored_generation, &queued)?;
+    if advanced {
+        state.provider.put_secret(
+            &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
+            generation.to_string().as_bytes(),
+        )?;
+    }
+    let mut profile = android_profile_name(site_id, generation);
+
+    // 2. One-time migration of the pre-profile cookie jar (0.3.4 installs).
+    //    localStorage/IndexedDB snapshots are intentionally NOT imported:
+    //    the dump was lossy and origin-checking it again would revive the
+    //    TOCTOU problems profiles remove. The blobs themselves stay
+    //    untouched until the user clears or deletes the site.
+    let pending_migration = state
+        .provider
+        .get_secret(&format!("{MIGRATION_FLAG_PREFIX}{site_id}"))?
+        .is_none();
+    let mut cookie_headers = Vec::new();
+    if pending_migration {
+        if let Some(bytes) = state.provider.get_secret(&format!("cookies-{site_id}"))? {
+            let jar: CookieJar = serde_json::from_slice(&bytes)?;
+            let now = crate::anilist::now_unix();
+            for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
+                // Qualified: the `restore` import is iOS-only, and this
+                // protocol body is host-compiled (and host-tested).
+                if let Some(cookie) = crate::web::session::restore(stored) {
+                    cookie_headers.push(cookie.to_string());
+                }
+            }
+        }
+    }
+
+    // 3. Phase 1 (migrate, no view) → durable flag → phase 2 (the view).
+    //
+    //    A `migration-partial` failure means the virgin-profile import did
+    //    NOT complete (a cookie was rejected, an exception fired, a callback
+    //    or the flush never landed — Kotlin fails instead of faking it).
+    //    Retire THAT profile name (queue + generation bump) and retry
+    //    exactly once on a fresh generation: a half-imported profile must
+    //    never pass as complete, and the legacy snapshot stays untouched
+    //    until the import really lands. A second `migration-partial` fails
+    //    the open with a retryable, visible error — flag and jar intact, so
+    //    the NEXT open starts the whole migration over from a virgin name.
+    if pending_migration {
+        let mut migrate_result = ops.migrate(url, &profile, &cookie_headers);
+        if let Err(AppError::Other(message)) = &migrate_result {
+            if !cookie_headers.is_empty()
+                && message.contains(animehub_android::MIGRATION_RETRY_SENTINEL)
+            {
+                log::warn!(
+                    "profil göçü tamamlanamadı ({site_id})={message}; profil emekliye ayrılıyor"
+                );
+                queue_pending_profile_delete(state, &profile)?;
+                let retry_generation = bump_profile_generation(state, site_id)?;
+                profile = android_profile_name(site_id, retry_generation);
+                migrate_result = ops.migrate(url, &profile, &cookie_headers);
+                if let Err(AppError::Other(retry_message)) = &migrate_result {
+                    if retry_message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) {
+                        // Retire this attempt too and surface a retryable error.
+                        if let Err(e) = queue_pending_profile_delete(state, &profile) {
+                            log::warn!("ikinci göç profili kuyruğa alınamadı: {e}");
+                        }
+                        if let Err(e) = bump_profile_generation(state, site_id) {
+                            log::warn!("göç sonrası nesil artırılamadı: {e}");
+                        }
+                        return Err(AppError::Other(format!(
+                            "site çerezleri profiline taşınamadı: {retry_message}. Çerezler saklandı; sonraki açılışta yeniden denenecek."
+                        )));
+                    }
+                }
+            }
+        }
+        migrate_result?;
+
+        // Durable BEFORE the view exists. A failed write aborts the open on
+        // purpose: continuing would show the user a profile whose migration
+        // state is unrecorded, and the next open would treat that in-use
+        // profile as pending and retire it — the data-loss path this
+        // ordering removes. Nothing was built yet, so the abort leaves no
+        // orphan view and no ownership to unwind; the jar and the (missing)
+        // flag stay exactly as they were and the next open re-imports.
+        mark_migration_done(state, site_id).map_err(|e| {
+            AppError::Other(format!(
+                "site göç durumu kalıcılaştırılamadı ({site_id}): {e}. Site açılmadı; çerezler korundu, sonraki açılışta yeniden denenecek."
+            ))
+        })?;
+    }
+
+    ops.open(url, &profile, init_script)?;
+    Ok(profile)
+}
+
+/// Android half of one site's clear: wipe the profile in place, then drop the
+/// encrypted session blobs — in that order, and never skipping the second half.
+///
+/// Host-compiled and host-tested: the platform call is injected as
+/// `clear_profile` (the same trick [`MobileOpenOps`] uses for the open
+/// protocol), so `cargo test --all` proves the ordering on all three host OSes
+/// instead of leaving it to the aarch64 compile alone.
+///
+/// Contract (proved by the `mobile_clear_protocol_*` tests):
+///  * the profile is wiped FIRST: if that fails, the error propagates and
+///    `delete_site_session` is never reached, so the encrypted jar survives and
+///    the user can retry — a kept jar next to a half-wiped profile is
+///    recoverable, the reverse is not;
+///  * on success `delete_site_session` is NOT optional. The jar and the
+///    `profilemig-<site>` flag go together, because a jar kept next to a wiped
+///    profile would be re-imported into the next virgin profile and resurrect
+///    exactly the cookies the user asked to erase. Kotlin's "the provider
+///    deleted nothing because the jar was already empty" success lands here
+///    too, so an already-clean profile still drops its blobs — the shape that
+///    used to fail the whole clear and strand the jar;
+///  * `profilegen-<site>` deliberately survives (see
+///    `SecureStore::delete_site_session`): the generation counter must outlive
+///    the session so a restored registry can never re-open a profile name whose
+///    on-disk deletion is still pending;
+///  * the name handed to `clear_profile` is derived from the site id at its
+///    CURRENT generation — never from the URL or the display name.
+pub fn run_mobile_clear_protocol<C>(
+    state: &AppState,
+    site_id: &str,
+    clear_profile: C,
+) -> AppResult<()>
+where
+    C: FnOnce(&str) -> AppResult<()>,
+{
+    let generation = profile_generation(state, site_id)?;
+    let profile = android_profile_name(site_id, generation);
+    clear_profile(&profile)?;
+    state.provider.delete_site_session(site_id)?;
+    Ok(())
+}
+
+/// Android: delete one site's profile, then retire its quarantine ledger —
+/// in the ONLY order that keeps a failed cleanup from re-opening an unsafe name.
+///
+/// THE BUG THIS ORDERING FIXES: Kotlin used to retire the name's
+/// [`ProfileQuarantine`] ledger the moment the provider *accepted* the
+/// deletion, while the generation bump that makes the name underivable happened
+/// afterwards, here. If the bump or its storage write failed, `remove_site`
+/// aborted with the registry intact, the next open derived the SAME name, and
+/// the gate no longer knew about the `removeAllCookies` deletion that could
+/// still be in flight on it — the exact race the per-operation ledger exists to
+/// prevent, re-opened by the cleanup path.
+///
+/// So the sequence is: derive the name from the CURRENT generation → **durably
+/// queue the name (tombstone)** → delete → durably bump the generation → and
+/// only for a confirmed deletion, lift the tombstone and retire. Every earlier
+/// failure propagates and leaves both the tombstone and the ledger in place,
+/// i.e. the name stays blocked; a retry re-runs the whole protocol and is
+/// idempotent (the same name is derived again while the bump never landed, and
+/// queueing a name that is already queued changes nothing).
+///
+/// WHY THE TOMBSTONE COMES FIRST (AH-04 / R-07, process death): `deleteProfile`
+/// is a provider call that can take arbitrarily long — the reason the watchdogs
+/// exist — and "accepted" does not mean Chromium has removed the directory yet.
+/// If the process is killed during that call, or between it and the generation
+/// write, an in-memory-only ledger is gone with it: nothing durable says the
+/// deletion was ever requested, the generation never moved, so the next open
+/// derives the SAME name and `getOrCreateProfile` happily reuses the leftover
+/// directory — the session the user asked to delete comes back. Queueing the
+/// name before touching the provider closes that window with the two mechanisms
+/// that already survive a restart: `resolve_queued_free_generation` refuses to
+/// hand a queued name to an open, and the startup drain re-runs the deletion
+/// until it lands. The cost of a false tombstone (the provider call fails) is
+/// one generation number and a deletion that completes at the next start —
+/// which is what the caller asked for anyway.
+///
+/// A `Pending` (deferred) deletion is deliberately NOT retired and keeps its
+/// tombstone: the profile still exists on disk and is still loaded in this
+/// process, so its ledger stays until the deferred deletion actually lands —
+/// the startup drain retires it after durably forgetting the queued name. The
+/// bump still happens, so the next open of this site derives a DIFFERENT name
+/// and can never collide with a deletion that is still finishing.
+///
+/// Host-testable on purpose: the platform calls are injected, so `cargo test`
+/// proves the order (and the failed-write cases) on every OS instead of leaving
+/// it to the aarch64 compile.
+pub fn run_mobile_delete_protocol<D, R>(
+    state: &AppState,
+    site_id: &str,
+    delete_profile: D,
+    retire_profile: R,
+) -> AppResult<crate::android_bridge::SiteProfileAction>
+where
+    D: FnOnce(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
+    R: FnOnce(&str) -> AppResult<u32>,
+{
+    use crate::android_bridge::SiteProfileAction;
+
+    let generation = profile_generation(state, site_id)?;
+    let profile = android_profile_name(site_id, generation);
+
+    // 1. DURABLE INTENT, before the provider is touched. If this write fails
+    //    nothing has happened yet: no deletion was requested, the name is still
+    //    derivable and still clean, and the caller gets a retryable error.
+    queue_pending_profile_delete(state, &profile)?;
+
+    // 2. The provider call. Its outcome no longer decides whether the name is
+    //    remembered — only when the tombstone may be lifted.
+    let action = match delete_profile(&profile) {
+        Ok(action) => action,
+        Err(e) => {
+            // Keep the tombstone: the deletion is finished by the startup drain
+            // instead of being forgotten with the data still on disk, and the
+            // name cannot be handed to an open in the meantime.
+            log::warn!("profil silinemedi, bekleyenler kuyruğunda bırakıldı: {profile}");
+            return Err(e);
+        }
+    };
+
+    // 3. Durable: after this write no future open can derive `profile` again
+    //    (and the queue already guaranteed it before this line).
+    bump_profile_generation(state, site_id)?;
+
+    if matches!(action, SiteProfileAction::Pending) {
+        // Deferred: the profile still exists and is still loaded in this
+        // process. Tombstone and ledger both stay until the drain lands it.
+        return Ok(action);
+    }
+
+    // 4. Confirmed deleted (or already absent): lift the tombstone, and only
+    //    then drop the ledger. A failure here is reported, not swallowed:
+    //    keeping both is the conservative direction (the name is already
+    //    unreachable), and the retry re-runs the protocol cleanly.
+    forget_pending_profile_delete(state, &profile)?;
+    let dropped = retire_profile(&profile)?;
+    if dropped > 0 {
+        log::info!(
+            "profil karantinası emekliye ayrıldı ({dropped} bekleyen işlem düştü): {profile}"
+        );
+    }
+    Ok(action)
+}
+
+/// Android: open the site in a fresh native WebView bound to its own profile.
+///
+/// Runs entirely under `ANDROID_SESSION_LOCK`: the outgoing site WebView is
+/// closed first (its data lives in its profile — nothing is exported), then
+/// [`run_mobile_open_protocol`] resolves the profile name, hands the
+/// one-time 0.3.4 cookie jar to the profile cookie manager, persists
+/// `profilemig-<site>` and ONLY THEN builds the view — so no WebView the
+/// user can see exists while the migration state is not durable. A
+/// `MULTI_PROFILE`-unsupported provider aborts with [`AppError::Unsupported`]
+/// and no session state is changed.
+#[cfg(target_os = "android")]
+fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
     let _session_guard = lock_android_session()?;
     // Re-validate the `Site` snapshot while holding `ANDROID_SESSION_LOCK`.
     // See `open_in_main_window_inner` for the stale-snapshot race.
@@ -591,83 +1273,103 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     }
     let state = app.state::<AppState>();
 
-    // 1. Export the outgoing site's cookies and web storage while its page is
-    //    still the loaded origin — `localStorage`/IndexedDB reads must happen
-    //    before anything is cleared or navigated. The storage export is
-    //    best-effort and never blocks the switch.
+    // 1. Close the outgoing site, if any. One site WebView at a time; its
+    //    data stays in its profile, so there is no export step any more.
+    let previous = state
+        .current_site
+        .lock()
+        .expect("current_site lock")
+        .clone();
+    if previous.is_some() {
+        crate::android_bridge::site_close(true)?;
+        *state.current_site.lock().expect("current_site lock") = None;
+        if let Some(closed) = previous {
+            let _ = app.emit("animehub://site-closed", closed.site_id);
+        }
+    }
+
+    // 2. Profile resolution, the one-time cookie migration, the durable
+    //    migration flag and the view itself — `run_mobile_open_protocol`
+    //    owns that ordering (migrate → flag → open), so no view the user can
+    //    see exists while `profilemig-<site>` is missing. Any failure,
+    //    including the MULTI_PROFILE-unsupported refusal, leaves no session
+    //    behind: the view is only built after the flag write succeeded.
+    let opened_profile = run_mobile_open_protocol(
+        &state,
+        &site.id,
+        url.as_str(),
+        init_script,
+        &mut BridgeOpenOps,
+    )?;
+    log::debug!("site profili açıldı ({}): {opened_profile}", site.id);
+
+    let label = label_for(&site.id);
+    *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
+        site_id: site.id.clone(),
+        host: site.host(),
+        window_label: label.clone(),
+        entered_fullscreen: false,
+    });
+
+    // Periodic profile-cookie flush: an Android process kill skips close.
+    spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
+
+    Ok(label)
+}
+
+/// Non-Android mobile (iOS): the pre-existing shared-WebView flow, minus the
+/// removed localStorage/IndexedDB snapshot machinery.
+#[cfg(all(mobile, not(target_os = "android")))]
+fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
+    let window = app
+        .get_webview_window(LAUNCHER_LABEL)
+        .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
+    // Re-validate the `Site` snapshot (see `open_in_main_window_inner`).
+    {
+        let state = app.state::<AppState>();
+        let reg = state
+            .registry
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        match reg.get(&site.id) {
+            Some(current) => {
+                if current.hidden {
+                    return Err(AppError::SiteNotFound(site.id.clone()));
+                }
+                if current.url != site.url {
+                    return Err(AppError::SiteNotFound(site.id.clone()));
+                }
+            }
+            None => return Err(AppError::SiteNotFound(site.id.clone())),
+        }
+    }
+    let state = app.state::<AppState>();
+
     let previous_site = state
         .current_site
         .lock()
         .expect("current_site lock")
         .clone();
-    #[cfg(target_os = "android")]
-    let previous_url = if let Some(current) = previous_site.as_ref() {
-        match window.url() {
-            Ok(active_url) if active_url.host_str() == Some(current.host.as_str()) => {
-                export_cookies(&window, &current.site_id, &current.host)?;
-                export_site_storage(app, &current.site_id);
-                Some(active_url)
-            }
-            Ok(_) => {
-                // `navigate()` is queued before the page finishes loading. A
-                // quick second provider click can still see the launcher URL;
-                // keep the last saved snapshot rather than exporting launcher
-                // state into this provider's jar.
-                log::debug!(
-                    "Android outgoing session snapshot skipped before provider load ({})",
-                    current.site_id
-                );
-                Some(provider_cookie_url(&current.host)?)
-            }
-            Err(e) => {
-                log::debug!(
-                    "Android outgoing session URL unavailable; keeping saved snapshot ({}, {e})",
-                    current.site_id
-                );
-                Some(provider_cookie_url(&current.host)?)
-            }
-        }
-    } else {
-        // First Android site open: there is no outgoing provider session to snapshot.
-        None
-    };
-    #[cfg(not(target_os = "android"))]
     if let Some(current) = previous_site.as_ref() {
         export_cookies(&window, &current.site_id, &current.host)?;
-        export_site_storage(app, &current.site_id);
     }
 
-    // 2. Preserve the existing Wry cleanup on non-Android mobile platforms.
-    // Android must not run clear_all_browsing_data here: on first open there
-    // is no outgoing session, and on provider switches the saved cookie jar
-    // is replaced below without a global WebView data wipe. Storage remains
-    // origin-scoped and the target site's storage is restored after loading.
-    #[cfg(not(target_os = "android"))]
     window.clear_all_browsing_data().map_err(|e| {
         log::error!("çerezler temizlenemedi: {e}");
         AppError::Other("çerezler temizlenemedi".into())
     })?;
 
-    // On Android this replaces only CookieManager's shared cookie jar with
-    // the target provider's saved cookies; it does not clear WebView storage.
     if let Err(e) = import_cookies(&window, &site.id, url) {
-        #[cfg(target_os = "android")]
-        rollback_android_cookie_swap(&window, previous_site.as_ref(), previous_url.as_ref());
         return Err(e);
     }
 
-    // 3. Install the cosmetic/anti-popup script and navigate.
     if let Err(e) = window.eval(init_script) {
         log::error!("script yüklenemedi: {e}");
-        #[cfg(target_os = "android")]
-        rollback_android_cookie_swap(&window, previous_site.as_ref(), previous_url.as_ref());
         return Err(AppError::Other("script yüklenemedi".into()));
     }
 
     if let Err(e) = window.navigate(url.clone()) {
         log::error!("sayfa açılamadı: {e}");
-        #[cfg(target_os = "android")]
-        rollback_android_cookie_swap(&window, previous_site.as_ref(), previous_url.as_ref());
         return Err(AppError::Other("sayfa açılamadı".into()));
     }
 
@@ -678,8 +1380,6 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         entered_fullscreen: false,
     });
 
-    // Live-session sync: Android may kill the process without running the
-    // close path, so the blobs are refreshed on an interval while open.
     spawn_session_sync(
         app.clone(),
         LAUNCHER_LABEL.to_string(),
@@ -687,190 +1387,25 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         site.host(),
     );
 
-    // 4. Restore the target site's web storage once its page is loaded.
-    //    `localStorage` is origin-scoped: writing before the site page is the
-    //    loaded document would land in the launcher's origin. A small watcher
-    //    thread polls the WebView URL (sites open rarely; a dedicated thread
-    //    keeps this off the async runtime) and then runs the blocking
-    //    restore. `import_site_storage` re-checks that the session is still
-    //    this site's, so a watcher left behind by a quick close can never
-    //    write into another site's origin.
-    let watcher_app = app.clone();
-    let watcher_window = window;
-    let watcher_site_id = site.id.clone();
-    let watcher_host = site.host();
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if std::time::Instant::now() >= deadline {
-                log::warn!("site deposu geri yükleme zaman aşımı: {watcher_site_id}");
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let loaded = watcher_window
-                .url()
-                .ok()
-                .is_some_and(|u| u.host_str() == Some(watcher_host.as_str()));
-            if loaded {
-                break;
-            }
-        }
-        import_site_storage(&watcher_app, &watcher_site_id);
-    });
-
     Ok(LAUNCHER_LABEL.to_string())
 }
 
-/// Export the live site's `localStorage` and IndexedDB into per-site sealed
-/// secrets.
-///
-/// Best-effort by design: a failed export is logged and costs the site its
-/// stored state on the next visit, but never blocks closing or switching.
-/// Must run while the site page is still the loaded origin.
-#[cfg(mobile)]
-fn export_site_storage(app: &AppHandle, site_id: &str) {
-    let state = app.state::<AppState>();
-    let purpose = format!("site-{site_id}");
-    for (kind, result) in [
-        (
-            "localstorage",
-            crate::android_bridge::localstorage_export(&purpose),
-        ),
-        (
-            "indexeddb",
-            crate::android_bridge::indexeddb_export(&purpose),
-        ),
-    ] {
-        match result {
-            // An empty export means the page had no storage yet — storing an
-            // empty blob would only add noise, skip it.
-            Ok(sealed) if !sealed.is_empty() => {
-                let name = format!("{kind}-{site_id}");
-                if let Err(e) = state.provider.put_secret(&name, sealed.as_bytes()) {
-                    log::warn!("{kind} blob'u kaydedilemedi ({site_id}): {e}");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => log::warn!("{kind} dışa aktarılamadı ({site_id}): {e}"),
-        }
-    }
-}
-
-/// Restore a site's `localStorage` and IndexedDB into the currently loaded
-/// page.
-///
-/// Refuses to run unless `site_id` is still the current session, so a stale
-/// watcher can never write one site's state into another site's origin.
-#[cfg(mobile)]
-fn import_site_storage(app: &AppHandle, site_id: &str) {
-    #[cfg(target_os = "android")]
-    let _session_guard = match lock_android_session() {
-        Ok(guard) => guard,
-        Err(e) => {
-            log::error!("Android site storage restore kilitlenemedi: {e}");
-            return;
-        }
-    };
-    {
-        let state = app.state::<AppState>();
-        if !session_is_current(&state, site_id) {
-            return;
-        }
-    }
-    let state = app.state::<AppState>();
-    let purpose = format!("site-{site_id}");
-    for kind in ["localstorage", "indexeddb"] {
-        let sealed = match state.provider.get_secret(&format!("{kind}-{site_id}")) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => continue,
-            Err(e) => {
-                log::warn!("{kind} blob'u okunamadı ({site_id}): {e}");
-                continue;
-            }
-        };
-        let Ok(sealed) = String::from_utf8(sealed.to_vec()) else {
-            log::warn!("{kind} blob'u bozuk ({site_id})");
-            continue;
-        };
-        if sealed.is_empty() {
-            continue;
-        }
-        let result = if kind == "localstorage" {
-            crate::android_bridge::localstorage_import(&purpose, &sealed)
-        } else {
-            crate::android_bridge::indexeddb_import(&purpose, &sealed)
-        };
-        if let Err(e) = result {
-            log::warn!("{kind} geri yüklenemedi ({site_id}): {e}");
-        }
-    }
-}
-
 /// Save the WebView's current cookie jar into the named site's encrypted blob.
-#[cfg(mobile)]
+///
+/// iOS only: Android's site cookies live in their WebView profile and are
+/// never snapshotted any more (see the module docs).
+#[cfg(all(mobile, not(target_os = "android")))]
 fn export_cookies(
     window: &tauri::WebviewWindow,
     site_id: &str,
     expected_host: &str,
 ) -> AppResult<()> {
-    #[cfg(target_os = "android")]
-    {
-        // Wry's Android `cookies()` API is unsupported (it always returns an
-        // empty Vec). Read the shared CookieManager directly, but only when
-        // the tracked provider is actually loaded; a fast provider switch can
-        // otherwise snapshot the launcher URL as an empty provider jar.
-        let url = match window.url() {
-            Ok(url) if url.host_str() == Some(expected_host) => url,
-            Ok(_) => {
-                log::debug!("Android cookie snapshot skipped before provider load ({site_id})");
-                return Ok(());
-            }
-            Err(e) => {
-                log::debug!("Android cookie snapshot skipped; URL unavailable ({site_id}): {e}");
-                return Ok(());
-            }
-        };
-        let header = crate::android_bridge::webview_cookies_get(url.as_str())?;
-        if header.is_empty() {
-            log::debug!("Android cookie result is empty ({site_id})");
-        }
-        return export_cookies_from(
-            parse_android_cookie_header(&header),
-            window.app_handle(),
-            site_id,
-        );
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = expected_host;
-        let live = window.cookies().map_err(|e| {
-            log::error!("çerezler okunamadı: {e}");
-            AppError::Other("çerezler okunamadı".into())
-        })?;
-        export_cookies_from(live, window.app_handle(), site_id)
-    }
-}
-
-/// Parse the request-cookie header returned by Android's CookieManager.
-///
-/// **Mimari kısıtlama:** `CookieManager.getCookie()` *request* `Cookie`
-/// başlığını (`name=value; name2=value2`) döndürür, `Set-Cookie` değil.
-/// `HttpOnly`, `Secure`, `SameSite`, `Domain`, `Path` ve `Expires` bu
-/// nedenle yakalama anında kaybolur; `capture()` bu alanlara `None`/`false`
-/// yazar ve `restore()` yalnızca minimal `name=value` geri kurar. Sadece
-/// `name=value`'ye dayalı oturum çerezleri korunur; öznitelik bağımlı
-/// davranışlar (`__Host-` prefix, katı `SameSite`) Android'de aslına uygun
-/// geri getirilemez. Bu Android platform kısıtlamasıdır, farklı bir WebView
-/// API'si olmadan düzeltilemez. Wry'nin `cookies_for_url` davranışıyla
-/// uyumludur ve CookieJar formatını değiştirmez.
-#[cfg(any(target_os = "android", test))]
-fn parse_android_cookie_header(header: &str) -> Vec<cookie::Cookie<'static>> {
-    header
-        .split("; ")
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| cookie::Cookie::parse(part.to_string()).ok())
-        .collect()
+    let _ = expected_host;
+    let live = window.cookies().map_err(|e| {
+        log::error!("çerezler okunamadı: {e}");
+        AppError::Other("çerezler okunamadı".into())
+    })?;
+    export_cookies_from(live, window.app_handle(), site_id)
 }
 
 /// Same as [`export_cookies`] but for a bare child `Webview` (desktop).
@@ -883,6 +1418,7 @@ fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<
     export_cookies_from(live, webview.app_handle(), site_id)
 }
 
+#[cfg(any(desktop, all(mobile, not(target_os = "android"))))]
 fn export_cookies_from(
     live: Vec<cookie::Cookie<'static>>,
     app: &AppHandle,
@@ -893,7 +1429,7 @@ fn export_cookies_from(
 
     let mut jar = CookieJar {
         site_id: site_id.to_string(),
-        cookies: live.iter().map(capture).collect(),
+        cookies: live.iter().map(crate::web::session::capture).collect(),
         saved_at: now,
     };
     jar.prune_expired(now);
@@ -904,82 +1440,55 @@ fn export_cookies_from(
         .put_secret(&format!("cookies-{site_id}"), &bytes)
 }
 
-/// Load a site's encrypted cookie jar into the WebView.
-#[cfg(mobile)]
+/// Load a site's encrypted cookie jar into the shared WebView (iOS only).
+///
+/// Android never reaches this: its jars are imported profile-scoped inside
+/// `AnimeHubSiteController` before the first navigation of a virgin profile.
+#[cfg(all(mobile, not(target_os = "android")))]
 fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> AppResult<()> {
     let app = window.app_handle().clone();
     let state = app.state::<AppState>();
-    let stored = state.provider.get_secret(&format!("cookies-{site_id}"))?;
-    #[cfg(not(target_os = "android"))]
     let _ = url;
-
-    // Android's shared CookieManager must be cleared even when this provider
-    // has no saved jar; otherwise cookies from the previous provider survive.
-    #[cfg(target_os = "android")]
-    let jar: CookieJar = match stored {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
-        None => CookieJar::default(),
-    };
-    #[cfg(not(target_os = "android"))]
+    let stored = state.provider.get_secret(&format!("cookies-{site_id}"))?;
     let jar: CookieJar = match stored {
         Some(bytes) => serde_json::from_slice(&bytes)?,
         None => return Ok(()),
     };
 
     let now = crate::anilist::now_unix();
-    #[cfg(target_os = "android")]
-    let mut cookie_headers = Vec::new();
-
     for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
         if let Some(cookie) = restore(stored) {
-            #[cfg(target_os = "android")]
-            cookie_headers.push(cookie.to_string());
-
-            #[cfg(not(target_os = "android"))]
-            {
-                // Preserve the existing non-Android mobile path.
-                if let Err(e) = window.set_cookie(cookie) {
-                    log::debug!("cookie restore failed for {site_id}: {e}");
-                }
+            if let Err(e) = window.set_cookie(cookie) {
+                log::debug!("cookie restore failed for {site_id}: {e}");
             }
         }
     }
 
-    #[cfg(target_os = "android")]
-    crate::android_bridge::webview_cookies_replace(url.as_str(), &cookie_headers)?;
-
     Ok(())
 }
 
-/// Roll back a failed Android site open without leaving the attempted
-/// provider's cookies in the still-active WebView.
-#[cfg(target_os = "android")]
-fn rollback_android_cookie_swap(
-    window: &tauri::WebviewWindow,
-    previous_site: Option<&CurrentSite>,
-    previous_url: Option<&Url>,
-) {
-    let rollback = match (previous_site, previous_url) {
-        (Some(site), Some(url)) => import_cookies(window, &site.site_id, url),
-        _ => crate::android_bridge::webview_cookies_clear(),
-    };
-    if let Err(e) = rollback {
-        log::error!("Android cookie session rollback failed: {e}");
-        if let Err(clear_error) = crate::android_bridge::webview_cookies_clear() {
-            log::error!("Android cookie cleanup after rollback failure failed: {clear_error}");
-        }
-    }
-}
-
-/// Close a site session, persisting its cookies and web storage first.
+/// Close the active site session on mobile.
 ///
-/// Mobile: save the jar and the sealed localStorage/IndexedDB blobs (the site
-/// page is still loaded here, so the storage export reads the right origin),
-/// then send the single WebView back to the launcher.
+/// Android: destroy the site WebView through the Kotlin controller (which
+/// flushes the *profile* cookie manager first, re-binds PiP and focus to the
+/// launcher). The launcher page never moved, so there is nothing to
+/// navigate back to — removing the site view reveals it. Idempotent: the
+/// Kotlin side resolves normally when no site view exists, which keeps a
+/// stale session record harmless.
+///
+/// iOS: persist the jar, then send the shared WebView back to the launcher.
 #[cfg(mobile)]
 pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
     #[cfg(target_os = "android")]
     let _session_guard = lock_android_session()?;
+
+    #[cfg(target_os = "android")]
+    {
+        // Flush + destroy the site view before releasing state: a failure
+        // here means the view may still be alive, so the session must stay
+        // claimed for a retry.
+        crate::android_bridge::site_close(true)?;
+    }
 
     let current = {
         let state = app.state::<AppState>();
@@ -993,31 +1502,16 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
         value
     };
 
+    #[cfg(not(target_os = "android"))]
     if let Some(current) = &current {
         let window = app
             .get_webview_window(LAUNCHER_LABEL)
             .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
         export_cookies(&window, &current.site_id, &current.host)?;
-        // The live page is still this site's origin; after the navigate below
-        // the storage would be unreachable until the next visit. If close was
-        // tapped during startup, keep the last stored snapshot rather than
-        // exporting the launcher's origin into this provider's storage blob.
-        #[cfg(target_os = "android")]
-        if window
-            .url()
-            .ok()
-            .is_some_and(|url| url.host_str() == Some(current.host.as_str()))
-        {
-            export_site_storage(app, &current.site_id);
-        } else {
-            log::debug!(
-                "Android storage snapshot skipped before provider load ({})",
-                current.site_id
-            );
-        }
-        #[cfg(not(target_os = "android"))]
-        export_site_storage(app, &current.site_id);
     }
+
+    // iOS only: the shared WebView was navigated away from the launcher.
+    #[cfg(not(target_os = "android"))]
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         let state = app.state::<AppState>();
         let back = state
@@ -1032,13 +1526,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
             })?;
         }
     }
-    #[cfg(target_os = "android")]
-    if current.is_some() {
-        // After navigation is accepted, remove the shared jar before releasing
-        // the session lock; a failed navigation must leave the old page's jar
-        // intact for the still-active provider.
-        crate::android_bridge::webview_cookies_clear()?;
-    }
+
     let closed_site = current.as_ref().map(|c| c.site_id.clone());
     let state = app.state::<AppState>();
     *state.current_site.lock().expect("current_site lock") = None;
@@ -1113,11 +1601,9 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     Ok(())
 }
 
-/// Mobile wipe-close: clear the shared WebView without re-exporting the
-/// deleted site's cookies/storage. Used by `remove_site` / `clear_site_data`
-/// when the deleted site is currently open. Holds the Android session lock
-/// so a concurrent `spawn_session_sync` cannot export the doomed jar after
-/// the wipe. No `export_cookies` / `export_site_storage` is called.
+/// Mobile wipe-close for `remove_site` / `clear_site_data` when the target
+/// site is currently open. Holds `ANDROID_SESSION_LOCK` so a concurrent sync
+/// tick cannot flush the doomed profile between the close and the wipe.
 #[cfg(mobile)]
 pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<()> {
     #[cfg(target_os = "android")]
@@ -1126,8 +1612,14 @@ pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<
 }
 
 /// Locked variant: caller must hold `ANDROID_SESSION_LOCK` (on Android).
-/// Checks that `site_id` is still the current site before clearing, so a
+/// Checks that `site_id` is still the current site before closing, so a
 /// concurrent site switch does not close the wrong session.
+///
+/// Android destroys the site WebView with `flush=false`: its data is about
+/// to be cleared or deleted, so re-persisting cookie writes first would only
+/// give the deletion a chance to lose the race. The launcher WebView is
+/// untouched (its data is the default profile and is never part of a site
+/// wipe).
 #[cfg(mobile)]
 pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> AppResult<()> {
     let current = {
@@ -1145,31 +1637,34 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
     if !should_clear {
         return Ok(());
     }
-    let back = {
-        let state = app.state::<AppState>();
-        let value = state
-            .launcher_url
-            .lock()
-            .expect("launcher_url lock")
-            .clone();
-        value
-    };
-    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-        if let Some(url) = back {
-            window.navigate(url).map_err(|e| {
-                log::error!("başlatıcıya dönülemedi: {e}");
-                AppError::Other("başlatıcıya dönülemedi".into())
-            })?;
-        }
-    }
+
     #[cfg(target_os = "android")]
     {
-        // Clear the shared CookieManager without first exporting the doomed
-        // site's live jar. A failed navigate must not leave the old jar for
-        // the still-active provider, but here the provider is being deleted
-        // so we clear unconditionally for the matching site.
-        crate::android_bridge::webview_cookies_clear()?;
+        // Destroy without flushing — the caller wipes right after.
+        crate::android_bridge::site_close(false)?;
     }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let back = {
+            let state = app.state::<AppState>();
+            let value = state
+                .launcher_url
+                .lock()
+                .expect("launcher_url lock")
+                .clone();
+            value
+        };
+        if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+            if let Some(url) = back {
+                window.navigate(url).map_err(|e| {
+                    log::error!("başlatıcıya dönülemedi: {e}");
+                    AppError::Other("başlatıcıya dönülemedi".into())
+                })?;
+            }
+        }
+    }
+
     let closed_site = current.as_ref().map(|c| c.site_id.clone());
     {
         let state = app.state::<AppState>();
@@ -1292,7 +1787,7 @@ mod tests {
     use crate::secure::store::SecureStore;
     use crate::secure::SecretProvider;
     use crate::sites::blocklist::Blocklist;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn labels_are_unique_per_site_and_filesystem_safe() {
@@ -1358,39 +1853,442 @@ mod tests {
         assert!(SESSION_SYNC_INTERVAL.as_secs() <= 300);
         // The safety valve must always outlive many intervals.
         assert!(SESSION_SYNC_MAX_LIFETIME > SESSION_SYNC_INTERVAL * 100);
-        #[cfg(mobile)]
-        {
-            assert!(STORAGE_SYNC_EVERY_N_TICKS >= 2, "storage dumps are heavy");
+    }
+
+    #[test]
+    fn android_profile_names_are_deterministic_stable_and_safe() {
+        // Deterministic: the same site id always yields the same name, or a
+        // site's profile would be orphaned on every launch.
+        assert_eq!(
+            android_profile_name("builtin-openanime", 0),
+            android_profile_name("builtin-openanime", 0)
+        );
+        let name = android_profile_name("builtin-openanime", 0);
+        // Conservative charset the WebView provider accepts anywhere, and
+        // never the raw id: sanitised/odd ids must not change that shape.
+        assert!(name.starts_with("site-"));
+        assert!(name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert_eq!(
+            android_profile_name("../../etc/passwd", 0).len(),
+            name.len()
+        );
+        // Not derived from the URL or display name: only site_id matters.
+        assert_eq!(name, android_profile_name("builtin-openanime", 0));
+        // Never the default profile's name.
+        assert_ne!(name, "Default");
+    }
+
+    #[test]
+    fn android_profile_names_are_unique_per_site_id() {
+        // "Each site id gets a different profile": 128 bits of SHA-256 in the
+        // name make cross-site collisions negligible, including ids that
+        // sanitise to the same bytes (the old directory scheme collided here).
+        let a = android_profile_name("user-1", 0);
+        let b = android_profile_name("user-2", 0);
+        let c = android_profile_name("../../user-1", 0);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        // The generation distinguishes re-created profiles from names whose
+        // deletion may still be finishing on disk.
+        assert_ne!(
+            android_profile_name("user-1", 0),
+            android_profile_name("user-1", 1)
+        );
+        assert_eq!(
+            android_profile_name("user-1", 1),
+            android_profile_name("user-1", 1)
+        );
+    }
+
+    #[test]
+    fn profile_generation_roundtrips_and_bumps() {
+        let state = state_with_current_site(None);
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), 0);
+        assert_eq!(bump_profile_generation(&state, "user-1").unwrap(), 1);
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), 1);
+        // A different site id keeps its own counter.
+        assert_eq!(profile_generation(&state, "user-2").unwrap(), 0);
+        assert_eq!(bump_profile_generation(&state, "user-1").unwrap(), 2);
+    }
+
+    #[test]
+    fn pending_profile_deletes_queue_dedupes_and_forgets() {
+        // Fixtures use the REAL name shape (32 lowercase hex): the reader
+        // drops anything `is_valid_site_profile_name` rejects, and the
+        // validator is never loosened for tests.
+        let name_a = format!("{}{}-g0", ANDROID_PROFILE_PREFIX, "a".repeat(32));
+        let name_b = format!("{}{}-g0", ANDROID_PROFILE_PREFIX, "b".repeat(32));
+        let state = state_with_current_site(None);
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        queue_pending_profile_delete(&state, &name_a).unwrap();
+        queue_pending_profile_delete(&state, &name_a).unwrap();
+        queue_pending_profile_delete(&state, &name_b).unwrap();
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(queued, vec![name_a.clone(), name_b.clone()]);
+        forget_pending_profile_delete(&state, &name_a).unwrap();
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(queued, vec![name_b.clone()]);
+        forget_pending_profile_delete(&state, &name_b).unwrap();
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn profile_name_validator_is_strict_and_namespace_scoped() {
+        let hex32 = "a".repeat(32);
+        assert!(is_valid_site_profile_name(&format!("site-{hex32}-g0")));
+        assert!(is_valid_site_profile_name(&format!("site-{hex32}-g123456")));
+        // Full u32 range stays representable (10 digits).
+        assert!(is_valid_site_profile_name(&format!(
+            "site-{hex32}-g4294967295"
+        )));
+        // Never a handle for anything outside our namespace:
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{}-g0",
+            "a".repeat(31)
+        )));
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{}-g0",
+            "A".repeat(32)
+        )));
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g")));
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g-1")));
+        assert!(!is_valid_site_profile_name(&format!("site-{hex32}-g+1")));
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{hex32}-g01234567890"
+        )));
+        // 10 digits beyond u32 must not validate as a "generation".
+        assert!(!is_valid_site_profile_name(&format!(
+            "site-{hex32}-g9999999999"
+        )));
+        assert!(!is_valid_site_profile_name("Default"));
+        assert!(!is_valid_site_profile_name(&format!("xsite-{hex32}-g0")));
+    }
+
+    #[test]
+    fn scan_valid_profile_names_salvages_broken_bytes() {
+        let name_a = format!("site-{}-g3", "c".repeat(32));
+        let name_b = format!("site-{}-g0", "d".repeat(32));
+        // Structurally broken JSON: quotes/brackets missing, an invalid
+        // short-hex name, and noise around the valid tokens.
+        let raw = format!("{{garbage [{name_a}, \"site-e-f0\", tail {name_b} end");
+        let found = scan_valid_profile_names(raw.as_bytes());
+        assert_eq!(found, vec![name_a, name_b]);
+        // Clean input keeps order and nothing extra.
+        let clean = serde_json::to_vec(&["unrelated".to_string()]).unwrap();
+        assert!(scan_valid_profile_names(&clean).is_empty());
+    }
+
+    #[test]
+    fn scan_recovers_complete_multi_digit_generations() {
+        // The regression this pins: growing-length candidates used to stop at
+        // the SHORTEST valid prefix, so `-g123` was salvaged as `-g1` — the
+        // wrong profile got queued for deletion while the real one stayed out
+        // of the queue, and generation recovery derived from truncated digits.
+        let hex = "a".repeat(32);
+        for gen in ["g1", "g12", "g123", "g4567", "g4294967295"] {
+            let name = format!("site-{hex}-{gen}");
+            let raw = format!("[{{broken {name},");
+            let found = scan_valid_profile_names(raw.as_bytes());
+            assert_eq!(found, vec![name.clone()], "full name must survive: {gen}");
+            assert!(is_valid_site_profile_name(&found[0]));
         }
     }
 
     #[test]
-    fn android_cookie_header_parses_empty_and_multiple_cookies() {
-        assert!(parse_android_cookie_header("").is_empty());
-        let cookies = parse_android_cookie_header("sid=abc=123; theme=dark");
-        assert_eq!(cookies.len(), 2);
-        assert_eq!(cookies[0].name(), "sid");
-        assert_eq!(cookies[0].value(), "abc=123");
-        assert_eq!(cookies[1].name(), "theme");
-        assert_eq!(cookies[1].value(), "dark");
+    fn scan_never_truncates_a_generation_into_a_shorter_valid_name() {
+        let hex = "b".repeat(32);
+        let name = format!("site-{hex}-g123");
+        let truncated = format!("site-{hex}-g1");
+        let raw = format!("\"{name}\"");
+        let found = scan_valid_profile_names(raw.as_bytes());
+        assert_eq!(found, vec![name]);
+        assert!(
+            !found.contains(&truncated),
+            "the truncated prefix is a DIFFERENT profile and must not be salvaged"
+        );
+        // Repeated reads of the same bytes are deterministic (the queue is
+        // re-salvaged on every read until it is repaired).
+        assert_eq!(found, scan_valid_profile_names(raw.as_bytes()));
     }
 
     #[test]
-    fn android_cookie_header_drops_attributes_intentionally() {
-        // `getCookie()` never returns HttpOnly/Secure/etc. StoredCookie
-        // captures what is available; attributes are intentionally lost on
-        // Android and restored as minimal cookies. This test documents the
-        // architectural limitation rather than asserting it is fixed.
-        let cookies = parse_android_cookie_header("sid=abc; HttpOnly; Secure");
-        // The header `sid=abc; HttpOnly` is parsed as two cookies (`sid` and
-        // `HttpOnly` with empty value) because the source is a Cookie request
-        // header, not Set-Cookie. Only name/value of the first cookie is
-        // meaningful.
-        assert_eq!(cookies[0].name(), "sid");
-        assert_eq!(cookies[0].value(), "abc");
-        // No domain/secure/httpOnly survives the Android header.
-        assert!(cookies[0].domain().is_none());
-        assert_eq!(cookies[0].secure(), None);
+    fn scan_refuses_generations_beyond_u32_instead_of_cutting_them_down() {
+        let hex = "c".repeat(32);
+        // 4294967296 = u32::MAX + 1: right shape, no representable
+        // generation. Cutting it back to `…-g429496729` would salvage a
+        // name that was never queued.
+        let overflow = format!("site-{hex}-g4294967296");
+        assert!(scan_valid_profile_names(overflow.as_bytes()).is_empty());
+        // Longer than the 10-digit shape the validator allows.
+        let too_long = format!("site-{hex}-g12345678901");
+        assert!(scan_valid_profile_names(too_long.as_bytes()).is_empty());
+        // The largest representable generation is still salvaged in full.
+        let max = format!("site-{hex}-g4294967295");
+        assert_eq!(scan_valid_profile_names(max.as_bytes()), vec![max]);
+    }
+
+    #[test]
+    fn scan_handles_lookalikes_and_token_boundaries_exactly() {
+        let hex = "d".repeat(32);
+        // Shape violations salvage nothing.
+        for bad in [
+            format!("site-{hex}-g"),                   // no generation digits
+            format!("site-{}-g3", "d".repeat(31)),     // short hex digest
+            format!("site-{}-g3", "d".repeat(33)),     // long hex digest
+            format!("site-{}-G3", hex.to_uppercase()), // uppercase hex + G
+            "Default".to_string(),                     // the launcher profile
+            "site-not-hex-g3".to_string(),
+        ] {
+            assert!(
+                scan_valid_profile_names(bad.as_bytes()).is_empty(),
+                "lookalike must not be salvaged: {bad}"
+            );
+        }
+        // A non-digit ends the token: junk after complete digits does not
+        // stop the full name from being salvaged (corrupt neighbours are
+        // exactly what this scan exists for).
+        let with_junk = format!("site-{hex}-g12xyz");
+        assert_eq!(
+            scan_valid_profile_names(with_junk.as_bytes()),
+            vec![format!("site-{hex}-g12")]
+        );
+        // An embedded valid token is salvaged as itself — still never
+        // anything outside the `site-…` namespace.
+        let embedded = format!("xsite-{hex}-g3");
+        assert_eq!(
+            scan_valid_profile_names(embedded.as_bytes()),
+            vec![format!("site-{hex}-g3")]
+        );
+    }
+
+    #[test]
+    fn scan_recovers_every_valid_name_in_broken_json_with_noise() {
+        let a = format!("site-{}-g1", "a".repeat(32));
+        let b = format!("site-{}-g12", "b".repeat(32));
+        let c = format!("site-{}-g123", "c".repeat(32));
+        let raw = format!("{{oops [\"{a}\", garbage, {b} , \"site-short-g1\", tail {c}}}");
+        let found = scan_valid_profile_names(raw.as_bytes());
+        assert_eq!(
+            found,
+            vec![a, b, c],
+            "order preserved; noise and invalid tokens dropped"
+        );
+    }
+
+    #[test]
+    fn salvaged_queue_feeds_generation_recovery_and_collision_resolution() {
+        // End-to-end over the REAL production paths: corrupt queue bytes →
+        // salvaged names → generation recovery → collision resolution.
+        let state = state_with_current_site(None);
+        let site = "user-scan";
+        let gen7 = android_profile_name(site, 7);
+        let gen12 = android_profile_name(site, 12);
+        let raw = format!("[{{oops \"{gen7}\", noise {gen12}");
+        state
+            .provider
+            .put_secret(PENDING_PROFILE_DELETES_KEY, raw.as_bytes())
+            .unwrap();
+
+        // The reader salvages the COMPLETE names — a truncated `…-g1` would
+        // queue a deletion for a profile that was never retired.
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(queued, vec![gen7, gen12.clone()]);
+
+        // A corrupt generation counter recovers from those salvaged names.
+        state
+            .provider
+            .put_secret(&format!("{PROFILE_GENERATION_PREFIX}{site}"), b"broken")
+            .unwrap();
+        assert_eq!(profile_generation(&state, site).unwrap(), 13);
+
+        // Collision resolution never hands out a queued name: stored 12 IS
+        // queued, so the derived generation moves past the queue maximum.
+        let (generation, advanced) = resolve_queued_free_generation(site, 12, &queued).unwrap();
+        assert!(advanced);
+        assert_eq!(generation, 13);
+        let derived = android_profile_name(site, generation);
+        assert!(
+            !queued.contains(&derived),
+            "derived name must not collide with the salvaged queue"
+        );
+    }
+
+    #[test]
+    fn recover_pending_profile_deletes_reports_corruption() {
+        // Parses but contains junk entries: junk dropped, still corrupt.
+        let name_a = format!("site-{}-g1", "f".repeat(32));
+        let mixed = serde_json::to_vec(&[name_a.clone(), "Default".to_string()]).unwrap();
+        let (list, corrupt) = recover_pending_profile_deletes(&mixed);
+        assert_eq!(list, vec![name_a.clone()]);
+        assert!(corrupt);
+        // Broken document: salvaged, always corrupt.
+        let broken = format!("[{name_a}").into_bytes();
+        let (list, corrupt) = recover_pending_profile_deletes(&broken);
+        assert_eq!(list, vec![name_a.clone()]);
+        assert!(corrupt);
+        // Clean document: untouched, not corrupt.
+        let clean = serde_json::to_vec(&[name_a]).unwrap();
+        let (list, corrupt) = recover_pending_profile_deletes(&clean);
+        assert_eq!(list.len(), 1);
+        assert!(!corrupt);
+    }
+
+    #[test]
+    fn corrupt_queue_is_backed_up_and_repaired_on_read() {
+        let state = state_with_current_site(None);
+        let name = format!("site-{}-g2", "1".repeat(32));
+        // Broken JSON that still contains one valid name.
+        let raw = format!("[{{oops {name}").into_bytes();
+        state
+            .provider
+            .put_secret(PENDING_PROFILE_DELETES_KEY, &raw)
+            .unwrap();
+
+        let list = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(list, vec![name.clone()], "salvaged, never silently empty");
+        // The raw bytes were preserved before the working copy was repaired.
+        let backup = state
+            .provider
+            .get_secret(CORRUPT_QUEUE_BACKUP_KEY)
+            .unwrap()
+            .expect("corrupt backup must exist");
+        assert_eq!(backup.as_slice(), raw.as_slice());
+        // The working copy is now valid JSON so later reads stop repairing.
+        let reread = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(reread, vec![name]);
+    }
+
+    #[test]
+    fn corrupt_generation_recovers_from_the_queue_and_persists() {
+        let state = state_with_current_site(None);
+        let queued_name = android_profile_name("user-1", 3);
+        queue_pending_profile_delete(&state, &queued_name).unwrap();
+        // A generation for a DIFFERENT site must not influence recovery.
+        queue_pending_profile_delete(&state, &android_profile_name("user-2", 7)).unwrap();
+        state
+            .provider
+            .put_secret(
+                &format!("{PROFILE_GENERATION_PREFIX}user-1"),
+                b"not-a-number",
+            )
+            .unwrap();
+
+        // Recovered to max-queued-for-this-site + 1 — never silently 0,
+        // which could re-open a name whose deletion is still queued.
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), 4);
+        // And persisted: the next read comes from storage, not recovery.
+        let stored = state
+            .provider
+            .get_secret(&format!("{PROFILE_GENERATION_PREFIX}user-1"))
+            .unwrap()
+            .expect("recovered generation persisted");
+        assert_eq!(String::from_utf8_lossy(&stored), "4");
+        // user-1's queue entry no longer collides with the derived name.
+        let resolved = android_profile_name("user-1", 4);
+        assert!(!read_pending_profile_deletes(&state)
+            .unwrap()
+            .contains(&resolved));
+        // An untouched site still starts at 0.
+        assert_eq!(profile_generation(&state, "user-3").unwrap(), 0);
+    }
+
+    #[test]
+    fn corrupt_generation_with_no_queue_recovers_to_zero() {
+        let state = state_with_current_site(None);
+        state
+            .provider
+            .put_secret(&format!("{PROFILE_GENERATION_PREFIX}user-1"), b"3.4")
+            .unwrap();
+        // No queued deletions at all: 0 is safe (nothing pending for it).
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn bump_profile_generation_refuses_to_overflow() {
+        let state = state_with_current_site(None);
+        state
+            .provider
+            .put_secret(
+                &format!("{PROFILE_GENERATION_PREFIX}user-1"),
+                u32::MAX.to_string().as_bytes(),
+            )
+            .unwrap();
+        // saturating_add would pin at MAX and reuse the queued name forever.
+        assert!(bump_profile_generation(&state, "user-1").is_err());
+        // The stored value is untouched by the refused bump.
+        assert_eq!(profile_generation(&state, "user-1").unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn generation_recovery_at_queued_max_refuses() {
+        let queued = vec![android_profile_name("user-1", u32::MAX)];
+        assert!(recover_generation_for("user-1", &queued).is_err());
+        // No queued name → plain 0.
+        assert_eq!(recover_generation_for("user-1", &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_queued_free_generation_only_moves_on_real_collision() {
+        let own = android_profile_name("user-1", 2);
+        let other = android_profile_name("user-2", 2);
+        // Nothing queued: unchanged.
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[]).unwrap(),
+            (2, false)
+        );
+        // Someone else's name: unchanged.
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[other]).unwrap(),
+            (2, false)
+        );
+        // A different generation of this site: unchanged (names differ).
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[android_profile_name("user-1", 5)])
+                .unwrap(),
+            (2, false)
+        );
+        // The stored name itself is queued: advance past the queue maximum,
+        // which by construction cannot be in the queue either.
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, std::slice::from_ref(&own)).unwrap(),
+            (3, true)
+        );
+        assert_eq!(
+            resolve_queued_free_generation("user-1", 2, &[own, android_profile_name("user-1", 9)])
+                .unwrap(),
+            (10, true)
+        );
+    }
+
+    #[test]
+    fn migration_flag_marks_once_and_clears_with_the_session() {
+        let state = state_with_current_site(None);
+        let id = "user-migrate";
+        assert!(
+            state
+                .provider
+                .get_secret(&format!("profilemig-{id}"))
+                .unwrap()
+                .is_none(),
+            "fresh site has not migrated"
+        );
+        mark_migration_done(&state, id).unwrap();
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
+        // Clearing/removing the site deletes the flag with the rest of the
+        // session data, so a wiped site never re-imports its wiped jar.
+        state.provider.delete_site_session(id).unwrap();
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1402,10 +2300,7 @@ mod tests {
         // longer current after the wipe's `current_site` is cleared.
         #[cfg(desktop)]
         {
-            use std::sync::{
-                atomic::{AtomicBool, Ordering},
-                Arc,
-            };
+            use std::sync::atomic::{AtomicBool, Ordering};
             let state = Arc::new(state_with_current_site(Some("s1")));
             let sync_started = Arc::new(AtomicBool::new(false));
             let sync_done = Arc::new(AtomicBool::new(false));
@@ -1473,5 +2368,1296 @@ mod tests {
         let uid = user.id.clone();
         reg.remove(&uid).unwrap();
         assert!(reg.get(&uid).is_none(), "user site must be deleted");
+    }
+
+    // ---------------------------------------------------------------------
+    // Two-phase open protocol (migrate → durable flag → view).
+    //
+    // These drive the REAL `run_mobile_open_protocol` over the REAL
+    // `SecureStore`; only the plugin half is scripted (it is Kotlin on a
+    // device) and only the storage WRITE failure is injected — at the real
+    // `SecretProvider` boundary, through a wrapper that delegates every
+    // other operation to the production store.
+    // ---------------------------------------------------------------------
+
+    /// Scripted plugin error, mirroring what `android_bridge` delivers.
+    #[derive(Clone)]
+    enum ScriptErr {
+        Other(String),
+        Unsupported,
+        /// What `classify_site_open_error` makes of Kotlin's
+        /// `profile-quarantined` refusal: the guidance message, typed.
+        Quarantined(String),
+    }
+
+    impl ScriptErr {
+        fn into_app(self) -> AppError {
+            match self {
+                ScriptErr::Other(message) => AppError::Other(message),
+                ScriptErr::Unsupported => {
+                    AppError::Unsupported("sağlayıcı çoklu profili desteklemiyor".into())
+                }
+                ScriptErr::Quarantined(message) => AppError::Quarantined(message),
+            }
+        }
+    }
+
+    /// Records every phase call so ordering — not just outcomes — is asserted.
+    struct ScriptedOpenOps {
+        calls: Vec<String>,
+        cookies_seen: Vec<usize>,
+        migrate_results: std::collections::VecDeque<Result<(), ScriptErr>>,
+        open_result: Result<(), ScriptErr>,
+    }
+
+    impl ScriptedOpenOps {
+        fn ok() -> Self {
+            Self {
+                calls: Vec::new(),
+                cookies_seen: Vec::new(),
+                migrate_results: std::collections::VecDeque::new(),
+                open_result: Ok(()),
+            }
+        }
+
+        fn with_migrate(results: Vec<Result<(), ScriptErr>>) -> Self {
+            Self {
+                migrate_results: results.into(),
+                ..Self::ok()
+            }
+        }
+    }
+
+    impl MobileOpenOps for ScriptedOpenOps {
+        fn migrate(&mut self, _url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
+            self.calls.push(format!("migrate:{profile}"));
+            self.cookies_seen.push(cookies.len());
+            match self.migrate_results.pop_front() {
+                None | Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(e.into_app()),
+            }
+        }
+
+        fn open(&mut self, _url: &str, profile: &str, _init_script: &str) -> AppResult<()> {
+            self.calls.push(format!("open:{profile}"));
+            match &self.open_result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.clone().into_app()),
+            }
+        }
+    }
+
+    /// The real [`SecureStore`] with an injectable `profilemig-*` write
+    /// failure — the exact storage-layer fault the protocol must survive
+    /// without ever showing a view.
+    struct FailingFlagStore {
+        inner: SecureStore,
+        fail_flag: Arc<std::sync::atomic::AtomicBool>,
+        flag_writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SecretProvider for FailingFlagStore {
+        fn backend(&self) -> crate::secure::master_key::Backend {
+            self.inner.backend()
+        }
+
+        fn load_doc_bytes(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.load_doc_bytes(name)
+        }
+
+        fn save_doc_bytes(&self, name: &str, bytes: &[u8]) -> AppResult<()> {
+            self.inner.save_doc_bytes(name, bytes)
+        }
+
+        fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+            if name.starts_with(MIGRATION_FLAG_PREFIX) {
+                self.flag_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(AppError::Storage("keystore yazılamadı (test)".into()));
+                }
+            }
+            self.inner.put_secret(name, plaintext)
+        }
+
+        fn get_secret(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.get_secret(name)
+        }
+
+        fn delete_secret(&self, name: &str) -> AppResult<()> {
+            self.inner.delete_secret(name)
+        }
+
+        fn wipe_secrets(&self) -> AppResult<usize> {
+            self.inner.wipe_secrets()
+        }
+
+        fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+            self.inner.delete_site_session(site_id)
+        }
+    }
+
+    /// State over a real store whose migration-flag writes can be failed and
+    /// healed from the test.
+    fn failing_flag_state() -> (
+        AppState,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let inner = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = inner.load_registry();
+        let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = FailingFlagStore {
+            inner,
+            fail_flag: fail_flag.clone(),
+            flag_writes: flag_writes.clone(),
+        };
+        let state = AppState {
+            provider: Box::new(provider),
+            registry: Mutex::new(registry),
+            settings: Mutex::new(Settings::default()),
+            blocklist: Mutex::new(Blocklist::default()),
+            oauth_state: Mutex::new(None),
+            startup_warning: Mutex::new(warning),
+            launcher_url: Mutex::new(None),
+            current_site: Mutex::new(None),
+            pip_lock: Mutex::new(()),
+            pip_generation: std::sync::atomic::AtomicU64::new(0),
+        };
+        (state, fail_flag, flag_writes)
+    }
+
+    /// A legacy 0.3.4 jar with two live cookies (one session cookie, one
+    /// with a future expiry) — both must reach phase 1 as headers.
+    fn live_jar_bytes() -> Vec<u8> {
+        let jar = CookieJar {
+            site_id: "jar-site".into(),
+            saved_at: crate::anilist::now_unix(),
+            cookies: vec![
+                crate::web::session::StoredCookie {
+                    name: "session".into(),
+                    value: "abc".into(),
+                    domain: Some(".example.com".into()),
+                    path: Some("/".into()),
+                    expires: None,
+                    secure: true,
+                    http_only: true,
+                    same_site: Some("Lax".into()),
+                },
+                crate::web::session::StoredCookie {
+                    name: "pref".into(),
+                    value: "1".into(),
+                    domain: None,
+                    path: None,
+                    expires: Some(crate::anilist::now_unix() + 3600),
+                    secure: false,
+                    http_only: false,
+                    same_site: None,
+                },
+            ],
+        };
+        serde_json::to_vec(&jar).unwrap()
+    }
+
+    #[test]
+    fn protocol_aborts_before_the_view_when_the_flag_write_fails() {
+        // Flow: migration succeeds, `profilemig-<site>` cannot be persisted.
+        let (state, _fail, flag_writes) = failing_flag_state();
+        let id = "user-flagfail";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::ok();
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("a failed flag write must abort the open");
+        let profile = android_profile_name(id, 0);
+
+        // A visible, retryable error — never the old log-and-continue.
+        assert!(matches!(err, AppError::Other(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("kalıcılaştırılamadı"),
+            "error must say the migration state could not be persisted: {err}"
+        );
+        // The view was NEVER built: phase 1 ran, phase 2 did not. In
+        // production that means no Kotlin WebView exists, so Rust claiming
+        // nothing keeps both sides' ownership identical.
+        assert_eq!(ops.calls, vec![format!("migrate:{profile}")]);
+        assert_eq!(ops.cookies_seen, vec![2], "the whole live jar rode phase 1");
+        assert_eq!(
+            flag_writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one flag write was attempted"
+        );
+        // The jar survived for the retry; the flag is still absent; nothing
+        // was retired and the generation never moved.
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        // The caller only claims the session after Ok — nothing was claimed.
+        assert!(state.current_site.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn protocol_retires_only_a_never_shown_profile_and_recovers_afterwards() {
+        // Flows: (1) migrate ok + flag write fails → no view; (2) reopen with
+        // the flag still missing; (3) the profile created in (1) meets the
+        // stale jar — Kotlin reports it as already existing; (4) the profile
+        // the user was eventually SHOWN is never queued; (6) once the storage
+        // fault heals, later opens proceed consistently.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        let id = "user-reopen";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        // Attempt 1: migration lands, the flag does not → abort before view.
+        let mut ops = ScriptedOpenOps::ok();
+        assert!(run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).is_err());
+        let never_shown = android_profile_name(id, 0);
+        assert_eq!(ops.calls, vec![format!("migrate:{never_shown}")]);
+
+        // Attempt 2 (storage healed): the profile from attempt 1 exists but
+        // was NEVER shown, so Kotlin's `ProfileAlreadyExists` → the retry
+        // sentinel → retire + re-import from the intact jar is the safe
+        // resolution.
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut ops = ScriptedOpenOps::with_migrate(vec![
+            Err(ScriptErr::Other(format!(
+                "{}: profil zaten mevcut",
+                animehub_android::MIGRATION_RETRY_SENTINEL
+            ))),
+            Ok(()),
+        ]);
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        let shown = android_profile_name(id, 1);
+        assert_eq!(opened, shown);
+        assert_eq!(
+            ops.calls,
+            vec![
+                format!("migrate:{never_shown}"),
+                format!("migrate:{shown}"),
+                format!("open:{shown}"),
+            ],
+            "retire → retry on a fresh generation → flag → view"
+        );
+        // Only the never-shown name is queued; the flag became durable in the
+        // same attempt that opened the view; the jar was never deleted.
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![never_shown.clone()]
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+
+        // Attempt 3: the flag is durable → straight to phase 2 on the SAME
+        // profile. The profile the user has seen is never re-migrated from
+        // the stale jar and never queued for deletion.
+        let mut ops = ScriptedOpenOps::ok();
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        assert_eq!(opened, shown);
+        assert_eq!(
+            ops.calls,
+            vec![format!("open:{shown}")],
+            "no migration at all once the flag is durable"
+        );
+        assert!(ops.cookies_seen.is_empty());
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![never_shown],
+            "a shown profile must never be retired"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+    }
+
+    #[test]
+    fn partial_migration_retires_once_retries_and_keeps_the_jar() {
+        // Flow 5: a half-finished migration keeps the legacy jar and retries
+        // safely on a virgin generation within the same open.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-partial";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::with_migrate(vec![
+            Err(ScriptErr::Other(format!(
+                "{}: çerez reddedildi (1/2)",
+                animehub_android::MIGRATION_RETRY_SENTINEL
+            ))),
+            Ok(()),
+        ]);
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        let retry = android_profile_name(id, 1);
+        assert_eq!(opened, retry);
+        assert_eq!(
+            ops.calls,
+            vec![
+                format!("migrate:{}", android_profile_name(id, 0)),
+                format!("migrate:{retry}"),
+                format!("open:{retry}"),
+            ]
+        );
+        // The doomed first name is queued, the jar survives, the flag landed.
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![android_profile_name(id, 0)]
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn second_partial_migration_fails_visibly_without_opening_anything() {
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-twice";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let partial = || -> Result<(), ScriptErr> {
+            Err(ScriptErr::Other(format!(
+                "{}: çerez aktarımı zaman aşımına uğradı",
+                animehub_android::MIGRATION_RETRY_SENTINEL
+            )))
+        };
+        let mut ops = ScriptedOpenOps::with_migrate(vec![partial(), partial()]);
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("two partials must fail the open");
+        let message = err.to_string();
+        assert!(
+            message.contains("taşınamadı") && message.contains("sonraki açılışta"),
+            "retryable, user-visible error: {message}"
+        );
+        // No view, no flag; BOTH doomed names are queued; the jar stays for
+        // the next open, which starts the migration over from a virgin name.
+        assert_eq!(
+            ops.calls,
+            vec![
+                format!("migrate:{}", android_profile_name(id, 0)),
+                format!("migrate:{}", android_profile_name(id, 1)),
+            ]
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.contains(&android_profile_name(id, 0)));
+        assert!(queued.contains(&android_profile_name(id, 1)));
+    }
+
+    #[test]
+    fn unsupported_provider_refuses_without_touching_flag_queue_or_view() {
+        // The MULTI_PROFILE refusal must leave every piece of state exactly
+        // as it was — no flag, no queue entry, no generation move, no view.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-unsupported";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::with_migrate(vec![Err(ScriptErr::Unsupported)]);
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("unsupported must refuse");
+        assert!(matches!(err, AppError::Unsupported(_)), "{err:?}");
+        assert_eq!(
+            ops.calls,
+            vec![format!("migrate:{}", android_profile_name(id, 0))],
+            "phase 2 must never run after a refusal"
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+    }
+
+    #[test]
+    fn quarantine_refusal_never_retires_the_profile_or_writes_the_flag() {
+        // Kotlin refuses BOTH open phases for a profile whose last in-place
+        // wipe timed out on `removeAllCookies` — a destructive provider call
+        // that cannot be cancelled, so it may still delete cookies a reopened
+        // session creates (see `ProfileQuarantine` / `SiteOpenGate`). That
+        // refusal must be propagated as-is: it is NOT `migration-partial`, so
+        // it must not trigger the retire-and-reimport path (which would delete
+        // the user's live profile and rebuild it from the stale jar), and it
+        // must not persist the flag or claim a session.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-quarantined";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &live_jar_bytes())
+            .unwrap();
+        // Scripted exactly as production delivers it: Kotlin's sentinel has
+        // already been classified by `android_bridge::classify_site_open_error`
+        // (host-tested there) into the typed guidance error.
+        let quarantine = || -> ScriptErr {
+            ScriptErr::Quarantined(crate::android_bridge::PROFILE_QUARANTINED_MSG.to_string())
+        };
+        let classified = crate::android_bridge::classify_site_open_error(
+            animehub_android::Error::Bridge(format!(
+                "{}: çerez temizliği zaman aşımına uğradı, işlem doğrulanamadı",
+                animehub_android::QUARANTINE_SENTINEL
+            )),
+        );
+        assert!(
+            matches!(classified, AppError::Quarantined(_)),
+            "the sentinel must classify to the typed refusal: {classified:?}"
+        );
+        assert_eq!(
+            classified.to_string(),
+            crate::android_bridge::PROFILE_QUARANTINED_MSG
+        );
+
+        // Phase 1 refusal (pending migration): no retry, no view, no flag.
+        let mut ops = ScriptedOpenOps::with_migrate(vec![Err(quarantine())]);
+        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+            .expect_err("a quarantined profile must not be migrated into");
+        let profile = android_profile_name(id, 0);
+        assert!(matches!(err, AppError::Quarantined(_)), "{err:?}");
+        assert!(
+            !err.to_string()
+                .contains(animehub_android::QUARANTINE_SENTINEL),
+            "the user reads the guidance, never the raw sentinel: {err}"
+        );
+        assert!(
+            !animehub_android::is_migration_retry(&animehub_android::Error::Bridge(format!(
+                "{}: çerez temizliği zaman aşımına uğradı",
+                animehub_android::QUARANTINE_SENTINEL
+            ))),
+            "a quarantine refusal must never be read as a migration retry"
+        );
+        assert_eq!(
+            ops.calls,
+            vec![format!("migrate:{profile}")],
+            "exactly one attempt: no retirement, no second generation, no view"
+        );
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        assert!(state
+            .provider
+            .get_secret(&format!("cookies-{id}"))
+            .unwrap()
+            .is_some());
+        assert!(state.current_site.lock().unwrap().is_none());
+
+        // Phase 2 refusal (flag already durable, the common reopen): the view
+        // is not built, the session is not claimed and nothing is retired —
+        // the user retries the wipe instead of losing the profile.
+        mark_migration_done(&state, id).unwrap();
+        let mut ops2 = ScriptedOpenOps {
+            open_result: Err(quarantine()),
+            ..ScriptedOpenOps::ok()
+        };
+        let err2 = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops2)
+            .expect_err("a quarantined profile must not be opened");
+        assert_eq!(
+            ops2.calls,
+            vec![format!("open:{profile}")],
+            "no migration is re-run once the flag is durable"
+        );
+        assert!(matches!(err2, AppError::Quarantined(_)), "{err2:?}");
+        assert_eq!(
+            err2.to_string(),
+            crate::android_bridge::PROFILE_QUARANTINED_MSG,
+            "the refusal is explained, not forwarded raw"
+        );
+        assert!(state.current_site.lock().unwrap().is_none());
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        assert!(
+            state
+                .provider
+                .get_secret(&format!("profilemig-{id}"))
+                .unwrap()
+                .is_some(),
+            "the durable flag is untouched by a refused open"
+        );
+    }
+
+    /// The real [`SecureStore`] with a counted `delete_site_session`, so the
+    /// clear protocol can be proved to REACH the session drop on success and to
+    /// SKIP it on a failed wipe (not merely to leave the right bytes behind).
+    struct CountingSessionStore {
+        inner: SecureStore,
+        session_deletes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SecretProvider for CountingSessionStore {
+        fn backend(&self) -> crate::secure::master_key::Backend {
+            self.inner.backend()
+        }
+
+        fn load_doc_bytes(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.load_doc_bytes(name)
+        }
+
+        fn save_doc_bytes(&self, name: &str, bytes: &[u8]) -> AppResult<()> {
+            self.inner.save_doc_bytes(name, bytes)
+        }
+
+        fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+            self.inner.put_secret(name, plaintext)
+        }
+
+        fn get_secret(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.get_secret(name)
+        }
+
+        fn delete_secret(&self, name: &str) -> AppResult<()> {
+            self.inner.delete_secret(name)
+        }
+
+        fn wipe_secrets(&self) -> AppResult<usize> {
+            self.inner.wipe_secrets()
+        }
+
+        fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+            self.session_deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.delete_site_session(site_id)
+        }
+    }
+
+    /// State over a real store whose `delete_site_session` calls are counted.
+    fn counting_session_state() -> (AppState, Arc<std::sync::atomic::AtomicUsize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let inner = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = inner.load_registry();
+        let session_deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = CountingSessionStore {
+            inner,
+            session_deletes: session_deletes.clone(),
+        };
+        let state = AppState {
+            provider: Box::new(provider),
+            registry: Mutex::new(registry),
+            settings: Mutex::new(Settings::default()),
+            blocklist: Mutex::new(Blocklist::default()),
+            oauth_state: Mutex::new(None),
+            startup_warning: Mutex::new(warning),
+            launcher_url: Mutex::new(None),
+            current_site: Mutex::new(None),
+            pip_lock: Mutex::new(()),
+            pip_generation: std::sync::atomic::AtomicU64::new(0),
+        };
+        (state, session_deletes)
+    }
+
+    fn stored(state: &AppState, name: &str) -> bool {
+        state.provider.get_secret(name).unwrap().is_some()
+    }
+
+    /// A site whose profile is already clean: Kotlin reports success (its
+    /// cookie step saw an empty jar), so the session drop MUST still happen.
+    /// This is the shape that used to fail the whole clear — the provider
+    /// answered "no cookies deleted" for an empty jar, Rust saw an error and
+    /// returned before `delete_site_session`, stranding the encrypted jar and
+    /// the migration flag next to a profile that no longer held any cookies.
+    #[test]
+    fn mobile_clear_protocol_drops_the_session_after_a_successful_wipe() {
+        let (state, session_deletes) = counting_session_state();
+        let id = "user-clean";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), b"legacy-jar")
+            .unwrap();
+        mark_migration_done(&state, id).unwrap();
+        assert!(stored(&state, &format!("cookies-{id}")));
+        assert!(stored(&state, &format!("profilemig-{id}")));
+
+        let mut wiped: Vec<String> = Vec::new();
+        run_mobile_clear_protocol(&state, id, |profile| {
+            wiped.push(profile.to_string());
+            Ok(())
+        })
+        .expect("a successful in-place wipe is not an error");
+
+        assert_eq!(
+            wiped,
+            vec![android_profile_name(id, 0)],
+            "the wipe gets this site's profile name at its current generation"
+        );
+        assert_eq!(
+            session_deletes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "delete_site_session must be reached exactly once on success"
+        );
+        assert!(
+            !stored(&state, &format!("cookies-{id}")),
+            "the encrypted jar goes with the wiped profile"
+        );
+        assert!(
+            !stored(&state, &format!("profilemig-{id}")),
+            "and so does the one-time migration flag, so a wiped jar is never re-imported"
+        );
+    }
+
+    /// The generation counter must SURVIVE the session drop: it is what keeps a
+    /// restored registry from re-opening a profile name whose on-disk deletion
+    /// may still be pending.
+    #[test]
+    fn mobile_clear_protocol_keeps_the_generation_counter() {
+        let (state, _) = counting_session_state();
+        let id = "user-generation";
+        assert_eq!(bump_profile_generation(&state, id).unwrap(), 1);
+        assert_eq!(bump_profile_generation(&state, id).unwrap(), 2);
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), b"jar")
+            .unwrap();
+
+        let mut wiped: Vec<String> = Vec::new();
+        run_mobile_clear_protocol(&state, id, |profile| {
+            wiped.push(profile.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(wiped, vec![android_profile_name(id, 2)]);
+        assert!(!stored(&state, &format!("cookies-{id}")));
+        assert_eq!(
+            profile_generation(&state, id).unwrap(),
+            2,
+            "profilegen outlives the session it belonged to"
+        );
+    }
+
+    /// A failed wipe must propagate and leave the blobs ALONE: the retry needs
+    /// the jar, and a half-wiped profile must never be reported as cleared.
+    #[test]
+    fn mobile_clear_protocol_skips_the_session_drop_when_the_wipe_fails() {
+        let (state, session_deletes) = counting_session_state();
+        let id = "user-failed";
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), b"legacy-jar")
+            .unwrap();
+        mark_migration_done(&state, id).unwrap();
+
+        let err = run_mobile_clear_protocol(&state, id, |_| {
+            Err(AppError::Other(
+                "çerez deposuna erişilemedi: store gone".into(),
+            ))
+        })
+        .expect_err("a failed wipe must not look like a clear");
+        assert!(
+            err.to_string().contains("çerez deposuna erişilemedi"),
+            "{err}"
+        );
+        assert_eq!(
+            session_deletes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "delete_site_session must NOT run after a failed wipe"
+        );
+        assert!(
+            stored(&state, &format!("cookies-{id}")),
+            "the jar survives for the retry"
+        );
+        assert!(
+            stored(&state, &format!("profilemig-{id}")),
+            "the flag survives too: the profile was not wiped, so nothing may be re-imported over it"
+        );
+    }
+
+    /// The profile name is derived from the site id only, at the generation the
+    /// store knows — never from a URL, a display name or a caller-supplied name.
+    #[test]
+    fn mobile_clear_protocol_addresses_only_this_sites_profile() {
+        let (state, _) = counting_session_state();
+        let id = "user-namespace";
+        bump_profile_generation(&state, id).unwrap();
+
+        let mut wiped: Vec<String> = Vec::new();
+        run_mobile_clear_protocol(&state, id, |profile| {
+            wiped.push(profile.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        let name = &wiped[0];
+        assert!(is_valid_site_profile_name(name), "{name}");
+        assert!(name.starts_with(ANDROID_PROFILE_PREFIX), "{name}");
+        assert_eq!(name, &android_profile_name(id, 1));
+        assert_ne!(name, &android_profile_name("another-site", 1));
+        assert_ne!(name, "Default");
+    }
+
+    /// The real [`SecureStore`] with (a) a log of every durable write — shared
+    /// with the injected platform closures, so a test can assert the ORDER of
+    /// the delete protocol and not only its outcome — and (b) an injectable
+    /// failure count for `profilegen-*` writes, which is the exact fault that
+    /// must keep a profile name's quarantine ledger alive.
+    struct OrderingStore {
+        inner: SecureStore,
+        fail_generation_writes: Arc<std::sync::atomic::AtomicUsize>,
+        writes: OrderLog,
+    }
+
+    impl SecretProvider for OrderingStore {
+        fn backend(&self) -> crate::secure::master_key::Backend {
+            self.inner.backend()
+        }
+
+        fn load_doc_bytes(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.load_doc_bytes(name)
+        }
+
+        fn save_doc_bytes(&self, name: &str, bytes: &[u8]) -> AppResult<()> {
+            self.inner.save_doc_bytes(name, bytes)
+        }
+
+        fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+            // Only DURABLE writes join the ordered log, so a test asserting the
+            // order asserts what actually landed. A refused write is recorded
+            // distinctly, which keeps the injection visible.
+            if name.starts_with(PROFILE_GENERATION_PREFIX)
+                && self
+                    .fail_generation_writes
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+            {
+                self.fail_generation_writes
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .push(format!("put-failed:{name}"));
+                return Err(AppError::Storage("keystore yazılamadı (test)".into()));
+            }
+            self.inner.put_secret(name, plaintext)?;
+            self.writes.lock().unwrap().push(format!("put:{name}"));
+            Ok(())
+        }
+
+        fn get_secret(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.get_secret(name)
+        }
+
+        fn delete_secret(&self, name: &str) -> AppResult<()> {
+            self.inner.delete_secret(name)
+        }
+
+        fn wipe_secrets(&self) -> AppResult<usize> {
+            self.inner.wipe_secrets()
+        }
+
+        fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push(format!("session:{site_id}"));
+            self.inner.delete_site_session(site_id)
+        }
+    }
+
+    /// The ordered log a delete-protocol test asserts on: every durable write
+    /// the store performs, interleaved with the injected platform calls.
+    type OrderLog = Arc<Mutex<Vec<String>>>;
+
+    /// `(state, ordered write/call log, remaining generation-write failures)`
+    fn ordering_state() -> (AppState, OrderLog, Arc<std::sync::atomic::AtomicUsize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let inner = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = inner.load_registry();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let fail_generation_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = OrderingStore {
+            inner,
+            fail_generation_writes: fail_generation_writes.clone(),
+            writes: writes.clone(),
+        };
+        let state = AppState {
+            provider: Box::new(provider),
+            registry: Mutex::new(registry),
+            settings: Mutex::new(Settings::default()),
+            blocklist: Mutex::new(Blocklist::default()),
+            oauth_state: Mutex::new(None),
+            startup_warning: Mutex::new(warning),
+            launcher_url: Mutex::new(None),
+            current_site: Mutex::new(None),
+            pip_lock: Mutex::new(()),
+            pip_generation: std::sync::atomic::AtomicU64::new(0),
+        };
+        (state, writes, fail_generation_writes)
+    }
+
+    #[test]
+    fn mobile_delete_protocol_retires_only_after_the_generation_is_durable() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-order";
+        let name = android_profile_name(id, 0);
+
+        let action = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(2)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(action, SiteProfileAction::Deleted);
+        // THE ORDER IS THE SAFETY PROPERTY: the tombstone is durable before the
+        // provider is called, the generation write lands between the deletion
+        // and the retirement, the tombstone is lifted only after a confirmed
+        // deletion, and all of it is about the same name.
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{name}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("retire:{name}"),
+            ],
+            "tombstone → provider → durable bump → lift → retire"
+        );
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+        // A confirmed deletion leaves nothing behind in the queue.
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mobile_delete_protocol_keeps_the_ledger_when_the_generation_write_fails() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, fail) = ordering_state();
+        fail.store(1, std::sync::atomic::Ordering::SeqCst);
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-failed-bump";
+        let name = android_profile_name(id, 0);
+
+        let err = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        // The provider accepted the deletion, but the bump never became durable:
+        // the command fails, the ledger is NOT dropped, and the name a retry (or
+        // a reopen) derives is still the same one — so it must still be blocked.
+        assert!(matches!(err, AppError::Storage(_)), "{err}");
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{name}"),
+                format!("put-failed:{PROFILE_GENERATION_PREFIX}{id}"),
+            ],
+            "the tombstone is the only durable write, then the refused bump; nothing landed after it"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        assert_eq!(android_profile_name(id, 0), name);
+        // STRONGER THAN BEFORE: the generation write was refused, so the stored
+        // generation still derives the deleted name — but the tombstone is
+        // durable, and the open path resolves through the queue, so the name is
+        // never handed out again even without the bump.
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()]
+        );
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) =
+            resolve_queued_free_generation(id, profile_generation(&state, id).unwrap(), &queued)
+                .unwrap();
+        assert!(advanced, "a tombstoned name must not be reusable");
+        assert_ne!(android_profile_name(id, resolved), name);
+    }
+
+    #[test]
+    fn mobile_delete_protocol_queues_a_deferred_deletion_and_keeps_its_ledger() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-pending";
+        let name = android_profile_name(id, 0);
+
+        let action = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Pending)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(action, SiteProfileAction::Pending);
+        // The queue write is durable BEFORE the bump, and the ledger survives:
+        // a pending profile still exists on disk, so only the startup drain may
+        // retire it (after it durably forgets the queued name).
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()]
+        );
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{name}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+            ],
+            "the tombstone is written once (before the provider) and NOT lifted for a deferred deletion"
+        );
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The new generation is a DIFFERENT name, so the next open can never
+        // collide with the deletion still finishing on disk.
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+        assert_ne!(android_profile_name(id, 1), name);
+    }
+
+    #[test]
+    fn mobile_delete_protocol_is_safe_to_retry_after_a_failed_bump() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, fail) = ordering_state();
+        fail.store(1, std::sync::atomic::Ordering::SeqCst);
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-retry";
+        let name = android_profile_name(id, 0);
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delete = |profile: &str| {
+            writes.lock().unwrap().push(format!("delete:{profile}"));
+            // First attempt: the provider accepts. Every later attempt finds the
+            // profile already gone — the generation cannot distinguish them,
+            // because the failed bump is exactly what never moved it.
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if attempt == 0 {
+                SiteProfileAction::Deleted
+            } else {
+                SiteProfileAction::Absent
+            })
+        };
+        assert!(run_mobile_delete_protocol(&state, id, delete, |profile| {
+            writes.lock().unwrap().push(format!("retire:{profile}"));
+            retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        })
+        .is_err());
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Retry with the storage fault healed: the SAME name is derived again
+        // (the bump never landed), the protocol completes, and the ledger is
+        // dropped exactly once — for that name.
+        let action = run_mobile_delete_protocol(&state, id, delete, |profile| {
+            writes.lock().unwrap().push(format!("retire:{profile}"));
+            retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(action, SiteProfileAction::Absent);
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{name}"),
+                format!("put-failed:{PROFILE_GENERATION_PREFIX}{id}"),
+                // The retry re-queues the SAME name, which the deduped queue
+                // already holds, so it writes nothing.
+                format!("delete:{name}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("retire:{name}"),
+            ],
+            "the retry re-derives the SAME name, and only its durable bump is followed by a lifted tombstone and a retirement"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+    }
+
+    #[test]
+    fn mobile_delete_protocol_retires_each_generation_exactly_once_on_repeat() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-repeat";
+        let first = android_profile_name(id, 0);
+        let second = android_profile_name(id, 1);
+
+        for action in [SiteProfileAction::Deleted, SiteProfileAction::Absent] {
+            let outcome = run_mobile_delete_protocol(
+                &state,
+                id,
+                |profile| {
+                    writes.lock().unwrap().push(format!("delete:{profile}"));
+                    Ok(action)
+                },
+                |profile| {
+                    writes.lock().unwrap().push(format!("retire:{profile}"));
+                    retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(0)
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, action);
+        }
+
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{first}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("retire:{first}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{second}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("retire:{second}"),
+            ],
+            "each generation: tombstone → provider → bump → lift → retire"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 2);
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mobile_delete_protocol_tombstones_the_name_before_the_provider_is_called() {
+        // AH-04 / R-07. `deleteProfile` is a provider call that can take
+        // arbitrarily long — the reason the watchdogs exist — and "accepted"
+        // does not mean Chromium removed the directory. A process kill inside
+        // that call used to leave NO durable trace: the Kotlin ledger is
+        // in-memory, the generation had not moved, so the next open derived the
+        // same name and `getOrCreateProfile` reused the leftover directory —
+        // the session the user asked to delete came back. The tombstone is what
+        // survives the kill, so it has to exist before the call, not after it.
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let id = "user-delete-tombstone";
+        let name = android_profile_name(id, 0);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let queued_during_call = seen.clone();
+
+        let action = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                // Read the durable state AT THE MOMENT the provider is asked:
+                // this is exactly what a kill inside the call would leave.
+                *queued_during_call.lock().unwrap() = read_pending_profile_deletes(&state).unwrap();
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                Ok(0)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(action, SiteProfileAction::Deleted);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![name.clone()],
+            "the name must already be durably queued while the provider call is in flight"
+        );
+        let log = writes.lock().unwrap().clone();
+        assert_eq!(
+            log[0],
+            format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+            "the tombstone is the first durable write of the protocol"
+        );
+        assert_eq!(log[1], format!("delete:{name}"));
+    }
+
+    #[test]
+    fn a_failed_provider_delete_keeps_the_tombstone_so_the_name_cannot_come_back() {
+        // The kill scenario, expressed as the closest thing a host test can do:
+        // the deletion was requested, the provider never answered successfully,
+        // and nothing in memory survives. What a restart can see is the durable
+        // queue and the generation counter, so those are what is asserted.
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-provider-failed";
+        let name = android_profile_name(id, 0);
+
+        let err = run_mobile_delete_protocol(
+            &state,
+            id,
+            |_profile| Err(AppError::Other("sağlayıcı yanıt vermedi".into())),
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Other(_)), "{err}");
+        assert_eq!(
+            retired.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the ledger must stay: the deletion is not confirmed"
+        );
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()],
+            "the tombstone survives, so the startup drain finishes the deletion instead of forgetting it"
+        );
+        // No bump — the deletion is unconfirmed — and none is needed, because
+        // the open path resolves the generation through the queue.
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) = resolve_queued_free_generation(id, 0, &queued).unwrap();
+        assert!(
+            advanced,
+            "a tombstoned name must never be handed to an open"
+        );
+        assert_ne!(
+            android_profile_name(id, resolved),
+            name,
+            "the reopened session gets a different profile, never the leftover directory"
+        );
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![format!("put:{PENDING_PROFILE_DELETES_KEY}")],
+            "only the tombstone landed"
+        );
+    }
+
+    #[test]
+    fn pending_without_a_jar_still_records_the_flag_before_the_view() {
+        // A fresh install has the flag missing and no jar: phase 1 runs with
+        // an empty cookie list (Kotlin treats that as nothing-to-import),
+        // the flag becomes durable, and only then does the view exist.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-nojar";
+
+        let mut ops = ScriptedOpenOps::ok();
+        let opened =
+            run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        let profile = android_profile_name(id, 0);
+        assert_eq!(opened, profile);
+        assert_eq!(
+            ops.calls,
+            vec![format!("migrate:{profile}"), format!("open:{profile}")]
+        );
+        assert_eq!(ops.cookies_seen, vec![0]);
+        assert!(state
+            .provider
+            .get_secret(&format!("profilemig-{id}"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn expired_jar_cookies_never_ride_the_migration() {
+        // Only live cookies are handed to phase 1 — an expired snapshot must
+        // not be resurrected into a virgin profile.
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-expired";
+        let jar = CookieJar {
+            site_id: "jar-site".into(),
+            saved_at: crate::anilist::now_unix(),
+            cookies: vec![crate::web::session::StoredCookie {
+                name: "old".into(),
+                value: "x".into(),
+                domain: None,
+                path: None,
+                expires: Some(crate::anilist::now_unix() - 10),
+                secure: false,
+                http_only: false,
+                same_site: None,
+            }],
+        };
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &serde_json::to_vec(&jar).unwrap())
+            .unwrap();
+
+        let mut ops = ScriptedOpenOps::ok();
+        run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops).unwrap();
+        assert_eq!(ops.cookies_seen, vec![0], "expired cookies are dropped");
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// Android half of AnimeHub's Keystore + Picture-in-Picture + cookie +
-// web-storage bridge.
+// Android half of AnimeHub's Keystore + Picture-in-Picture + per-site
+// WebView profile bridge.
 //
 // The PiP commands below delegate to `AnimeHubPipController`, which owns the
 // PiP lifecycle and the WebView preparation handshake; the file next to this
@@ -31,20 +31,28 @@
 // standard Android APIs listed in the imports. The Keystore half predates this
 // note. The controlled PiP chain (this file + `AnimeHubPipController.kt`) was
 // written from the AOSP sources of `Activity`/`PictureInPictureParams` and has
-// NOT been run on a device yet; the CookieManager and localStorage/IndexedDB
-// bridges have not been compiled or run on a device either (the build
-// environment has no Android SDK/NDK). Treat it as unverified until a real
-// `./scripts/build.sh android` / `tauri android build` has been installed on
-// hardware. Only the JS half of PiP has automated tests
-// (`tests/pip_controller.test.js`).
+// NOT been run on a device yet; the site-profile commands (`site_open` and
+// friends, in `AnimeHubSiteController.kt`) were written against the AndroidX
+// WebKit 1.16.0 multi-profile reference and have not been compiled or run on
+// a device either (the build environment has no Android SDK/NDK). Treat it as
+// unverified until a real `./scripts/build.sh android` / `tauri android
+// build` has been installed on hardware. Only the JS half of PiP has
+// automated tests (`tests/pip_controller.test.js`).
 //
-// STORAGE ISOLATION CONTRACT (localStorage/IndexedDB commands)
-// ------------------------------------------------------------
-// The Rust side starts exports only while the site page is loaded and imports
-// after the target page's URL is observed. WebView operations run on Android's
-// UI thread. IndexedDB export/import remains best-effort: the scripts use
-// asynchronous IndexedDB APIs and do not provide full database fidelity.
-// Keep restored payloads JSON-encoded; never interpolate raw page/user strings.
+// STORAGE ISOLATION CONTRACT (site commands)
+// ------------------------------------------
+// Sites open in their own WebView bound to their own androidx.webkit Profile
+// (`AnimeHubSiteController`), so localStorage, IndexedDB, cookies and cache
+// are isolated per site by the provider itself. There is no JSON
+// export/import path any more: the old dump was lossy and never a security
+// boundary. Cookie migration from the pre-profile era is a one-time,
+// profile-scoped import inside the controller; every other cookie operation
+// goes through the site profile's own `Profile.getCookieManager()`, never the
+// static `CookieManager.getInstance()` (that one is the launcher's default
+// profile). When the WebView provider lacks `WebViewFeature.MULTI_PROFILE`,
+// `site_open` fails with a sentinel instead of silently sharing the default
+// profile. WebView operations run on Android's UI thread; blocking cookie
+// flushes run on a background executor.
 
 package dev.animehub.app
 
@@ -59,7 +67,6 @@ import android.util.Log
 import android.widget.Toast
 import java.net.Inet6Address
 import java.net.InetAddress
-import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -88,16 +95,13 @@ import javax.crypto.spec.GCMParameterSpec
 @TauriPlugin
 class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
-  /** The shared WebView, handed to the plugin by Tauri at startup. */
-  @Volatile
-  private var sharedWebView: WebView? = null
-
   override fun load(webView: WebView) {
-    // On Android the launcher and the sites share this single WebView, so
-    // keeping the reference is all the storage commands need.
-    sharedWebView = webView
+    // The launcher keeps the default profile. Sites open above it in their
+    // own profiled WebViews (AnimeHubSiteController), so this WebView stays
+    // launcher-only: policy guard + IPC restriction as before.
     installNavigationGuard(webView)
     restrictIpcToLauncher(webView)
+    AnimeHubSiteController.bindLauncher(webView)
     AnimeHubDebugLog.add("app", "WebView ready, api ${Build.VERSION.SDK_INT}")
   }
 
@@ -181,9 +185,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   override fun onDestroy(activity: AppCompatActivity) {
-    // Plugin instances can outlive their Activity. Reject later WebView work
-    // rather than keep a reference to the destroyed native View.
-    if (activity === this.activity) sharedWebView = null
+    // Plugin instances can outlive their Activity. The site WebView is torn
+    // down by AnimeHubSiteController.destroy (MainActivity block) before this
+    // runs; no WebView reference is kept on the plugin any more.
   }
 
   /** Reject an async reply if its Android host was destroyed while work was pending. */
@@ -208,41 +212,6 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       }
     } catch (e: Exception) {
       invoke.reject("Android Activity artık kullanılamıyor", e)
-    }
-  }
-
-  /** Persist CookieManager state away from Android's UI thread. */
-  private fun flushCookieStoreAsync(manager: CookieManager) {
-    try {
-      COOKIE_FLUSH_EXECUTOR.execute {
-        try {
-          manager.flush()
-        } catch (_: Exception) {
-          Log.w(LOG_TAG, "CookieManager persistence sync failed")
-          AnimeHubDebugLog.add("cookie", "persistence sync failed")
-        }
-      }
-    } catch (_: Exception) {
-      Log.w(LOG_TAG, "CookieManager persistence sync could not be queued")
-    }
-  }
-
-  /** Run WebView work on Android's UI thread and reject stale Activity/View handles. */
-  private fun withLiveWebView(invoke: Invoke, action: (WebView) -> Unit) {
-    val webView = sharedWebView ?: run {
-      invoke.reject("WebView hazır değil")
-      return
-    }
-    withLiveActivity(invoke) {
-      if (sharedWebView !== webView) {
-        invoke.reject("WebView artık kullanılamıyor")
-        return@withLiveActivity
-      }
-      try {
-        action(webView)
-      } catch (e: Exception) {
-        invoke.reject("WebView işlemi başarısız", e)
-      }
     }
   }
 
@@ -297,284 +266,196 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  // ------------------------------------------------------- Android cookies
+  // -------------------------------------------------------- Site profiles
+  //
+  // Per-site WebViews with androidx.webkit multi-profile (see the header and
+  // AnimeHubSiteController). Every command resolves with data or rejects with
+  // a message Rust classifies. The open is TWO-PHASED: `site_migrate` (the
+  // one-time legacy jar import, no view) and `site_open` (the view). Both
+  // reject with the exact sentinel `unsupported-multi-profile` when the
+  // WebView provider cannot isolate sites — Rust turns that into the
+  // user-facing guidance, and the site is never opened on the shared default
+  // profile. `site_migrate` additionally rejects with `migration-partial: …`
+  // when the strict import criterion was not met, which Rust retires and
+  // retries on a fresh generation.
 
-  /** Read the current cookie header. Android returns null when there are no cookies. */
+  /**
+   * PHASE 1 of the two-phase open protocol: import the one-time legacy jar
+   * into `profile` WITHOUT creating the site WebView. Rust persists
+   * `profilemig-<site>` only after this resolves, and only then calls
+   * `site_open` — so no view the user sees can exist while the migration
+   * state is not durable, and a failed flag write aborts the open before any
+   * view is built (no orphan WebView, no split Rust/Kotlin ownership).
+   * Rejects with `migration-partial: …` when the import did not strictly
+   * complete (Rust retires that profile name and retries on a fresh
+   * generation), and with `unsupported-multi-profile` when the provider
+   * cannot isolate sites at all.
+   */
   @Command
-  fun webview_cookies_get(invoke: Invoke) {
-    val url = invoke.getArgs().getString("url") ?: run {
-      invoke.reject("url gerekli"); return
-    }
-    val parsed = android.net.Uri.parse(url)
-    if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
-      invoke.reject("HTTP(S) URL gerekli"); return
-    }
-    withLiveActivity(invoke) {
-      try {
-        // CookieManager.getCookie legitimately returns null for an empty jar.
-        val header = CookieManager.getInstance().getCookie(url) ?: ""
-        invoke.resolve(JSObject().put("value", header))
-      } catch (_: Exception) {
-        invoke.reject("Android çerezleri okunamadı")
-      }
-    }
-  }
-
-  /** Replace the shared CookieManager jar; disk persistence is queued off the UI thread. */
-  @Command
-  fun webview_cookies_replace(invoke: Invoke) {
+  fun site_migrate(invoke: Invoke) {
     val args = invoke.getArgs()
     val url = args.getString("url") ?: run {
       invoke.reject("url gerekli"); return
     }
-    val cookieHeaders = try {
-      val array = args.getJSONArray("cookies")
-      ArrayList<String>(array.length()).apply {
-        for (index in 0 until array.length()) add(array.getString(index))
-      }
-    } catch (_: Exception) {
-      invoke.reject("çerez listesi geçersiz"); return
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
     }
-    if (cookieHeaders.isNotEmpty()) {
-      val parsed = android.net.Uri.parse(url)
-      if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
-        invoke.reject("HTTP(S) URL gerekli"); return
+    val cookies = mutableListOf<String>()
+    try {
+      args.optJSONArray("cookies")?.let { array ->
+        for (i in 0 until array.length()) {
+          cookies.add(array.getString(i))
+        }
       }
+    } catch (e: Exception) {
+      invoke.reject("çerez listesi çözümlenemedi", e)
+      return
     }
-
     withLiveActivity(invoke) {
-      try {
-        val manager = CookieManager.getInstance()
-        val startedAt = android.os.SystemClock.elapsedRealtime()
-        // removeAllCookies is asynchronous; restoring/navigating before its
-        // callback would let the outgoing provider's cookies leak forward.
-        manager.removeAllCookies {
-          if (rejectIfActivityUnavailable(invoke)) return@removeAllCookies
-          var rejected = 0
-          fun setNext(index: Int) {
-            if (index >= cookieHeaders.size) {
-              if (rejected > 0) {
-                Log.w(LOG_TAG, "CookieManager rejected $rejected restored cookie(s)")
-                AnimeHubDebugLog.add("cookie", "rejected $rejected restored cookie(s)")
-              }
-              val elapsedMs = android.os.SystemClock.elapsedRealtime() - startedAt
-              Log.d(
-                LOG_TAG,
-                "Cookie jar ready: ${cookieHeaders.size} cookie(s), ${elapsedMs}ms"
-              )
-              // Durability: flush on a background thread and resolve
-              // only after it completes. `manager.flush()` is blocking I/O
-              // so it must not run on the UI thread, but the Rust
-              // `webview_cookies_replace`/`clear` must not return success
-              // before the jar is durable — otherwise a process kill
-              // immediately after `clear_site_data` could resurrect the old
-              // jar. Errors are propagated as rejections, not silent
-              // success. Even an empty jar is flushed for the same reason.
-              try {
-                COOKIE_FLUSH_EXECUTOR.execute {
-                  try {
-                    manager.flush()
-                  } catch (e: Exception) {
-                    Log.w(LOG_TAG, "CookieManager flush failed", e)
-                    AnimeHubDebugLog.add("cookie", "flush failed: \${e.message}")
-                    activity.runOnUiThread {
-                      if (!rejectIfActivityUnavailable(invoke)) {
-                        invoke.reject("CookieManager kalıcılığı başarısız", e)
-                      }
-                    }
-                    return@execute
-                  }
-                  activity.runOnUiThread {
-                    if (rejectIfActivityUnavailable(invoke)) return@runOnUiThread
-                    invoke.resolve(JSObject().put("ok", true))
-                  }
-                }
-              } catch (e: Exception) {
-                Log.w(LOG_TAG, "CookieManager flush could not be queued", e)
-                invoke.reject("CookieManager kalıcılığı kuyruğa alınamadı", e)
-              }
-              return
-            }
-            try {
-              manager.setCookie(url, cookieHeaders[index]) { accepted ->
-                if (rejectIfActivityUnavailable(invoke)) return@setCookie
-                if (accepted != true) rejected += 1
-                setNext(index + 1)
-              }
-            } catch (_: Exception) {
-              // Avoid leaving a partial target jar available to the page
-              // that was active before the provider switch.
-              try {
-                manager.removeAllCookies {
-                  if (!rejectIfActivityUnavailable(invoke)) {
-                    invoke.reject("Android çerezleri geri yüklenemedi")
-                  }
-                }
-              } catch (_: Exception) {
-                invoke.reject("Android çerezleri geri yüklenemedi")
-              }
-            }
-          }
-          setNext(0)
-        }
-      } catch (_: Exception) {
-        invoke.reject("Android çerezleri temizlenemedi")
-      }
-    }
-  }
-
-  // ------------------------------------------------- localStorage / IndexedDB
-
-  /**
-   * Dump the loaded page's `localStorage` and resolve with the Keystore-sealed
-   * base64 blob.
-   *
-   * The script returns the object itself (not a `JSON.stringify` string), so
-   * the `evaluateJavascript` callback receives exactly the JSON text we want
-   * to encrypt — no double encoding to undo.
-   */
-  @Command
-  fun localstorage_export(invoke: Invoke) {
-    val purpose = invoke.getArgs().getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
-    }
-    withLiveWebView(invoke) { webView ->
-      webView.evaluateJavascript(
-        "(function(){var o={};for(var i=0;i<localStorage.length;i++){" +
-          "var k=localStorage.key(i);o[k]=localStorage.getItem(k);}return o;})()"
-      ) { result ->
-        if (rejectIfActivityUnavailable(invoke)) return@evaluateJavascript
-        if (result == null || result == "null") {
-          // Context torn down mid-evaluation (navigation won the race): report
-          // an empty payload rather than half a jar.
-          invoke.resolve(JSObject().put("value", ""))
-          return@evaluateJavascript
-        }
-        try {
-          invoke.resolve(JSObject().put("value", seal(purpose, result)))
-        } catch (e: Exception) {
-          invoke.reject("localStorage şifrelemesi başarısız: ${e.message}", e)
+      AnimeHubSiteController.migrate(activity, url, profileName, cookies) { error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("ok", true))
         }
       }
-    }
-  }
-
-  /** Restore a [`localstorage_export`] blob into the loaded page. */
-  @Command
-  fun localstorage_import(invoke: Invoke) {
-    val args = invoke.getArgs()
-    val purpose = args.getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
-    }
-    val sealed = args.getString("value") ?: run {
-      invoke.reject("value gerekli"); return
-    }
-    try {
-      val json = openSealed(purpose, sealed)
-      if (json.isEmpty()) {
-        invoke.resolve(JSObject().put("ok", true)); return
-      }
-      // Valid JSON is a valid JS object literal, so the payload is embedded
-      // directly — never interpolated as source text.
-      val js = "(function(){try{var d=$json;localStorage.clear();" +
-        "for(var k in d){localStorage.setItem(k,d[k]);}}catch(e){}})();"
-      withLiveWebView(invoke) { webView ->
-        webView.evaluateJavascript(js, null)
-        invoke.resolve(JSObject().put("ok", true))
-      }
-    } catch (e: Exception) {
-      invoke.reject("localStorage çözülemedi", e)
     }
   }
 
   /**
-   * Dump the loaded page's IndexedDB databases (best effort) and resolve with
-   * the Keystore-sealed base64 blob.
-   *
-   * Fidelity notes, by design: document *values* are captured via
-   * `getAll`/`getAllKeys` pairs, so original keys survive; secondary indexes,
-   * key paths and auto-increment counters are **not** reconstructed, and
-   * structured-clone-only values (Blob, etc.) are dropped by
-   * `JSON.stringify`. Good enough for the auth/setting state sites in scope
-   * keep in IndexedDB; anything richer is a documented limitation.
+   * PHASE 2: open the site WebView bound to `profile`. Takes no cookies —
+   * the one-time jar import runs in [site_migrate] before Rust persists the
+   * migration flag, so this call can never migrate behind the flag's back.
    */
   @Command
-  fun indexeddb_export(invoke: Invoke) {
-    val purpose = invoke.getArgs().getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
-    }
-    // Keep the existing export script and callback contract, but run the
-    // WebView call on Android's required UI thread.
-    withLiveWebView(invoke) { webView ->
-      webView.evaluateJavascript(EXPORT_IDB_JS) { result ->
-        if (rejectIfActivityUnavailable(invoke)) return@evaluateJavascript
-        if (result == null || result == "null") {
-          invoke.resolve(JSObject().put("value", ""))
-          return@evaluateJavascript
-        }
-        try {
-          invoke.resolve(JSObject().put("value", seal(purpose, result)))
-        } catch (e: Exception) {
-          invoke.reject("IndexedDB şifrelemesi başarısız: ${e.message}", e)
-        }
-      }
-    }
-  }
-
-  /** Restore an [`indexeddb_export`] blob into the loaded page. */
-  @Command
-  fun indexeddb_import(invoke: Invoke) {
+  fun site_open(invoke: Invoke) {
     val args = invoke.getArgs()
-    val purpose = args.getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
+    val url = args.getString("url") ?: run {
+      invoke.reject("url gerekli"); return
     }
-    val sealed = args.getString("value") ?: run {
-      invoke.reject("value gerekli"); return
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
     }
-    try {
-      val json = openSealed(purpose, sealed)
-      if (json.isEmpty()) {
-        invoke.resolve(JSObject().put("ok", true)); return
+    val initScript = args.getString("initScript") ?: ""
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.open(activity, url, profileName, initScript) { error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("ok", true))
+        }
       }
-      // Same no-interpolation rule: the payload becomes a parsed literal.
-      val js = "(async function(){try{var d=$json;" +
-        "for(var name in d){var spec=d[name];" +
-        "var db=await new Promise(function(res,rej){var r=indexedDB.open(name,spec.version||1);" +
-        "r.onupgradeneeded=function(){var b=r.result;" +
-        "for(var sn in spec.stores){if(!b.objectStoreNames.contains(sn))b.createObjectStore(sn);}};" +
-        "r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)}});" +
-        "for(var sn in spec.stores){await new Promise(function(res,rej){" +
-        "var tx=db.transaction(sn,'readwrite');var st=tx.objectStore(sn);" +
-        "spec.stores[sn].forEach(function(row){st.put(row.value,row.key);});" +
-        "tx.oncomplete=function(){res()};tx.onerror=function(){rej(tx.error)}});}" +
-        "db.close();}}catch(e){}})();"
-      withLiveWebView(invoke) { webView ->
-        webView.evaluateJavascript(js, null)
-        invoke.resolve(JSObject().put("ok", true))
-      }
-    } catch (e: Exception) {
-      invoke.reject("IndexedDB çözülemedi", e)
     }
   }
 
-  /** Seal a JSON payload with the Keystore key for `purpose` (IV-prefixed b64). */
-  private fun seal(purpose: String, plaintext: String): String {
-    val cipher = Cipher.getInstance(TRANSFORMATION)
-    cipher.init(Cipher.ENCRYPT_MODE, keyFor(purpose))
-    val ct = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
-    return Base64.encodeToString(cipher.iv + ct, Base64.NO_WRAP)
+  /**
+   * Close the active site WebView. `flush=false` is the wipe path: the data
+   * is about to be cleared or deleted, so it must not be re-persisted first.
+   * Idempotent — a stale Rust session resolves `ok` instead of failing.
+   */
+  @Command
+  fun site_close(invoke: Invoke) {
+    val flush = invoke.getArgs().optBoolean("flush", true)
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.close(activity, flush) { error ->
+        if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
+      }
+    }
   }
 
-  /** Open a [`seal`] blob; an empty payload short-circuits to `""`. */
-  private fun openSealed(purpose: String, sealed: String): String {
-    if (sealed.isEmpty()) return ""
-    val combined = Base64.decode(sealed, Base64.NO_WRAP)
-    if (combined.size <= GCM_IV_LENGTH) return ""
-    val iv = combined.copyOfRange(0, GCM_IV_LENGTH)
-    val ct = combined.copyOfRange(GCM_IV_LENGTH, combined.size)
-    val cipher = Cipher.getInstance(TRANSFORMATION)
-    cipher.init(Cipher.DECRYPT_MODE, keyFor(purpose), GCMParameterSpec(GCM_TAG_BITS, iv))
-    return String(cipher.doFinal(ct), Charsets.UTF_8)
+  /**
+   * Delete one site profile's data. `{deleted:false, pending:true}` means the
+   * provider refused right now (in use / unsupported) and Rust must queue the
+   * name for the next process start; a reject is a hard failure the caller
+   * must not interpret as success.
+   */
+  @Command
+  fun site_profile_delete(invoke: Invoke) {
+    val profileName = invoke.getArgs().getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.deleteProfileData(profileName) { deleted, pending, error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          val payload = JSObject()
+          payload.put("deleted", deleted)
+          payload.put("pending", pending)
+          invoke.resolve(payload)
+        }
+      }
+    }
+  }
+
+  /**
+   * Retire one profile name's quarantine ledger.
+   *
+   * Rust calls this ONLY after the site's generation bump is durably stored
+   * (`run_mobile_delete_protocol`), which is what makes the name underivable
+   * forever; retiring earlier would leave a name both reachable and unblocked
+   * when the bump or its write fails. Replies `{dropped}` — how many
+   * outstanding operation records went with it — or rejects with the refusal
+   * decided by the pure `ProfileRetirement` rule.
+   */
+  @Command
+  fun site_profile_retire(invoke: Invoke) {
+    val profileName = invoke.getArgs().getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.retireProfileQuarantine(profileName) { dropped, error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("dropped", dropped))
+        }
+      }
+    }
+  }
+
+  /** Clear one site profile in place (cookies, web storage, permissions). */
+  @Command
+  fun site_clear_data(invoke: Invoke) {
+    val profileName = invoke.getArgs().getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.clearProfileData(activity, profileName) { error ->
+        if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
+      }
+    }
+  }
+
+  /** Periodic durability hook: flush the active site profile's cookies. */
+  @Command
+  fun site_flush(invoke: Invoke) {
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.flush(activity) { error ->
+        if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
+      }
+    }
+  }
+
+  /**
+   * Every profile name the provider store knows (for the "clear all" orphan
+   * sweep). An unsupported provider resolves an empty list with
+   * `unsupported=true`: Rust skips the sweep and logs instead of guessing.
+   */
+  @Command
+  fun site_profile_names(invoke: Invoke) {
+    withLiveActivity(invoke) {
+      val names = AnimeHubSiteController.allProfileNames()
+      val payload = JSObject()
+      val array = org.json.JSONArray()
+      if (names == null) {
+        payload.put("unsupported", true)
+      } else {
+        names.forEach { array.put(it) }
+      }
+      payload.put("names", array)
+      invoke.resolve(payload)
+    }
   }
 
   // ------------------------------------------------------------------- PiP
@@ -654,53 +535,12 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
   companion object {
     private const val LOG_TAG = "AnimeHubPlugin"
-    private val COOKIE_FLUSH_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
-      Thread(runnable, "AnimeHubCookieFlush").apply { isDaemon = true }
-    }
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val KEY_ALIAS_PREFIX = "animehub_"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_IV_LENGTH = 12
     private const val GCM_TAG_BITS = 128
 
-    /**
-     * Best-effort dump of every IndexedDB database on the current origin:
-     * `{ "<db>": { "version": n, "stores": { "<store>": [ {key, value} ] } } }`.
-     * Returns `"{}"` (never `null`) on any internal failure so the caller can
-     * treat a missing dump and an empty one identically.
-     */
-    private val EXPORT_IDB_JS = """
-        (async function(){
-          var out={};
-          function openDb(name,version){return new Promise(function(res,rej){
-            var r=indexedDB.open(name,version||undefined);
-            r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)};});}
-          try{
-            var dbs=await indexedDB.databases();
-            for(var i=0;i<dbs.length;i++){
-              var name=dbs[i].name;if(!name)continue;
-              var db=await openDb(name,dbs[i].version);
-              var stores={};
-              for(var j=0;j<db.objectStoreNames.length;j++){
-                var sn=db.objectStoreNames[j];
-                var rows=await new Promise(function(res,rej){
-                  var tx=db.transaction(sn,'readonly');
-                  var st=tx.objectStore(sn);
-                  var keys=st.getAllKeys();var vals=st.getAll();
-                  var failed=function(){rej(keys.error||vals.error||new Error('getAll'))};
-                  keys.onsuccess=function(){vals.onsuccess=function(){
-                    res(vals.result.map(function(v,k){return{key:keys.result[k],value:v}}))};
-                    vals.onerror=failed};
-                  keys.onerror=failed;vals.onerror=failed;});
-                stores[sn]=rows;
-              }
-              out[name]={version:db.version,stores:stores};
-              db.close();
-            }
-          }catch(e){return '{}';}
-          return out;
-        })()
-    """.trimIndent().replace("\n", "")
 
     /** Return the existing key for `purpose`, generating one on first use. */
     private fun keyFor(purpose: String): SecretKey {
@@ -733,66 +573,6 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
   }
 }
-
-/**
- * Top-level navigation guard for the shared site WebView (Android only).
- *
- * Desktop enforces the site policy in Tauri's `on_navigation` hook. Android has
- * no equivalent for the single launcher WebView: wry's navigation handler is
- * fixed when the WebView is created and is not reachable from app code. So this
- * class wraps wry's `WebViewClient` and cancels the navigations that the desktop
- * policy would refuse.
- *
- * Scope (verified against wry 0.55.1 source and the Android WebView docs, not on
- * a device):
- *  - Covered: top-level navigations that the WebView routes through
- *    `shouldOverrideUrlLoading` (link clicks, `location` changes, main-frame
- *    redirects as delivered by the WebView).
- *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
- *    `open_on_mobile` already validates the first URL), subframes, and
- *    sub-resources.
- *  - Not covered: the blocklist and DNS rebinding checks. Those live in Rust;
- *    running DNS on the UI thread from this callback is not acceptable.
- *
- * Every other callback is forwarded unchanged, so wry's custom-protocol
- * handling, the IPC page-started tracking and the error recovery keep working.
- */
-class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
-
-  override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-    val uri = request.url
-    if (!SiteNavigationPolicy.allows(uri)) {
-      // Host and scheme only: paths and queries can carry tokens.
-      Log.w(LOG_TAG, "navigation blocked: ${uri.scheme}://${uri.host}")
-      // Scheme only in the in-app log: the host can identify the site.
-      AnimeHubDebugLog.add("nav", "blocked scheme=${uri.scheme}")
-      return true
-    }
-    return inner.shouldOverrideUrlLoading(view, request)
-  }
-
-  override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
-    inner.shouldInterceptRequest(view, request)
-
-  override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) =
-    inner.onPageStarted(view, url, favicon)
-
-  override fun onPageFinished(view: WebView, url: String) =
-    inner.onPageFinished(view, url)
-
-  override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-    // Error code and frame only: the description and URL are left out.
-    if (request.isForMainFrame) {
-      AnimeHubDebugLog.add("web", "main frame error code=${error.errorCode}")
-    }
-    inner.onReceivedError(view, request, error)
-  }
-
-  companion object {
-    private const val LOG_TAG = "AnimeHubNavGuard"
-  }
-}
-
 
 /**
  * Receives `window.ipc.postMessage` from the launcher only. The origin rules
@@ -855,25 +635,4 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     const val OBJECT_NAME = "ipc"
     val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
   }
-}
-
-/**
- * In-app diagnostics for the launcher's developer panel, read through the
- * `debug_log` plugin command. Holds the last 200 lines of status text only:
- * a short area tag, the outcome, and error codes. Never site URLs or hosts,
- * and never message bodies or cookie values.
- */
-object AnimeHubDebugLog {
-  private const val MAX_LINES = 200
-  private val lines = ArrayDeque<String>()
-  private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
-
-  @Synchronized
-  fun add(area: String, message: String) {
-    if (lines.size >= MAX_LINES) lines.removeFirst()
-    lines.addLast(stamp.format(Date()) + " [" + area + "] " + message)
-  }
-
-  @Synchronized
-  fun snapshot(): List<String> = lines.toList()
 }

@@ -9,7 +9,7 @@ use crate::secure::master_key::Backend;
 use crate::secure::SecretProvider;
 use crate::sites::blocklist::{Blocklist, BlocklistState};
 use crate::sites::registry::{Category, Icon, Registry, Site, SiteDraft};
-use crate::web::session::{build_init_script, CookieJar, InjectedConfig};
+use crate::web::session::{build_init_script, InjectedConfig};
 use crate::web::windows;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -36,8 +36,8 @@ pub struct AppState {
     /// Which site currently owns the WebView session.
     ///
     /// On desktop this names the extra window; on Android it names the site
-    /// whose cookies are currently loaded into the single shared WebView, so
-    /// `open_site` knows which jar to export before swapping.
+    /// whose profiled WebView is currently attached above the launcher, so
+    /// open/close/wipe/flush all serialize against the same fact.
     pub current_site: Mutex<Option<CurrentSite>>,
     /// Serialize Picture-in-Picture native applies (startup vs toggle, and
     /// rapid toggles). `set_pip_auto_enter` and the startup thread both hold
@@ -256,8 +256,52 @@ pub fn update_site(
     Ok(to_view(&site, false))
 }
 
+/// What happened to the site's *profile data* during `remove_site`.
+///
+/// One explicit vocabulary for Kotlin ⇄ Rust ⇄ JS, so the UI never has to
+/// infer an outcome from missing fields (A.8 delete/clear/UI contract):
+/// * `deleted` — accepted now (disk work may finish asynchronously), or
+///   absent (already clean);
+/// * `deferred` — provider refused because the profile is loaded in this
+///   process; the name is queued and retried at next start;
+/// * `unsupported` — the provider has no profile API (feature gap; the
+///   command surfaces it as an error and keeps the record);
+/// * `hidden` — builtin site: hidden, no profile to delete;
+/// * `notApplicable` — platforms without WebView profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProfileRemoval {
+    Deleted,
+    Deferred,
+    Unsupported,
+    Hidden,
+    NotApplicable,
+}
+
+/// `remove_site` result: registry/session success plus the profile outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RemoveSiteOutcome {
+    pub profile: ProfileRemoval,
+}
+
+/// Pure mapping from the bridge's delete action to the contract above —
+/// tested directly so a registry change can never be paired with a wrong
+/// outcome string. `Absent` means the profile was already clean, which the
+/// UI reports as `deleted` (nothing is left behind either way).
+pub fn profile_removal_for(action: crate::android_bridge::SiteProfileAction) -> ProfileRemoval {
+    use crate::android_bridge::SiteProfileAction;
+    match action {
+        SiteProfileAction::Deleted | SiteProfileAction::Absent => ProfileRemoval::Deleted,
+        SiteProfileAction::Pending => ProfileRemoval::Deferred,
+    }
+}
+
 #[tauri::command]
-pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub fn remove_site(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<RemoveSiteOutcome> {
     // Preserve the registry until the destructive cleanup succeeds, so a
     // failed close/delete does not orphan the tile. The whole sequence is
     // serialized by the desktop/android lifecycle lock (`DESKTOP` →
@@ -284,7 +328,9 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
             reg.remove(&id)?;
             drop(reg);
             persist_registry(&state)?;
-            return Ok(());
+            return Ok(RemoveSiteOutcome {
+                profile: ProfileRemoval::Hidden,
+            });
         }
         // User site: close, delete, then remove from registry. Close and
         // delete are done before the registry mutation so a failure keeps the
@@ -330,11 +376,17 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
                 Some(_) => {
                     reg.remove(&id)?;
                 }
-                None => return Ok(()),
+                None => {
+                    return Ok(RemoveSiteOutcome {
+                        profile: ProfileRemoval::Deleted,
+                    })
+                }
             }
         }
         persist_registry(&state)?;
-        Ok(())
+        Ok(RemoveSiteOutcome {
+            profile: ProfileRemoval::Deleted,
+        })
     }
     #[cfg(not(desktop))]
     {
@@ -355,8 +407,15 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
             reg.remove(&id)?;
             drop(reg);
             persist_registry(&state)?;
-            return Ok(());
+            return Ok(RemoveSiteOutcome {
+                profile: ProfileRemoval::Hidden,
+            });
         }
+        // Platform default for this block: no WebView profiles (iOS).
+        #[cfg(not(target_os = "android"))]
+        let profile_outcome = ProfileRemoval::NotApplicable;
+        #[cfg(target_os = "android")]
+        let profile_outcome;
         let should_close = {
             let cur = state
                 .current_site
@@ -370,6 +429,32 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
             #[cfg(not(target_os = "android"))]
             crate::web::windows::close_site_window_for_clear(&app, &id)?;
         }
+        // Android: the site's data lives in its WebView profile. Delete the
+        // profile *before* the registry mutation so a failure keeps the tile
+        // and the user can retry. `Pending` (profile loaded in this process)
+        // is queued for the next process start and reported as `deferred` —
+        // never as deleted. An `unsupported-multi-profile` refusal (a
+        // provider feature gap) propagates as an error so the record stays
+        // and the UI shows the MULTI_PROFILE guidance; it must not be faked
+        // as deferred-forever success.
+        //
+        // The whole delete → queue → generation bump → quarantine retirement
+        // order lives in ONE host-tested function. Retirement LAST is the
+        // safety property: the ledger for this name may only be dropped once
+        // the bump is durably stored, because a failed bump/write aborts this
+        // command with the registry intact and the next open would derive the
+        // very same name — which must still be blocked while a
+        // `removeAllCookies` deletion may be in flight on it.
+        #[cfg(target_os = "android")]
+        {
+            let action = crate::web::windows::run_mobile_delete_protocol(
+                &state,
+                &id,
+                |profile| crate::android_bridge::site_profile_delete(profile),
+                |profile| crate::android_bridge::site_profile_retire(profile),
+            )?;
+            profile_outcome = profile_removal_for(action);
+        }
         state.provider.delete_site_session(&id)?;
         {
             let mut reg = state
@@ -377,12 +462,16 @@ pub fn remove_site(app: AppHandle, state: State<'_, AppState>, id: String) -> Ap
                 .lock()
                 .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
             if reg.get(&id).is_none() {
-                return Ok(());
+                return Ok(RemoveSiteOutcome {
+                    profile: profile_outcome,
+                });
             }
             reg.remove(&id)?;
         }
         persist_registry(&state)?;
-        Ok(())
+        Ok(RemoveSiteOutcome {
+            profile: profile_outcome,
+        })
     }
 }
 
@@ -405,7 +494,9 @@ pub fn set_site_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> 
 /// Open a site in its own isolated, full-screen WebView.
 ///
 /// Desktop: a new window with a per-site profile directory.
-/// Android: the main WebView is navigated, with the cookie jar swapped first.
+/// Android: a separate native WebView above the launcher, bound to its own
+/// androidx.webkit profile (refused outright when the provider lacks
+/// `MULTI_PROFILE`).
 #[tauri::command]
 pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     let (site, settings) = {
@@ -471,22 +562,27 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     .map(|label| OpenedSite {
         label,
         mobile: cfg!(any(target_os = "android", target_os = "ios")),
-        isolated: !cfg!(any(target_os = "android", target_os = "ios")),
+        // Android now gives real per-site isolation (one WebView profile per
+        // site); iOS still shares the single WebView.
+        isolated: !cfg!(target_os = "ios"),
     })
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenedSite {
-    /// Window label (desktop) or `"main"` (mobile).
+    /// Window label (desktop) or the site label (mobile bookkeeping).
     pub label: String,
     pub mobile: bool,
-    /// Whether this platform gives true per-site storage isolation.
-    /// `false` on Android — see `web::session` for why.
+    /// Whether this platform gives true per-site storage isolation: per-site
+    /// profile directories on desktop, per-site WebView profiles on Android,
+    /// single shared WebView on iOS.
     pub isolated: bool,
 }
 
-/// Close a site session and persist its cookie jar (mobile cookie-swap path).
+/// Close a site session. Mobile keeps the shared WebView's jar (iOS) or
+/// flushes/destroys the site's profiled WebView (Android); desktop removes
+/// the child WebView.
 #[tauri::command]
 pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
     windows::close_site_window(&app, &label)
@@ -499,8 +595,10 @@ pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
 /// the wipe atomic with respect to the live WebView: on desktop the profile
 /// directory is deleted only after the WebView is closed *without* exporting
 /// its live cookies, and the whole close+delete sequence is serialized
-/// against the periodic sync via the desktop session lock. On Android the
-/// shared CookieManager is cleared while holding the Android session lock.
+/// against the periodic sync via the desktop session lock. On Android each
+/// target site's profile is cleared in place (profile cookie manager +
+/// web storage) while holding the Android session lock; the launcher's
+/// default profile and its data are never touched.
 #[tauri::command]
 pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u32> {
     // `is_all` captures whether the caller asked for "all sites" before `id`
@@ -554,11 +652,10 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
         if clear_live {
             if let Some(active) = current_snapshot {
                 crate::web::windows::close_site_window_for_clear_locked(&app, &active.site_id)?;
-            } else {
-                // `all_sites` with no active session: still clear the shared
-                // CookieManager so no stale cookies survive.
-                crate::android_bridge::webview_cookies_clear()?;
             }
+            // No `else`: with no active site view there is no shared jar to
+            // clear any more — site cookies live in per-site profiles, and
+            // the launcher's default profile is never part of a site wipe.
         }
     }
     #[cfg(desktop)]
@@ -593,8 +690,73 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     }
     let mut n = 0;
     for id in &ids {
+        // Android: clear the site's profile in place — its own cookie
+        // manager, web storage and permissions. The profile object itself
+        // survives, so the next open starts logged out without a
+        // delete/recreate race. An absent profile is already clean; a hard
+        // failure aborts so the caller never sees a false success.
+        #[cfg(target_os = "android")]
+        {
+            // Profile first, encrypted blobs second, as one host-tested
+            // protocol: a wipe failure keeps the jar for a retry, and a success
+            // always reaches `delete_site_session` — including Kotlin's "the
+            // provider deleted nothing because the jar was already empty"
+            // success, which used to fail the whole clear and strand the jar.
+            windows::run_mobile_clear_protocol(&state, id, |profile| {
+                crate::android_bridge::site_clear_data(profile)
+            })?;
+        }
+        #[cfg(not(target_os = "android"))]
         state.provider.delete_site_session(id)?;
         n += 1;
+    }
+    // Android orphan sweep for "clear all": profile names that no registered
+    // site currently owns (an interrupted remove, an old generation, an
+    // imported registry). Mirrors the desktop `profiles/site-*` sweep — only
+    // names in our namespace are ever addressed, the live site view was
+    // closed above, and `Pending` results are queued instead of dropped.
+    #[cfg(target_os = "android")]
+    if is_all {
+        use crate::android_bridge::SiteProfileAction;
+        let mut owned = std::collections::HashSet::new();
+        {
+            let reg = state
+                .registry
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            for site in reg.sites.iter() {
+                let generation = windows::profile_generation(&state, &site.id)?;
+                owned.insert(windows::android_profile_name(&site.id, generation));
+            }
+        }
+        for name in crate::android_bridge::site_profile_names()? {
+            if !name.starts_with(windows::ANDROID_PROFILE_PREFIX) || owned.contains(&name) {
+                continue;
+            }
+            match crate::android_bridge::site_profile_delete(&name)? {
+                SiteProfileAction::Pending => {
+                    windows::queue_pending_profile_delete(&state, &name)?;
+                }
+                SiteProfileAction::Deleted | SiteProfileAction::Absent => {
+                    // Same rule as `run_mobile_delete_protocol`: the ledger goes
+                    // only once the name cannot come back. An orphan has no
+                    // registered owner and no generation to bump — the deletion
+                    // itself is what makes it unreachable — while a deferred
+                    // deletion keeps its ledger until the startup drain lands it.
+                    // A retire failure is NOT a data-safety failure (keeping the
+                    // ledger is the conservative direction), so it is logged
+                    // instead of aborting the whole "clear all".
+                    match crate::android_bridge::site_profile_retire(&name) {
+                        Ok(dropped) => log::info!(
+                            "yetim site profili temizlendi (düşen karantina kaydı: {dropped})"
+                        ),
+                        Err(e) => {
+                            log::warn!("yetim profil karantinası emekliye ayrılamadı ({name}): {e}")
+                        }
+                    }
+                }
+            }
+        }
     }
     // Desktop profile directories hold the real cookie DB. A missing
     // directory is success; a failed delete is not. This runs only on
@@ -662,27 +824,17 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     Ok(n)
 }
 
-/// Read a site's stored cookie jar (used by the mobile swap and by tests).
-#[tauri::command]
-pub fn get_site_cookies(state: State<'_, AppState>, id: String) -> AppResult<CookieJar> {
-    match state.provider.get_secret(&format!("cookies-{id}"))? {
-        Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        None => Ok(CookieJar {
-            site_id: id,
-            cookies: vec![],
-            saved_at: 0,
-        }),
-    }
-}
-
-/// Replace a site's stored cookie jar.
-#[tauri::command]
-pub fn set_site_cookies(state: State<'_, AppState>, jar: CookieJar) -> AppResult<()> {
-    let bytes = serde_json::to_vec(&jar)?;
-    state
-        .provider
-        .put_secret(&format!("cookies-{}", jar.site_id), &bytes)
-}
+// The raw cookie-jar commands (`get_site_cookies` / `set_site_cookies`) are
+// GONE. Nothing in the frontend or any other production path called them: the
+// one-time 0.3.4 jar import reads `cookies-<site_id>` inside
+// `web::windows::run_mobile_open_protocol`, and the desktop profile flow never
+// touched them. What they did offer was an IPC surface that would read or
+// overwrite ANY site's encrypted cookie jar from the WebView — with no site
+// ownership, no profile generation and no quarantine check in the way. Keeping
+// unused authority "for tests" is exactly the surface a compromised launcher
+// page would use, and the storage behaviour they were said to cover is tested
+// directly against the provider (`cookie_jar_secret_roundtrips`) and through the
+// real protocol (`mobile_clear_protocol_*`).
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -936,31 +1088,27 @@ pub async fn anilist_login_callback(
     callback_url: String,
 ) -> AppResult<AniListUser> {
     let state = app.state::<AppState>();
-    let (code, returned_state) = anilist::parse_callback(&callback_url)?;
+    let (cli, cfg) = client(&state)?;
+    // The callback must match THIS session's configured redirect URI exactly
+    // (scheme, host, port and path) before its `code` means anything.
+    let (code, returned_state) = anilist::parse_callback(&callback_url, &cfg.redirect_uri)?;
 
-    let expected = {
-        let s = state
-            .oauth_state
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        s.clone()
-    };
-    let expected = expected.ok_or_else(|| AppError::AniList("bekleyen bir oturum yok".into()))?;
-    if !anilist::state_matches(&expected, &returned_state) {
-        return Err(AppError::AniList("state doğrulaması başarısız".into()));
+    // Single-use, consumed under the lock and only on a match: a repeated or
+    // replayed callback finds no pending attempt and cannot race a second token
+    // exchange, while a bogus state never burns the genuine login.
+    match anilist::take_pending_state(&state.oauth_state, &returned_state)? {
+        anilist::PendingState::None => {
+            return Err(AppError::AniList("bekleyen bir oturum yok".into()))
+        }
+        anilist::PendingState::Mismatched => {
+            return Err(AppError::AniList("state doğrulaması başarısız".into()))
+        }
+        anilist::PendingState::Consumed(_) => {}
     }
 
-    let (cli, _) = client(&state)?;
     let token = cli.exchange_code(&code).await?;
     let viewer = cli.viewer(&token).await?;
     save_token(&state, &token)?;
-    {
-        let mut s = state
-            .oauth_state
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        *s = None;
-    }
     Ok(AniListUser {
         id: viewer.id,
         name: viewer.name,
@@ -1321,10 +1469,31 @@ pub fn pip_startup_should_apply(
 }
 
 /// Developer panel: the last PiP diagnostic lines (empty off Android).
+///
+/// GATED on the `developerOptions` setting (AH-P9). The launcher UI already
+/// hides the panel when the setting is off, but the command itself was callable
+/// by anything running in the launcher WebView. Site WebViews have no Tauri IPC
+/// at all (no `@JavascriptInterface`, no `addWebMessageListener` — pinned by
+/// tests), so this is defence in depth on the trusted surface, not a hole in the
+/// site boundary. With the setting off the answer is an EMPTY LIST rather than
+/// an error, so a stale or hand-built UI learns nothing — not even whether the
+/// log has content.
+///
+/// The lock is released before the bridge call: the Kotlin side answers through
+/// the plugin, and a settings lock must not be held across it.
 // `async` runs the body on Tauri's async runtime, not on the IPC dispatch
 // thread. These commands wait for a Kotlin reply through the plugin bridge.
 #[tauri::command(async)]
-pub fn debug_log() -> AppResult<Vec<String>> {
+pub fn debug_log(app: AppHandle) -> AppResult<Vec<String>> {
+    let state = app.state::<AppState>();
+    let enabled = state
+        .settings
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?
+        .developer_options;
+    if !enabled {
+        return Ok(Vec::new());
+    }
     crate::android_bridge::debug_log()
 }
 
@@ -1343,7 +1512,6 @@ pub fn app_info(app: AppHandle) -> AppResult<AppInfo> {
         key_backend_os_backed: state.provider.backend().is_os_backed(),
         webview: webview_name(),
         anilist_configured: s.anilist.is_configured(),
-        android_isolation_note: cfg!(target_os = "android"),
     })
 }
 
@@ -1357,9 +1525,6 @@ pub struct AppInfo {
     pub key_backend_os_backed: bool,
     pub webview: String,
     pub anilist_configured: bool,
-    /// `true` on Android, where cookie jars are swapped but same-origin
-    /// localStorage/IndexedDB provider isolation remains unresolved.
-    pub android_isolation_note: bool,
 }
 
 pub fn platform_name() -> String {
@@ -1397,6 +1562,11 @@ mod tests {
     use super::*;
     use crate::secure::master_key::load_master_key;
     use crate::secure::store::SecureStore;
+    // Test-only: the raw cookie-jar COMMANDS are gone (§AH-03), the jar type
+    // itself stays — `web::windows` still reads `cookies-<site_id>`, and these
+    // tests prove the scoping. Importing it at module level would make it an
+    // unused import in the non-test build.
+    use crate::web::session::CookieJar;
 
     fn state_in(dir: &std::path::Path) -> AppState {
         let key = load_master_key(dir).expect("key");
@@ -1414,6 +1584,46 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn profile_removal_outcome_mapping_is_exact() {
+        use crate::android_bridge::SiteProfileAction;
+        // Absent means "already clean" — the UI contract reports it as
+        // deleted (nothing is left behind), never as deferred.
+        assert_eq!(
+            profile_removal_for(SiteProfileAction::Deleted),
+            ProfileRemoval::Deleted
+        );
+        assert_eq!(
+            profile_removal_for(SiteProfileAction::Absent),
+            ProfileRemoval::Deleted
+        );
+        assert_eq!(
+            profile_removal_for(SiteProfileAction::Pending),
+            ProfileRemoval::Deferred
+        );
+        // The serialized names the JS relies on (A.8 contract).
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Deferred).unwrap(),
+            "\"deferred\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Deleted).unwrap(),
+            "\"deleted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Unsupported).unwrap(),
+            "\"unsupported\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::Hidden).unwrap(),
+            "\"hidden\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProfileRemoval::NotApplicable).unwrap(),
+            "\"notApplicable\""
+        );
     }
 
     #[test]
@@ -1572,6 +1782,50 @@ mod tests {
         let back: CookieJar = serde_json::from_slice(&got).unwrap();
         assert_eq!(back.site_id, "builtin-openanime");
         assert_eq!(back.saved_at, 5);
+    }
+
+    /// The removed `get_site_cookies` / `set_site_cookies` commands took an
+    /// arbitrary `id` / jar from the WebView, so any page could read or
+    /// overwrite ANY site's encrypted cookie jar. Storage itself is per-site by
+    /// key: prove that, because it is the property the IPC surface must not
+    /// re-expose.
+    #[test]
+    fn cookie_jar_secrets_are_scoped_per_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+
+        let jar = |site_id: &str, saved_at: i64| CookieJar {
+            site_id: site_id.into(),
+            cookies: vec![],
+            saved_at,
+        };
+        let key = |site_id: &str| format!("cookies-{site_id}");
+        let put = |site_id: &str, saved_at: i64| {
+            let bytes = serde_json::to_vec(&jar(site_id, saved_at)).unwrap();
+            st.provider.put_secret(&key(site_id), &bytes).unwrap();
+        };
+        put("site-a", 11);
+        put("site-b", 22);
+
+        let read = |site_id: &str| -> CookieJar {
+            let got = st
+                .provider
+                .get_secret(&key(site_id))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{site_id} jar'ı yazılmıştı"));
+            serde_json::from_slice(&got).unwrap()
+        };
+        assert_eq!(read("site-a").saved_at, 11);
+        assert_eq!(read("site-b").saved_at, 22);
+
+        // A never leaks through B's key, and an unknown site has no jar at all
+        // (no implicit fallback to another site's data).
+        assert_eq!(read("site-a").site_id, "site-a");
+        assert!(st.provider.get_secret(&key("site-c")).unwrap().is_none());
+        // Overwriting A leaves B untouched.
+        put("site-a", 99);
+        assert_eq!(read("site-a").saved_at, 99);
+        assert_eq!(read("site-b").saved_at, 22);
     }
 
     #[test]
