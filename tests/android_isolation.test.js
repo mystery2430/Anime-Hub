@@ -601,7 +601,7 @@ test("every awaited flush is watchdog-bounded, in close and clear alike", () => 
   const closeBody = controllerKt.slice(closeAt, controllerKt.indexOf("SiteCloseFlow.run", closeAt));
   assert.match(
     closeBody,
-    /override fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/,
+    /override fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\): Watchdog/,
   );
   // The adapters delegate to ONE helper, which posts on the main looper and
   // returns a removeCallbacks-based canceller (see the watchdog test below).
@@ -814,10 +814,10 @@ test("every awaited step cancels its watchdog, and an unarmable one fails fast",
   );
   // All three ports hand back a canceller...
   assert.equal(
-    (ops.match(/fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/g) || [])
+    (ops.match(/fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\): Watchdog/g) || [])
       .length,
     3,
-    "close, clear and migration ports",
+    "close, clear and migration ports report armed/refused explicitly",
   );
   // ...and every arming site has a matching cancellation once the step settles.
   // Without it a step that answered normally left its delayed runnable queued
@@ -825,9 +825,9 @@ test("every awaited step cancels its watchdog, and an unarmable one fails fast",
   // and through it the site WebView and the Activity — reachable.
   assert.equal((ops.match(/port\.scheduleTimeout\(/g) || []).length, 5);
   assert.equal((ops.match(/cancel\w*Watchdog\(\)/g) || []).length, 6);
-  assert.match(ops, /var cancelWatchdog: \(\) -> Unit = \{\}/);
-  assert.match(ops, /var cancelFlushWatchdog: \(\) -> Unit = \{\}/);
-  assert.match(ops, /var cancelCookieWatchdog: \(\) -> Unit = \{\}/);
+  assert.match(ops, /val cancelWatchdog = \(watchdog as Watchdog\.Armed\)\.cancel/);
+  assert.match(ops, /val cancelFlushWatchdog = \(flushWatchdog as Watchdog\.Armed\)\.cancel/);
+  assert.match(ops, /val cancelCookieWatchdog = \(cookieWatchdog as Watchdog\.Armed\)\.cancel/);
 
   // ONE production helper arms watchdogs: removeCallbacks-based cancellation,
   // and an immediate failure when the handler refuses the post (a flow whose
@@ -835,11 +835,27 @@ test("every awaited step cancels its watchdog, and an unarmable one fails fast",
   // the caller — and the bridge call behind it — waiting forever).
   assert.match(
     flushWorkerKt,
-    /fun scheduleWatchdog\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/,
+    /fun scheduleWatchdog\(millis: Long, onTimeout: \(\) -> Unit\): Watchdog/,
   );
-  assert.match(flushWorkerKt, /mainHandler\.postDelayed\(task, millis\)/);
-  assert.match(flushWorkerKt, /mainHandler\.removeCallbacks\(task\)/);
-  assert.match(flushWorkerKt, /watchdog could not be armed/);
+  // postDelayed's RETURN VALUE is the refusal channel (it throws nothing), so
+  // it must be captured and fed to the pure decision.
+  assert.match(flushWorkerKt, /queued = mainHandler\.postDelayed\(task, millis\)/);
+  assert.match(flushWorkerKt, /WatchdogArming\.refusal\(queued, thrown\)/);
+  assert.match(flushWorkerKt, /return Watchdog\.Refused/);
+  assert.match(flushWorkerKt, /Watchdog\.Armed\(\{ mainHandler\.removeCallbacks\(task\) \}\)/);
+  assert.match(
+    pureKotlin,
+    /watchdog could not be armed \(postDelayed returned false\)/,
+    "the pure decision must name the false-return contract",
+  );
+  // On refusal the worker must NOT settle the step itself: the flow owns that,
+  // and firing onTimeout here would report a timeout for a provider call that
+  // was never issued (and quarantine an operation that does not exist).
+  const refusalBranch = flushWorkerKt.slice(
+    flushWorkerKt.indexOf("if (refusal != null)"),
+    flushWorkerKt.indexOf("return Watchdog.Armed"),
+  );
+  assert.doesNotMatch(code(refusalBranch), /onTimeout\(\)/);
   assert.equal(
     (controllerKt.match(/SiteFlushWorker\.scheduleWatchdog\(millis, onTimeout\)/g) || []).length,
     3,
@@ -855,11 +871,64 @@ test("every awaited step cancels its watchdog, and an unarmable one fails fast",
   for (const name of [
     "a settled clear cancels every watchdog it armed",
     "the watchdog that fired is the only one a timed-out clear leaves queued",
-    "a watchdog that cannot be armed fails the step instead of hanging the caller",
+    "a refused watchdog fails the step and never starts the provider call",
+    "a refusal of only the final flush skips the flush and fails the wipe",
+    "WatchdogArming treats a false postDelayed exactly like a throw",
+    "a refused close watchdog keeps the view and never starts the flush",
+    "a refused migration watchdog writes no cookie and claims no success",
     "a settled migration cancels its per-cookie and flush watchdogs",
   ]) {
     assert.ok(opsTest.includes(name), `missing Kotlin case: ${name}`);
   }
+});
+
+test("a refused watchdog stops the flow before any provider work starts", () => {
+  const close = pureFile("SiteCloseFlow.kt");
+  const clear = pureFile("SiteClearFlow.kt");
+  const migration = pureFile("SiteMigrationFlow.kt");
+  // Each arming site decides on Watchdog.Refused BEFORE the call it would bound.
+  assert.ok(
+    close.indexOf("is Watchdog.Refused") < close.indexOf("port.flushCookies(profileName)"),
+    "close must not start an unbounded blocking flush",
+  );
+  assert.ok(
+    clear.indexOf("is Watchdog.Refused") < clear.indexOf("arm(guard)"),
+    "an awaited clear step must not arm its provider call without a watchdog",
+  );
+  assert.ok(
+    clear.indexOf("flushWatchdog is Watchdog.Refused") < clear.lastIndexOf("port.flushCookies"),
+    "the clear's final flush must not start unbounded",
+  );
+  assert.ok(
+    migration.indexOf("cookieWatchdog is Watchdog.Refused") < migration.indexOf("port.setCookie("),
+    "a migration cookie must not be written without a bound",
+  );
+  assert.ok(
+    migration.indexOf("flushWatchdog is Watchdog.Refused") < migration.indexOf("port.flushCookies"),
+    "a migration flush must not start unbounded",
+  );
+  // The refusal is its own reported outcome, distinct from a timeout, and the
+  // timeout hook (which quarantines an outstanding cookie deletion) is NOT run
+  // for it — nothing was issued, so nothing is outstanding.
+  assert.match(pureKotlin, /const val WATCHDOG_REFUSED: String = "zamanlayıcı kurulamadı"/);
+  const refusedAt = clear.indexOf("if (watchdog is Watchdog.Refused)");
+  assert.ok(refusedAt > 0);
+  // Only the refusal branch: the timeout lambda above it legitimately runs the
+  // hook, because there a deletion really was issued and is now unverified.
+  const refusedBranch = clear.slice(refusedAt, clear.indexOf("arm(guard)", refusedAt));
+  assert.match(refusedBranch, /SiteProfileErrors\.WATCHDOG_REFUSED/);
+  assert.doesNotMatch(
+    code(refusedBranch),
+    /onTimeout\(guard\)/,
+    "a refusal must not quarantine an operation that was never issued",
+  );
+  assert.match(
+    refusedBranch,
+    /no operation\s*\n?\s*\/\/ is left outstanding|nothing is quarantined|is deliberately not/,
+    "the branch must say why nothing is quarantined",
+  );
+  // And the timeout path still quarantines (unchanged contract).
+  assert.match(clear, /ProfileQuarantine\.quarantine\(profileName, guard\.operationId, COOKIE_UNVERIFIED_REASON\)/);
 });
 
 test("all blocking flushes share ONE worker, with stuck detection not new threads", () => {
@@ -1021,7 +1090,13 @@ test("the pure Kotlin split is packaged, pure, copied and homed", () => {
     );
   }
   const homes = {
-    "SiteProfileOps.kt": ["object SiteProfileErrors", "class SiteSessionState", "object GeolocationWipe"],
+    "SiteProfileOps.kt": [
+      "object SiteProfileErrors",
+      "class SiteSessionState",
+      "object GeolocationWipe",
+      "sealed interface Watchdog",
+      "object WatchdogArming",
+    ],
     "ProfileQuarantine.kt": ["object ProfileQuarantine", "object SiteOpenGate", "object ProfileRetirement"],
     "SiteCloseFlow.kt": ["interface SiteClosePort", "object SiteCloseFlow"],
     "SiteShutdownFlow.kt": ["object ShutdownFlow", "sealed interface ShutdownFlush"],

@@ -380,7 +380,7 @@ object AnimeHubSiteController {
         SiteFlushWorker.submit(activity, "migration", { m.flush() }, onDone)
       }
 
-      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
+      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
         SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
     }
 
@@ -519,7 +519,7 @@ object AnimeHubSiteController {
             SiteFlushWorker.submit(activity, "close", { profile.cookieManager.flush() }, onDone)
           }
 
-          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
+          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
             SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
 
           override fun destroyActiveView() {
@@ -962,7 +962,7 @@ object AnimeHubSiteController {
             SiteFlushWorker.submit(activity, "clear", { profile.cookieManager.flush() }, onDone)
           }
 
-          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
+          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
             SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
         }
       SiteClearFlow.run(isSupported(), profileName, port) { error ->

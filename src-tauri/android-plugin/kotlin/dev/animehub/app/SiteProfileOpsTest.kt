@@ -52,6 +52,15 @@ class SiteProfileOpsTest {
 
     /** How many armed watchdogs the flow cancelled after settling. */
     var cancelled = 0
+    /** Arming counter, so a test can refuse one specific watchdog. */
+    private var armings = 0
+
+    /** How many armings the scheduler refused. */
+    var refusals = 0
+
+    /** Refuse every arming (`true`) or only the one with this index. */
+    var armFails = false
+    var refuseArmingAt: Int = -1
     val log = mutableListOf<String>()
 
     override fun hasActiveView(): Boolean = active
@@ -73,9 +82,16 @@ class SiteProfileOpsTest {
       onDone(flushError)
     }
 
-    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
+    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog {
+      val index = armings++
+      if (armFails || index == refuseArmingAt) {
+        // The scheduler refused: nothing was queued, so nothing is recorded as
+        // an armed watchdog and no timeout may ever be fired by a test.
+        refusals++
+        return Watchdog.Refused
+      }
       timeouts += onTimeout
-      return { cancelled++ }
+      return Watchdog.Armed({ cancelled++ })
     }
 
     override fun destroyActiveView() {
@@ -150,7 +166,8 @@ class SiteProfileOpsTest {
           onDone(RuntimeException("late duplicate"))
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
+          Watchdog.Armed({})
         override fun destroyActiveView() {}
       }
     var count = 0
@@ -299,16 +316,23 @@ class SiteProfileOpsTest {
      */
     var hasCookiesProbe: (() -> Boolean)? = null,
     /**
-     * The handler refuses the post, so the production adapter fires the
-     * timeout IMMEDIATELY instead of leaving the flow without a watchdog.
+     * The scheduler refuses EVERY arming — what `SiteFlushWorker` reports as
+     * [Watchdog.Refused] when `Handler.postDelayed` returns `false` or throws.
      */
     var armFails: Boolean = false,
+    /** Refuse only the arming with this index (0 = the cookie step's). */
+    var refuseArmingAt: Int = -1,
     /** The geolocation enumeration is held so a test can deliver it LATE. */
     geoHoldsCallback: Boolean = false,
     val geo: FakeGeolocationApi = FakeGeolocationApi(hold = geoHoldsCallback),
   ) : SiteClearPort {
     /** How many armed watchdogs the flow cancelled after settling. */
     var cancelled = 0
+    /** Arming counter, so a test can refuse one specific watchdog. */
+    private var armings = 0
+
+    /** How many armings the scheduler refused. */
+    var refusals = 0
 
     val log = mutableListOf<String>()
     var timeouts = mutableListOf<() -> Unit>()
@@ -368,15 +392,17 @@ class SiteProfileOpsTest {
       onDone(flushError)
     }
 
-    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
-      timeouts += onTimeout
-      if (armFails) {
-        // Exactly what AnimeHubSiteController.scheduleWatchdog does when
-        // postDelayed throws: answer now rather than wait forever.
-        onTimeout()
-        return {}
+    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog {
+      val index = armings++
+      if (armFails || index == refuseArmingAt) {
+        // The scheduler refused (postDelayed == false, or a throw): nothing was
+        // queued, so this is NOT recorded as an armed watchdog and no test may
+        // fire it. The flow must fail the step itself and skip the provider call.
+        refusals++
+        return Watchdog.Refused
       }
-      return { cancelled++ }
+      timeouts += onTimeout
+      return Watchdog.Armed({ cancelled++ })
     }
   }
 
@@ -457,10 +483,10 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog {
           scheduled = onTimeout
-          return {}
-        }
+          return Watchdog.Armed({})
+          }
       }
     var last: String? = null
     SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it }
@@ -474,7 +500,8 @@ class SiteProfileOpsTest {
       override fun hasActiveView(): Boolean = false
       override fun resolveProfileName(): Result<String> = Result.success("x")
       override fun flushCookies(profileName: String, onDone: (Throwable?) -> Unit) {}
-      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
+      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
+          Watchdog.Armed({})
       override fun destroyActiveView() {}
     }) { extra++ }
     Assert.assertEquals(1, extra)
@@ -504,9 +531,6 @@ class SiteProfileOpsTest {
     val port =
       object : SiteClearPort {
         val timeouts = mutableListOf<() -> Unit>()
-
-    /** How many armed watchdogs the flow cancelled after settling. */
-    var cancelled = 0
         var pendingFlush: ((Throwable?) -> Unit)? = null
         override fun profileExists(): Boolean = true
         override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
@@ -526,10 +550,10 @@ class SiteProfileOpsTest {
           pendingFlush = onDone
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog {
           timeouts += onTimeout
-          return {}
-        }
+          return Watchdog.Armed({})
+          }
       }
     var results = 0
     var last: String? = null
@@ -593,7 +617,8 @@ class SiteProfileOpsTest {
           onDone(RuntimeException("late"))
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
+          Watchdog.Armed({})
       }
     SiteClearFlow.run(supported = true, profileName = profile, port = port) {
       count++
@@ -732,10 +757,10 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog {
           timeouts += onTimeout
-          return {}
-        }
+          return Watchdog.Armed({})
+          }
       }
     var results = 0
     var last: String? = null
@@ -994,20 +1019,122 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `a watchdog that cannot be armed fails the step instead of hanging the caller`() {
-    // AnimeHubSiteController.scheduleWatchdog invokes onTimeout immediately when
-    // the handler refuses the post. The flow must then answer its caller rather
-    // than wait for a watchdog that will never fire — and it must still keep the
-    // unverified cookie deletion quarantined.
+  fun `a refused watchdog fails the step and never starts the provider call`() {
+    // `Handler.postDelayed` reports a refusal by returning false (no exception),
+    // and SiteFlushWorker turns that into Watchdog.Refused. The flow must answer
+    // its caller instead of waiting for a watchdog that will never fire — and it
+    // must NOT issue the provider call nobody could bound.
     val port = FakeClearPort(armFails = true)
+    var results = 0
     var last: String? = "unset"
-    SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it }
-    Assert.assertNotEquals("the caller was answered", "unset", last)
-    Assert.assertTrue(last!!.contains("zaman aşımı"))
-    Assert.assertTrue(
-      "the fail-fast path still quarantines the unverified deletion",
-      ProfileQuarantine.isBlocked(profile),
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) {
+      results++
+      last = it
+    }
+    Assert.assertEquals("the caller is answered exactly once", 1, results)
+    Assert.assertTrue("refusal is reported as its own outcome: $last",
+      last!!.contains(SiteProfileErrors.WATCHDOG_REFUSED))
+    // No provider work was started: only the synchronous, unawaited storage
+    // step ran. The cookie, geolocation and flush calls never happened.
+    Assert.assertEquals(listOf("exists", "storage"), port.log)
+    Assert.assertNull("no cookie callback was ever captured", port.pendingCookies)
+    Assert.assertNull("no flush callback was ever captured", port.pendingFlush)
+    Assert.assertEquals(0, port.geo.getOriginsCalls)
+    Assert.assertTrue(port.refusals >= 1)
+    Assert.assertTrue("nothing was armed, so nothing may be fireable", port.timeouts.isEmpty())
+    // And because no destructive call was issued, nothing is outstanding: the
+    // ledger tracks provider operations that may still land, not refusals.
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+  }
+
+  @Test
+  fun `a refusal of only the final flush skips the flush and fails the wipe`() {
+    // Arming index 2 is the final flush (0 = cookie step, 1 = geolocation).
+    val port = FakeClearPort(refuseArmingAt = 2)
+    var last: String? = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it ?: "ok" }
+    Assert.assertTrue("the earlier steps really ran: ${port.log}",
+      port.log.containsAll(listOf("exists", "cookies", "geo", "storage")))
+    Assert.assertFalse("the unbounded flush is never started", port.log.contains("flush"))
+    Assert.assertNull(port.pendingFlush)
+    Assert.assertEquals(1, port.refusals)
+    Assert.assertEquals(2, port.cancelled) // the two armed watchdogs were cancelled
+    Assert.assertEquals("çerez kalıcılığı: ${SiteProfileErrors.WATCHDOG_REFUSED}", last)
+  }
+
+  @Test
+  fun `WatchdogArming treats a false postDelayed exactly like a throw`() {
+    val cancel: () -> Unit = {}
+    val armed = WatchdogArming.decide(queued = true, thrown = null, cancel = cancel)
+    Assert.assertTrue("a queued runnable is armed", armed is Watchdog.Armed)
+    Assert.assertNull(WatchdogArming.refusal(queued = true, thrown = null))
+
+    // THE CONTRACT THIS ROUND FIXES: postDelayed returns false and throws
+    // nothing, so a try/catch alone never sees it.
+    val refusedByReturnValue = WatchdogArming.decide(queued = false, thrown = null, cancel = cancel)
+    Assert.assertEquals(Watchdog.Refused, refusedByReturnValue)
+    Assert.assertEquals(
+      "watchdog could not be armed (postDelayed returned false)",
+      WatchdogArming.refusal(queued = false, thrown = null),
     )
+
+    val refusedByThrow = WatchdogArming.decide(queued = false, thrown = IllegalStateException("looper gone"), cancel = cancel)
+    Assert.assertEquals(Watchdog.Refused, refusedByThrow)
+    Assert.assertEquals(
+      "watchdog could not be armed (IllegalStateException)",
+      WatchdogArming.refusal(queued = false, thrown = IllegalStateException("looper gone")),
+    )
+    // A throw wins even if something claims it queued: never hand out a canceller
+    // for a runnable that is not in the queue.
+    Assert.assertEquals(
+      Watchdog.Refused,
+      WatchdogArming.decide(queued = true, thrown = IllegalStateException("x"), cancel = cancel),
+    )
+  }
+
+  @Test
+  fun `a refused close watchdog keeps the view and never starts the flush`() {
+    val port = FakeClosePort()
+    port.armFails = true
+    var results = 0
+    var last: String? = null
+    SiteCloseFlow.run(port, flush = true) { results++; last = it }
+    Assert.assertEquals(1, results)
+    Assert.assertTrue(last!!.contains(SiteProfileErrors.WATCHDOG_REFUSED))
+    Assert.assertTrue("keeps the retryable wording", last!!.contains("görünüm açık kaldı"))
+    Assert.assertEquals("the blocking flush is never started", 0, port.flushCalls)
+    Assert.assertNull("no flush callback exists to arrive late", port.pendingFlush)
+    Assert.assertEquals("the view survives: durability was never verified", 0, port.destroyed)
+    Assert.assertTrue(port.timeouts.isEmpty())
+  }
+
+  @Test
+  fun `a refused migration watchdog writes no cookie and claims no success`() {
+    // Refuse the very first arming: the per-cookie watchdog.
+    val cookiePort = FakeMigrationPort()
+    cookiePort.armFails = true
+    var outcome: MigrationOutcome? = null
+    SiteMigrationFlow.run(listOf("a=1", "b=2"), cookiePort) { outcome = it }
+    val failed = outcome as? MigrationOutcome.Failed
+    Assert.assertNotNull("a refusal is a retryable failure, never Complete: $outcome", failed)
+    Assert.assertTrue(failed!!.reason.contains(SiteProfileErrors.WATCHDOG_REFUSED))
+    Assert.assertFalse("no cookie was written", cookiePort.log.any { it.startsWith("cookie") })
+    Assert.assertFalse("and no flush was started", cookiePort.log.contains("flush"))
+
+    // Refuse only the flush arming (index 1 with a single cookie): the cookie
+    // was written, but an unbounded flush still cannot pass as durability.
+    val flushPort = FakeMigrationPort(cookieCount = 1)
+    flushPort.refuseArmingAt = 1
+    var second: MigrationOutcome? = null
+    SiteMigrationFlow.run(listOf("a=1"), flushPort) { second = it }
+    val failedFlush = second as? MigrationOutcome.Failed
+    Assert.assertNotNull("expected Failed, got $second", failedFlush)
+    Assert.assertTrue(failedFlush!!.reason.contains("kalıcı hale getirilemedi"))
+    Assert.assertTrue(failedFlush.reason.contains(SiteProfileErrors.WATCHDOG_REFUSED))
+    Assert.assertTrue("the cookie step did run", flushPort.log.contains("cookie0"))
+    Assert.assertFalse("the unbounded flush did not", flushPort.log.contains("flush"))
+    Assert.assertEquals(1, flushPort.cancelled)
   }
 
   @Test
@@ -1834,6 +1961,15 @@ class SiteProfileOpsTest {
 
     /** How many armed watchdogs the flow cancelled after settling. */
     var cancelled = 0
+    /** Arming counter, so a test can refuse one specific watchdog. */
+    private var armings = 0
+
+    /** How many armings the scheduler refused. */
+    var refusals = 0
+
+    /** Refuse every arming (`true`) or only the one with this index. */
+    var armFails = false
+    var refuseArmingAt: Int = -1
     var cookieIndex = 0
     val totalCookies = cookieCount
 
@@ -1859,9 +1995,14 @@ class SiteProfileOpsTest {
       onDone(flushError)
     }
 
-    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
+    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog {
+      val index = armings++
+      if (armFails || index == refuseArmingAt) {
+        refusals++
+        return Watchdog.Refused
+      }
       scheduled += onTimeout
-      return { cancelled++ }
+      return Watchdog.Armed({ cancelled++ })
     }
   }
 
@@ -1941,10 +2082,10 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog {
           scheduled = onTimeout
-          return {}
-        }
+          return Watchdog.Armed({})
+          }
       }
     SiteMigrationFlow.run(listOf("a=1"), port) { port.outcome = it }
     Assert.assertNull(port.outcome)
@@ -1968,7 +2109,8 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
+          Watchdog.Armed({})
       }
     var results = 0
     SiteMigrationFlow.run(listOf("only"), port) { results++ ; port.count = results }

@@ -73,6 +73,16 @@ object SiteProfileErrors {
    * Rust maps the sentinel onto user-facing guidance instead of showing it raw.
    */
   const val QUARANTINED: String = "profile-quarantined"
+
+  /**
+   * A step's watchdog could not be armed on the platform scheduler, so the step
+   * was failed WITHOUT starting its provider call. Distinct from a timeout on
+   * purpose: a timeout means the provider call was issued and never answered
+   * (for `removeAllCookies` that leaves an operation outstanding, which
+   * [ProfileQuarantine] tracks), while a refused watchdog means nothing was ever
+   * issued — so nothing is outstanding and nothing is quarantined.
+   */
+  const val WATCHDOG_REFUSED: String = "zamanlayıcı kurulamadı"
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +146,48 @@ class SiteSessionState<T : Any> {
 // ---------------------------------------------------------------------------
 // Awaited steps: the one-shot validity token and the gated geolocation wipe
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether a step's watchdog could be armed on the platform scheduler.
+ *
+ * WHY A BARE CANCELLER IS NOT ENOUGH: `Handler.postDelayed` reports a refusal
+ * through its RETURN VALUE — `false` means the runnable could not be queued
+ * (typically a looper that is exiting) and **nothing throws**. A canceller-only
+ * contract could not express that, so a caller could not tell "armed, here is
+ * how to drop it" from "there is no watchdog at all". Starting a provider call
+ * with no watchdog is how a flow ends up waiting forever: nothing bounds the
+ * callback, and the caller — plus the Tauri bridge call behind it — hangs.
+ */
+sealed interface Watchdog {
+  /** Armed. [cancel] drops it; idempotent and safe from any thread. */
+  data class Armed(val cancel: () -> Unit) : Watchdog
+
+  /**
+   * Not armed. The FLOW owns the consequence: fail the step now and do NOT
+   * start the provider work the watchdog was meant to bound.
+   */
+  object Refused : Watchdog
+}
+
+/**
+ * The arming decision, pure — so CI executes the platform contract instead of
+ * trusting somebody's reading of it: a refusal arrives either as `queued ==
+ * false` (the return value) or as a thrown exception, and both must end in
+ * [Watchdog.Refused].
+ */
+object WatchdogArming {
+  /** Why arming failed, or `null` when the runnable was queued. */
+  fun refusal(queued: Boolean, thrown: Throwable?): String? =
+    when {
+      thrown != null -> "watchdog could not be armed (${thrown.javaClass.simpleName})"
+      !queued -> "watchdog could not be armed (postDelayed returned false)"
+      else -> null
+    }
+
+  /** [cancel] is handed out only when the runnable really was queued. */
+  fun decide(queued: Boolean, thrown: Throwable?, cancel: () -> Unit): Watchdog =
+    if (refusal(queued, thrown) == null) Watchdog.Armed(cancel) else Watchdog.Refused
+}
 
 /**
  * Validity token for ONE awaited step: the cancellation flag a port must

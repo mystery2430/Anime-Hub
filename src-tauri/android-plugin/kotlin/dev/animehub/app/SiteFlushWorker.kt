@@ -71,27 +71,39 @@ object SiteFlushWorker {
    * migration step paid that. `removeCallbacks` is idempotent and thread-safe,
    * so the flows cancel from whichever thread settles the step.
    *
-   * If the watchdog cannot be armed at all, [onTimeout] runs IMMEDIATELY: a
-   * flow whose watchdog never fires and whose provider never answers would
-   * otherwise leave its caller — and the Tauri bridge call behind it — waiting
-   * forever. Silently ignoring the failure (as this used to) traded a hang for
-   * an unbounded wait.
+   * If the watchdog cannot be armed — `postDelayed` returning `false` (its
+   * documented, NON-throwing refusal) or an exception — this returns
+   * [Watchdog.Refused] and does not invoke [onTimeout]: the flow fails the step
+   * and skips the provider work, because a call nobody can time out would leave
+   * the caller, and the Tauri bridge call behind it, waiting forever. Silently
+   * ignoring the refusal (as this used to) traded a hang for an unbounded wait,
+   * and answering the timeout here would have claimed a provider operation that
+   * was never issued.
    */
-  fun scheduleWatchdog(millis: Long, onTimeout: () -> Unit): () -> Unit {
+  fun scheduleWatchdog(millis: Long, onTimeout: () -> Unit): Watchdog {
     val task = Runnable { onTimeout() }
-    return try {
-      mainHandler.postDelayed(task, millis)
-      // Named, not a bare lambda on its own line: Kotlin would otherwise parse
-      // it as a trailing lambda of `postDelayed`.
-      val cancel: () -> Unit = { mainHandler.removeCallbacks(task) }
-      cancel
+    var queued = false
+    var thrown: Throwable? = null
+    try {
+      // The API reports a refusal by RETURN VALUE: `false` means the runnable
+      // could NOT be queued (typically a looper that is exiting) and nothing
+      // throws — which is why the old try/catch alone never saw this case.
+      queued = mainHandler.postDelayed(task, millis)
     } catch (e: Exception) {
-      Log.w(LOG_TAG, "watchdog could not be armed (${e.javaClass.simpleName}); failing the step now")
-      AnimeHubDebugLog.add("site", "watchdog not armed (${e.javaClass.simpleName}) - step failed now")
-      onTimeout()
-      val noop: () -> Unit = {}
-      noop
+      thrown = e
     }
+    val refusal = WatchdogArming.refusal(queued, thrown)
+    if (refusal != null) {
+      // Honest, measurable, and NOT our call to settle: the flow fails the step
+      // and skips the provider work (see [Watchdog.Refused]). Invoking
+      // [onTimeout] here instead would report a timeout for a provider call
+      // that was never issued — and, for the cookie step, quarantine an
+      // operation that does not exist.
+      Log.w(LOG_TAG, "$refusal; the step fails without starting its provider call")
+      AnimeHubDebugLog.add("site", "watchdog refused - step failed without provider work")
+      return Watchdog.Refused
+    }
+    return Watchdog.Armed({ mainHandler.removeCallbacks(task) })
   }
 
   /**

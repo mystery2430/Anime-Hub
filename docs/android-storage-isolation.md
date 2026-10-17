@@ -336,11 +336,27 @@ remove, no legacy data remains (`delete_site_session` also drops the
     migration step paid that. Arming happens in ONE production helper
     (`AnimeHubSiteController.scheduleWatchdog`, `postDelayed` +
     `removeCallbacks`, idempotent and thread-safe). If the handler refuses the
-    post, the helper invokes the timeout **immediately** instead of ignoring the
-    failure: a flow whose watchdog never fires and whose provider never answers
-    would leave its caller — and the Tauri bridge call behind it — waiting
-    forever. The step then fails in the conservative direction (for the cookie
-    step, the unverified deletion is still quarantined).
+    post, the arming is **refused explicitly** instead of being ignored: a flow
+    whose watchdog never fires and whose provider never answers would leave its
+    caller — and the Tauri bridge call behind it — waiting forever.
+  * *A refused watchdog is not a timeout.* `Handler.postDelayed` reports a
+    refusal through its **return value** — `false` means the runnable could not
+    be queued (typically a looper that is exiting) and **nothing throws**, which
+    is why a `try/catch` alone never saw this case. `scheduleTimeout` therefore
+    returns a `Watchdog`: `Armed(cancel)` or `Refused`, decided by the pure
+    `WatchdogArming` (a `false` return and a throw both end in `Refused`, and a
+    canceller is never handed out for a runnable that is not in the queue). On
+    `Refused` the **flow** fails the step with its own wording
+    (`SiteProfileErrors.WATCHDOG_REFUSED`, "zamanlayıcı kurulamadı") and — this
+    is the point — **never starts the provider call** it was meant to bound:
+    `awaited()` skips `arm(guard)`, and the clear's final flush, the close flush
+    and both migration steps skip theirs. A refusal also runs **no timeout
+    hook**, so nothing is quarantined: `ProfileQuarantine` tracks provider
+    operations that may still land, and a call that was never issued cannot.
+    Everything else stays conservative — the close keeps the view and the session
+    ownership, the clear reports a failure (so Rust keeps the encrypted blobs),
+    and a migration reports `Failed` (so the caller retires the virgin name and
+    retries).
   * *Ungated steps — per-operation profile quarantine.* `removeAllCookies` is
     a destructive provider call issued **before** the await, with no
     cancellation API: when its watchdog fires, the deletion may still be in
@@ -498,7 +514,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
 
 **Behavioural coverage (mocks/injected callbacks, no new dependencies):**
 
-* `SiteProfileOpsTest.kt` (87 cases, executed by the CI Gradle unit-test
+* `SiteProfileOpsTest.kt` (91 cases, executed by the CI Gradle unit-test
   step against the real sequencing code in the pure Kotlin flow files): close
   durability (flush failure keeps the view, resolve failure is an error,
   exactly-once completion, **flush watchdog on a lost callback, a late
@@ -530,12 +546,18 @@ remove, no legacy data remains (`delete_site_session` also drops the
   session-slot rollback after a failed open (stale failure cannot clear a
   newer session), and the back-status decision matrix. These catch the
   real error paths A.1–A.5 were about; the controller only *wires* them.
-* **Watchdog arming and cancellation** (4 cases): a settled clear cancels every
-  watchdog it armed, a timed-out clear leaves exactly the one that fired queued
-  (and a late answer cancels nothing more and changes nothing), a watchdog that
-  cannot be armed fails the step instead of hanging the caller while still
-  quarantining the unverified deletion, and a settled migration cancels its
-  per-cookie and flush watchdogs.
+* **Watchdog arming, cancellation and refusal** (8 cases): a settled clear
+  cancels every watchdog it armed; a timed-out clear leaves exactly the one that
+  fired queued (and a late answer cancels nothing more and changes nothing); a
+  settled migration cancels its per-cookie and flush watchdogs; a **refused**
+  arming (`postDelayed == false`) fails the step at once, starts **no** provider
+  call (cookie/geolocation/flush all skipped, only the synchronous storage step
+  runs), reports exactly once and quarantines nothing; refusing only the final
+  flush skips just that flush; `WatchdogArming` treats a `false` return exactly
+  like a throw and never hands out a canceller for an unqueued runnable; a
+  refused close keeps the view and never starts the blocking flush; a refused
+  migration writes no cookie and claims no success (both the per-cookie and the
+  flush arming).
 * **Shutdown protocol** (7 cases): submit → teardown → bounded await, the four
   outcomes, a double teardown flushing nothing, independent completion state per
   call, and a non-positive budget refused before anything runs.
@@ -656,7 +678,11 @@ State-machine coverage that needs a real device/provider (actual
   the timeout side-effect races on a real provider — a slow `getOrigins`
   answering after the 10 s watchdog (confirm in the site's own UI that a
   permission granted by the reopened session was NOT revoked, and that the
-  in-app log shows the stale `operationId`), a slow `removeAllCookies`
+  in-app log shows the stale `operationId`), **a watchdog refused by a real
+  looper** (exit the app while a clear/close/migration is in flight and confirm
+  the step reports `zamanlayıcı kurulamadı`, that no half-started provider call
+  is left behind, and that the profile is NOT quarantined for an operation that
+  never ran), a slow `removeAllCookies`
   (confirm the reopen is refused with the quarantine guidance, that the
   refusal lifts only after every outstanding deletion has settled AND a
   further wipe was verified, and that no cookie of the new session

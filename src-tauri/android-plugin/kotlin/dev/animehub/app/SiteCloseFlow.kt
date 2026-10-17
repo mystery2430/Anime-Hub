@@ -39,16 +39,20 @@ interface SiteClosePort {
    * the same bound [SiteClearFlow] and [SiteMigrationFlow] put on their
    * awaited steps. A flush that never calls back must not hang the close.
    *
-   * Returns the watchdog's CANCELLER (idempotent, callable from any thread).
-   * The flow calls it the moment the step settles, so a step that answered
-   * normally does not leave a delayed runnable queued — holding this port, and
-   * through it the WebView and the Activity — for the rest of the timeout
-   * window. An implementation that cannot arm the timeout MUST invoke
-   * [onTimeout] immediately instead: a flow whose watchdog never fires and
-   * whose provider never answers would leave the caller, and the bridge call
-   * behind it, waiting forever.
+   * Returns [Watchdog.Armed] with the canceller (idempotent, callable from any
+   * thread): the flow calls it the moment the step settles, so a step that
+   * answered normally does not leave a delayed runnable queued — holding this
+   * port, and through it the WebView and the Activity — for the rest of the
+   * window.
+   *
+   * An implementation that CANNOT arm the watchdog must return
+   * [Watchdog.Refused] and must NOT invoke [onTimeout] itself: the flow fails
+   * the step and skips the provider work, because a call nobody can time out
+   * would leave the caller — and the bridge call behind it — waiting forever.
+   * `Handler.postDelayed` reports that case as a `false` return value, not as an
+   * exception; [WatchdogArming] is the pure decision both forms go through.
    */
-  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit
+  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog
 
   /** Remove + destroy the active view and re-bind PiP/focus to the launcher. */
   fun destroyActiveView()
@@ -107,12 +111,22 @@ object SiteCloseFlow {
     // callback loses the race and is ignored — it must not destroy a view
     // whose ownership was never released.
     val settled = AtomicBoolean(false)
-    var cancelWatchdog: () -> Unit = {}
-    cancelWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
+    val watchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
       if (settled.compareAndSet(false, true)) {
         done("çerez kalıcılığı zaman aşımına uğradı: görünüm açık kaldı")
       }
     }
+    if (watchdog is Watchdog.Refused) {
+      // No watchdog ⇒ no bound on the blocking flush, so the flush is never
+      // started. Reported like a timeout (failure, retryable) and with the same
+      // conservative state: the view AND the session ownership stay, because
+      // durability was never verified.
+      if (settled.compareAndSet(false, true)) {
+        done("çerez kalıcılığı ${SiteProfileErrors.WATCHDOG_REFUSED}: görünüm açık kaldı")
+      }
+      return
+    }
+    val cancelWatchdog = (watchdog as Watchdog.Armed).cancel
     port.flushCookies(profileName) { error ->
       if (!settled.compareAndSet(false, true)) return@flushCookies
       // The flush answered: drop the queued watchdog so it cannot keep this

@@ -33,7 +33,7 @@ interface SiteMigrationPort {
   fun flushCookies(onDone: (Throwable?) -> Unit)
 
   /** One-shot watchdog for the awaited steps. */
-  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit
+  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog
 }
 
 /** Result of the migration attempt, with the strict success criterion. */
@@ -95,12 +95,26 @@ object SiteMigrationFlow {
       val i = index.get()
       if (i >= cookies.size) {
         val settled = AtomicBoolean(false)
-        var cancelFlushWatchdog: () -> Unit = {}
-        cancelFlushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
+        val flushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
           if (settled.compareAndSet(false, true)) {
             finish(MigrationOutcome.Failed("çerez aktarımı kalıcı hale getirilemedi: zaman aşımı"))
           }
         }
+        if (flushWatchdog is Watchdog.Refused) {
+          // No bound on the flush ⇒ do not start it. The strict criterion means
+          // this attempt is a retryable failure: the flag is not written, the
+          // profile is retired by the caller and the import is retried on a
+          // fresh generation — never reported as a complete migration.
+          if (settled.compareAndSet(false, true)) {
+            finish(
+              MigrationOutcome.Failed(
+                "çerez aktarımı kalıcı hale getirilemedi: ${SiteProfileErrors.WATCHDOG_REFUSED}"
+              )
+            )
+          }
+          return
+        }
+        val cancelFlushWatchdog = (flushWatchdog as Watchdog.Armed).cancel
         port.flushCookies { error ->
           if (!settled.compareAndSet(false, true)) return@flushCookies
           cancelFlushWatchdog()
@@ -113,12 +127,21 @@ object SiteMigrationFlow {
         return
       }
       val perCookie = AtomicBoolean(false)
-      var cancelCookieWatchdog: () -> Unit = {}
-      cancelCookieWatchdog = port.scheduleTimeout(COOKIE_TIMEOUT_MS) {
+      val cookieWatchdog = port.scheduleTimeout(COOKIE_TIMEOUT_MS) {
         if (perCookie.compareAndSet(false, true)) {
           finish(MigrationOutcome.Failed("çerez aktarımı zaman aşımına uğradı"))
         }
       }
+      if (cookieWatchdog is Watchdog.Refused) {
+        // No bound ⇒ never write the cookie: an unbounded `setCookie` could
+        // answer after this attempt was reported failed, into a profile that is
+        // about to be retired, and nothing would notice.
+        if (perCookie.compareAndSet(false, true)) {
+          finish(MigrationOutcome.Failed("çerez aktarımı ${SiteProfileErrors.WATCHDOG_REFUSED}"))
+        }
+        return
+      }
+      val cancelCookieWatchdog = (cookieWatchdog as Watchdog.Armed).cancel
       try {
         port.setCookie(cookies[i]) { ok ->
           if (!perCookie.compareAndSet(false, true)) return@setCookie

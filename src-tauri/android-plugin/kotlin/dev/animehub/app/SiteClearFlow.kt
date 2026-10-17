@@ -152,7 +152,7 @@ interface SiteClearPort {
   fun flushCookies(onDone: (Throwable?) -> Unit)
 
   /** One-shot delayed callback used as the watchdog for awaited steps. */
-  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit
+  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog
 }
 
 /**
@@ -320,8 +320,7 @@ object SiteClearFlow {
     ) {
       val settled = AtomicBoolean(false)
       val guard = StepGuards.create()
-      var cancelWatchdog: () -> Unit = {}
-      cancelWatchdog = port.scheduleTimeout(STEP_TIMEOUT_MS) {
+      val watchdog = port.scheduleTimeout(STEP_TIMEOUT_MS) {
         // Close the mutation window before deciding the result: a callback
         // racing this watchdog on another thread must see the guard shut even
         // if it arrives between the two atomic steps.
@@ -334,6 +333,20 @@ object SiteClearFlow {
           next(false)
         }
       }
+      if (watchdog is Watchdog.Refused) {
+        // The scheduler refused, so there is nothing to bound this step's
+        // provider call: the call is NOT issued. That also means no operation
+        // is left outstanding, and [ProfileQuarantine] tracks only provider
+        // calls that may still land — so the timeout hook is deliberately not
+        // run here and nothing is quarantined. Failing the step (and continuing
+        // with the rest) is the same conservative direction a timeout takes.
+        if (settled.compareAndSet(false, true)) {
+          record("$stepName: ${SiteProfileErrors.WATCHDOG_REFUSED}")
+          next(false)
+        }
+        return
+      }
+      val cancelWatchdog = (watchdog as Watchdog.Armed).cancel
       arm(guard) { ok ->
         if (settled.compareAndSet(false, true)) {
           // This step is settled: cancel its watchdog instead of leaving a
@@ -407,19 +420,29 @@ object SiteClearFlow {
         // already exists, so a late one cannot delete or grant anything a new
         // session created (see [ProfileQuarantine] for the full argument).
         val flushSettled = AtomicBoolean(false)
-        var cancelFlushWatchdog: () -> Unit = {}
-        cancelFlushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
+        val flushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
           if (flushSettled.compareAndSet(false, true)) {
             record("çerez kalıcılığı: zaman aşımı")
             done(firstError)
           }
         }
+        if (flushWatchdog is Watchdog.Refused) {
+          // Unbounded ⇒ the flush is never started, and the wipe is reported as
+          // the failure it is: Rust keeps the encrypted session blobs and the
+          // retry starts over instead of a half-finished clear passing as done.
+          if (flushSettled.compareAndSet(false, true)) {
+            record("çerez kalıcılığı: ${SiteProfileErrors.WATCHDOG_REFUSED}")
+            done(firstError)
+          }
+        } else {
+        val cancelFlushWatchdog = (flushWatchdog as Watchdog.Armed).cancel
         port.flushCookies { flushError ->
           if (!flushSettled.compareAndSet(false, true)) return@flushCookies
           // Settled: drop the queued watchdog (see [SiteClearPort.scheduleTimeout]).
           cancelFlushWatchdog()
           if (flushError != null) record("çerez kalıcılığı başarısız: ${flushError.message}")
           done(firstError)
+        }
         }
       }
     }
