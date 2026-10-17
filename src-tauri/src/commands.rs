@@ -1098,31 +1098,27 @@ pub async fn anilist_login_callback(
     callback_url: String,
 ) -> AppResult<AniListUser> {
     let state = app.state::<AppState>();
-    let (code, returned_state) = anilist::parse_callback(&callback_url)?;
+    let (cli, cfg) = client(&state)?;
+    // The callback must match THIS session's configured redirect URI exactly
+    // (scheme, host, port and path) before its `code` means anything.
+    let (code, returned_state) = anilist::parse_callback(&callback_url, &cfg.redirect_uri)?;
 
-    let expected = {
-        let s = state
-            .oauth_state
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        s.clone()
-    };
-    let expected = expected.ok_or_else(|| AppError::AniList("bekleyen bir oturum yok".into()))?;
-    if !anilist::state_matches(&expected, &returned_state) {
-        return Err(AppError::AniList("state doğrulaması başarısız".into()));
+    // Single-use, consumed under the lock and only on a match: a repeated or
+    // replayed callback finds no pending attempt and cannot race a second token
+    // exchange, while a bogus state never burns the genuine login.
+    match anilist::take_pending_state(&state.oauth_state, &returned_state)? {
+        anilist::PendingState::None => {
+            return Err(AppError::AniList("bekleyen bir oturum yok".into()))
+        }
+        anilist::PendingState::Mismatched => {
+            return Err(AppError::AniList("state doğrulaması başarısız".into()))
+        }
+        anilist::PendingState::Consumed(_) => {}
     }
 
-    let (cli, _) = client(&state)?;
     let token = cli.exchange_code(&code).await?;
     let viewer = cli.viewer(&token).await?;
     save_token(&state, &token)?;
-    {
-        let mut s = state
-            .oauth_state
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        *s = None;
-    }
     Ok(AniListUser {
         id: viewer.id,
         name: viewer.name,

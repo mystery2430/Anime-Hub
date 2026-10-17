@@ -288,7 +288,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle().clone();
     app.deep_link().on_open_url(move |event| {
         for url in event.urls() {
-            if url.scheme() != OAUTH_SCHEME || url.host_str() != Some("anilist") {
+            // Exact registered redirect only; see `is_registered_mobile_callback`.
+            if !is_registered_mobile_callback(&url.to_string()) {
+                log::warn!(
+                    "kayıtlı olmayan deep-link yok sayıldı (şema: {})",
+                    url.scheme()
+                );
                 continue;
             }
             let handle = handle.clone();
@@ -394,7 +399,39 @@ fn build_provider(config_dir: &std::path::Path) -> AppResult<Box<dyn SecretProvi
 
 /// Full callback URL for the mobile OAuth redirect.
 pub fn mobile_callback_url(query: &str) -> String {
-    format!("{OAUTH_SCHEME}://{OAUTH_CALLBACK_PATH}?{query}")
+    format!("{}?{query}", mobile_redirect_uri())
+}
+
+/// The exact redirect URI the mobile deep link is registered for.
+///
+/// Built from the same constants that build the callback URL, so the value the
+/// OAuth parser compares against and the value the OS intent filter matches
+/// cannot drift apart. It must stay equal to `plugins.deep-link.mobile` in
+/// `tauri.conf.json` (`scheme: animehub`, `host: anilist`,
+/// `pathPrefix: /callback`) — `tests/security.test.js` pins that.
+pub fn mobile_redirect_uri() -> String {
+    format!("{OAUTH_SCHEME}://{OAUTH_CALLBACK_PATH}")
+}
+
+/// True when `raw` is the registered mobile redirect URI (optionally with a
+/// query), and nothing else.
+///
+/// WHY A SEPARATE FUNCTION: the deep-link closure can only run on a device, so
+/// its decision is extracted here where host tests can exercise it. The old
+/// filter compared scheme and host only, which let `animehub://anilist/other`
+/// or `animehub://anilist/callback/extra` reach the login command; the command
+/// now rejects those too (`anilist::parse_callback`), but an intent that is not
+/// ours should not start a token exchange at all.
+pub fn is_registered_mobile_callback(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Ok(expected) = url::Url::parse(&mobile_redirect_uri()) else {
+        return false;
+    };
+    url.scheme() == expected.scheme()
+        && url.host_str() == expected.host_str()
+        && url.path() == expected.path()
 }
 
 #[cfg(test)]
@@ -405,10 +442,65 @@ mod tests {
     fn callback_url_uses_the_registered_scheme() {
         let u = mobile_callback_url("code=abc&state=s1");
         assert_eq!(u, "animehub://anilist/callback?code=abc&state=s1");
-        // Must be parseable by the same parser the command uses.
-        let (code, state) = crate::anilist::parse_callback(&u).unwrap();
+        // Must be parseable by the same parser the command uses, against the
+        // same redirect URI the command will pass in.
+        let (code, state) = crate::anilist::parse_callback(&u, &mobile_redirect_uri()).unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "s1");
+    }
+
+    #[test]
+    fn mobile_intent_filter_accepts_only_the_registered_redirect() {
+        assert!(is_registered_mobile_callback(&mobile_redirect_uri()));
+        assert!(is_registered_mobile_callback(&mobile_callback_url(
+            "code=a&state=b"
+        )));
+        assert!(is_registered_mobile_callback(
+            "ANIMEHUB://anilist/callback?code=a&state=b"
+        ));
+
+        // A hijacked or merely similar intent must not reach the login command.
+        for raw in [
+            "animehub://evil/callback?code=a&state=b",
+            "animehub://anilist/other?code=a&state=b",
+            "animehub://anilist/callback/extra?code=a&state=b",
+            "animehub://anilist?code=a&state=b",
+            "animehub:/anilist/callback?code=a&state=b",
+            "https://anilist/callback?code=a&state=b",
+            "http://127.0.0.1:17395/callback?code=a&state=b",
+            "",
+            "not a url",
+            "//anilist/callback?code=a&state=b",
+        ] {
+            assert!(!is_registered_mobile_callback(raw), "{raw} kabul edildi");
+        }
+    }
+
+    #[test]
+    fn registered_mobile_redirect_matches_the_deep_link_config() {
+        // The runtime intent filter and `tauri.conf.json` must describe the same
+        // redirect, or the OS hands the callback to nobody.
+        let conf = include_str!("../tauri.conf.json");
+        let conf: serde_json::Value = serde_json::from_str(conf).expect("tauri.conf.json");
+        let mobile = &conf["plugins"]["deep-link"]["mobile"];
+        let entries = mobile.as_array().expect("mobile deep-link listesi");
+        let entry = entries
+            .iter()
+            .find(|e| e["scheme"] == OAUTH_SCHEME)
+            .expect("animehub şeması kayıtlı olmalı");
+        let uri = mobile_redirect_uri();
+        assert!(uri.starts_with(&format!("{OAUTH_SCHEME}://")), "{uri}");
+        let host = entry["host"].as_str().unwrap();
+        assert!(uri.contains(host), "{uri} config host'u içermeli: {host}");
+        let path_prefix = entry["pathPrefix"].as_str().unwrap();
+        assert!(
+            uri.ends_with(path_prefix),
+            "{uri} config pathPrefix'i ile bitmeli: {path_prefix}"
+        );
+        // ... and the OAuth parser agrees with the intent filter.
+        let callback = mobile_callback_url("code=a&state=b");
+        assert!(crate::anilist::parse_callback(&callback, &uri).is_ok());
+        assert!(crate::anilist::parse_callback(&callback, "animehub://evil/callback").is_err());
     }
 
     #[test]

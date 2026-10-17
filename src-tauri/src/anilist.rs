@@ -196,48 +196,165 @@ pub fn oauth_error_message(code: &str) -> &'static str {
 ///
 /// Accepts both the loopback (`http://127.0.0.1:PORT/callback?code=…`) and
 /// custom-scheme (`animehub://anilist/callback?code=…`) forms so the same code
-/// serves desktop and Android.
-pub fn parse_callback(raw: &str) -> AppResult<(String, String)> {
+/// Split a callback URL into `(code, state)`, accepting ONLY the exact redirect
+/// URI the pending login was started with.
+///
+/// WHY "exact" AND NOT "is it loopback?": the old check accepted any
+/// `http://localhost:ANY_PORT/ANY_PATH` and, for the custom scheme, any
+/// `animehub://ANY_HOST/ANY_PATH`. A registered deep-link scheme can be claimed
+/// by another installed app, and a loopback port/path that is not ours is not
+/// our listener — so the callback has to match the configured redirect URI
+/// (scheme, host, port and path) before its `code` is worth anything. Anything
+/// else is rejected, and a repeated `code`/`state` parameter is rejected too:
+/// one callback carries exactly one of each.
+///
+/// This does NOT and cannot fix custom-scheme hijacking on Android (another app
+/// registering `animehub://anilist/callback` still receives the OS intent) —
+/// see `docs/` and the PR description; that needs provider-side PKCE or an
+/// app-link/asset-statement flow, and AniList's documented flow offers neither.
+pub fn parse_callback(raw: &str, expected_redirect: &str) -> AppResult<(String, String)> {
     let url =
         url::Url::parse(raw).map_err(|_| AppError::AniList("geçersiz dönüş adresi".into()))?;
+    let expected = url::Url::parse(expected_redirect)
+        .map_err(|_| AppError::AniList("yapılandırılmış dönüş adresi geçersiz".into()))?;
 
+    if url.scheme() != expected.scheme() {
+        return Err(AppError::AniList(format!(
+            "beklenmeyen dönüş şeması: {}",
+            url.scheme()
+        )));
+    }
+    let host = url.host_str().unwrap_or_default();
+    let expected_host = expected.host_str().unwrap_or_default();
     match url.scheme() {
-        "http" => {
-            let host = url.host_str().unwrap_or_default();
-            if host != "127.0.0.1" && host != "localhost" {
+        "http" | "https" => {
+            // Loopback only — and only OUR loopback endpoint.
+            if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
                 return Err(AppError::AniList(
                     "OAuth dönüşü yalnızca yerel adresten kabul edilir".into(),
                 ));
             }
+            if host != expected_host {
+                return Err(AppError::AniList(
+                    "dönüş adresinin host'u beklenenden farklı".into(),
+                ));
+            }
+            if url.port_or_known_default() != expected.port_or_known_default() {
+                return Err(AppError::AniList(
+                    "dönüş adresinin port'u beklenenden farklı".into(),
+                ));
+            }
         }
-        "animehub" => {}
+        // The custom scheme is registered with an exact host and path prefix
+        // (`animehub://anilist/callback` in tauri.conf.json), so accept nothing
+        // else: `animehub://evil/...` must not be able to carry a code here.
+        "animehub" => {
+            if host != expected_host {
+                return Err(AppError::AniList(
+                    "dönüş adresinin host'u beklenenden farklı".into(),
+                ));
+            }
+        }
         other => {
             return Err(AppError::AniList(format!(
                 "beklenmeyen dönüş şeması: {other}"
             )))
         }
     }
+    if url.path() != expected.path() {
+        return Err(AppError::AniList(
+            "dönüş adresinin yolu beklenenden farklı".into(),
+        ));
+    }
 
     // An error response (user denied consent) comes back as ?error=…
     let mut code = None;
     let mut state = None;
     let mut oauth_error = None;
+    let mut duplicated: Option<&str> = None;
     for (k, v) in url.query_pairs() {
         match k.as_ref() {
-            "code" => code = Some(v.to_string()),
-            "state" => state = Some(v.to_string()),
+            "code" => {
+                if code.replace(v.to_string()).is_some() {
+                    duplicated = Some("code");
+                }
+            }
+            "state" => {
+                if state.replace(v.to_string()).is_some() {
+                    duplicated = Some("state");
+                }
+            }
             "error" => oauth_error = Some(v.to_string()),
             _ => {}
         }
+    }
+    if let Some(field) = duplicated {
+        return Err(AppError::AniList(format!(
+            "dönüş adresinde birden fazla {field} parametresi var"
+        )));
     }
 
     if let Some(e) = oauth_error {
         return Err(AppError::AniList(oauth_error_message(&e).to_string()));
     }
 
-    let code = code.ok_or_else(|| AppError::AniList("dönüş adresinde kod yok".into()))?;
-    let state = state.ok_or_else(|| AppError::AniList("dönüş adresinde state yok".into()))?;
+    // Present-but-empty (`?code=&state=`) counts as absent: an empty state would
+    // otherwise compare equal to an empty pending slot.
+    let code = code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| AppError::AniList("dönüş adresinde kod yok".into()))?;
+    let state = state
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| AppError::AniList("dönüş adresinde state yok".into()))?;
     Ok((code, state))
+}
+
+/// What the single-use OAuth state slot decided about one callback.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PendingState {
+    /// No login was pending at all.
+    None,
+    /// The state matched and the attempt is now CONSUMED (the slot is empty).
+    Consumed(String),
+    /// A login is pending but this state does not match it. The genuine attempt
+    /// is deliberately left in place, so a bogus or replayed callback cannot
+    /// destroy a real login.
+    Mismatched,
+}
+
+/// Consume the pending OAuth attempt **if and only if** the returned state
+/// matches, atomically under the slot's lock.
+///
+/// WHY CONSUME-BEFORE-EXCHANGE: the old handler cloned the pending state,
+/// compared it, exchanged the code and only then cleared the slot — so two
+/// callbacks carrying the same state (a retry, a replayed deep link, or the
+/// loopback listener and the OS intent arriving together) both passed the check
+/// and raced two token exchanges and two token writes. Taking the value while
+/// still holding the lock makes the attempt single-use: the loser finds no
+/// pending session and is refused, and a *mismatched* state never consumes
+/// anything, so a stray callback cannot burn a legitimate login.
+pub fn take_pending_state(
+    slot: &std::sync::Mutex<Option<String>>,
+    returned_state: &str,
+) -> AppResult<PendingState> {
+    let mut guard = slot
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+    Ok(match guard.as_deref() {
+        // No pending session — including a slot that somehow holds an empty
+        // state, which must never compare equal to anything.
+        None | Some("") => PendingState::None,
+        Some(expected) => {
+            if state_matches(expected, returned_state) {
+                match guard.take() {
+                    Some(taken) => PendingState::Consumed(taken),
+                    None => PendingState::None,
+                }
+            } else {
+                PendingState::Mismatched
+            }
+        }
+    })
 }
 
 /// Constant-time comparison of the returned `state`.
@@ -996,6 +1113,14 @@ pub fn zeroize_secret(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The desktop loopback redirect the deep-link/loopback flow starts with
+    /// (`DEFAULT_REDIRECT_URI`).
+    const LOOPBACK: &str = "http://127.0.0.1:17395/callback";
+    /// The registered Android custom-scheme redirect (tauri.conf.json
+    /// `plugins.deep-link.mobile`).
+    const SCHEME: &str = "animehub://anilist/callback";
 
     #[test]
     fn viewer_stats_folds_statuses_into_hero_numbers() {
@@ -1086,40 +1211,198 @@ mod tests {
 
     #[test]
     fn parse_callback_extracts_code_and_state() {
-        let (code, state) =
-            parse_callback("http://127.0.0.1:17395/callback?code=abc&state=s1").unwrap();
+        let (code, state) = parse_callback(
+            "http://127.0.0.1:17395/callback?code=abc&state=s1",
+            LOOPBACK,
+        )
+        .unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "s1");
     }
 
     #[test]
     fn parse_callback_accepts_custom_scheme() {
-        let (code, _) = parse_callback("animehub://anilist/callback?code=abc&state=s1").unwrap();
+        let (code, _) =
+            parse_callback("animehub://anilist/callback?code=abc&state=s1", SCHEME).unwrap();
         assert_eq!(code, "abc");
     }
 
     #[test]
     fn parse_callback_rejects_remote_http_hosts() {
-        let err = parse_callback("http://evil.example/callback?code=abc&state=s1").unwrap_err();
+        let err =
+            parse_callback("http://evil.example/callback?code=abc&state=s1", LOOPBACK).unwrap_err();
         assert_eq!(err.code(), "anilist");
+        assert!(err.to_string().contains("yerel adresten"), "{err}");
     }
 
     #[test]
     fn parse_callback_rejects_unknown_scheme() {
-        assert!(parse_callback("https://anilist.co/cb?code=a&state=b").is_err());
+        assert!(parse_callback("https://anilist.co/cb?code=a&state=b", LOOPBACK).is_err());
+        assert!(parse_callback("ftp://127.0.0.1/callback?code=a&state=b", LOOPBACK).is_err());
+        // The configured redirect is the desktop loopback one: the same path on
+        // a remote https origin is not it, either way round.
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=a&state=b", SCHEME).is_err());
     }
 
     #[test]
     fn parse_callback_surfaces_oauth_error() {
-        let err =
-            parse_callback("http://127.0.0.1:1/callback?error=access_denied&state=s").unwrap_err();
+        let err = parse_callback(
+            "http://127.0.0.1:17395/callback?error=access_denied&state=s",
+            LOOPBACK,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reddedildi"), "{err}");
+        // ... and on the registered custom scheme too.
+        let err = parse_callback(
+            "animehub://anilist/callback?error=access_denied&state=s",
+            SCHEME,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("reddedildi"), "{err}");
     }
 
     #[test]
     fn parse_callback_requires_both_fields() {
-        assert!(parse_callback("http://127.0.0.1:1/callback?code=a").is_err());
-        assert!(parse_callback("http://127.0.0.1:1/callback?state=b").is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=a", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?state=b", LOOPBACK).is_err());
+        assert!(parse_callback(SCHEME, SCHEME).is_err());
+    }
+
+    // ---- the exact-redirect-URI requirement (AH-07 / AH-G1 / AH-G4 / AH-G5 / AH-G11) ----
+
+    #[test]
+    fn parse_callback_rejects_a_different_loopback_port_or_path() {
+        // Same scheme, same loopback host — but not OUR endpoint. The old
+        // parser accepted any loopback port and any path, which is a bigger
+        // target than the listener that started the flow.
+        let wrong_port = "http://127.0.0.1:17396/callback?code=abc&state=s1";
+        assert!(parse_callback(wrong_port, LOOPBACK).is_err());
+        let wrong_path = "http://127.0.0.1:17395/other?code=abc&state=s1";
+        let err = parse_callback(wrong_path, LOOPBACK).unwrap_err();
+        assert!(err.to_string().contains("yolu beklenenden"), "{err}");
+        // The default port is not our 17395 either.
+        assert!(parse_callback("http://127.0.0.1/callback?code=a&state=b", LOOPBACK).is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_a_different_loopback_host_form() {
+        // localhost and [::1] are loopback, but they are not the configured
+        // host, and the OS resolves each of them independently — an attacker
+        // controlling one must not satisfy the other's login.
+        assert!(
+            parse_callback("http://localhost:17395/callback?code=a&state=b", LOOPBACK).is_err()
+        );
+        assert!(parse_callback("http://[::1]:17395/callback?code=a&state=b", LOOPBACK).is_err());
+        // A non-loopback host that merely contains the loopback name is out too.
+        assert!(parse_callback(
+            "http://127.0.0.1.evil.example:17395/callback?code=a&state=b",
+            LOOPBACK
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_a_hijacked_custom_scheme() {
+        // Another app can register `animehub://`; only OUR host+path pair is a
+        // callback for the flow this build started.
+        let err = parse_callback("animehub://evil/callback?code=abc&state=s1", SCHEME).unwrap_err();
+        assert!(err.to_string().contains("host'u beklenenden"), "{err}");
+        assert!(parse_callback("animehub://anilist/other?code=abc&state=s1", SCHEME).is_err());
+        assert!(parse_callback("ANIMEHUB://anilist/callback?code=abc&state=s1", SCHEME).is_ok());
+    }
+
+    #[test]
+    fn parse_callback_rejects_present_but_empty_fields() {
+        // A partial or hand-built request (`?code=&state=`) must fail rather
+        // than hand out an empty code/state pair.
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=&state=", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=a&state=", LOOPBACK).is_err());
+        assert!(parse_callback("animehub://anilist/callback?code=&state=s", SCHEME).is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_a_truncated_request_target() {
+        // What a half-read or mangled callback looks like in practice.
+        assert!(parse_callback("", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395", LOOPBACK).is_err());
+        assert!(parse_callback("/callback?code=a&state=b", LOOPBACK).is_err());
+        assert!(parse_callback("http://127.0.0.1:17395/callback?", LOOPBACK).is_err());
+        assert!(
+            parse_callback("http://127.0.0.1:17395/callback#code=a&state=b", LOOPBACK).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_callback_rejects_duplicated_code_or_state() {
+        // One callback carries exactly one code and one state. A repeated
+        // parameter is how a relayed or hand-built callback smuggles in a
+        // value the first check did not see.
+        let dup_code = "http://127.0.0.1:17395/callback?code=good&code=bad&state=s1";
+        let err = parse_callback(dup_code, LOOPBACK).unwrap_err();
+        assert!(err.to_string().contains("birden fazla code"), "{err}");
+        let dup_state = "http://127.0.0.1:17395/callback?code=a&state=s1&state=s2";
+        let err = parse_callback(dup_state, LOOPBACK).unwrap_err();
+        assert!(err.to_string().contains("birden fazla state"), "{err}");
+        // Unknown parameters stay ignored, as before.
+        let extra = "http://127.0.0.1:17395/callback?code=a&state=s1&scope=user";
+        assert!(parse_callback(extra, LOOPBACK).is_ok());
+    }
+
+    #[test]
+    fn parse_callback_refuses_a_broken_configured_redirect() {
+        // A nonsensical ANILIST_REDIRECT_URI must fail closed rather than
+        // silently widening the check.
+        assert!(parse_callback(LOOPBACK, "not a uri").is_err());
+    }
+
+    #[test]
+    fn take_pending_state_is_single_use_and_only_consumes_on_a_match() {
+        let slot: Mutex<Option<String>> = Mutex::new(Some("st4te".to_string()));
+
+        // A bogus callback does NOT burn the genuine attempt...
+        assert_eq!(
+            take_pending_state(&slot, "nope").unwrap(),
+            PendingState::Mismatched
+        );
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("st4te"));
+        // ... and neither does a malformed one.
+        assert_eq!(
+            take_pending_state(&slot, "").unwrap(),
+            PendingState::Mismatched
+        );
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("st4te"));
+
+        // The matching callback consumes it exactly once.
+        assert_eq!(
+            take_pending_state(&slot, "st4te").unwrap(),
+            PendingState::Consumed("st4te".to_string())
+        );
+        assert!(slot.lock().unwrap().is_none());
+        // A replay of the same callback now finds no pending session instead of
+        // racing a second token exchange.
+        assert_eq!(
+            take_pending_state(&slot, "st4te").unwrap(),
+            PendingState::None
+        );
+    }
+
+    #[test]
+    fn take_pending_state_never_matches_an_empty_slot() {
+        let slot: Mutex<Option<String>> = Mutex::new(Some(String::new()));
+        assert_eq!(take_pending_state(&slot, "").unwrap(), PendingState::None);
+        assert_eq!(
+            take_pending_state(&slot, "st4te").unwrap(),
+            PendingState::None
+        );
+    }
+
+    #[test]
+    fn take_pending_state_reports_no_pending_session() {
+        let slot: Mutex<Option<String>> = Mutex::new(None);
+        assert_eq!(
+            take_pending_state(&slot, "anything").unwrap(),
+            PendingState::None
+        );
     }
 
     #[test]
@@ -1384,7 +1667,8 @@ mod tests {
         let target = handle.await.unwrap().expect("callback");
         assert_eq!(target, "/callback?code=abc123&state=st4te");
 
-        let (code, state) = parse_callback(&absolute_callback(&uri, &target).unwrap()).unwrap();
+        let (code, state) =
+            parse_callback(&absolute_callback(&uri, &target).unwrap(), &uri).unwrap();
         assert_eq!(code, "abc123");
         assert_eq!(state, "st4te");
     }
