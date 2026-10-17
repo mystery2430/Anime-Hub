@@ -3334,7 +3334,7 @@ mod tests {
             };
             Ok(action)
         };
-        assert!(run_mobile_delete_protocol(&state, id, &delete, |profile| {
+        assert!(run_mobile_delete_protocol(&state, id, delete, |profile| {
             writes.lock().unwrap().push(format!("retire:{profile}"));
             retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(1)
@@ -3345,7 +3345,7 @@ mod tests {
         // Retry with the storage fault healed: the SAME name is derived again
         // (the bump never landed), the protocol completes, and the ledger is
         // dropped exactly once — for that name.
-        let action = run_mobile_delete_protocol(&state, id, &delete, |profile| {
+        let action = run_mobile_delete_protocol(&state, id, delete, |profile| {
             writes.lock().unwrap().push(format!("retire:{profile}"));
             retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(1)
