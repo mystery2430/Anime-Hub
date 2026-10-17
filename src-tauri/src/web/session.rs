@@ -994,4 +994,57 @@ mod tests {
         assert!(!profile_dir_name("a/b").contains('/'));
         assert!(!profile_dir_name("").contains('/'));
     }
+
+    /// AH-P2: `WebViewCompat.addDocumentStartJavaScript(webView, initScript,
+    /// setOf("*"))` runs this script for EVERY origin the site WebView loads,
+    /// including cross-origin player domains and third-party frames. That is
+    /// only acceptable because the script carries no capability and no secret —
+    /// a site WebView has no Tauri IPC bridge at all, and the PiP controller's
+    /// functions are called BY the native side, never the other way round.
+    /// Narrowing the origin set would break cross-origin players (very common
+    /// for anime sites) and the popup guard on ad-driven redirects, so the
+    /// requirement is that the payload stays inert, which this pins.
+    #[test]
+    fn init_script_is_inert_enough_to_run_for_every_origin() {
+        let cfg = InjectedConfig {
+            block_popups: true,
+            hide_selectors: vec![".ad-container".to_string(), "#popup".to_string()],
+            pip_controller: true,
+        };
+        let script = build_init_script(&cfg);
+        let lowered = script.to_lowercase();
+
+        // Nothing a page could turn into a credential, a request or a redirect.
+        for needle in [
+            "token",
+            "secret",
+            "cookie",
+            "authorization",
+            "bearer",
+            "client_id",
+            "http:",
+            "client_secret",
+            "accesstoken",
+        ] {
+            assert!(
+                !lowered.contains(needle),
+                "init script must stay inert, but mentions {needle}"
+            );
+        }
+        // The injected payload is exactly the three display settings.
+        for key in ["blockPopups", "hideSelectors", "pipController"] {
+            assert!(script.contains(key), "payload lost {key}");
+        }
+        // The site URL, the profile name and any per-site value are not in it.
+        assert!(
+            !lowered.contains("openani"),
+            "no site identity in the script"
+        );
+        assert!(
+            !lowered.contains("profile"),
+            "no profile name in the script"
+        );
+        // And the escape hatch stays: no `</script>` can appear in the payload.
+        assert!(!script.contains("</script>"));
+    }
 }

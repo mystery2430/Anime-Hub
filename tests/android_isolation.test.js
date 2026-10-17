@@ -1123,6 +1123,41 @@ test("the site WebView settings come from a tested plan, not inline defaults", (
   assert.doesNotMatch(chromeBody, /AnimeHubDebugLog\.add\([^)]*origin/, "no origin in the denial log");
 });
 
+test("the developer log is gated and carries no host, url or token values", () => {
+  // AH-P9. The launcher UI hides the panel when developerOptions is off, but
+  // the command was callable by anything in the launcher WebView. Site WebViews
+  // have no Tauri IPC at all, so this is defence in depth on the trusted side.
+  const commands = read("src-tauri/src/commands.rs");
+  const at = commands.indexOf("pub fn debug_log(");
+  assert.ok(at > 0, "debug_log is missing");
+  const body = commands.slice(at, commands.indexOf("\n}\n", at));
+  assert.match(body, /developer_options/, "must consult the setting");
+  assert.match(body, /return Ok\(Vec::new\(\)\)/, "an empty list, not an error");
+  const gate = body.indexOf("if !enabled");
+  const bridge = body.indexOf("crate::android_bridge::debug_log()");
+  assert.ok(gate > 0 && bridge > gate, "the bridge is only reached when enabled");
+  assert.match(body, /app: AppHandle/, "state comes from the handle");
+
+  // Every Kotlin log line is an event, never a value from the page or the URL.
+  for (const file of [
+    "SiteNavigationGuard.kt",
+    "SiteNavigationPolicy.kt",
+    "SiteWebViewSettings.kt",
+    "AnimeHubSiteController.kt",
+    "AnimeHubPipController.kt",
+  ]) {
+    const src = code(read(`${KOTLIN}/${file}`));
+    for (const raw of src.split("\n")) {
+      if (!/AnimeHubDebugLog\.add\(|\bnote\(|Log\.[dweiv]\(/.test(raw)) continue;
+      assert.doesNotMatch(
+        raw,
+        /\$\{?\s*(uri|url|request\.url|host|token|cookie|secret|origin)/i,
+        `${file} logs a sensitive value: ${raw.trim()}`,
+      );
+    }
+  }
+});
+
 test("the navigation guard logs the reason, never the host or path", () => {
   // AH-12 / AH-G8 / AH-13: logcat is readable over adb and by apps holding
   // READ_LOGS on older releases, and the host alone identifies the site.

@@ -1056,40 +1056,154 @@ impl LoopbackListener {
         &self.redirect_uri
     }
 
-    /// Wait for the single redirect request. Returns the raw request target.
+    /// Wait for the redirect request. Returns the raw request target.
+    ///
+    /// The listener survives anything else that shows up on the port: a
+    /// speculative browser preconnect, a favicon probe, a fragmented request
+    /// line, a silent or oversized client. Each of those is answered and closed,
+    /// and the wait continues until the real callback arrives or `timeout`
+    /// expires. It used to accept exactly ONE connection and read it with a
+    /// single `read`, so the first unrelated socket — or a request line that
+    /// arrived in two segments — consumed the whole authorisation.
     pub async fn wait_for_callback(&self, timeout: std::time::Duration) -> AppResult<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(AppError::AniList(
+                    "yetkilendirme zaman aşımına uğradı".into(),
+                ));
+            }
+            match tokio::time::timeout(remaining, self.accept_one()).await {
+                Ok(Ok(Accepted::Callback(target))) => return Ok(target),
+                Ok(Ok(Accepted::Ignored)) => continue,
+                Ok(Err(e)) => {
+                    return Err(AppError::AniList(format!("geri çağırma dinlenemedi: {e}")));
+                }
+                Err(_) => {
+                    return Err(AppError::AniList(
+                        "yetkilendirme zaman aşımına uğradı".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The path the registered redirect URI points at (`/callback`).
+    fn callback_path(&self) -> String {
+        url::Url::parse(&self.redirect_uri)
+            .map(|url| url.path().to_string())
+            .unwrap_or_else(|_| "/callback".to_string())
+    }
+
+    /// Handle one connection: read the header block within a bounded budget,
+    /// answer it, and say whether it was the callback.
+    async fn accept_one(&self) -> AppResult<Accepted> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let accept = async {
-            let (mut sock, _peer) = self.listener.accept().await?;
-            let mut buf = vec![0u8; 4096];
-            let n = sock.read(&mut buf).await?;
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+        let (mut sock, _peer) = self.listener.accept().await?;
 
-            let body = CALLBACK_HTML;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.flush().await;
-            Ok::<String, std::io::Error>(req)
+        // Incremental, bounded, time-bounded. One `read` is not guaranteed to
+        // carry the whole request line, and a truncated target used to fail an
+        // otherwise valid authorisation; an unbounded read would let any local
+        // process make us buffer forever.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut complete = false;
+        let read_deadline = tokio::time::Instant::now() + CONNECTION_READ_BUDGET;
+        while buf.len() < MAX_REQUEST_BYTES {
+            let remaining = read_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sock.read(&mut chunk)).await {
+                Ok(Ok(0)) => break, // peer closed without finishing
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                        complete = true;
+                        break;
+                    }
+                }
+                // A slow or broken client loses its connection, not the flow.
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        let oversized = !complete && buf.len() >= MAX_REQUEST_BYTES;
+
+        let req = String::from_utf8_lossy(&buf);
+        let mut parts = req.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("");
+        // Only the registered redirect path counts, so a probe cannot consume
+        // the authorisation and the completion page is still only ever served
+        // for the real callback.
+        let is_callback = complete
+            && !oversized
+            && method == "GET"
+            && target.split('?').next().unwrap_or("") == self.callback_path();
+
+        let (status, body) = if is_callback {
+            ("200 OK", CALLBACK_HTML)
+        } else if oversized {
+            ("413 Payload Too Large", "")
+        } else {
+            ("404 Not Found", "")
         };
+        let resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.flush().await;
+        if !complete {
+            // The peer is still sending (a flood, or a client that never
+            // finished its headers). Drain briefly and discard so the close is
+            // a FIN rather than a RST — a reset would throw our own answer away
+            // on the client side. Bounded by the budget, never by the peer.
+            let drain_deadline = tokio::time::Instant::now() + RESPONSE_DRAIN_BUDGET;
+            loop {
+                let remaining =
+                    drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, sock.read(&mut chunk)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(_)) => continue,
+                }
+            }
+        }
+        let _ = sock.shutdown().await;
 
-        let req = tokio::time::timeout(timeout, accept)
-            .await
-            .map_err(|_| AppError::AniList("yetkilendirme zaman aşımına uğradı".into()))??;
-
-        // "GET /callback?code=…&state=… HTTP/1.1"
-        let target = req
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| AppError::AniList("geçersiz istek".into()))?
-            .to_string();
-        Ok(target)
+        Ok(if is_callback {
+            Accepted::Callback(target.to_string())
+        } else {
+            Accepted::Ignored
+        })
     }
+}
+
+/// Hard cap on one request's header block. A browser OAuth callback is a few
+/// hundred bytes; anything larger is not our request and is never buffered
+/// further.
+const MAX_REQUEST_BYTES: usize = 8 * 1024;
+
+/// Per-connection budget for the header block, so one silent client cannot
+/// consume the whole authorisation window.
+const CONNECTION_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Budget for discarding what a refused peer is still sending, so our answer
+/// reaches it instead of being lost to a reset.
+const RESPONSE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What one accepted connection turned out to be.
+enum Accepted {
+    /// The OAuth redirect, as the raw request target (`/callback?code=…`).
+    Callback(String),
+    /// Anything else: answered, closed, and the wait continues.
+    Ignored,
 }
 
 /// Static completion page. Contains no reflected input.
@@ -1671,6 +1785,182 @@ mod tests {
             parse_callback(&absolute_callback(&uri, &target).unwrap(), &uri).unwrap();
         assert_eq!(code, "abc123");
         assert_eq!(state, "st4te");
+    }
+
+    /// Send `request` to the listener and return the response it answers with.
+    async fn exchange(port: u16, request: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // A refused/oversized request may close the socket mid-write; the
+        // answer, not the write, is what the test asserts.
+        let _ = sock.write_all(request).await;
+        let mut resp = Vec::new();
+        let _ = sock.read_to_end(&mut resp).await;
+        String::from_utf8_lossy(&resp).to_string()
+    }
+
+    fn listener_port(uri: &str) -> u16 {
+        uri.rsplit(':')
+            .next()
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_ignores_unrelated_requests_and_keeps_waiting() {
+        // A speculative preconnect, a favicon probe or any local process used to
+        // consume the ONE accept the listener performed, so the real browser
+        // callback then had nobody listening and the login failed.
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(5)).await },
+            );
+
+        let probe = exchange(
+            port,
+            b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(probe.starts_with("HTTP/1.1 404"), "probe answer: {probe}");
+        let root = exchange(port, b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        assert!(root.starts_with("HTTP/1.1 404"), "root answer: {root}");
+        // A POST to the callback path is not the redirect either.
+        let post = exchange(
+            port,
+            b"POST /callback?code=x&state=y HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(post.starts_with("HTTP/1.1 404"), "post answer: {post}");
+
+        // The real callback still lands.
+        let real = exchange(
+            port,
+            b"GET /callback?code=abc123&state=st4te HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(
+            real.starts_with("HTTP/1.1 200 OK"),
+            "callback answer: {real}"
+        );
+        assert!(!real.contains("abc123"), "callback reflected user input");
+        let target = handle.await.unwrap().expect("callback");
+        assert_eq!(target, "/callback?code=abc123&state=st4te");
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_reassembles_a_fragmented_request_line() {
+        // One `read` is not guaranteed to deliver the whole request line; a
+        // truncated target used to fail an otherwise valid authorisation.
+        use tokio::io::AsyncWriteExt as _;
+
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(5)).await },
+            );
+
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        sock.write_all(b"GET /call").await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sock.write_all(b"back?code=frag&state=s1 HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .await
+            .unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sock.write_all(b"\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+
+        let target = handle.await.unwrap().expect("callback");
+        assert_eq!(target, "/callback?code=frag&state=s1");
+        let (code, state) =
+            parse_callback(&absolute_callback(&uri, &target).unwrap(), &uri).unwrap();
+        assert_eq!(code, "frag");
+        assert_eq!(state, "s1");
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_refuses_an_oversized_header_block() {
+        // Bounded: a local process must not be able to make the listener buffer
+        // without limit, and the refusal must not end the authorisation.
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(8)).await },
+            );
+
+        let mut flood = b"GET /callback HTTP/1.1\r\nX-Pad: ".to_vec();
+        flood.extend(std::iter::repeat(b'a').take(MAX_REQUEST_BYTES + 4096));
+        let answer = exchange(port, &flood).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 413"),
+            "oversized answer: {}",
+            answer.chars().take(40).collect::<String>()
+        );
+
+        let real = exchange(
+            port,
+            b"GET /callback?code=after&state=flood HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(
+            real.starts_with("HTTP/1.1 200 OK"),
+            "callback answer: {real}"
+        );
+        assert_eq!(
+            handle.await.unwrap().expect("callback"),
+            "/callback?code=after&state=flood"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_drops_a_silent_client_and_still_finishes() {
+        // A connection that sends nothing is abandoned after its own budget
+        // instead of holding the whole authorisation window.
+        let l = LoopbackListener::bind().await.expect("bind");
+        let uri = l.redirect_uri().to_string();
+        let port = listener_port(&uri);
+        let handle =
+            tokio::spawn(
+                async move { l.wait_for_callback(std::time::Duration::from_secs(8)).await },
+            );
+
+        let silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // Held open, never written to: it must be dropped once its budget runs
+        // out, and the real callback must still be accepted afterwards.
+        tokio::time::sleep(CONNECTION_READ_BUDGET + std::time::Duration::from_millis(200)).await;
+        drop(silent);
+
+        let real = exchange(
+            port,
+            b"GET /callback?code=late&state=quiet HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(
+            real.starts_with("HTTP/1.1 200 OK"),
+            "callback answer: {real}"
+        );
+        assert_eq!(
+            handle.await.unwrap().expect("callback"),
+            "/callback?code=late&state=quiet"
+        );
     }
 
     #[tokio::test]

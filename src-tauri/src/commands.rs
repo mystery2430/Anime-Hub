@@ -1469,10 +1469,31 @@ pub fn pip_startup_should_apply(
 }
 
 /// Developer panel: the last PiP diagnostic lines (empty off Android).
+///
+/// GATED on the `developerOptions` setting (AH-P9). The launcher UI already
+/// hides the panel when the setting is off, but the command itself was callable
+/// by anything running in the launcher WebView. Site WebViews have no Tauri IPC
+/// at all (no `@JavascriptInterface`, no `addWebMessageListener` — pinned by
+/// tests), so this is defence in depth on the trusted surface, not a hole in the
+/// site boundary. With the setting off the answer is an EMPTY LIST rather than
+/// an error, so a stale or hand-built UI learns nothing — not even whether the
+/// log has content.
+///
+/// The lock is released before the bridge call: the Kotlin side answers through
+/// the plugin, and a settings lock must not be held across it.
 // `async` runs the body on Tauri's async runtime, not on the IPC dispatch
 // thread. These commands wait for a Kotlin reply through the plugin bridge.
 #[tauri::command(async)]
-pub fn debug_log() -> AppResult<Vec<String>> {
+pub fn debug_log(app: AppHandle) -> AppResult<Vec<String>> {
+    let state = app.state::<AppState>();
+    let enabled = state
+        .settings
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?
+        .developer_options;
+    if !enabled {
+        return Ok(Vec::new());
+    }
     crate::android_bridge::debug_log()
 }
 
