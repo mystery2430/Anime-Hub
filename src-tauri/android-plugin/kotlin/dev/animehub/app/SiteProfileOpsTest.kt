@@ -929,6 +929,130 @@ class SiteProfileOpsTest {
     Assert.assertEquals(listOf(both[1]), ProfileQuarantine.pendingOperations(profile))
   }
 
+  // ------------------------------------------------- shutdown (destroy) flow
+
+  /**
+   * Models the destroy path: [submitFlush] only HANDS the flush over (it never
+   * runs inline — the real one is disk I/O on a worker), [teardownView] is the
+   * view detach+destroy, and [awaitFlush] reports whether the worker landed
+   * inside the budget.
+   */
+  private class FakeShutdownPort(
+    /** How many calls to [submitFlush] report work to await. */
+    var submissions: Int = 1,
+    var completesInTime: Boolean = true,
+    var failure: String? = null,
+  ) : ShutdownPort {
+    val log = mutableListOf<String>()
+    var awaitedBudget: Long? = null
+    var teardowns = 0
+
+    override fun submitFlush(): Boolean {
+      log += "submit"
+      if (submissions <= 0) return false
+      submissions -= 1
+      return true
+    }
+
+    override fun teardownView() {
+      teardowns++
+      log += "teardown"
+    }
+
+    override fun awaitFlush(budgetMillis: Long): Boolean {
+      awaitedBudget = budgetMillis
+      log += "await"
+      return completesInTime
+    }
+
+    override fun flushFailure(): String? {
+      log += "failure?"
+      return failure
+    }
+  }
+
+  @Test
+  fun `the destroy-time flush is submitted, torn down, then awaited inside a budget`() {
+    val port = FakeShutdownPort()
+    Assert.assertEquals(ShutdownFlush.Completed, ShutdownFlow.run(port, 250))
+    // Order: the I/O is handed to the worker FIRST, the view is torn down while
+    // it runs, and only then is the bounded wait performed.
+    Assert.assertEquals(listOf("submit", "teardown", "await", "failure?"), port.log)
+    Assert.assertEquals(250L, port.awaitedBudget)
+    Assert.assertEquals(1, port.teardowns)
+  }
+
+  @Test
+  fun `the default teardown budget is bounded and far below the in-app flush timeout`() {
+    Assert.assertEquals(1_000L, ShutdownFlow.DESTROY_FLUSH_BUDGET_MS)
+    Assert.assertTrue(
+      "teardown must not wait like an in-app flush (ANR)",
+      ShutdownFlow.DESTROY_FLUSH_BUDGET_MS < SiteCloseFlow.FLUSH_TIMEOUT_MS,
+    )
+    val port = FakeShutdownPort()
+    ShutdownFlow.run(port)
+    Assert.assertEquals(ShutdownFlow.DESTROY_FLUSH_BUDGET_MS, port.awaitedBudget)
+  }
+
+  @Test
+  fun `a flush that outlives the budget is a timeout, never a durable shutdown`() {
+    val port = FakeShutdownPort(completesInTime = false)
+    Assert.assertEquals(ShutdownFlush.TimedOut, ShutdownFlow.run(port, 50))
+    Assert.assertEquals("the view is torn down anyway", 1, port.teardowns)
+    Assert.assertFalse(
+      "a timeout must not be dressed up with a failure/success verdict",
+      port.log.contains("failure?"),
+    )
+    Assert.assertNotEquals(ShutdownFlush.Completed, ShutdownFlow.run(port, 50))
+  }
+
+  @Test
+  fun `a failed flush reports its reason and is not a success`() {
+    val port = FakeShutdownPort(failure = "IOException: disk full")
+    val outcome = ShutdownFlow.run(port, 50)
+    Assert.assertTrue("a throw is a Failed, not Completed", outcome is ShutdownFlush.Failed)
+    Assert.assertEquals("IOException: disk full", (outcome as ShutdownFlush.Failed).reason)
+    Assert.assertEquals(1, port.teardowns)
+  }
+
+  @Test
+  fun `no site profile means nothing to flush, but the view is still torn down`() {
+    val port = FakeShutdownPort(submissions = 0)
+    Assert.assertEquals(ShutdownFlush.NotNeeded, ShutdownFlow.run(port, 50))
+    Assert.assertEquals(listOf("submit", "teardown"), port.log)
+    Assert.assertNull("it never waits for work it never submitted", port.awaitedBudget)
+  }
+
+  @Test
+  fun `a double teardown flushes nothing the second time and shares no state`() {
+    val port = FakeShutdownPort(submissions = 1)
+    Assert.assertEquals(ShutdownFlush.Completed, ShutdownFlow.run(port, 50))
+    // Second destroy: the session slot was already cleared, so nothing is
+    // submitted — but the view teardown still runs.
+    Assert.assertEquals(ShutdownFlush.NotNeeded, ShutdownFlow.run(port, 50))
+    Assert.assertEquals(2, port.teardowns)
+    // Two independent calls keep independent verdicts.
+    val slow = FakeShutdownPort(completesInTime = false)
+    val fast = FakeShutdownPort()
+    Assert.assertEquals(ShutdownFlush.TimedOut, ShutdownFlow.run(slow, 50))
+    Assert.assertEquals(ShutdownFlush.Completed, ShutdownFlow.run(fast, 50))
+  }
+
+  @Test
+  fun `a non-positive budget is refused instead of silently skipping the wait`() {
+    for (budget in listOf(0L, -1L)) {
+      val port = FakeShutdownPort()
+      var thrown: Throwable? = null
+      try {
+        ShutdownFlow.run(port, budget)
+      } catch (t: Throwable) {
+        thrown = t
+      }
+      Assert.assertTrue("budget $budget must be refused", thrown is IllegalArgumentException)
+      Assert.assertTrue("nothing may run on a refused budget", port.log.isEmpty())
+    }
+  }
+
   // --------------------------------------- profile retirement (delete protocol)
 
   @Test

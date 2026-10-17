@@ -310,8 +310,11 @@ def pip_lifecycle_block() -> str:
   }}
 
   override fun onDestroy() {{
-    // Site WebView first: flush its profile cookies and destroy the view
-    // while the Activity is still whole, then unbind PiP from it.
+    // Site WebView first: AnimeHubSiteController.destroy(this) hands THAT site
+    // profile's cookie flush to the background worker and AWAITS it for a
+    // bounded budget (ShutdownFlow.DESTROY_FLUSH_BUDGET_MS) before returning,
+    // then destroys the view while the Activity is still whole. PiP unbinds
+    // from the view afterwards.
     AnimeHubSiteController.destroy(this)
     AnimeHubPipController.detach(this)
     super.onDestroy()
@@ -320,8 +323,15 @@ def pip_lifecycle_block() -> str:
       // against the first Activity. When the system finishes this Activity
       // (for example the PiP window's X), that state keeps pointing at a dead
       // Activity and every site open fails. Ending the process lets the next
-      // launch set everything up again. Cookies are flushed first: flush()
-      // blocks until the cookies are written, so the kill comes after them.
+      // launch set everything up again.
+      //
+      // ORDERING: the kill comes after the site profile's flush was awaited
+      // above. This default-profile flush covers the LAUNCHER's own cookie jar
+      // only — it is NOT evidence that the site profile's store landed, and it
+      // must never be relied on as such. If the site flush budget expired,
+      // durability is not guaranteed, and AnimeHubSiteController says so in the
+      // log ("durability not guaranteed") instead of reporting a clean
+      // shutdown.
       android.webkit.CookieManager.getInstance().flush()
       android.os.Process.killProcess(android.os.Process.myPid())
     }}

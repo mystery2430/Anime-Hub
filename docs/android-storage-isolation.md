@@ -60,7 +60,10 @@ storage write failure.
 * **Launcher**: default profile, `main` origin, IPC-restricted as before.
   Site clear/delete paths never address it (`Default` is rejected by name
   validation; the static `CookieManager.getInstance()` appears only in
-  MainActivity's destroy-time flush of the launcher's own jar).
+  MainActivity's destroy-time flush of the launcher's own jar — which is why it
+  is never treated as evidence about a SITE profile's store: the site profile's
+  flush is submitted to the worker and awaited inside
+  `AnimeHubSiteController.destroy` instead).
 * **Site views**: one native `WebView` at a time, layered above the launcher
   via `android.R.id.content.addView`. Adding the view last puts it on top;
   removing it reveals the launcher — the launcher WebView is never removed,
@@ -195,7 +198,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
 | User site remove | closed first, no flush | `ProfileStore.deleteProfile` attempted | removed last; a hard failure keeps the tile |
 | Clear one site | closed first, no flush | cleared **in place**: profile cookies (`removeAllCookies`, its delivery read as a typed `CookieWipe` — an empty jar answering "deleted nothing" is a success — plus the final flush), `WebStorage.deleteAllData()`, geolocation permissions | untouched |
 | Clear all | active site closed | same in-place clear per registered site + orphan sweep over `ProfileStore.getAllProfileNames()`, restricted to `site-*` names not owned by the current registry | untouched |
-| App teardown | view destroyed, profile flushed | — | — |
+| App teardown | the site profile's flush is submitted to the background worker and **awaited within `ShutdownFlow.DESTROY_FLUSH_BUDGET_MS` (1 s)** before the generated Activity kills the process; the view is torn down whatever the outcome; a timeout/failure is logged as *durability not guaranteed* | — | — |
 
 * **One outcome vocabulary, backend to UI** (`remove_site` returns
   `{profile: …}`; `clear_site_data` returns only on a verified clear):
@@ -356,6 +359,19 @@ remove, no legacy data remains (`delete_site_session` also drops the
     retirement call fails — keeping a ledger is the conservative direction.
     The new generation is a different string and starts unblocked, so an old
     operation cannot mutate the new profile's data.
+  * *Shutdown (destroy) is a bounded await, not a fire-and-forget.* The
+    generated `MainActivity.onDestroy` ends the process when the Activity is
+    finishing, so a flush that was merely *scheduled* could be killed
+    mid-write. `ShutdownFlow` (pure, CI-tested) now sequences it: hand the
+    site profile's flush to the single background worker (the disk I/O never
+    runs on the UI thread) → tear the view down, overlapping the flush →
+    await it for `DESTROY_FLUSH_BUDGET_MS` (1 s, deliberately far below the
+    15 s in-app flush timeout so teardown cannot ANR). The outcome is one of
+    `Completed` / `Failed(reason)` / `TimedOut` / `NotNeeded` and is logged as
+    such: a timeout is reported as *durability not guaranteed*, never as a
+    landed flush. Each call owns its completion state (a local latch), and the
+    session slot is cleared first, so a double teardown flushes nothing the
+    second time and an older session's flush cannot be counted for a newer one.
   * *What is deliberately NOT quarantined:* the geolocation step (gated, so a
     late callback provably changes nothing); `WebStorage.deleteAllData()`
     (synchronous — it returned or threw, so the outcome is verified); the
@@ -445,7 +461,10 @@ remove, no legacy data remains (`delete_site_session` also drops the
   callback-wins-the-race, retry after a timeout**), clear verification
   (unsupported refuses without touching ports, absent profile, full order,
   cookie/geo/storage/flush failures each fail the clear while later steps
-  still run, geolocation watchdog on a lost callback, **an unanswered (`null`)
+  still run, **the shutdown protocol (submit → teardown → bounded await, the
+  four outcomes, a double teardown flushing nothing, independent completion
+  state per call, a non-positive budget refused)**, geolocation watchdog on a
+  lost callback, **an unanswered (`null`)
   geolocation enumeration fails the wipe, clears nothing and still runs the
   later steps**, **final-flush
   watchdog, stale watchdogs cannot change a delivered result**, never a
@@ -593,6 +612,12 @@ State-machine coverage that needs a real device/provider (actual
   already-clean profile** (the provider answers "no cookies deleted" over an
   empty jar: confirm the clear reports success, the site's stored session jar
   and its `profilemig-*` flag are gone, `profilegen-*` survives, and a site
-  whose cookie store cannot be read still reports a retryable failure).**
+  whose cookie store cannot be read still reports a retryable failure), and
+  **the destroy-time flush on a real provider** (log into a site, exit through
+  the PiP window's X or any path that finishes the Activity, and confirm the
+  session survives the next launch; check the in-app log shows which outcome
+  happened — `destroy-time flush completed` vs `flush unfinished in 1000ms -
+  durability not guaranteed` — and that a slow provider flush does not ANR the
+  teardown).**
 * iOS/macOS: out of scope; the iOS path keeps the shared-WebView flow minus
   the removed snapshot machinery and was not touched beyond that.

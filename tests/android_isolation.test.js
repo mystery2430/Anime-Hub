@@ -787,23 +787,37 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
     4,
     "migration, close, clear and the periodic sync",
   );
-  // The only other submission is destroy's deliberately fire-and-forget
-  // flush: never awaited, no caller to answer, documented as making no
-  // durability claim.
+  // The only other submission is destroy's flush. It runs on that SAME single
+  // worker — no extra threads — and is awaited for a bounded budget, because
+  // the generated Activity kills the process right after teardown: a
+  // fire-and-forget flush there could be killed mid-write.
   assert.equal(
     (controllerKt.match(/FLUSH_EXECUTOR\.execute/g) || []).length,
     2,
-    "submitFlush plus the destroy-time fire-and-forget",
+    "submitFlush plus the destroy-time flush",
   );
   const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity)");
   assert.ok(destroyAt > 0);
-  const destroyBody = controllerKt.slice(destroyAt, controllerKt.indexOf("\n  }\n", destroyAt));
+  const destroyBody = controllerKt.slice(
+    destroyAt,
+    controllerKt.indexOf("private fun ensureBackCallback", destroyAt),
+  );
   assert.match(destroyBody, /FLUSH_EXECUTOR\.execute/);
+  assert.match(
+    destroyBody,
+    /ShutdownFlow\.run\(/,
+    "the destroy-time flush is awaited within a budget, not fire-and-forget",
+  );
   const teardownDoc = controllerKt.slice(
-    controllerKt.indexOf("Activity teardown:"),
+    controllerKt.indexOf("Activity teardown hands"),
     destroyAt,
   );
-  assert.match(teardownDoc, /never awaited/, "destroy's flush stays fire-and-forget, documented");
+  assert.match(teardownDoc, /BOUNDED budget/, "documented as a bounded await");
+  assert.doesNotMatch(
+    controllerKt,
+    /never awaited/,
+    "the fire-and-forget teardown claim must be gone",
+  );
   // A watchdog answers the caller; it cannot cancel the blocking provider
   // call, so a stuck worker must be observable instead of hidden.
   assert.match(controllerKt, /FLUSH_STUCK_WARN_MS/);
@@ -918,6 +932,82 @@ test("android_prepare copies the site controller and pins androidx.webkit", () =
   assert.match(preparePy, /KGP_DEP_RE = re\.compile\(/);
   assert.match(preparePy, /pinned kotlin-gradle-plugin:2\.1\.20/);
   assert.match(preparePy, /kotlin-stdlib:2\.1\.20/, "the alignment rationale stays documented");
+});
+
+test("the destroy-time site flush is awaited within a bounded budget", () => {
+  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  // The protocol and its four honest outcomes.
+  assert.match(ops, /sealed interface ShutdownFlush/);
+  for (const outcome of ["NotNeeded", "Completed", "TimedOut"]) {
+    assert.match(ops, new RegExp(`object ${outcome} : ShutdownFlush`));
+  }
+  assert.match(ops, /data class Failed\(val reason: String\) : ShutdownFlush/);
+  assert.match(ops, /const val DESTROY_FLUSH_BUDGET_MS: Long = 1_000/);
+  assert.match(ops, /require\(budgetMillis > 0\)/);
+  const flowAt = ops.indexOf("object ShutdownFlow");
+  const flow = ops.slice(flowAt, ops.indexOf("\n}\n", flowAt));
+  assert.ok(
+    flow.indexOf("port.submitFlush()") < flow.indexOf("port.teardownView()"),
+    "the flush is handed to the worker before teardown, never run inline",
+  );
+  assert.ok(
+    flow.indexOf("port.teardownView()") < flow.indexOf("port.awaitFlush(budgetMillis)"),
+    "the bounded wait follows teardown, so the two overlap",
+  );
+  assert.match(flow, /if \(!port\.awaitFlush\(budgetMillis\)\) return ShutdownFlush\.TimedOut/);
+
+  // The controller side: worker-submitted I/O, per-call completion state,
+  // bounded await, teardown for every outcome, honest reporting.
+  const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity)");
+  assert.ok(destroyAt > 0);
+  const destroy = controllerKt.slice(
+    destroyAt,
+    controllerKt.indexOf("private fun ensureBackCallback", destroyAt),
+  );
+  assert.match(destroy, /ShutdownFlow\.run\(/);
+  assert.match(destroy, /val finished = CountDownLatch\(1\)/);
+  assert.match(destroy, /val failure = AtomicReference<String\?>\(null\)/);
+  assert.match(destroy, /FLUSH_EXECUTOR\.execute \{/);
+  assert.match(destroy, /finished\.await\(budgetMillis, TimeUnit\.MILLISECONDS\)/);
+  assert.match(destroy, /finished\.countDown\(\)/);
+  assert.doesNotMatch(
+    code(destroy),
+    /flush scheduled, not awaited/,
+    "the unawaited-flush teardown must not come back",
+  );
+  const submitAt = destroy.indexOf("override fun submitFlush()");
+  const submitBody = destroy.slice(submitAt, destroy.indexOf("override fun teardownView()"));
+  assert.match(submitBody, /target\.cookieManager\.flush\(\)/);
+  assert.doesNotMatch(
+    code(submitBody),
+    /\bactivity\b/,
+    "the flush task must not capture the Activity (no leak past teardown)",
+  );
+  assert.match(destroy, /override fun teardownView\(\)/);
+  assert.match(destroy, /webView\.destroy\(\)/);
+  assert.match(destroy, /ShutdownFlush\.TimedOut ->/);
+  assert.match(destroy, /durability not guaranteed/);
+
+  // The generated Activity awaits destroy() before killing the process, and no
+  // longer presents the default-profile flush as site-profile evidence.
+  const generatedAt = preparePy.indexOf("override fun onDestroy()");
+  const generated = preparePy.slice(generatedAt, preparePy.indexOf("killProcess", generatedAt));
+  assert.ok(
+    generated.indexOf("AnimeHubSiteController.destroy(this)") <
+      generated.indexOf("CookieManager.getInstance().flush()"),
+    "the site profile's awaited flush precedes the default-profile flush",
+  );
+  assert.ok(
+    generated.indexOf("CookieManager.getInstance().flush()") <
+      preparePy.indexOf("killProcess", generatedAt) - generatedAt,
+    "the process is killed only after both flushes",
+  );
+  assert.match(generated, /NOT evidence that the site profile's store landed/);
+  assert.doesNotMatch(
+    generated,
+    /blocks until the cookies are written, so the kill comes after them/,
+    "the old false durability claim must be gone",
+  );
 });
 
 test("the injected lifecycle block owns the site view across pause/resume/destroy", () => {

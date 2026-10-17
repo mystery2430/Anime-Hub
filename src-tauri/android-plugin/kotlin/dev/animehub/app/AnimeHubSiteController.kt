@@ -46,8 +46,11 @@
 // * a failed open rolls back the view and releases the active slot (only if
 //   it still holds that view), so the next open never sees a stuck
 //   `ERR_ACTIVE_SITE`;
-// * Activity teardown schedules the flush on the background executor and
-//   never blocks the UI thread or claims durability it did not await;
+// * Activity teardown hands the site profile's flush to the background
+//   executor (the disk I/O never runs on the UI thread) and awaits it for a
+//   BOUNDED budget, so the process kill the generated Activity performs right
+//   after cannot land mid-write; a timeout or a failure is logged as
+//   "durability not guaranteed" instead of being claimed;
 // * the launcher back hook only *starts* the normal `close_site` flow;
 //   Kotlin polls its status, surfaces failures with a native Toast (visible
 //   above the site view) and falls back to a native close when the launcher
@@ -78,8 +81,11 @@ import androidx.webkit.ProfileStore
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.lang.ref.WeakReference
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONTokener
 
 /**
@@ -642,47 +648,113 @@ object AnimeHubSiteController {
   }
 
   /**
-   * Activity teardown: schedule the site profile's flush on the background
-   * executor (the same durability attempt the launcher's onDestroy gives the
-   * default profile), then destroy the view. The flush is **never awaited**
-   * and never runs on the UI thread — `flush()` may block on disk I/O — so
-   * this path makes no durability claim: the write either lands during the
-   * process's remaining lifetime or the periodic sync/normal close already
-   * persisted it earlier. Never touches the default profile.
+   * UI thread, from the generated `MainActivity.onDestroy`.
+   *
+   * The site profile's cookie flush is submitted to [FLUSH_EXECUTOR] — disk I/O
+   * never runs here — and then awaited for
+   * [ShutdownFlow.DESTROY_FLUSH_BUDGET_MS], because the generated Activity ends
+   * the process right after this when it is finishing: an unawaited flush could
+   * be killed mid-write and lose the site's cookies. The outcome is reported
+   * honestly ([ShutdownFlush]): a timeout or a failure is logged as "durability
+   * NOT guaranteed", never as a completed flush, and the default-profile
+   * `CookieManager.getInstance().flush()` the generated Activity performs is NOT
+   * treated as evidence about this profile's store. Teardown of the view runs
+   * regardless of the flush outcome; a second call finds the session slot
+   * already cleared and flushes nothing.
    */
-  fun destroy(activity: Activity) {
+    fun destroy(activity: Activity) {
     val webView = active.activeToken
     val profileName = active.clear()
     exitCustomViewIfNeeded()
     backCallback?.isEnabled = false
     if (webView == null) return
-    if (profileName != null) {
-      try {
-        val profile = WebViewCompat.getProfile(webView)
-        FLUSH_EXECUTOR.execute {
-          try {
-            profile.cookieManager.flush()
-            AnimeHubDebugLog.add("site", "destroy-time flush completed")
-          } catch (e: Exception) {
-            Log.w(LOG_TAG, "profile flush on destroy failed (${e.javaClass.simpleName})")
-            AnimeHubDebugLog.add("site", "destroy-time flush failed (${e.javaClass.simpleName})")
-          }
+    // Resolved BEFORE the view is destroyed, and the ONLY thing the worker task
+    // captures: a `Profile` comes from the store and outlives its WebView,
+    // while capturing the Activity (or the view) here would leak it past
+    // teardown. The completion state below is local to THIS call, so a double
+    // destroy — or a flush belonging to an older session — cannot be counted
+    // here.
+    val profile =
+      if (profileName != null) {
+        try {
+          WebViewCompat.getProfile(webView)
+        } catch (e: Exception) {
+          Log.w(LOG_TAG, "profile flush on destroy skipped (${e.javaClass.simpleName})")
+          null
         }
-      } catch (e: Exception) {
-        Log.w(LOG_TAG, "profile flush on destroy skipped (${e.javaClass.simpleName})")
+      } else {
+        null
       }
+    val finished = CountDownLatch(1)
+    val failure = AtomicReference<String?>(null)
+    val outcome =
+      ShutdownFlow.run(
+        object : ShutdownPort {
+          override fun submitFlush(): Boolean {
+            val target = profile ?: return false
+            // Disk I/O on the worker, never on this (UI) thread.
+            FLUSH_EXECUTOR.execute {
+              try {
+                target.cookieManager.flush()
+                AnimeHubDebugLog.add("site", "destroy-time flush completed")
+              } catch (e: Exception) {
+                failure.set("${e.javaClass.simpleName}: ${e.message}")
+                Log.w(LOG_TAG, "profile flush on destroy failed (${e.javaClass.simpleName})")
+                AnimeHubDebugLog.add("site", "destroy-time flush failed (${e.javaClass.simpleName})")
+              } finally {
+                finished.countDown()
+              }
+            }
+            return true
+          }
+
+          override fun teardownView() {
+            try {
+              (webView.parent as? ViewGroup)?.removeView(webView)
+            } catch (_: Exception) {
+              // Detached with the Activity already.
+            }
+            try {
+              webView.destroy()
+            } catch (_: Exception) {
+              // Never crash teardown.
+            }
+          }
+
+          override fun awaitFlush(budgetMillis: Long): Boolean =
+            try {
+              finished.await(budgetMillis, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+              // Interrupted teardown: report honestly, never as a landed flush.
+              Thread.currentThread().interrupt()
+              false
+            }
+
+          override fun flushFailure(): String? = failure.get()
+        },
+      )
+    when (outcome) {
+      ShutdownFlush.Completed ->
+        AnimeHubDebugLog.add("site", "destroyed with activity (site profile flush completed)")
+      ShutdownFlush.NotNeeded ->
+        AnimeHubDebugLog.add("site", "destroyed with activity (no site profile to flush)")
+      ShutdownFlush.TimedOut -> {
+        // The generated Activity kills the process right after this when it is
+        // finishing, so a timeout means the write may never land: say so.
+        Log.w(
+          LOG_TAG,
+          "destroy-time flush unfinished in ${ShutdownFlow.DESTROY_FLUSH_BUDGET_MS}ms; " +
+            "cookie durability NOT guaranteed",
+        )
+        AnimeHubDebugLog.add(
+          "site",
+          "destroyed with activity (flush unfinished in " +
+            "${ShutdownFlow.DESTROY_FLUSH_BUDGET_MS}ms - durability not guaranteed)",
+        )
+      }
+      is ShutdownFlush.Failed ->
+        AnimeHubDebugLog.add("site", "destroyed with activity (flush failed: ${outcome.reason})")
     }
-    try {
-      (webView.parent as? ViewGroup)?.removeView(webView)
-    } catch (_: Exception) {
-      // Detached with the Activity already.
-    }
-    try {
-      webView.destroy()
-    } catch (_: Exception) {
-      // Never crash teardown.
-    }
-    AnimeHubDebugLog.add("site", "destroyed with activity (flush scheduled, not awaited)")
   }
 
   /**
