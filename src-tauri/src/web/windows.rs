@@ -3126,7 +3126,9 @@ mod tests {
         }
 
         fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
-            self.writes.lock().unwrap().push(format!("put:{name}"));
+            // Only DURABLE writes join the ordered log, so a test asserting the
+            // order asserts what actually landed. A refused write is recorded
+            // distinctly, which keeps the injection visible.
             if name.starts_with(PROFILE_GENERATION_PREFIX)
                 && self
                     .fail_generation_writes
@@ -3135,9 +3137,15 @@ mod tests {
             {
                 self.fail_generation_writes
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .push(format!("put-failed:{name}"));
                 return Err(AppError::Storage("keystore yazılamadı (test)".into()));
             }
-            self.inner.put_secret(name, plaintext)
+            self.inner.put_secret(name, plaintext)?;
+            self.writes.lock().unwrap().push(format!("put:{name}"));
+            Ok(())
         }
 
         fn get_secret(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
@@ -3262,7 +3270,14 @@ mod tests {
         // a reopen) derives is still the same one — so it must still be blocked.
         assert!(matches!(err, AppError::Storage(_)), "{err}");
         assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(*writes.lock().unwrap(), vec![format!("delete:{name}")]);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("delete:{name}"),
+                format!("put-failed:{PROFILE_GENERATION_PREFIX}{id}"),
+            ],
+            "the refused write is visible and NOTHING durable landed after the delete"
+        );
         assert_eq!(profile_generation(&state, id).unwrap(), 0);
         assert_eq!(android_profile_name(id, 0), name);
     }
@@ -3324,15 +3339,18 @@ mod tests {
         let id = "user-delete-retry";
         let name = android_profile_name(id, 0);
 
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let delete = |profile: &str| {
             writes.lock().unwrap().push(format!("delete:{profile}"));
-            // Second attempt: the profile is already gone from the first one.
-            let action = if profile_generation(&state, id).unwrap() == 0 {
+            // First attempt: the provider accepts. Every later attempt finds the
+            // profile already gone — the generation cannot distinguish them,
+            // because the failed bump is exactly what never moved it.
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if attempt == 0 {
                 SiteProfileAction::Deleted
             } else {
                 SiteProfileAction::Absent
-            };
-            Ok(action)
+            })
         };
         assert!(run_mobile_delete_protocol(&state, id, delete, |profile| {
             writes.lock().unwrap().push(format!("retire:{profile}"));
@@ -3357,10 +3375,12 @@ mod tests {
             *writes.lock().unwrap(),
             vec![
                 format!("delete:{name}"),
+                format!("put-failed:{PROFILE_GENERATION_PREFIX}{id}"),
                 format!("delete:{name}"),
                 format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
                 format!("retire:{name}"),
-            ]
+            ],
+            "the retry re-derives the SAME name, and only its durable bump is followed by a retirement"
         );
         assert_eq!(profile_generation(&state, id).unwrap(), 1);
     }
