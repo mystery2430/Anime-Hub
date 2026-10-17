@@ -577,8 +577,18 @@ test("every awaited flush is watchdog-bounded, in close and clear alike", () => 
   const closeAt = controllerKt.indexOf("fun close(activity: Activity, flush: Boolean");
   assert.ok(closeAt > 0);
   const closeBody = controllerKt.slice(closeAt, controllerKt.indexOf("SiteCloseFlow.run", closeAt));
-  assert.match(closeBody, /override fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\)/);
-  assert.match(closeBody, /mainHandler\.postDelayed/);
+  assert.match(
+    closeBody,
+    /override fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/,
+  );
+  // The adapters delegate to ONE helper, which posts on the main looper and
+  // returns a removeCallbacks-based canceller (see the watchdog test below).
+  assert.match(closeBody, /scheduleWatchdog\(millis, onTimeout\)/);
+  const helperAt = controllerKt.indexOf("private fun scheduleWatchdog(");
+  assert.ok(helperAt > 0);
+  const helper = controllerKt.slice(helperAt, controllerKt.indexOf("\n  }\n", helperAt));
+  assert.match(helper, /mainHandler\.postDelayed\(task, millis\)/);
+  assert.match(helper, /mainHandler\.removeCallbacks\(task\)/);
   // The doc's "every awaited step has a watchdog" claim is now backed by the
   // flush constants it names.
   assert.match(read("docs/android-storage-isolation.md"), /FLUSH_TIMEOUT_MS/);
@@ -775,6 +785,61 @@ test("the cookie step reads a TYPED delivery: an empty jar succeeds, an unreacha
     /ProfileQuarantine\.quarantine\(profileName, guard\.operationId, COOKIE_UNVERIFIED_REASON\)/,
   );
   assert.match(ops, /ProfileQuarantine\.settle\(profileName, guard\.operationId\)/);
+});
+
+test("every awaited step cancels its watchdog, and an unarmable one fails fast", () => {
+  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  const opsTest = read(
+    "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt",
+  );
+  // All three ports hand back a canceller...
+  assert.equal(
+    (ops.match(/fun scheduleTimeout\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/g) || [])
+      .length,
+    3,
+    "close, clear and migration ports",
+  );
+  // ...and every arming site has a matching cancellation once the step settles.
+  // Without it a step that answered normally left its delayed runnable queued
+  // for the whole window (10 s per step, 15 s per flush), holding the port —
+  // and through it the site WebView and the Activity — reachable.
+  assert.equal((ops.match(/port\.scheduleTimeout\(/g) || []).length, 5);
+  assert.equal((ops.match(/cancel\w*Watchdog\(\)/g) || []).length, 6);
+  assert.match(ops, /var cancelWatchdog: \(\) -> Unit = \{\}/);
+  assert.match(ops, /var cancelFlushWatchdog: \(\) -> Unit = \{\}/);
+  assert.match(ops, /var cancelCookieWatchdog: \(\) -> Unit = \{\}/);
+
+  // ONE production helper arms watchdogs: removeCallbacks-based cancellation,
+  // and an immediate failure when the handler refuses the post (a flow whose
+  // watchdog never fires and whose provider never answers would otherwise leave
+  // the caller — and the bridge call behind it — waiting forever).
+  assert.match(
+    controllerKt,
+    /private fun scheduleWatchdog\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/,
+  );
+  assert.match(controllerKt, /mainHandler\.postDelayed\(task, millis\)/);
+  assert.match(controllerKt, /mainHandler\.removeCallbacks\(task\)/);
+  assert.match(controllerKt, /watchdog could not be armed/);
+  assert.equal(
+    (controllerKt.match(/scheduleWatchdog\(millis, onTimeout\)/g) || []).length,
+    3,
+    "migration, close and clear adapters all share the helper",
+  );
+  assert.doesNotMatch(
+    code(controllerKt),
+    /postDelayed\(\{ onTimeout\(\) \}, millis\)/,
+    "the un-cancellable inline post must be gone",
+  );
+
+  // The contract is executed, not just written down.
+  for (const name of [
+    "a settled clear cancels every watchdog it armed",
+    "the watchdog that fired is the only one a timed-out clear leaves queued",
+    "a watchdog that cannot be armed fails the step instead of hanging the caller",
+    "a settled migration cancels its per-cookie and flush watchdogs",
+  ]) {
+    assert.ok(opsTest.includes(name), `missing Kotlin case: ${name}`);
+  }
 });
 
 test("all blocking flushes share ONE worker, with stuck detection not new threads", () => {

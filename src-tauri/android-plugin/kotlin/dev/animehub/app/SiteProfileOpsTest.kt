@@ -49,6 +49,9 @@ class SiteProfileOpsTest {
     var resolveCalls = 0
     var flushCalls = 0
     val timeouts = mutableListOf<() -> Unit>()
+
+    /** How many armed watchdogs the flow cancelled after settling. */
+    var cancelled = 0
     val log = mutableListOf<String>()
 
     override fun hasActiveView(): Boolean = active
@@ -70,8 +73,9 @@ class SiteProfileOpsTest {
       onDone(flushError)
     }
 
-    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
       timeouts += onTimeout
+      return { cancelled++ }
     }
 
     override fun destroyActiveView() {
@@ -146,7 +150,7 @@ class SiteProfileOpsTest {
           onDone(RuntimeException("late duplicate"))
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {}
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
         override fun destroyActiveView() {}
       }
     var count = 0
@@ -294,10 +298,18 @@ class SiteProfileOpsTest {
      * models an unreadable store.
      */
     var hasCookiesProbe: (() -> Boolean)? = null,
+    /**
+     * The handler refuses the post, so the production adapter fires the
+     * timeout IMMEDIATELY instead of leaving the flow without a watchdog.
+     */
+    var armFails: Boolean = false,
     /** The geolocation enumeration is held so a test can deliver it LATE. */
     geoHoldsCallback: Boolean = false,
     val geo: FakeGeolocationApi = FakeGeolocationApi(hold = geoHoldsCallback),
   ) : SiteClearPort {
+    /** How many armed watchdogs the flow cancelled after settling. */
+    var cancelled = 0
+
     val log = mutableListOf<String>()
     var timeouts = mutableListOf<() -> Unit>()
 
@@ -356,8 +368,15 @@ class SiteProfileOpsTest {
       onDone(flushError)
     }
 
-    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
       timeouts += onTimeout
+      if (armFails) {
+        // Exactly what AnimeHubSiteController.scheduleWatchdog does when
+        // postDelayed throws: answer now rather than wait forever.
+        onTimeout()
+        return {}
+      }
+      return { cancelled++ }
     }
   }
 
@@ -438,8 +457,9 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
           scheduled = onTimeout
+          return {}
         }
       }
     var last: String? = null
@@ -454,7 +474,7 @@ class SiteProfileOpsTest {
       override fun hasActiveView(): Boolean = false
       override fun resolveProfileName(): Result<String> = Result.success("x")
       override fun flushCookies(profileName: String, onDone: (Throwable?) -> Unit) {}
-      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {}
+      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
       override fun destroyActiveView() {}
     }) { extra++ }
     Assert.assertEquals(1, extra)
@@ -484,6 +504,9 @@ class SiteProfileOpsTest {
     val port =
       object : SiteClearPort {
         val timeouts = mutableListOf<() -> Unit>()
+
+    /** How many armed watchdogs the flow cancelled after settling. */
+    var cancelled = 0
         var pendingFlush: ((Throwable?) -> Unit)? = null
         override fun profileExists(): Boolean = true
         override fun removeAllCookies(onDone: (CookieWipe) -> Unit) {
@@ -503,8 +526,9 @@ class SiteProfileOpsTest {
           pendingFlush = onDone
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
           timeouts += onTimeout
+          return {}
         }
       }
     var results = 0
@@ -569,7 +593,7 @@ class SiteProfileOpsTest {
           onDone(RuntimeException("late"))
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {}
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
       }
     SiteClearFlow.run(supported = true, profileName = profile, port = port) {
       count++
@@ -708,8 +732,9 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
           timeouts += onTimeout
+          return {}
         }
       }
     var results = 0
@@ -927,6 +952,72 @@ class SiteProfileOpsTest {
     Assert.assertFalse(ProfileQuarantine.settle(profile, both[0]))
     Assert.assertFalse(ProfileQuarantine.settle(profile, 999_999L))
     Assert.assertEquals(listOf(both[1]), ProfileQuarantine.pendingOperations(profile))
+  }
+
+  // ------------------------------------------- watchdog arming + cancellation
+
+  @Test
+  fun `a settled clear cancels every watchdog it armed`() {
+    val port = FakeClearPort()
+    var last: String? = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it ?: "ok" }
+    Assert.assertEquals("ok", last)
+    Assert.assertTrue("watchdogs were armed", port.timeouts.isNotEmpty())
+    Assert.assertEquals(
+      "a settled step must not leave its watchdog queued: the delayed runnable " +
+        "keeps the port — and through it the WebView and the Activity — reachable " +
+        "until it fires",
+      port.timeouts.size,
+      port.cancelled,
+    )
+  }
+
+  @Test
+  fun `the watchdog that fired is the only one a timed-out clear leaves queued`() {
+    val port = FakeClearPort(cookiesNeverAnswer = true)
+    var last: String? = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it }
+    Assert.assertEquals("suspended until its watchdog", "unset", last)
+    Assert.assertEquals(0, port.cancelled)
+
+    port.timeouts[0]()
+    val delivered = last
+    Assert.assertTrue("the timeout answered the caller", delivered!!.contains("zaman aşımı"))
+    // The fired watchdog is not cancelled; every later step cancels its own.
+    Assert.assertEquals(port.timeouts.size - 1, port.cancelled)
+
+    // A late cookie answer neither changes the delivered result nor cancels more.
+    val cancelledBefore = port.cancelled
+    port.pendingCookies!!.invoke(CookieWipe.Answered(true))
+    Assert.assertEquals(cancelledBefore, port.cancelled)
+    Assert.assertEquals(delivered, last)
+  }
+
+  @Test
+  fun `a watchdog that cannot be armed fails the step instead of hanging the caller`() {
+    // AnimeHubSiteController.scheduleWatchdog invokes onTimeout immediately when
+    // the handler refuses the post. The flow must then answer its caller rather
+    // than wait for a watchdog that will never fire — and it must still keep the
+    // unverified cookie deletion quarantined.
+    val port = FakeClearPort(armFails = true)
+    var last: String? = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { last = it }
+    Assert.assertNotEquals("the caller was answered", "unset", last)
+    Assert.assertTrue(last!!.contains("zaman aşımı"))
+    Assert.assertTrue(
+      "the fail-fast path still quarantines the unverified deletion",
+      ProfileQuarantine.isBlocked(profile),
+    )
+  }
+
+  @Test
+  fun `a settled migration cancels its per-cookie and flush watchdogs`() {
+    val port = FakeMigrationPort(cookieCount = 2)
+    var outcome: MigrationOutcome? = null
+    SiteMigrationFlow.run(listOf("a=1", "b=2"), port) { outcome = it }
+    Assert.assertNotNull("expected Complete, got $outcome", outcome as? MigrationOutcome.Complete)
+    Assert.assertEquals("one watchdog per cookie plus the flush", 3, port.scheduled.size)
+    Assert.assertEquals(port.scheduled.size, port.cancelled)
   }
 
   // ------------------------------------------------- shutdown (destroy) flow
@@ -1740,6 +1831,9 @@ class SiteProfileOpsTest {
   ) : SiteMigrationPort {
     val log = mutableListOf<String>()
     var scheduled = mutableListOf<() -> Unit>()
+
+    /** How many armed watchdogs the flow cancelled after settling. */
+    var cancelled = 0
     var cookieIndex = 0
     val totalCookies = cookieCount
 
@@ -1765,8 +1859,9 @@ class SiteProfileOpsTest {
       onDone(flushError)
     }
 
-    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+    override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
       scheduled += onTimeout
+      return { cancelled++ }
     }
   }
 
@@ -1846,8 +1941,9 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit {
           scheduled = onTimeout
+          return {}
         }
       }
     SiteMigrationFlow.run(listOf("a=1"), port) { port.outcome = it }
@@ -1872,7 +1968,7 @@ class SiteProfileOpsTest {
           onDone(null)
         }
 
-        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {}
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit = {}
       }
     var results = 0
     SiteMigrationFlow.run(listOf("only"), port) { results++ ; port.count = results }

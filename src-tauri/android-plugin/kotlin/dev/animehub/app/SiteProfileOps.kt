@@ -154,8 +154,17 @@ interface SiteClosePort {
    * One-shot delayed callback used as the watchdog for the flush await —
    * the same bound [SiteClearFlow] and [SiteMigrationFlow] put on their
    * awaited steps. A flush that never calls back must not hang the close.
+   *
+   * Returns the watchdog's CANCELLER (idempotent, callable from any thread).
+   * The flow calls it the moment the step settles, so a step that answered
+   * normally does not leave a delayed runnable queued — holding this port, and
+   * through it the WebView and the Activity — for the rest of the timeout
+   * window. An implementation that cannot arm the timeout MUST invoke
+   * [onTimeout] immediately instead: a flow whose watchdog never fires and
+   * whose provider never answers would leave the caller, and the bridge call
+   * behind it, waiting forever.
    */
-  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit)
+  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit
 
   /** Remove + destroy the active view and re-bind PiP/focus to the launcher. */
   fun destroyActiveView()
@@ -214,13 +223,17 @@ object SiteCloseFlow {
     // callback loses the race and is ignored — it must not destroy a view
     // whose ownership was never released.
     val settled = AtomicBoolean(false)
-    port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
+    var cancelWatchdog: () -> Unit = {}
+    cancelWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
       if (settled.compareAndSet(false, true)) {
         done("çerez kalıcılığı zaman aşımına uğradı: görünüm açık kaldı")
       }
     }
     port.flushCookies(profileName) { error ->
       if (!settled.compareAndSet(false, true)) return@flushCookies
+      // The flush answered: drop the queued watchdog so it cannot keep this
+      // port (and the view/Activity behind it) reachable for another 15 s.
+      cancelWatchdog()
       if (error != null) {
         done("çerez kalıcılığı başarısız: ${error.message}")
         return@flushCookies
@@ -873,7 +886,7 @@ interface SiteClearPort {
   fun flushCookies(onDone: (Throwable?) -> Unit)
 
   /** One-shot delayed callback used as the watchdog for awaited steps. */
-  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit)
+  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit
 }
 
 /**
@@ -1041,7 +1054,8 @@ object SiteClearFlow {
     ) {
       val settled = AtomicBoolean(false)
       val guard = StepGuards.create()
-      port.scheduleTimeout(STEP_TIMEOUT_MS) {
+      var cancelWatchdog: () -> Unit = {}
+      cancelWatchdog = port.scheduleTimeout(STEP_TIMEOUT_MS) {
         // Close the mutation window before deciding the result: a callback
         // racing this watchdog on another thread must see the guard shut even
         // if it arrives between the two atomic steps.
@@ -1055,7 +1069,15 @@ object SiteClearFlow {
         }
       }
       arm(guard) { ok ->
-        if (settled.compareAndSet(false, true)) next(ok) else onLateAnswer(guard)
+        if (settled.compareAndSet(false, true)) {
+          // This step is settled: cancel its watchdog instead of leaving a
+          // delayed runnable queued — it would keep this port, and through it
+          // the WebView and the Activity, reachable for the rest of the window.
+          cancelWatchdog()
+          next(ok)
+        } else {
+          onLateAnswer(guard)
+        }
       }
     }
 
@@ -1119,7 +1141,8 @@ object SiteClearFlow {
         // already exists, so a late one cannot delete or grant anything a new
         // session created (see [ProfileQuarantine] for the full argument).
         val flushSettled = AtomicBoolean(false)
-        port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
+        var cancelFlushWatchdog: () -> Unit = {}
+        cancelFlushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
           if (flushSettled.compareAndSet(false, true)) {
             record("çerez kalıcılığı: zaman aşımı")
             done(firstError)
@@ -1127,6 +1150,8 @@ object SiteClearFlow {
         }
         port.flushCookies { flushError ->
           if (!flushSettled.compareAndSet(false, true)) return@flushCookies
+          // Settled: drop the queued watchdog (see [SiteClearPort.scheduleTimeout]).
+          cancelFlushWatchdog()
           if (flushError != null) record("çerez kalıcılığı başarısız: ${flushError.message}")
           done(firstError)
         }
@@ -1154,7 +1179,7 @@ interface SiteMigrationPort {
   fun flushCookies(onDone: (Throwable?) -> Unit)
 
   /** One-shot watchdog for the awaited steps. */
-  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit)
+  fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit
 }
 
 /** Result of the migration attempt, with the strict success criterion. */
@@ -1216,13 +1241,15 @@ object SiteMigrationFlow {
       val i = index.get()
       if (i >= cookies.size) {
         val settled = AtomicBoolean(false)
-        port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
+        var cancelFlushWatchdog: () -> Unit = {}
+        cancelFlushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
           if (settled.compareAndSet(false, true)) {
             finish(MigrationOutcome.Failed("çerez aktarımı kalıcı hale getirilemedi: zaman aşımı"))
           }
         }
         port.flushCookies { error ->
           if (!settled.compareAndSet(false, true)) return@flushCookies
+          cancelFlushWatchdog()
           if (error != null) {
             finish(MigrationOutcome.Failed("çerez aktarımı kalıcı hale getirilemedi: ${error.message}"))
           } else {
@@ -1232,7 +1259,8 @@ object SiteMigrationFlow {
         return
       }
       val perCookie = AtomicBoolean(false)
-      port.scheduleTimeout(COOKIE_TIMEOUT_MS) {
+      var cancelCookieWatchdog: () -> Unit = {}
+      cancelCookieWatchdog = port.scheduleTimeout(COOKIE_TIMEOUT_MS) {
         if (perCookie.compareAndSet(false, true)) {
           finish(MigrationOutcome.Failed("çerez aktarımı zaman aşımına uğradı"))
         }
@@ -1240,6 +1268,7 @@ object SiteMigrationFlow {
       try {
         port.setCookie(cookies[i]) { ok ->
           if (!perCookie.compareAndSet(false, true)) return@setCookie
+          cancelCookieWatchdog()
           if (!ok) {
             // Strict criterion: a rejected cookie fails the migration and
             // stops the chain — the doomed profile gets retired, and writing
@@ -1253,6 +1282,7 @@ object SiteMigrationFlow {
         }
       } catch (e: Exception) {
         if (perCookie.compareAndSet(false, true)) {
+          cancelCookieWatchdog()
           finish(MigrationOutcome.Failed("çerez aktarımı başarısız: ${e.message}"))
         }
       }

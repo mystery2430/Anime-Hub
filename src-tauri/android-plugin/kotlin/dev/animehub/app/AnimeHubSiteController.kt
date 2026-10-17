@@ -150,6 +150,39 @@ object AnimeHubSiteController {
   private const val FLUSH_STUCK_WARN_MS = 10_000L
 
   /**
+   * Arm one watchdog on the UI-thread handler and return its canceller.
+   *
+   * The canceller is the point: a step that answered normally used to leave its
+   * delayed runnable queued for the whole timeout window (10 s per step, 15 s
+   * for a flush), and that runnable holds the port — and through it the site
+   * WebView and the Activity — reachable until it fires. Every close, clear and
+   * migration step paid that. `removeCallbacks` is idempotent and thread-safe,
+   * so the flows cancel from whichever thread settles the step.
+   *
+   * If the watchdog cannot be armed at all, the step is failed IMMEDIATELY: a
+   * flow whose watchdog never fires and whose provider never answers would
+   * otherwise leave its caller — and the Tauri bridge call behind it — waiting
+   * forever. Silently ignoring the failure (as this used to) traded a hang for
+   * an unbounded wait.
+   */
+  private fun scheduleWatchdog(millis: Long, onTimeout: () -> Unit): () -> Unit {
+    val task = Runnable { onTimeout() }
+    return try {
+      mainHandler.postDelayed(task, millis)
+      // Named, not a bare lambda on its own line: Kotlin would otherwise parse
+      // it as a trailing lambda of `postDelayed`.
+      val cancel: () -> Unit = { mainHandler.removeCallbacks(task) }
+      cancel
+    } catch (e: Exception) {
+      Log.w(LOG_TAG, "watchdog could not be armed (${e.javaClass.simpleName}); failing the step now")
+      AnimeHubDebugLog.add("site", "watchdog not armed (${e.javaClass.simpleName}) - step failed now")
+      onTimeout()
+      val noop: () -> Unit = {}
+      noop
+    }
+  }
+
+  /**
    * Run one blocking `flush()` on [FLUSH_EXECUTOR] and deliver its result on
    * the UI thread. Warns (logcat + in-app log) when a previous flush has
    * still been running for [FLUSH_STUCK_WARN_MS] or more — the caller has
@@ -444,13 +477,8 @@ object AnimeHubSiteController {
         submitFlush(activity, "migration", { m.flush() }, onDone)
       }
 
-      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
-        try {
-          mainHandler.postDelayed({ onTimeout() }, millis)
-        } catch (_: Exception) {
-          // A dead looper only exists with a dead process; ignore.
-        }
-      }
+      override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
+        scheduleWatchdog(millis, onTimeout)
     }
 
   /** Construct, configure, attach and navigate the site WebView. UI thread. */
@@ -588,13 +616,8 @@ object AnimeHubSiteController {
             submitFlush(activity, "close", { profile.cookieManager.flush() }, onDone)
           }
 
-          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
-            try {
-              mainHandler.postDelayed({ onTimeout() }, millis)
-            } catch (_: Exception) {
-              // Dead looper ⇒ dead process; nothing to time out.
-            }
-          }
+          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
+            scheduleWatchdog(millis, onTimeout)
 
           override fun destroyActiveView() {
             finishClose(activity)
@@ -1034,13 +1057,8 @@ object AnimeHubSiteController {
             submitFlush(activity, "clear", { profile.cookieManager.flush() }, onDone)
           }
 
-          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit) {
-            try {
-              mainHandler.postDelayed({ onTimeout() }, millis)
-            } catch (_: Exception) {
-              // Dead looper ⇒ dead process; nothing to time out.
-            }
-          }
+          override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
+            scheduleWatchdog(millis, onTimeout)
         }
       SiteClearFlow.run(isSupported(), profileName, port) { error ->
         when (error) {
@@ -1125,9 +1143,17 @@ object AnimeHubSiteController {
       // because a pending profile still exists on disk.
       AnimeHubDebugLog.add("site", if (deleted) "profile deleted" else "profile absent")
       onResult(deleted, false, null)
-    } catch (_: IllegalStateException) {
-      // Living/loaded context: defer to the next process start.
-      AnimeHubDebugLog.add("site", "profile delete deferred (in use)")
+    } catch (e: IllegalStateException) {
+      // Living/loaded context: defer to the next process start. "In use" is the
+      // DOCUMENTED reason for this exception, but a provider could throw it for
+      // another one — and a deferral that can never succeed would then be
+      // re-queued at every start while the user is told "deferred". The reason
+      // is therefore kept measurable instead of discarded; the classification
+      // itself stays (a deferred deletion is recoverable, an error is not, and
+      // which one a given provider means can only be settled on a device — see
+      // docs/android-storage-isolation.md).
+      AnimeHubDebugLog.add("site", "profile delete deferred (in use: ${e.message})")
+      Log.w(LOG_TAG, "profile delete deferred (${e.javaClass.simpleName}: ${e.message})")
       onResult(false, true, null)
     } catch (e: Exception) {
       Log.e(LOG_TAG, "profile delete failed (${e.javaClass.simpleName})")

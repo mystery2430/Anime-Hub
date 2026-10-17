@@ -211,7 +211,13 @@ remove, no legacy data remains (`delete_site_session` also drops the
     next process start, before any site can open**; the UI says so
     explicitly ("bir sonraki açılışta otomatik silinecek") — it is never
     presented as an instant delete. Anything still pending stays queued;
-    the clear-all orphan sweep is the second net;
+    the clear-all orphan sweep is the second net. "In use" is the documented
+    reason for the `IllegalStateException` that maps to `deferred`, but a
+    provider could throw it for another one — so the exception's message is
+    written to `Log.w` and the in-app debug log instead of being discarded,
+    which keeps a misclassification diagnosable rather than silent (which
+    reason a given provider really means is a device-only question; see the
+    checklist);
   * `unsupported` — the provider has no profile API (feature gap). The
     command **rejects** with the MULTI_PROFILE guidance, keeps the record
     and queues nothing: a permanent feature gap is never disguised as
@@ -296,6 +302,21 @@ remove, no legacy data remains (`delete_site_session` also drops the
     unknown rather than clean. Claim and mutation
     run on the UI thread — where the watchdog is posted as well — and the
     guard is a CAS, so the race is decided atomically either way.
+  * *Watchdog lifetime — armed once, cancelled on settle, fail-fast when it
+    cannot be armed.* Every awaited step (`scheduleTimeout` on all three ports)
+    now returns its **canceller**, and the flow calls it the moment the step
+    settles. Before that, a step whose callback answered normally still left its
+    delayed runnable queued for the rest of the window (10 s per step, 15 s per
+    flush), and that runnable holds the port — and through it the site WebView
+    and the Activity — reachable until it fires; every close, clear and
+    migration step paid that. Arming happens in ONE production helper
+    (`AnimeHubSiteController.scheduleWatchdog`, `postDelayed` +
+    `removeCallbacks`, idempotent and thread-safe). If the handler refuses the
+    post, the helper invokes the timeout **immediately** instead of ignoring the
+    failure: a flow whose watchdog never fires and whose provider never answers
+    would leave its caller — and the Tauri bridge call behind it — waiting
+    forever. The step then fails in the conservative direction (for the cookie
+    step, the unverified deletion is still quarantined).
   * *Ungated steps — per-operation profile quarantine.* `removeAllCookies` is
     a destructive provider call issued **before** the await, with no
     cancellation API: when its watchdog fires, the deletion may still be in
@@ -485,6 +506,15 @@ remove, no legacy data remains (`delete_site_session` also drops the
   session-slot rollback after a failed open (stale failure cannot clear a
   newer session), and the back-status decision matrix. These catch the
   real error paths A.1–A.5 were about; the controller only *wires* them.
+* **Watchdog arming and cancellation** (4 cases): a settled clear cancels every
+  watchdog it armed, a timed-out clear leaves exactly the one that fired queued
+  (and a late answer cancels nothing more and changes nothing), a watchdog that
+  cannot be armed fails the step instead of hanging the caller while still
+  quarantining the unverified deletion, and a settled migration cancels its
+  per-cookie and flush watchdogs.
+* **Shutdown protocol** (7 cases): submit → teardown → bounded await, the four
+  outcomes, a double teardown flushing nothing, independent completion state per
+  call, and a non-positive budget refused before anything runs.
 * **Timeout side-effect races** (26 of those cases) are measured as data, not
   as callback counts: the fake records every `clear` the production
   `GeolocationWipe` triggers and the origins a session currently holds. They
@@ -588,7 +618,10 @@ State-machine coverage that needs a real device/provider (actual
   default-profile data untouched after clear/remove; back-button ladder
   (fullscreen → history → launcher → task preserved); PiP handoff while a
   site is open; one-time migration showing the old session on first open;
-  deferred deletion draining on the next start; **real `CookieManager.flush()`
+  deferred deletion draining on the next start, and **which exception a real
+  provider throws when a deletion cannot run** (the `deferred` classification
+  reads `IllegalStateException` as "in use"; the reason is logged, so a device
+  run should confirm no other cause is being queued as deferred forever); **real `CookieManager.flush()`
   latency and the watchdog paths on a real provider (a deliberately stuck
   flush: caller answered with a failure, view/session kept, retry works, and
   the `submitFlush` stuck-worker warning appears in the in-app log); the
