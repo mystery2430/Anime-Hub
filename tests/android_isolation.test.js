@@ -69,13 +69,28 @@ test("profile names derive from site_id only, hashed, with a generation", () => 
   // The generation comes from a persisted counter, not from memory.
   assert.match(windowsRs, /const PROFILE_GENERATION_PREFIX: &str = "profilegen-"/);
   // Kotlin enforces the exact shape, so a stray name can never reach the
-  // default profile.
+  // default profile. The rule is defined ONCE — in SiteProfileOps.kt — and
+  // shared by the controller's validation and the retirement decision.
+  assert.match(
+    read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt"),
+    /val SITE_PROFILE_NAME: Regex = Regex\("""site-\[0-9a-f\]\{32\}-g\\d\{1,10\}"""\)/,
+    "Kotlin must validate profile names against the Rust derivation",
+  );
+  // The rule is defined ONCE (SiteProfileOps.kt) and shared by the controller's
+  // validation and the retirement decision, so the two cannot drift.
   assert.match(
     controllerKt,
-    /Regex\("""site-\[0-9a-f\]\{32\}-g\\d\{1,10\}"""\)/,
-    "controller must validate profile names against the Rust derivation",
+    /fun profileNameIsValid\(name: String\): Boolean = SITE_PROFILE_NAME\.matches\(name\)/,
   );
-  assert.match(controllerKt, /fun profileNameIsValid\(name: String\): Boolean = PROFILE_NAME\.matches\(name\)/);
+  assert.match(
+    read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt"),
+    /val SITE_PROFILE_NAME: Regex = Regex\("""site-\[0-9a-f\]\{32\}-g\\d\{1,10\}"""\)/,
+  );
+  assert.doesNotMatch(
+    code(controllerKt),
+    /Regex\("""site-/,
+    "the controller must not keep a second copy of the name rule",
+  );
 });
 
 test("delete and clear refuse names outside the derivation", () => {
@@ -315,7 +330,7 @@ test("remove_site deletes the profile, queues refusals, bumps the generation", (
   const body = commandsRs.slice(nonDesktop, commandsRs.indexOf("pub fn set_site_hidden", nonDesktop));
   // Builtin → hide and return BEFORE any profile deletion.
   const builtinAt = body.indexOf("if was_builtin");
-  const deleteAt = body.indexOf("site_profile_delete");
+  const deleteAt = body.indexOf("run_mobile_delete_protocol");
   assert.ok(builtinAt > 0 && deleteAt > builtinAt, "profile delete must come after the builtin check");
   // The builtin early-return happens before the delete call (and reports
   // the explicit `hidden` outcome, never a bare success).
@@ -333,20 +348,92 @@ test("remove_site deletes the profile, queues refusals, bumps the generation", (
     /SiteProfileAction::Pending => ProfileRemoval::Deferred/,
     "Pending must map to deferred, never to deleted",
   );
-  // Pending → queued (never silently dropped), hard errors → propagate.
-  assert.match(body, /SiteProfileAction::Pending => \{\s*w::queue_pending_profile_delete\(&state, &profile\)\?;/);
-  // Generation bumps only after a successful/queued delete.
-  assert.ok(
-    body.indexOf("site_profile_delete(&profile)?") < body.indexOf("bump_profile_generation(&state, &id)?"),
-    "bump must follow the delete",
+  // The delete → queue → bump → retire order lives in ONE host-tested function
+  // (windows.rs), with the platform calls injected — so `cargo test` proves it
+  // on every OS instead of leaving it to the aarch64 compile.
+  assert.match(body, /windows::run_mobile_delete_protocol\(/);
+  assert.match(body, /crate::android_bridge::site_profile_delete\(profile\)/);
+  assert.match(body, /crate::android_bridge::site_profile_retire\(profile\)/);
+  assert.doesNotMatch(
+    body,
+    /w::bump_profile_generation/,
+    "the command must not re-implement the protocol inline",
   );
   // Active site is closed (destroyed) before the delete.
-  assert.ok(body.indexOf("close_site_window_for_clear_locked") < body.indexOf("site_profile_delete"));
+  assert.ok(body.indexOf("close_site_window_for_clear_locked") < deleteAt);
   // Registry mutation follows the delete (the first persist in the block is
   // the builtin early-return, which must stay before it): a failed delete
   // keeps the tile.
   const persistAfterDelete = body.indexOf("persist_registry(&state)?;", deleteAt);
   assert.ok(persistAfterDelete > deleteAt, "the user-site registry write must follow the delete");
+});
+
+test("the quarantine ledger is retired only AFTER the generation is durable", () => {
+  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  // windows.rs: delete → (queue) → bump → retire, all on the derived name.
+  const at = windowsRs.indexOf("pub fn run_mobile_delete_protocol");
+  assert.ok(at > 0, "the delete protocol is missing");
+  const body = windowsRs.slice(at, windowsRs.indexOf("\n}\n", at));
+  const del = body.indexOf("delete_profile(&profile)?");
+  const queue = body.indexOf("queue_pending_profile_delete(state, &profile)?");
+  const bump = body.indexOf("bump_profile_generation(state, site_id)?");
+  const retire = body.indexOf("retire_profile(&profile)?");
+  assert.ok(del > 0, "the deletion runs first");
+  assert.ok(queue > del, "a deferred deletion is queued before the bump");
+  assert.ok(bump > queue, "the durable bump follows the queue write");
+  assert.ok(retire > bump, "THE ORDER: retirement only after the bump is durable");
+  // A Pending profile still exists on disk → its ledger survives until the
+  // startup drain lands the deletion.
+  assert.match(body, /if !matches!\(action, SiteProfileAction::Pending\) \{[\s\S]*retire_profile/);
+  // Host tests that execute the order itself.
+  for (const name of [
+    "mobile_delete_protocol_retires_only_after_the_generation_is_durable",
+    "mobile_delete_protocol_keeps_the_ledger_when_the_generation_write_fails",
+    "mobile_delete_protocol_queues_a_deferred_deletion_and_keeps_its_ledger",
+    "mobile_delete_protocol_is_safe_to_retry_after_a_failed_bump",
+    "mobile_delete_protocol_retires_each_generation_exactly_once_on_repeat",
+  ]) {
+    assert.match(windowsRs, new RegExp(`fn ${name}\\(\\)`), `missing host test ${name}`);
+  }
+  // Kotlin: acceptance by the provider no longer retires anything.
+  const deleteFn = code(
+    controllerKt.slice(
+      controllerKt.indexOf("fun deleteProfileData("),
+      controllerKt.indexOf("fun retireProfileQuarantine("),
+    ),
+  );
+  assert.doesNotMatch(
+    deleteFn,
+    /ProfileQuarantine\.retire\(/,
+    "deleteProfileData must not retire on mere acceptance",
+  );
+  assert.match(
+    controllerKt,
+    /fun retireProfileQuarantine\(profileName: String, onResult: \(dropped: Int, error: String\?\) -> Unit\)/,
+  );
+  assert.match(controllerKt, /ProfileRetirement\.refusal\(profileName, active\.activeProfile\)/);
+  assert.match(ops, /object ProfileRetirement/);
+  assert.match(ops, /fun refusal\(profileName: String, activeProfile: String\?\): String\?/);
+  assert.match(ops, /!SITE_PROFILE_NAME\.matches\(profileName\) -> INVALID_NAME/);
+  assert.match(ops, /activeProfile == profileName -> ACTIVE_PROFILE/);
+  // Bridge + plugin surface for the new, separately-sequenced operation.
+  assert.match(bridgeRs, /pub fn site_profile_retire\(profile: &str\) -> AppResult<u32>/);
+  assert.match(
+    pluginLibRs,
+    /pub const CMD_SITE_PROFILE_RETIRE: &str = "site_profile_retire"/,
+  );
+  assert.match(pluginLibRs, /pub struct SiteProfileRetireResult/);
+  assert.match(pluginKt, /fun site_profile_retire\(invoke: Invoke\)/);
+  assert.match(pluginKt, /AnimeHubSiteController\.retireProfileQuarantine\(profileName\)/);
+  // The other two deletion paths keep the same rule: durable step first.
+  const sweep = commandsRs.slice(commandsRs.indexOf('orphan sweep for "clear all"'));
+  assert.match(sweep, /site_profile_retire\(&name\)/, "the orphan sweep retires what it deleted");
+  const libRs = read("src-tauri/src/lib.rs");
+  const drain = libRs.slice(libRs.indexOf("fn drain_pending_profile_deletes"));
+  assert.ok(
+    drain.indexOf("forget_pending_profile_delete") < drain.indexOf("site_profile_retire"),
+    "the startup drain forgets the queued name durably before retiring it",
+  );
 });
 
 test("clear_site_data clears profiles in place and sweeps orphans, never the launcher", () => {
@@ -582,11 +669,18 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
       `${entry} must consult the same gate`,
     );
   }
-  // A deletion the provider accepted retires the name for good (generation
-  // bumped), which is the ONLY path that may drop outstanding records.
+  // Retirement is the ONLY path that may drop outstanding records, and it is a
+  // separate entry point that Rust sequences AFTER the durable generation bump
+  // (see the delete-protocol test above): a provider merely *accepting* the
+  // deletion is not proof the name is unreachable, so `deleteProfileData` must
+  // not retire anything itself.
   const deleteAt = controllerKt.indexOf("fun deleteProfileData");
-  const deleteBody = controllerKt.slice(deleteAt, controllerKt.indexOf("\n  }\n", deleteAt));
-  assert.match(deleteBody, /ProfileQuarantine\.retire\(profileName\)/);
+  const deleteBody = code(controllerKt.slice(deleteAt, controllerKt.indexOf("\n  }\n", deleteAt)));
+  assert.doesNotMatch(deleteBody, /ProfileQuarantine\.retire\(/);
+  const retireAt = controllerKt.indexOf("fun retireProfileQuarantine");
+  assert.ok(retireAt > deleteAt, "retirement is its own entry point");
+  const retireBody = controllerKt.slice(retireAt, controllerKt.indexOf("\n  }\n", retireAt));
+  assert.match(retireBody, /ProfileQuarantine\.retire\(profileName\)/);
   assert.match(controllerKt, /ProfileQuarantine\.isBlocked\(profileName\)/);
   const gateAt = ops.indexOf("object SiteOpenGate");
   const gate = ops.slice(gateAt, ops.indexOf("\n}\n", gateAt));

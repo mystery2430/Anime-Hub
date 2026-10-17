@@ -115,7 +115,8 @@ object AnimeHubSiteController {
    * Validating here means a hostile/buggy caller can never steer a delete or
    * clear at the `Default` profile or at arbitrary provider data.
    */
-  private val PROFILE_NAME = Regex("""site-[0-9a-f]{32}-g\d{1,10}""")
+  // The profile-name rule lives ONCE, in SiteProfileOps.kt (`SITE_PROFILE_NAME`),
+  // and is shared with [ProfileRetirement.refusal] so the two cannot drift.
 
   private val FLUSH_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "AnimeHubSiteFlush").apply { isDaemon = true }
@@ -217,7 +218,7 @@ object AnimeHubSiteController {
 
   fun isSupported(): Boolean = WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
 
-  private fun profileNameIsValid(name: String): Boolean = PROFILE_NAME.matches(name)
+  private fun profileNameIsValid(name: String): Boolean = SITE_PROFILE_NAME.matches(name)
 
   /**
    * Quarantine gate shared by BOTH phases of the two-phase open. Returns the
@@ -1015,10 +1016,11 @@ object AnimeHubSiteController {
    * Rejects (hard failure — the caller must NOT drop its record) for invalid
    * names, an active WebView on that profile, or unexpected exceptions.
    *
-   * A deletion the provider accepted (or an absent profile) RETIRES the name
-   * in [ProfileQuarantine] — dropping its outstanding-operation ledger too,
-   * since Rust bumps the generation and the name is never handed out again —
-   * while a *deferred* deletion keeps every record.
+   * This call NEVER retires the name in [ProfileQuarantine]: retirement is a
+   * separate, Rust-sequenced step ([retireProfileQuarantine]) that runs only
+   * once the generation bump is durably stored, because only then is the name
+   * underivable. A *deferred* deletion keeps every record too — the profile
+   * still exists on disk.
    */
   fun deleteProfileData(profileName: String, onResult: (deleted: Boolean, pending: Boolean, error: String?) -> Unit) {
     if (!profileNameIsValid(profileName)) {
@@ -1040,18 +1042,15 @@ object AnimeHubSiteController {
     // process (AwBrowserContextStore::Delete returns in-use).
     try {
       val deleted = ProfileStore.getInstance().deleteProfile(profileName)
-      // A deletion the provider did NOT refuse retires this name for good:
-      // Rust bumps the site's generation and never hands the name out again,
-      // so no new session can ever sit on it — which is the whole reason a
-      // quarantine block exists. Drop the name's ledger here, including any
-      // operation still outstanding: those callbacks can only land on a
-      // profile no session will ever use, and the NEW generation starts
-      // unblocked. The deferred branch below keeps every record, because the
-      // profile still exists and could be reopened under the same name.
-      val dropped = ProfileQuarantine.retire(profileName)
-      if (dropped > 0) {
-        AnimeHubDebugLog.add("site", "profile retired ($dropped pending wipe op(s) dropped)")
-      }
+      // NO retirement here. Acceptance by the provider is not proof that the
+      // name is unreachable: Rust still has to bump and *durably store* the
+      // generation, and that write can fail — in which case `remove_site`
+      // aborts with the registry intact and the next open derives this very
+      // name again. Dropping the ledger here would leave that name both
+      // reachable and unblocked, with a `removeAllCookies` deletion possibly
+      // still in flight on it. Rust calls [retireProfileQuarantine] once the
+      // bump succeeded; the deferred branch below keeps every record as well,
+      // because a pending profile still exists on disk.
       AnimeHubDebugLog.add("site", if (deleted) "profile deleted" else "profile absent")
       onResult(deleted, false, null)
     } catch (_: IllegalStateException) {
@@ -1062,6 +1061,34 @@ object AnimeHubSiteController {
       Log.e(LOG_TAG, "profile delete failed (${e.javaClass.simpleName})")
       onResult(false, false, "profil verisi silinemedi: ${e.message}")
     }
+  }
+
+  /**
+   * Retire one profile name's quarantine ledger — dropping every outstanding
+   * operation record with it — and report how many were dropped.
+   *
+   * THE CALL ORDER IS THE SAFETY PROPERTY: Rust invokes the matching
+   * `site_profile_retire` bridge command ONLY after `bump_profile_generation`
+   * has stored the new generation (`run_mobile_delete_protocol`), i.e. once no
+   * future open can derive this name again. Called earlier — as this controller
+   * used to, straight after the provider accepted a deletion — a failed bump or
+   * a failed storage write left the name reachable AND unblocked, so a session
+   * could reopen a profile whose `removeAllCookies` deletion was still in
+   * flight. The refusal cases are decided by the pure [ProfileRetirement]
+   * (an invalid name, or a profile a live session is using), never here.
+   */
+  fun retireProfileQuarantine(profileName: String, onResult: (dropped: Int, error: String?) -> Unit) {
+    val refusal = ProfileRetirement.refusal(profileName, active.activeProfile)
+    if (refusal != null) {
+      AnimeHubDebugLog.add("site", "profile retirement refused ($refusal)")
+      onResult(0, refusal)
+      return
+    }
+    val dropped = ProfileQuarantine.retire(profileName)
+    if (dropped > 0) {
+      AnimeHubDebugLog.add("site", "profile retired ($dropped pending wipe op(s) dropped)")
+    }
+    onResult(dropped, null)
   }
 
   /**

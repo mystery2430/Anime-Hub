@@ -1136,6 +1136,70 @@ where
     Ok(())
 }
 
+/// Android: delete one site's profile, then retire its quarantine ledger —
+/// in the ONLY order that keeps a failed cleanup from re-opening an unsafe name.
+///
+/// THE BUG THIS ORDERING FIXES: Kotlin used to retire the name's
+/// [`ProfileQuarantine`] ledger the moment the provider *accepted* the
+/// deletion, while the generation bump that makes the name underivable happened
+/// afterwards, here. If the bump or its storage write failed, `remove_site`
+/// aborted with the registry intact, the next open derived the SAME name, and
+/// the gate no longer knew about the `removeAllCookies` deletion that could
+/// still be in flight on it — the exact race the per-operation ledger exists to
+/// prevent, re-opened by the cleanup path.
+///
+/// So the sequence is: derive the name from the CURRENT generation → delete →
+/// durably queue a deferred deletion → durably bump the generation → and only
+/// then retire. Every earlier failure propagates and leaves the ledger in
+/// place, i.e. the name stays blocked; a retry re-runs the whole protocol and
+/// is idempotent (the same name is derived again while the bump never landed).
+///
+/// A `Pending` (deferred) deletion is deliberately NOT retired: the profile
+/// still exists on disk and is still loaded in this process, so its ledger
+/// stays until the deferred deletion actually lands — the startup drain
+/// retires it after durably forgetting the queued name. The bump still happens,
+/// so the next open of this site derives a DIFFERENT name and can never collide
+/// with a deletion that is still finishing.
+///
+/// Host-testable on purpose: the platform calls are injected, so `cargo test`
+/// proves the order (and the failed-write cases) on every OS instead of leaving
+/// it to the aarch64 compile.
+pub fn run_mobile_delete_protocol<D, R>(
+    state: &AppState,
+    site_id: &str,
+    delete_profile: D,
+    retire_profile: R,
+) -> AppResult<crate::android_bridge::SiteProfileAction>
+where
+    D: FnOnce(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
+    R: FnOnce(&str) -> AppResult<u32>,
+{
+    use crate::android_bridge::SiteProfileAction;
+
+    let generation = profile_generation(state, site_id)?;
+    let profile = android_profile_name(site_id, generation);
+    let action = delete_profile(&profile)?;
+    if matches!(action, SiteProfileAction::Pending) {
+        // Durable BEFORE the bump: a crash between the two must not lose the
+        // deferred deletion, or the name would survive on disk unqueued.
+        queue_pending_profile_delete(state, &profile)?;
+    }
+    // Durable: after this write no future open can derive `profile` again.
+    bump_profile_generation(state, site_id)?;
+    if !matches!(action, SiteProfileAction::Pending) {
+        // Only now is dropping the ledger safe. A failure here is reported, not
+        // swallowed: keeping the ledger is the conservative direction (the name
+        // is already unreachable), and the retry re-runs the protocol cleanly.
+        let dropped = retire_profile(&profile)?;
+        if dropped > 0 {
+            log::info!(
+                "profil karantinası emekliye ayrıldı ({dropped} bekleyen işlem düştü): {profile}"
+            );
+        }
+    }
+    Ok(action)
+}
+
 /// Android: open the site in a fresh native WebView bound to its own profile.
 ///
 /// Runs entirely under `ANDROID_SESSION_LOCK`: the outgoing site WebView is
@@ -3035,6 +3099,321 @@ mod tests {
         assert_eq!(name, &android_profile_name(id, 1));
         assert_ne!(name, &android_profile_name("another-site", 1));
         assert_ne!(name, "Default");
+    }
+
+    /// The real [`SecureStore`] with (a) a log of every durable write — shared
+    /// with the injected platform closures, so a test can assert the ORDER of
+    /// the delete protocol and not only its outcome — and (b) an injectable
+    /// failure count for `profilegen-*` writes, which is the exact fault that
+    /// must keep a profile name's quarantine ledger alive.
+    struct OrderingStore {
+        inner: SecureStore,
+        fail_generation_writes: Arc<std::sync::atomic::AtomicUsize>,
+        writes: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SecretProvider for OrderingStore {
+        fn backend(&self) -> crate::secure::master_key::Backend {
+            self.inner.backend()
+        }
+
+        fn load_doc_bytes(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.load_doc_bytes(name)
+        }
+
+        fn save_doc_bytes(&self, name: &str, bytes: &[u8]) -> AppResult<()> {
+            self.inner.save_doc_bytes(name, bytes)
+        }
+
+        fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+            self.writes.lock().unwrap().push(format!("put:{name}"));
+            if name.starts_with(PROFILE_GENERATION_PREFIX)
+                && self
+                    .fail_generation_writes
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+            {
+                self.fail_generation_writes
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(AppError::Storage("keystore yazılamadı (test)".into()));
+            }
+            self.inner.put_secret(name, plaintext)
+        }
+
+        fn get_secret(&self, name: &str) -> AppResult<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.inner.get_secret(name)
+        }
+
+        fn delete_secret(&self, name: &str) -> AppResult<()> {
+            self.inner.delete_secret(name)
+        }
+
+        fn wipe_secrets(&self) -> AppResult<usize> {
+            self.inner.wipe_secrets()
+        }
+
+        fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push(format!("session:{site_id}"));
+            self.inner.delete_site_session(site_id)
+        }
+    }
+
+    /// `(state, ordered write/call log, remaining generation-write failures)`
+    fn ordering_state() -> (
+        AppState,
+        Arc<Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let inner = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = inner.load_registry();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let fail_generation_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = OrderingStore {
+            inner,
+            fail_generation_writes: fail_generation_writes.clone(),
+            writes: writes.clone(),
+        };
+        let state = AppState {
+            provider: Box::new(provider),
+            registry: Mutex::new(registry),
+            settings: Mutex::new(Settings::default()),
+            blocklist: Mutex::new(Blocklist::default()),
+            oauth_state: Mutex::new(None),
+            startup_warning: Mutex::new(warning),
+            launcher_url: Mutex::new(None),
+            current_site: Mutex::new(None),
+            pip_lock: Mutex::new(()),
+            pip_generation: std::sync::atomic::AtomicU64::new(0),
+        };
+        (state, writes, fail_generation_writes)
+    }
+
+    #[test]
+    fn mobile_delete_protocol_retires_only_after_the_generation_is_durable() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-order";
+        let name = android_profile_name(id, 0);
+
+        let action = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(2)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(action, SiteProfileAction::Deleted);
+        // THE ORDER IS THE SAFETY PROPERTY: the generation write lands between
+        // the deletion and the retirement, all on the same name.
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("delete:{name}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("retire:{name}"),
+            ]
+        );
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+    }
+
+    #[test]
+    fn mobile_delete_protocol_keeps_the_ledger_when_the_generation_write_fails() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, fail) = ordering_state();
+        fail.store(1, std::sync::atomic::Ordering::SeqCst);
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-failed-bump";
+        let name = android_profile_name(id, 0);
+
+        let err = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        // The provider accepted the deletion, but the bump never became durable:
+        // the command fails, the ledger is NOT dropped, and the name a retry (or
+        // a reopen) derives is still the same one — so it must still be blocked.
+        assert!(matches!(err, AppError::Storage(_)), "{err}");
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(*writes.lock().unwrap(), vec![format!("delete:{name}")]);
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        assert_eq!(android_profile_name(id, 0), name);
+    }
+
+    #[test]
+    fn mobile_delete_protocol_queues_a_deferred_deletion_and_keeps_its_ledger() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-pending";
+        let name = android_profile_name(id, 0);
+
+        let action = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Pending)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(action, SiteProfileAction::Pending);
+        // The queue write is durable BEFORE the bump, and the ledger survives:
+        // a pending profile still exists on disk, so only the startup drain may
+        // retire it (after it durably forgets the queued name).
+        assert_eq!(read_pending_profile_deletes(&state).unwrap(), vec![name]);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("delete:{name}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+            ]
+        );
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The new generation is a DIFFERENT name, so the next open can never
+        // collide with the deletion still finishing on disk.
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+        assert_ne!(android_profile_name(id, 1), name);
+    }
+
+    #[test]
+    fn mobile_delete_protocol_is_safe_to_retry_after_a_failed_bump() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, fail) = ordering_state();
+        fail.store(1, std::sync::atomic::Ordering::SeqCst);
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-retry";
+        let name = android_profile_name(id, 0);
+
+        let delete = |profile: &str| {
+            writes.lock().unwrap().push(format!("delete:{profile}"));
+            // Second attempt: the profile is already gone from the first one.
+            let action = if profile_generation(&state, id).unwrap() == 0 {
+                SiteProfileAction::Deleted
+            } else {
+                SiteProfileAction::Absent
+            };
+            Ok(action)
+        };
+        assert!(run_mobile_delete_protocol(
+            &state,
+            id,
+            |p| delete(p),
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            }
+        )
+        .is_err());
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Retry with the storage fault healed: the SAME name is derived again
+        // (the bump never landed), the protocol completes, and the ledger is
+        // dropped exactly once — for that name.
+        let action = run_mobile_delete_protocol(
+            &state,
+            id,
+            |p| delete(p),
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert_eq!(action, SiteProfileAction::Absent);
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("delete:{name}"),
+                format!("delete:{name}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("retire:{name}"),
+            ]
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+    }
+
+    #[test]
+    fn mobile_delete_protocol_retires_each_generation_exactly_once_on_repeat() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-repeat";
+        let first = android_profile_name(id, 0);
+        let second = android_profile_name(id, 1);
+
+        for action in [SiteProfileAction::Deleted, SiteProfileAction::Absent] {
+            let outcome = run_mobile_delete_protocol(
+                &state,
+                id,
+                |profile| {
+                    writes.lock().unwrap().push(format!("delete:{profile}"));
+                    Ok(action)
+                },
+                |profile| {
+                    writes.lock().unwrap().push(format!("retire:{profile}"));
+                    retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(0)
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, action);
+        }
+
+        assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("delete:{first}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("retire:{first}"),
+                format!("delete:{second}"),
+                format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("retire:{second}"),
+            ]
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 2);
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
     }
 
     #[test]

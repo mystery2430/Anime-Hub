@@ -502,11 +502,16 @@ object ProfileQuarantine {
   }
 
   /**
-   * Drop every record for a name that is retired for good (a deletion the
-   * provider accepted, or an absent profile): Rust bumps the generation, so
-   * the name is never handed out again and its outstanding operations cannot
-   * reach a new session. Returns how many were dropped. A *deferred* deletion
-   * must not call this.
+   * Drop every record for a name that is retired for good. Returns how many
+   * outstanding operations were dropped with it.
+   *
+   * CALL ONLY AFTER THE NAME IS PROVABLY UNREACHABLE — i.e. after Rust has
+   * durably bumped and stored the site's generation (`bump_profile_generation`
+   * inside `run_mobile_delete_protocol`), or after a queued/orphan deletion was
+   * durably recorded. Acceptance by the provider is NOT that moment: the bump
+   * can still fail, and then the same name is derived again by the next open.
+   * See [ProfileRetirement] for the full ordering argument. A *deferred*
+   * (`Pending`) deletion must not call this either — the profile still exists.
    */
   @Synchronized
   fun retire(profileName: String): Int {
@@ -568,6 +573,48 @@ object SiteOpenGate {
   fun check(profileName: String): String? =
     ProfileQuarantine.reasonFor(profileName)?.let { reason ->
       "${SiteProfileErrors.QUARANTINED}: $reason"
+    }
+}
+
+/**
+ * The exact shape Rust's `android_profile_name` produces: `site-<32 hex>-g<N>`.
+ * ONE definition, shared by the controller's validation and
+ * [ProfileRetirement.refusal]. Two copies of this rule could drift, and a
+ * drifted copy is how an unvalidated name reaches a destructive provider call.
+ */
+val SITE_PROFILE_NAME: Regex = Regex("""site-[0-9a-f]{32}-g\d{1,10}""")
+
+/**
+ * Whether a profile name's quarantine ledger may be retired right now.
+ *
+ * ORDER IS THE SAFETY PROPERTY, and it is Rust's to keep: the ledger may be
+ * dropped ONLY once the site's generation bump is durably stored, because that
+ * is what makes the name underivable forever. This controller used to retire
+ * inside `deleteProfileData` — the moment the provider merely *accepted* the
+ * deletion, before Rust had written anything. If the bump or its storage write
+ * then failed, `remove_site` aborted with the registry intact, the next open
+ * derived the SAME name, and the gate no longer knew about the
+ * `removeAllCookies` deletion that could still be in flight on it: the exact
+ * race [ProfileQuarantine] exists to prevent, re-opened by the cleanup path.
+ * Rust now calls the separate `site_profile_retire` bridge operation after
+ * `bump_profile_generation` succeeded (`run_mobile_delete_protocol`), so any
+ * failure before that point leaves the name blocked and a retry safe.
+ *
+ * Pure, so CI executes the rule instead of trusting somebody's reading of it.
+ */
+object ProfileRetirement {
+  /** Not a name this app could have derived: never addressed destructively. */
+  const val INVALID_NAME: String = "geçersiz profil adı"
+
+  /** A profile a live session is using keeps its ledger until it is closed. */
+  const val ACTIVE_PROFILE: String = "aktif site profilinin karantinası emekliye ayrılamaz"
+
+  /** `null` when the ledger may be retired, otherwise the refusal to report. */
+  fun refusal(profileName: String, activeProfile: String?): String? =
+    when {
+      !SITE_PROFILE_NAME.matches(profileName) -> INVALID_NAME
+      activeProfile == profileName -> ACTIVE_PROFILE
+      else -> null
     }
 }
 

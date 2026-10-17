@@ -63,6 +63,9 @@ pub const CMD_SITE_MIGRATE: &str = "site_migrate";
 pub const CMD_SITE_OPEN: &str = "site_open";
 pub const CMD_SITE_CLOSE: &str = "site_close";
 pub const CMD_SITE_PROFILE_DELETE: &str = "site_profile_delete";
+
+/// Retire a profile name's quarantine ledger — see [`site_profile_retire`].
+pub const CMD_SITE_PROFILE_RETIRE: &str = "site_profile_retire";
 pub const CMD_SITE_CLEAR_DATA: &str = "site_clear_data";
 pub const CMD_SITE_FLUSH: &str = "site_flush";
 pub const CMD_SITE_PROFILE_NAMES: &str = "site_profile_names";
@@ -196,6 +199,14 @@ pub struct SiteProfileDeleteResult {
     pub pending: bool,
 }
 
+/// Kotlin's `{dropped}` reply from `site_profile_retire`: how many outstanding
+/// destructive-operation records went with the retired name (0 = the ledger was
+/// already empty, which is normal — most deletions never timed out).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteProfileRetireResult {
+    pub dropped: u32,
+}
+
 /// Kotlin's `{names, unsupported}` reply from `site_profile_names`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteProfileNamesResult {
@@ -314,6 +325,29 @@ pub fn site_profile_delete(profile: String) -> Result<SiteProfileDeleteResult> {
     #[cfg(target_os = "android")]
     {
         call_plugin(CMD_SITE_PROFILE_DELETE, SiteProfilePayload { profile })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = profile;
+        Err(Error::Unsupported)
+    }
+}
+
+/// Retire one profile name's quarantine ledger, dropping every outstanding
+/// destructive-operation record for it.
+///
+/// CALL ORDER IS THE SAFETY PROPERTY, and it belongs to the caller: this must
+/// run only AFTER the site's generation bump is durably stored
+/// (`run_mobile_delete_protocol`), because that bump is what makes the name
+/// underivable forever. Retiring on deletion *acceptance* — as Kotlin used to do
+/// inside `site_profile_delete` — left a window where a failed bump or a failed
+/// storage write aborted `remove_site` with the registry intact, the next open
+/// derived the SAME name, and the gate no longer knew about a
+/// `removeAllCookies` deletion that could still be in flight on it.
+pub fn site_profile_retire(profile: String) -> Result<SiteProfileRetireResult> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin(CMD_SITE_PROFILE_RETIRE, SiteProfilePayload { profile })
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -706,9 +740,47 @@ mod tests {
                 && !controller.contains("ProfileQuarantine.reset()"),
             "production Kotlin must never reset the ledger"
         );
+        // Retirement is a SEPARATE, Rust-sequenced step: the ledger may only be
+        // dropped once the generation bump is durable, so an accepted deletion
+        // must NOT retire the name by itself.
         assert!(
-            controller.contains("ProfileQuarantine.retire(profileName)"),
-            "an accepted deletion (or absent profile) retires the name for good"
+            controller.contains("fun retireProfileQuarantine(profileName: String"),
+            "the controller must expose retirement as its own entry point"
+        );
+        assert_eq!(
+            controller
+                .matches("ProfileQuarantine.retire(profileName)")
+                .count(),
+            1,
+            "exactly one retirement call site: inside retireProfileQuarantine"
+        );
+        {
+            let delete_fn = &controller[controller
+                .find("fun deleteProfileData(")
+                .expect("deleteProfileData must exist")
+                ..controller
+                    .find("fun retireProfileQuarantine(")
+                    .expect("retireProfileQuarantine must exist")];
+            assert!(
+                !delete_fn.contains("ProfileQuarantine.retire("),
+                "deleteProfileData must not retire on mere acceptance by the provider"
+            );
+        }
+        for marker in [
+            "object ProfileRetirement",
+            "fun refusal(profileName: String, activeProfile: String?): String?",
+            "!SITE_PROFILE_NAME.matches(profileName) -> INVALID_NAME",
+            "activeProfile == profileName -> ACTIVE_PROFILE",
+            "val SITE_PROFILE_NAME: Regex",
+        ] {
+            assert!(
+                ops.contains(marker),
+                "the retirement decision must stay pure and keep: {marker}"
+            );
+        }
+        assert!(
+            !controller.contains("Regex(\"\"\"site-"),
+            "the profile-name rule must not be duplicated in the controller"
         );
         assert!(
             controller.contains("ProfileQuarantine.isBlocked(profileName)"),
@@ -921,6 +993,7 @@ mod tests {
             CMD_SITE_OPEN,
             CMD_SITE_CLOSE,
             CMD_SITE_PROFILE_DELETE,
+            CMD_SITE_PROFILE_RETIRE,
             CMD_SITE_CLEAR_DATA,
             CMD_SITE_FLUSH,
             CMD_SITE_PROFILE_NAMES,

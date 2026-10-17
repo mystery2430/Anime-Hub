@@ -178,6 +178,23 @@ pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
     }
 }
 
+/// Retire one profile name's quarantine ledger; returns how many outstanding
+/// destructive-operation records were dropped with it.
+///
+/// ORDER IS THE CALLER'S SAFETY PROPERTY: invoke this only after the site's
+/// generation bump is durably stored — [`crate::web::windows::run_mobile_delete_protocol`]
+/// does exactly that. Kotlin no longer retires when the provider merely
+/// *accepts* a deletion, because the bump (or its storage write) can still fail;
+/// retiring first would leave the same name both derivable again and unblocked,
+/// with a `removeAllCookies` deletion possibly still in flight on it.
+#[cfg(target_os = "android")]
+pub fn site_profile_retire(profile: &str) -> AppResult<u32> {
+    match animehub_android::site_profile_retire(profile.to_string()) {
+        Ok(r) => Ok(r.dropped),
+        Err(e) => Err(AppError::Other(e.to_string())),
+    }
+}
+
 /// Clear one site profile in place (cookies, web storage, geolocation
 /// permissions, storage, final flush).
 ///
@@ -263,6 +280,13 @@ pub fn site_close(_flush: bool) -> AppResult<()> {
 
 #[cfg(not(target_os = "android"))]
 pub fn site_profile_delete(_profile: &str) -> AppResult<SiteProfileAction> {
+    Err(AppError::Unsupported(
+        "Site profilleri yalnızca Android'de kullanılabilir".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn site_profile_retire(_profile: &str) -> AppResult<u32> {
     Err(AppError::Unsupported(
         "Site profilleri yalnızca Android'de kullanılabilir".into(),
     ))

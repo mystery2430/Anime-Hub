@@ -337,7 +337,21 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
     for name in &pending {
         match crate::android_bridge::site_profile_delete(name) {
             Ok(SiteProfileAction::Deleted) | Ok(SiteProfileAction::Absent) => {
+                // Durable queue removal FIRST, then the quarantine ledger — the
+                // same order `run_mobile_delete_protocol` keeps for the direct
+                // path. A retire failure must not undo the fact that the
+                // deletion landed, so it is logged: keeping the ledger only
+                // blocks a name nothing can derive any more.
                 w::forget_pending_profile_delete(state, name)?;
+                match crate::android_bridge::site_profile_retire(name) {
+                    Ok(dropped) if dropped > 0 => log::info!(
+                        "ertelenen profil karantinası emekliye ayrıldı ({dropped} bekleyen kayıt)"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("ertelenen profil karantinası emekliye ayrılamadı ({name}): {e}")
+                    }
+                }
                 log::info!("ertelenen profil verisi silindi");
             }
             Ok(SiteProfileAction::Pending) => {

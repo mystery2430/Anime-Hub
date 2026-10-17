@@ -436,26 +436,24 @@ pub fn remove_site(
         // never as deleted. An `unsupported-multi-profile` refusal (a
         // provider feature gap) propagates as an error so the record stays
         // and the UI shows the MULTI_PROFILE guidance; it must not be faked
-        // as deferred-forever success. The generation bumps only after the
-        // delete was accepted/queued, so a subsequent open of this id derives
-        // a fresh name and can never collide with a deletion still finishing
-        // on disk; if the bump itself fails we abort with the registry intact
-        // (a retry re-attempts the same name, which is idempotent).
+        // as deferred-forever success.
+        //
+        // The whole delete → queue → generation bump → quarantine retirement
+        // order lives in ONE host-tested function. Retirement LAST is the
+        // safety property: the ledger for this name may only be dropped once
+        // the bump is durably stored, because a failed bump/write aborts this
+        // command with the registry intact and the next open would derive the
+        // very same name — which must still be blocked while a
+        // `removeAllCookies` deletion may be in flight on it.
         #[cfg(target_os = "android")]
         {
-            use crate::web::windows as w;
-            let generation = w::profile_generation(&state, &id)?;
-            let profile = w::android_profile_name(&id, generation);
-            let action = crate::android_bridge::site_profile_delete(&profile)?;
+            let action = crate::web::windows::run_mobile_delete_protocol(
+                &state,
+                &id,
+                |profile| crate::android_bridge::site_profile_delete(profile),
+                |profile| crate::android_bridge::site_profile_retire(profile),
+            )?;
             profile_outcome = profile_removal_for(action);
-            match action {
-                crate::android_bridge::SiteProfileAction::Pending => {
-                    w::queue_pending_profile_delete(&state, &profile)?;
-                }
-                crate::android_bridge::SiteProfileAction::Deleted
-                | crate::android_bridge::SiteProfileAction::Absent => {}
-            }
-            w::bump_profile_generation(&state, &id)?;
         }
         state.provider.delete_site_session(&id)?;
         {
@@ -740,7 +738,22 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                     windows::queue_pending_profile_delete(&state, &name)?;
                 }
                 SiteProfileAction::Deleted | SiteProfileAction::Absent => {
-                    log::info!("yetim site profili temizlendi");
+                    // Same rule as `run_mobile_delete_protocol`: the ledger goes
+                    // only once the name cannot come back. An orphan has no
+                    // registered owner and no generation to bump — the deletion
+                    // itself is what makes it unreachable — while a deferred
+                    // deletion keeps its ledger until the startup drain lands it.
+                    // A retire failure is NOT a data-safety failure (keeping the
+                    // ledger is the conservative direction), so it is logged
+                    // instead of aborting the whole "clear all".
+                    match crate::android_bridge::site_profile_retire(&name) {
+                        Ok(dropped) => log::info!(
+                            "yetim site profili temizlendi (düşen karantina kaydı: {dropped})"
+                        ),
+                        Err(e) => {
+                            log::warn!("yetim profil karantinası emekliye ayrılamadı ({name}): {e}")
+                        }
+                    }
                 }
             }
         }

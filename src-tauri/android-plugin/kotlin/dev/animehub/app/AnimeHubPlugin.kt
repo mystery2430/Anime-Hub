@@ -388,6 +388,32 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  /**
+   * Retire one profile name's quarantine ledger.
+   *
+   * Rust calls this ONLY after the site's generation bump is durably stored
+   * (`run_mobile_delete_protocol`), which is what makes the name underivable
+   * forever; retiring earlier would leave a name both reachable and unblocked
+   * when the bump or its write fails. Replies `{dropped}` — how many
+   * outstanding operation records went with it — or rejects with the refusal
+   * decided by the pure `ProfileRetirement` rule.
+   */
+  @Command
+  fun site_profile_retire(invoke: Invoke) {
+    val profileName = invoke.getArgs().getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.retireProfileQuarantine(profileName) { dropped, error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("dropped", dropped))
+        }
+      }
+    }
+  }
+
   /** Clear one site profile in place (cookies, web storage, permissions). */
   @Command
   fun site_clear_data(invoke: Invoke) {

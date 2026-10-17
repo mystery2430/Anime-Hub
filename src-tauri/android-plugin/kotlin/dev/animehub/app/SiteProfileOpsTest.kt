@@ -929,6 +929,70 @@ class SiteProfileOpsTest {
     Assert.assertEquals(listOf(both[1]), ProfileQuarantine.pendingOperations(profile))
   }
 
+  // --------------------------------------- profile retirement (delete protocol)
+
+  @Test
+  fun `retirement is refused for an invalid name or a profile a session is using`() {
+    val name = "site-11111111111111111111111111111111-g3"
+    Assert.assertNull("a derivable, inactive name may be retired", ProfileRetirement.refusal(name, null))
+    Assert.assertNull(ProfileRetirement.refusal(name, "site-22222222222222222222222222222222-g3"))
+    // Never address a name this app could not have derived — `Default` is the
+    // launcher's own profile.
+    for (bad in listOf("Default", "", "site-1111111111111111111111111111111g3", "site-ZZZZ", name + "x")) {
+      Assert.assertEquals("refused: $bad", ProfileRetirement.INVALID_NAME, ProfileRetirement.refusal(bad, null))
+    }
+    // A profile a live session is using keeps its ledger until it is closed:
+    // retiring it would unblock the very name that session is sitting on.
+    Assert.assertEquals(ProfileRetirement.ACTIVE_PROFILE, ProfileRetirement.refusal(name, name))
+  }
+
+  @Test
+  fun `the profile-name rule is shared, so validation and retirement cannot drift`() {
+    Assert.assertTrue(SITE_PROFILE_NAME.matches("site-00000000000000000000000000000000-g0"))
+    Assert.assertTrue(
+      SITE_PROFILE_NAME.matches("site-abcdef0123456789abcdef0123456789-g4294967295")
+    )
+    for (bad in listOf(
+      "site-ABCDEF0123456789ABCDEF0123456789-g0",
+      "site-abcdef0123456789abcdef0123456789-g42949672951",
+      "site-abcdef0123456789abcdef012345678-g0",
+      "Default",
+      "site-abcdef0123456789abcdef0123456789-g0 ",
+    )) {
+      Assert.assertFalse("must not match: $bad", SITE_PROFILE_NAME.matches(bad))
+      Assert.assertEquals(ProfileRetirement.INVALID_NAME, ProfileRetirement.refusal(bad, null))
+    }
+  }
+
+  @Test
+  fun `a late callback on a retired name cannot touch the new generation`() {
+    val old = "site-33333333333333333333333333333333-g0"
+    val next = "site-33333333333333333333333333333333-g1"
+    val operationId = 424242L
+    // A `removeAllCookies` deletion on the OLD name whose watchdog fired: the
+    // operation is still in flight, so the name is blocked.
+    ProfileQuarantine.quarantine(old, operationId, SiteClearFlow.COOKIE_UNVERIFIED_REASON)
+    Assert.assertTrue(ProfileQuarantine.isBlocked(old))
+    Assert.assertEquals(listOf(operationId), ProfileQuarantine.pendingOperations(old))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(next))
+
+    // Rust retires only after the generation bump is durable (round 9 order).
+    Assert.assertEquals(1, ProfileQuarantine.retire(old))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(old))
+
+    // The old deletion's late callback now settles a record that no longer
+    // exists, and must neither create nor clear nor verify anything for the
+    // NEW name — the generation that a fresh session will actually use.
+    Assert.assertFalse("a retired operation is unknown", ProfileQuarantine.settle(old, operationId))
+    ProfileQuarantine.verified(old)
+    Assert.assertNull(ProfileRetirement.refusal(next, null))
+    Assert.assertFalse("the new generation starts unblocked", ProfileQuarantine.isBlocked(next))
+    Assert.assertEquals(emptyList<Long>(), ProfileQuarantine.pendingOperations(next))
+    Assert.assertNull(SiteOpenGate.check(next))
+    // Retirement is idempotent: a repeated bridge call drops nothing.
+    Assert.assertEquals(0, ProfileQuarantine.retire(old))
+  }
+
   // ------------------------------------------- adapter mapping (CookieWipes)
 
   @Test

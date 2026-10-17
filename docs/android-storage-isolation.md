@@ -325,15 +325,29 @@ remove, no legacy data remains (`delete_site_session` also drops the
         declare the reopen safe by itself — it leaves the outstanding set
         empty but keeps the "verification predates the last settle" refusal
         standing until one more verified wipe runs.
-  * *Verified deletion + generation bump.* When the provider **accepts** a
-    profile deletion (or reports the profile absent), Rust retires the name
-    and bumps the site's generation, so that exact profile name is never
-    handed out again: a deletion still outstanding for it can only land on a
-    profile no session will ever use. That is the single path allowed to drop
-    a name's whole ledger — `retire(name)`, called by the controller on the
-    accepted/absent branch only. A **deferred** deletion (profile in use)
-    keeps every record, because the same name can still be reopened. The new
-    generation is a different string and starts unblocked, so an old
+  * *Verified deletion + generation bump, and the order between them.* The
+    delete side is ONE host-tested protocol, `run_mobile_delete_protocol`
+    (`web/windows.rs`): derive the name from the **current** generation →
+    delete → durably queue a deferred deletion → **durably bump the
+    generation** → and only then retire the name's ledger via the separate
+    `site_profile_retire` bridge call. Retirement last is the safety property:
+    the bump is what makes the name underivable, so if it (or its storage
+    write) fails, the command aborts with the ledger **intact** — the name is
+    still reachable by a retry or a reopen, and it must therefore still be
+    blocked while a `removeAllCookies` deletion may be in flight on it.
+    Kotlin used to retire inside `deleteProfileData`, i.e. the moment the
+    provider merely *accepted* the deletion and before Rust had written
+    anything; a failed bump then left the same name both derivable again and
+    unblocked. `deleteProfileData` now retires nothing, `retireProfileQuarantine`
+    is the single retirement entry point (refusals decided by the pure
+    `ProfileRetirement` rule: an underivable name, or a profile a live session
+    is using), and `retire(name)` stays the only way a whole ledger is dropped.
+    A **deferred** (`Pending`) deletion keeps every record even after the bump,
+    because that profile still exists on disk: the startup drain retires it
+    only after it has durably forgotten the queued name. The orphan sweep
+    retires what it deleted, and logs (rather than aborting "clear all") if a
+    retirement call fails — keeping a ledger is the conservative direction.
+    The new generation is a different string and starts unblocked, so an old
     operation cannot mutate the new profile's data.
   * *What is deliberately NOT quarantined:* the geolocation step (gated, so a
     late callback provably changes nothing); `WebStorage.deleteAllData()`
@@ -346,7 +360,8 @@ remove, no legacy data remains (`delete_site_session` also drops the
     shrinks only when the provider answers *that* operation; the block lifts
     only once a wipe has also been verified after the last settle — a retry
     whose every step answers, an absent profile, or a deletion the provider
-    accepted (which retires the name and bumps its generation) — or on a
+    accepted (whose generation bump was stored durably, after which the name
+    is retired) — or on a
     process restart: the late callbacks this defends against belong to this
     process, so persisting the ledger would lock a site out across restarts
     for a hazard that no longer exists. A deferred (in-use) deletion keeps the
