@@ -647,3 +647,53 @@ test("Android-only settings are marked and hidden by platform in main.js", () =>
   assert.match(main, /node\.dataset\.platform === "android" && isAndroid/);
   assert.match(main, /await applyPlatformVisibility\(\);\n\s*const s = await call\("get_settings"\)/);
 });
+
+test("CI keeps no workflow-wide token, no PR-comment dump and no masked prep failure", () => {
+  const yml = read(join(ROOT, ".github/workflows/ci.yml"));
+  // Negative assertions run against the file with full-line comments stripped:
+  // this workflow explains (in comments) exactly what it no longer does, and a
+  // comment mentioning `pull-requests: write` must not satisfy the check.
+  const code = yml
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+
+  // AH-09 / AH-P6: a build-and-test workflow needs no write token. Exporting
+  // `github.token` to every step of every job meant a compromised build step on
+  // a fork PR held a token that could comment on (and with pull-requests:write,
+  // edit around) the pull request.
+  assert.equal(
+    /GH_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}/.test(code),
+    false,
+    "no workflow-level GH_TOKEN",
+  );
+  assert.equal(/pull-requests:\s*write/.test(code), false, "no pull-requests: write");
+  assert.match(yml, /permissions:\n  contents: read/, "least privilege stays explicit");
+  // The release workflows set their own step-scoped token; this one must not.
+  assert.equal(/\bgh pr comment\b/.test(code), false, "no PR-comment dump");
+  assert.equal(code.includes("DEBUG123"), false, "the debug dump marker is gone");
+  assert.match(code, /GITHUB_STEP_SUMMARY/, "diagnostics go to the step summary");
+
+  // A mandatory prep step must keep its own exit code: `| head ... || true`
+  // reported head's status, so a failed android_prepare.py looked green and the
+  // APK step built without the Tauri plugin sources.
+  assert.equal(
+    /python3 scripts\/android_prepare\.py[^\n]*\|\s*head[^\n]*\|\|\s*true/.test(code),
+    false,
+    "android_prepare.py must not be piped into a masked head",
+  );
+  assert.match(code, /prepare_status=\$\?/, "python's own status is captured");
+  assert.match(code, /exit "\$prepare_status"/, "and it fails the step");
+  // The Gradle verdict still wins when both fail: the test result is reported
+  // before the restore status is checked.
+  const testVerdict = code.indexOf("if [ $status -ne 0 ]; then");
+  const prepVerdict = code.indexOf('if [ "$prepare_status" -ne 0 ]; then');
+  assert.ok(testVerdict > 0, "the Gradle verdict is still checked");
+  assert.ok(prepVerdict > testVerdict, "test failure is reported first");
+
+  // No sandbox-only absolute path may survive into a runner script.
+  assert.equal(code.includes("/home/user/"), false, "runner scripts must use relative paths");
+
+  // ... and nothing is skipped to make the job green.
+  assert.equal(/continue-on-error:\s*true/.test(code), false, "no continue-on-error");
+});

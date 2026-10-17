@@ -11,12 +11,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  PR_NUMBER: ${{ github.event.pull_request.number }}
-  GH_TOKEN: ${{ github.token }}
 
+# AH-09 / AH-P6: this workflow builds and tests. It used to hand
+# `github.token` to EVERY step of EVERY job through the workflow-level env and
+# ask for `pull-requests: write`, all so one debug step could post a PR comment.
+# That comment is gone (the diagnostics go to the step summary and the log
+# artifacts instead), so the token is no longer exported at all: a compromised
+# build step on a fork PR now has nothing to write with. Jobs that genuinely
+# need a token (the release workflows) set it on their own step.
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   # ------------------------------------------------------------------ tests
@@ -247,8 +251,9 @@ jobs:
             echo "found AnimeHubPlugin.kt, moving..."
             rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt
             # also move to /tmp for restore
-            cp /home/user/Anime-Hub/src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak 2>&1 | head -n 20 || true
-            echo "rm AnimeHubPlugin.kt exit $?"
+            # Relative path: the absolute /home/user/... path this used to have
+            # does not exist on a runner, so the backup silently never happened.
+            cp src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak || echo "::warning::AnimeHubPlugin.kt backup failed (prepare.py restores it anyway)"
             # also ensure file is gone
             ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt 2>&1 | head -n 5 || echo "AnimeHubPlugin.kt gone after rm"
           else
@@ -361,8 +366,15 @@ jobs:
           ls -R app/build/test-results 2>&1 | head -n 100 || echo "no test-results"
           echo "=== restoring Tauri-dependent files for APK build ==="
           if [ -f /tmp/MainActivity.kt.bak ]; then mv /tmp/MainActivity.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt && echo "restored MainActivity.kt"; fi
-          # AnimeHubPlugin.kt is copied by android_prepare.py, so re-run it to restore
-          python3 scripts/android_prepare.py 2>&1 | head -n 20 || true
+          # AnimeHubPlugin.kt is copied by android_prepare.py, so re-run it to restore.
+          # `python3 ... | head || true` used to report the exit code of `head`,
+          # so a failed restore looked green and the APK step then built without
+          # the Tauri plugin sources. Capture Python's own status; the verdict of
+          # the Gradle test run still wins if BOTH failed (a test failure is the
+          # more important one and is reported above).
+          python3 scripts/android_prepare.py > /tmp/prepare-restore.log 2>&1
+          prepare_status=$?
+          head -n 20 /tmp/prepare-restore.log
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           if [ $status -ne 0 ]; then
@@ -378,11 +390,41 @@ jobs:
             cat /tmp/cargo-tauri.log | tail -n 100
             echo "=== gradle tasks grep UnitTest ==="
             cat /tmp/gradle-tasks.log | grep -i "UnitTest" | head -n 30
-            echo "=== PR comment ls logs ==="
+            echo "=== source-set listing logs ==="
             cat /tmp/ls-before.log 2>&1 | head -n 20
             cat /tmp/ls-after.log 2>&1 | head -n 20
-            gh pr comment ${{ github.event.pull_request.number }} --body "DEBUG123 Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 2000) Cargo: $(tail -n 20 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 800) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 500) lsBefore: $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 500) lsAfter: $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 500)" || true
+            # Diagnostics go to the STEP SUMMARY, not onto the pull request.
+            # The debug step this replaces posted build-log tails as a comment
+            # from a workflow that runs on fork PRs: publicly visible, spammy,
+            # one more reason to hand every step a write token, and it could
+            # carry whatever the build happened to log. The summary is
+            # repo-scoped, and the full logs are already uploaded as artifacts.
+            {
+              echo "### Kotlin/Gradle diagnostics"
+              echo '```'
+              tail -n 60 /tmp/kotlin-test.log 2>&1 | head -c 4000
+              echo '```'
+              echo "### cargo (tauri gradle generation)"
+              echo '```'
+              tail -n 20 /tmp/cargo-tauri.log 2>&1 | head -c 1500
+              echo '```'
+              echo "### Gradle UnitTest tasks"
+              echo '```'
+              grep -i UnitTest /tmp/gradle-tasks.log 2>&1 | head -c 800
+              echo '```'
+              echo "### test source set before/after isolation"
+              echo '```'
+              cat /tmp/ls-before.log 2>&1 | head -c 800
+              echo "---"
+              cat /tmp/ls-after.log 2>&1 | head -c 800
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit $status
+          fi
+          if [ "$prepare_status" -ne 0 ]; then
+            echo "::error::android_prepare.py (restore) failed with exit $prepare_status"
+            tail -n 40 /tmp/prepare-restore.log 2>&1 | head -n 40
+            exit "$prepare_status"
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
           if grep -q "FAILED" /tmp/kotlin-test.log; then
