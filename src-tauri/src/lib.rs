@@ -482,18 +482,35 @@ mod tests {
         let conf: serde_json::Value = serde_json::from_str(conf).expect("tauri.conf.json");
         let mobile = &conf["plugins"]["deep-link"]["mobile"];
         let entries = mobile.as_array().expect("mobile deep-link listesi");
+        // In tauri.conf.json both `scheme` and `pathPrefix` are LISTS
+        // (`"scheme": ["animehub"]`, `"pathPrefix": ["/callback"]`), which is
+        // what the generated Android intent filter is built from. Reading them
+        // as strings silently matched nothing.
         let entry = entries
             .iter()
-            .find(|e| e["scheme"] == OAUTH_SCHEME)
+            .find(|e| {
+                e["scheme"].as_array().is_some_and(|list| {
+                    list.iter()
+                        .any(|scheme| scheme.as_str() == Some(OAUTH_SCHEME))
+                })
+            })
             .expect("animehub şeması kayıtlı olmalı");
         let uri = mobile_redirect_uri();
         assert!(uri.starts_with(&format!("{OAUTH_SCHEME}://")), "{uri}");
-        let host = entry["host"].as_str().unwrap();
+        let host = entry["host"]
+            .as_str()
+            .expect("deep-link host'u bir dize olmalı");
         assert!(uri.contains(host), "{uri} config host'u içermeli: {host}");
-        let path_prefix = entry["pathPrefix"].as_str().unwrap();
+        let prefixes: Vec<&str> = entry["pathPrefix"]
+            .as_array()
+            .expect("pathPrefix bir liste olmalı")
+            .iter()
+            .filter_map(|prefix| prefix.as_str())
+            .collect();
+        assert!(!prefixes.is_empty(), "pathPrefix listesi boş");
         assert!(
-            uri.ends_with(path_prefix),
-            "{uri} config pathPrefix'i ile bitmeli: {path_prefix}"
+            prefixes.iter().any(|prefix| uri.ends_with(prefix)),
+            "{uri} config pathPrefix değerlerinden biriyle bitmeli: {prefixes:?}"
         );
         // ... and the OAuth parser agrees with the intent filter.
         let callback = mobile_callback_url("code=a&state=b");
