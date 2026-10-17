@@ -319,7 +319,9 @@ interface GeolocationApi {
  *
  * The claim winner always reports (the `clear` loop is wrapped), so a won
  * step can never strand the flow; if `getOrigins` itself throws, the step is
- * claimed and reported as a failure immediately.
+ * claimed and reported as a failure immediately. An enumeration that answers
+ * `null` is a failure too — see [clearOrigins]: "could not enumerate" is not
+ * "there was nothing to revoke".
  */
 object GeolocationWipe {
   fun start(guard: StepGuard, api: GeolocationApi, onDone: (Boolean) -> Unit) {
@@ -337,14 +339,32 @@ object GeolocationWipe {
     if (!started && guard.claim()) onDone(false)
   }
 
+  /**
+   * Clear every enumerated origin. The three provider answers mean three
+   * different things, and only one of them is a success:
+   *
+   *  * `emptySet()` — the profile stores no geolocation permission: a success
+   *    with nothing to revoke;
+   *  * a non-empty set — revoke each one; a throwing [GeolocationApi.clear] is
+   *    a failure (some permission may still be granted);
+   *  * `null` — the enumeration produced NO answer, so the state is unknown:
+   *    a FAILURE. Android's `GeolocationPermissions.getOrigins(callback)`
+   *    documents a `Set<String>` callback, but the port types it nullable
+   *    because the value crosses a platform-type boundary (`Set<String!>!`) and
+   *    a provider can hand back null. Treating that as "there was nothing to
+   *    revoke" reported a clean profile whose permissions were never even
+   *    enumerated — the same class of false success the cookie step had.
+   */
   private fun clearOrigins(api: GeolocationApi, origins: Set<String>?): Boolean =
-    try {
-      if (origins != null) {
-        for (origin in origins) api.clear(origin)
-      }
-      true
-    } catch (_: Throwable) {
+    if (origins == null) {
       false
+    } else {
+      try {
+        for (origin in origins) api.clear(origin)
+        true
+      } catch (_: Throwable) {
+        false
+      }
     }
 }
 

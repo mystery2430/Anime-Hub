@@ -1519,12 +1519,32 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `GeolocationWipe tolerates a null origin set from the provider`() {
+  fun `GeolocationWipe reports a FAILURE for a null origin set`() {
+    // `null` means the enumeration produced no answer, so the profile's
+    // permission state is UNKNOWN. Reporting success here used to claim a
+    // clean profile whose origins were never even listed.
     val api = FakeGeolocationApi(origins = null)
-    var last = false
+    var last = true
     GeolocationWipe.start(StepGuards.create(), api) { last = it }
-    Assert.assertTrue(last)
+    Assert.assertFalse("an unanswered enumeration is not a clean profile", last)
     Assert.assertEquals(emptyList<String>(), api.cleared)
+  }
+
+  @Test
+  fun `an unanswered geolocation enumeration fails the whole clear`() {
+    val port = FakeClearPort(geo = FakeGeolocationApi(origins = null))
+    var result = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
+    Assert.assertEquals("geolocation izinleri temizlenemedi", result)
+    Assert.assertEquals(emptyList<String>(), port.geo.cleared)
+    Assert.assertEquals(
+      "the remaining steps still run",
+      listOf("exists", "cookies", "geo", "storage", "flush"),
+      port.log,
+    )
+    // Not a quarantine case: nothing was mutated and nothing is outstanding.
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
   }
 
   @Test

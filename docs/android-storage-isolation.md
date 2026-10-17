@@ -222,7 +222,9 @@ remove, no legacy data remains (`delete_site_session` also drops the
   (`removeAllCookies`, its delivery interpreted by TYPE — see the cookie-step
   bullet below), every stored
   geolocation permission (enumerated via `getOrigins` and awaited —
-  `GeolocationPermissions` has no removeAll-with-callback), then
+  `GeolocationPermissions` has no removeAll-with-callback; an enumeration that
+  answers `null` is a **failure**, not an empty set, because "could not
+  enumerate" must never be reported as "there was nothing to revoke"), then
   `WebStorage.deleteAllData()` (Web Storage + Web SQL), then a final
   `flush()`. **Every** awaited callback is bounded by a watchdog —
   `STEP_TIMEOUT_MS` (10 s) per step and `FLUSH_TIMEOUT_MS` (15 s) for the
@@ -283,7 +285,12 @@ remove, no legacy data remains (`delete_site_session` also drops the
     `clear`: the flow's watchdog closes the same guard when it fires, so a
     callback that arrives late performs **zero** `clear` calls and reports
     nothing. Each step carries an `operationId` for the in-app log, so a
-    stale callback can be tied to the step that owned it. Claim and mutation
+    stale callback can be tied to the step that owned it. The enumeration
+    answer itself is read three ways: `emptySet()` is a success with nothing to
+    revoke, a non-empty set is revoked origin by origin (a throwing `clear`
+    fails the step), and `null` — the callback crossing a platform-type
+    boundary without a set — is a failure, since the permission state is then
+    unknown rather than clean. Claim and mutation
     run on the UI thread — where the watchdog is posted as well — and the
     guard is a CAS, so the race is decided atomically either way.
   * *Ungated steps — per-operation profile quarantine.* `removeAllCookies` is
@@ -438,7 +445,9 @@ remove, no legacy data remains (`delete_site_session` also drops the
   callback-wins-the-race, retry after a timeout**), clear verification
   (unsupported refuses without touching ports, absent profile, full order,
   cookie/geo/storage/flush failures each fail the clear while later steps
-  still run, geolocation watchdog on a lost callback, **final-flush
+  still run, geolocation watchdog on a lost callback, **an unanswered (`null`)
+  geolocation enumeration fails the wipe, clears nothing and still runs the
+  later steps**, **final-flush
   watchdog, stale watchdogs cannot change a delivered result**, never a
   success after a failed flush, and **the typed cookie delivery**: an
   `Answered(false)` over a non-empty jar fails with the precise reason, over an
