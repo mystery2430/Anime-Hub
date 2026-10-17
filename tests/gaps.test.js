@@ -76,7 +76,11 @@ test("CI Kotlin step copies its test sources and reports the real cargo status",
   // passes when ANY matching class exists, so a silently missing
   // SiteProfileOpsTest.kt would shrink the suite to the policy test while
   // the job stayed green.
-  for (const name of ["SiteNavigationPolicyTest.kt", "SiteProfileOpsTest.kt"]) {
+  for (const name of [
+    "SiteNavigationPolicyTest.kt",
+    "SiteProfileOpsTest.kt",
+    "SiteWebViewSettingsTest.kt",
+  ]) {
     const at = yml.indexOf(
       `cp src-tauri/android-plugin/kotlin/dev/animehub/app/${name}`,
     );
@@ -85,6 +89,16 @@ test("CI Kotlin step copies its test sources and reports the real cargo status",
     assert.match(line, /\|\| \{/, `${name}: a failed copy must fail the step`);
     assert.equal(line.includes("|| true"), false, `${name}: never masked`);
   }
+  // The shared navigation-policy vectors are a test RESOURCE: the Kotlin suite
+  // loads navigation-policy.tsv from the classpath and the Rust suite includes
+  // the same file, so a missing copy must fail the step, not shrink the suite.
+  const fixtureAt = yml.indexOf("cp tests/fixtures/navigation-policy.tsv");
+  assert.ok(fixtureAt > 0, "the shared vectors must reach the test resources");
+  const fixtureLine = yml.slice(fixtureAt, yml.indexOf("\n", fixtureAt));
+  assert.match(fixtureLine, /src\/test\/resources/, "must land in the test resources");
+  assert.match(fixtureLine, /\|\| \{/, "a failed fixture copy must fail the step");
+  assert.equal(fixtureLine.includes("|| true"), false, "fixture copy never masked");
+
   // The tauri-gradle generation build stays non-gating on purpose (the real
   // gates are the Gradle exit code and the APK step), but the status it
   // prints must come from cargo itself: `$?` after `|| true` is always 0 and
@@ -449,8 +463,19 @@ test("Android navigation policy: numeric IPv4 spellings and documentation ranges
   const ktPolicy = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/IpPolicy.kt"));
   const ktSite = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicy.kt"));
   const kt = ktPlugin + "\n" + ktPolicy + "\n" + ktSite;
-  assert.match(kt, /NUMERIC_LABEL = Regex\("""\(0x\[0-9a-f\]\*\|\[0-9\]\+\)""", RegexOption\.IGNORE_CASE\)/);
-  assert.match(kt, /if \(NUMERIC_LABEL\.matches\(bare\.substringAfterLast\('\.'\)\)\) \{/);
+  // Numeric host forms now go through the WHATWG IPv4 parser in IpPolicy, the
+  // same algorithm the desktop `url` crate runs: `010.0.0.1` is 8.0.0.1 (public)
+  // while `0177.0.0.1` is 127.0.0.1 (loopback). A regex on the last label cannot
+  // express that, and Android's Uri does not normalise hosts for us.
+  assert.match(ktPolicy, /fun parseIpv4\(host: String\): String\?/);
+  assert.match(ktPolicy, /fun endsInANumber\(host: String\): Boolean/);
+  assert.match(ktSite, /if \(IpPolicy\.endsInANumber\(bare\)\) \{/);
+  assert.match(ktSite, /val canonical = IpPolicy\.parseIpv4\(bare\) \?: return false/);
+  assert.equal(/NUMERIC_LABEL/.test(kt), false, "the old last-label regex must be gone");
+  // ... and the Rust side uses the same parser instead of its own rule.
+  const rs = read(join(ROOT, "src-tauri/src/sites/url_policy.rs"));
+  assert.match(rs, /fn ends_in_a_number\(host: &str\) -> bool/);
+  assert.match(rs, /if ends_in_a_number\(&bare\)/);
   // Documentation ranges, as Rust url_policy::is_public_ip rejects them – now in IpPolicy.kt
   assert.match(kt, /\(a == 198 && b == 51 && c == 100\)/);
   assert.match(kt, /\(a == 203 && b == 0 && c == 113\)/);

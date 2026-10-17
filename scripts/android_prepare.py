@@ -469,6 +469,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
         "AnimeHubDebugLog",
         "SiteFlushWorker",
         "SiteNavigationGuard",
+        "SiteWebViewSettings",
         "SiteProfileOps",
         "ProfileQuarantine",
         "SiteCloseFlow",

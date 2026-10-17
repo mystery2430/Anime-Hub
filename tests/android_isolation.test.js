@@ -185,7 +185,7 @@ test("setProfile runs before any other WebView API, attach and navigation", () =
   assert.ok(buildAt > 0);
   const construct = controllerKt.indexOf("webView = WebView(activity)", buildAt);
   const setProfile = controllerKt.indexOf("WebViewCompat.setProfile(webView, profileName)", buildAt);
-  const settings = controllerKt.indexOf("webView.settings.javaScriptEnabled", buildAt);
+  const settings = controllerKt.indexOf("applySiteSettings(WebSettingsSink(webView.settings))", buildAt);
   const docStart = controllerKt.indexOf("WebViewCompat.addDocumentStartJavaScript", buildAt);
   const addView = controllerKt.indexOf("content.addView(", buildAt);
   const loadUrl = controllerKt.indexOf("webView.loadUrl(url)", buildAt);
@@ -1055,6 +1055,121 @@ test("the site WebView has no page-facing IPC surface", () => {
   assert.doesNotMatch(code(controllerKt), /RustWebViewClient|RustWebView\(/);
 });
 
+test("the site WebView settings come from a tested plan, not inline defaults", () => {
+  // AH-06 / AH-P1 / AH-P3. The values themselves are unit-tested in
+  // SiteWebViewSettingsTest through the real applySiteSettings; these pins hold
+  // the wiring: buildWebView applies the plan, the inline assignments are gone,
+  // and the file that decides them stays pure and packaged.
+  const settingsKt = read(`${KOTLIN}/SiteWebViewSettings.kt`);
+  const buildAt = controllerKt.indexOf("private fun buildWebView(");
+  assert.ok(buildAt > 0, "buildWebView missing");
+  const applyAt = controllerKt.indexOf("applySiteSettings(WebSettingsSink(webView.settings))", buildAt);
+  assert.ok(applyAt > buildAt, "buildWebView must apply the plan");
+  const setProfile = controllerKt.indexOf("WebViewCompat.setProfile(webView, profileName)", buildAt);
+  const addView = controllerKt.indexOf("content.addView(", buildAt);
+  const loadUrl = controllerKt.indexOf("webView.loadUrl(url)", buildAt);
+  assert.ok(setProfile < applyAt, "settings come after setProfile");
+  assert.ok(applyAt < addView && applyAt < loadUrl, "settings come before attach and navigation");
+
+  // No setting is assigned inline in buildWebView any more: the plan is the
+  // single source of truth (a stray `webView.settings.x = …` would bypass it).
+  const body = code(controllerKt).slice(buildAt, addView);
+  assert.doesNotMatch(body, /webView\.settings\.[A-Za-z]+\s*=/, "no inline settings assignment");
+  assert.doesNotMatch(body, /setGeolocationEnabled\(true\)/, "geolocation is not enabled inline");
+
+  // The plan is pure (compiled into the unit-test source set) and decides the
+  // settings that the platform defaults leave unsafe.
+  assert.equal(settingsKt.startsWith("// SPDX-License-Identifier: MIT"), true);
+  assert.doesNotMatch(settingsKt, /^import android\./m, "the plan file must stay pure");
+  assert.match(settingsKt, /val geolocationEnabled: Boolean = false/);
+  assert.match(settingsKt, /val allowFileAccess: Boolean = false/);
+  assert.match(settingsKt, /val allowContentAccess: Boolean = false/);
+  assert.match(settingsKt, /val allowFileAccessFromFileURLs: Boolean = false/);
+  assert.match(settingsKt, /val allowUniversalAccessFromFileURLs: Boolean = false/);
+  assert.match(settingsKt, /val mixedContentMode: Int = MIXED_CONTENT_NEVER_ALLOW/);
+  assert.match(settingsKt, /val supportMultipleWindows: Boolean = false/);
+  // Playback and site logins must keep working (PiP/video non-regression).
+  assert.match(settingsKt, /val mediaPlaybackRequiresUserGesture: Boolean = false/);
+  assert.match(settingsKt, /val javaScriptEnabled: Boolean = true/);
+  assert.match(settingsKt, /val domStorageEnabled: Boolean = true/);
+  // 1 is NEVER_ALLOW; 0 would be ALWAYS_ALLOW and 2 COMPATIBILITY_MODE.
+  assert.match(settingsKt, /const val MIXED_CONTENT_NEVER_ALLOW = 1/);
+  // The adapter is the only place the platform object is written.
+  assert.match(controllerKt, /private class WebSettingsSink\(private val s: WebSettings\) : SiteSettingsSink/);
+  // And the new pure file has to be packaged, or the APK build breaks.
+  assert.match(preparePy, /"SiteWebViewSettings"/);
+
+  // No silent grants: the chrome client denies permission and geolocation
+  // prompts instead of relying on the provider default.
+  assert.match(controllerKt, /override fun onPermissionRequest\(request: PermissionRequest\)/);
+  assert.match(controllerKt, /request\.deny\(\)/);
+  assert.match(controllerKt, /override fun onGeolocationPermissionsShowPrompt\(/);
+  assert.match(controllerKt, /callback\.invoke\(origin, false, false\)/);
+  // Neither denial logs the origin.
+  const chromeAt = controllerKt.indexOf("private class SiteChromeClient(");
+  const chromeBody = controllerKt.slice(chromeAt, controllerKt.indexOf("private class WebSettingsSink"));
+  assert.doesNotMatch(chromeBody, /AnimeHubDebugLog\.add\([^)]*origin/, "no origin in the denial log");
+});
+
+test("the navigation guard logs the reason, never the host or path", () => {
+  // AH-12 / AH-G8 / AH-13: logcat is readable over adb and by apps holding
+  // READ_LOGS on older releases, and the host alone identifies the site.
+  const guardKt = read(`${KOTLIN}/SiteNavigationGuard.kt`);
+  const policyKt = read(`${KOTLIN}/SiteNavigationPolicy.kt`);
+  const guardBody = code(guardKt);
+  assert.doesNotMatch(guardBody, /\$\{uri\.host\}/, "host must not be logged");
+  assert.doesNotMatch(guardBody, /uri\.path|uri\.query|uri\.toString\(\)/, "no path/query/url");
+  assert.match(guardBody, /SiteNavigationPolicy\.blockedMessage\(uri\.scheme, blocked, request\.isForMainFrame\)/);
+  // The redaction rule itself lives in pure code (the guard cannot even be
+  // class-loaded in a JVM test) and is asserted there behaviourally.
+  assert.match(policyKt, /fun blockedMessage\(scheme: String\?, reason: String, forMainFrame: Boolean\): String/);
+  assert.match(policyKt, /navigation blocked reason=\$reason scheme=\$\{scheme \?: "none"\} frame=\$frame/);
+});
+
+test("top-level data: is refused on both platforms while blob: playback is kept", () => {
+  // AH-12 / AH-G8: a top-level data: document is a fake page with an opaque
+  // origin. blob: stays allowed because MSE players navigate the main frame to
+  // blob object URLs; data:image/… logos are sub-resources and unaffected.
+  const rs = read("src-tauri/src/sites/url_policy.rs");
+  const policyKt = read(`${KOTLIN}/SiteNavigationPolicy.kt`);
+  assert.match(rs, /"data" => return Some\(NavBlock::DataNavigation\)/);
+  assert.match(rs, /url\.path\(\) == "blank"/, "only about:blank survives");
+  assert.match(rs, /"blob" => \{/, "blob stays a separate case");
+  assert.match(rs, /inner\.starts_with\("http:\/\/"/, "a blob over http is a downgrade");
+  assert.match(policyKt, /"data" -> DATA_NAVIGATION/);
+  assert.match(policyKt, /if \(target\.opaquePart == "blank"\) null else UNKNOWN_ABOUT/);
+  assert.match(policyKt, /startsWith\("http:\/\/"\)\) INSECURE_SCHEME else null/);
+  // The two platforms must not keep separate vector lists: one shared fixture.
+  const fixture = read("tests/fixtures/navigation-policy.tsv");
+  assert.match(rs, /include_str!\("\.\.\/\.\.\/\.\.\/tests\/fixtures\/navigation-policy\.tsv"\)/);
+  const ktTest = read(`${KOTLIN}/SiteNavigationPolicyTest.kt`);
+  assert.match(ktTest, /const val FIXTURE = "navigation-policy\.tsv"/);
+  const kinds = ["url", "host", "ip"];
+  for (const kind of kinds) {
+    const count = fixture
+      .split("\n")
+      .filter((line) => line.startsWith(`${kind}\t`) && !line.startsWith("#")).length;
+    assert.ok(count >= 30, `${kind} vectors: ${count} is too few to pin parity`);
+  }
+  // And the interesting cases really are in there.
+  for (const needle of [
+    "data:text/html",
+    "about:blank",
+    "about:srcdoc",
+    "blob:https://openani.me",
+    "javascript:alert(1)",
+    "https://0x7f000001/",
+    "https://tauri.localhost/",
+    "example.0x7f",
+    "0177.0.0.1",
+    "169.254.169.254",
+    "2001:db8::1",
+    "::ffff:8.8.8.8",
+  ]) {
+    assert.ok(fixture.includes(needle), `fixture lost the ${needle} vector`);
+  }
+});
+
 test("navigation policy wraps the site client too", () => {
   // Same guard as the launcher: scheme/host policy stays mandatory. The
   // guard was split out of AnimeHubPlugin.kt so the CI unit test can
@@ -1065,7 +1180,7 @@ test("navigation policy wraps the site client too", () => {
     "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt",
   );
   assert.match(guardKt, /class SiteNavigationGuard/);
-  assert.match(guardKt, /SiteNavigationPolicy\.allows\(uri\)/);
+  assert.match(guardKt, /SiteNavigationPolicy\.rejection\(uri\)/);
   assert.match(preparePy, /"SiteNavigationGuard"/);
   assert.match(preparePy, /"AnimeHubDebugLog"/);
   assert.match(preparePy, /"SiteProfileOps"/);

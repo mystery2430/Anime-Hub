@@ -42,11 +42,15 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
 
   override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
     val uri = request.url
-    if (!SiteNavigationPolicy.allows(uri)) {
-      // Host and scheme only: paths and queries can carry tokens.
-      Log.w(LOG_TAG, "navigation blocked: ${uri.scheme}://${uri.host}")
-      // Scheme only in the in-app log: the host can identify the site.
-      AnimeHubDebugLog.add("nav", "blocked scheme=${uri.scheme}")
+    val blocked = SiteNavigationPolicy.rejection(uri)
+    if (blocked != null) {
+      // NO host, NO path, NO query: logcat is readable by other apps on older
+      // Android releases and by anyone with adb, and the host alone identifies
+      // which site the user is watching. Scheme + reason code + frame kind is
+      // everything a developer needs to understand the decision.
+      val message = SiteNavigationPolicy.blockedMessage(uri.scheme, blocked, request.isForMainFrame)
+      Log.w(LOG_TAG, message)
+      AnimeHubDebugLog.add("nav", message)
       return true
     }
     return inner.shouldOverrideUrlLoading(view, request)
@@ -71,5 +75,6 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
 
   companion object {
     private const val LOG_TAG = "AnimeHubNavGuard"
+
   }
 }

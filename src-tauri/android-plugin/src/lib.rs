@@ -1016,6 +1016,7 @@ mod tests {
         let clear = include_str!("../kotlin/dev/animehub/app/SiteClearFlow.kt");
         let migration = include_str!("../kotlin/dev/animehub/app/SiteMigrationFlow.kt");
         let back = include_str!("../kotlin/dev/animehub/app/SiteBackStatus.kt");
+        let settings = include_str!("../kotlin/dev/animehub/app/SiteWebViewSettings.kt");
         for (name, src, homes) in [
             (
                 "SiteProfileOps.kt",
@@ -1071,6 +1072,15 @@ mod tests {
                 ][..],
             ),
             ("SiteBackStatus.kt", back, &["object SiteBackStatus"][..]),
+            (
+                "SiteWebViewSettings.kt",
+                settings,
+                &[
+                    "data class SiteWebViewSettings",
+                    "interface SiteSettingsSink",
+                    "fun applySiteSettings",
+                ][..],
+            ),
         ] {
             assert!(
                 src.starts_with("// SPDX-License-Identifier: MIT"),

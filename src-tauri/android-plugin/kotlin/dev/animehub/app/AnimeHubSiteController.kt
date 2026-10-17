@@ -72,7 +72,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.OnBackPressedCallback
@@ -399,15 +401,15 @@ object AnimeHubSiteController {
       webView = WebView(activity)
       WebViewCompat.setProfile(webView, profileName)
 
-      // (3) Settings: the same surface wry's RustWebView enables, so site
-      // behaviour (JS, DOM/web storage, autoplay, popup-capable scripts)
-      // matches the shared WebView this replaces.
-      webView.settings.javaScriptEnabled = true
-      webView.settings.domStorageEnabled = true
-      webView.settings.databaseEnabled = true
-      webView.settings.setGeolocationEnabled(true)
-      webView.settings.mediaPlaybackRequiresUserGesture = false
-      webView.settings.javaScriptCanOpenWindowsAutomatically = true
+      // (3) Settings: the decided plan from `SiteWebViewSettings`, applied
+      // through the only adapter that touches the platform object. JavaScript,
+      // DOM/web storage, autoplay and same-view window.open stay on so site
+      // behaviour matches the shared WebView this replaces; file and content
+      // access, both file-URL escape hatches and mixed content are OFF (the
+      // platform defaults are not), and geolocation is off because there is no
+      // consent flow to grant it. Every value and its reason is in the plan,
+      // which is unit-tested.
+      applySiteSettings(WebSettingsSink(webView.settings))
 
       // (4) Navigation protection: the same SiteNavigationGuard policy the
       // launcher WebView uses, over a plain client (never wry's client, which
@@ -1145,6 +1147,106 @@ object AnimeHubSiteController {
 
     override fun onHideCustomView() {
       onHide()
+    }
+
+    /**
+     * Explicit denial instead of relying on the provider default. Nothing in
+     * this app has a camera, microphone or DRM flow, and a silent grant would
+     * be invisible to the user. Note this also covers
+     * `RESOURCE_PROTECTED_MEDIA_ID`: DRM playback was already impossible
+     * without a grant, so denying changes nothing and keeps the boundary
+     * explicit. The log line carries no origin and no URL.
+     */
+    override fun onPermissionRequest(request: PermissionRequest) {
+      request.deny()
+      AnimeHubDebugLog.add("web", "permission request denied")
+    }
+
+    /**
+     * Geolocation: deny and do not retain the answer (`allow=false`,
+     * `retain=false`). Pairs with `SiteWebViewSettings.geolocationEnabled =
+     * false`; both together mean a provider default change cannot start
+     * granting location to a site.
+     */
+    override fun onGeolocationPermissionsShowPrompt(
+      origin: String,
+      callback: GeolocationPermissions.Callback,
+    ) {
+      callback.invoke(origin, false, false)
+      AnimeHubDebugLog.add("web", "geolocation denied")
+    }
+  }
+
+  /**
+   * The ONLY place `android.webkit.WebSettings` is written for a site WebView:
+   * a 1:1 adapter for [SiteSettingsSink], one property per decided setting.
+   *
+   * The values and their reasons are unit-tested through the real
+   * [applySiteSettings]; this class is a straight property mapping and can only
+   * be verified on a device (minSdkVersion is 26, so the API-26
+   * `safeBrowsingEnabled` setter needs no version guard).
+   */
+  private class WebSettingsSink(private val s: WebSettings) : SiteSettingsSink {
+    override fun javaScriptEnabled(value: Boolean) {
+      s.javaScriptEnabled = value
+    }
+
+    override fun domStorageEnabled(value: Boolean) {
+      s.domStorageEnabled = value
+    }
+
+    override fun databaseEnabled(value: Boolean) {
+      s.databaseEnabled = value
+    }
+
+    override fun geolocationEnabled(value: Boolean) {
+      s.setGeolocationEnabled(value)
+    }
+
+    override fun mediaPlaybackRequiresUserGesture(value: Boolean) {
+      s.mediaPlaybackRequiresUserGesture = value
+    }
+
+    override fun javaScriptCanOpenWindowsAutomatically(value: Boolean) {
+      s.javaScriptCanOpenWindowsAutomatically = value
+    }
+
+    override fun supportMultipleWindows(value: Boolean) {
+      s.setSupportMultipleWindows(value)
+    }
+
+    override fun allowFileAccess(value: Boolean) {
+      s.allowFileAccess = value
+    }
+
+    override fun allowContentAccess(value: Boolean) {
+      s.allowContentAccess = value
+    }
+
+    // Both setters are deprecated from API 30 (they are no-ops once file access
+    // is off, which it is). They are still written explicitly so an older
+    // provider and any future re-enabling of `allowFileAccess` cannot quietly
+    // reintroduce the file-URL escape hatches.
+    @Suppress("DEPRECATION")
+    override fun allowFileAccessFromFileURLs(value: Boolean) {
+      s.allowFileAccessFromFileURLs = value
+    }
+
+    @Suppress("DEPRECATION")
+    override fun allowUniversalAccessFromFileURLs(value: Boolean) {
+      s.allowUniversalAccessFromFileURLs = value
+    }
+
+    override fun mixedContentMode(value: Int) {
+      s.mixedContentMode = value
+    }
+
+    override fun safeBrowsingEnabled(value: Boolean) {
+      s.safeBrowsingEnabled = value
+    }
+
+    override fun cacheMode(value: Int) {
+      s.cacheMode = value
     }
   }
 

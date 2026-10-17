@@ -229,6 +229,13 @@ jobs:
           # failure — no `|| true`, no continue-on-error.
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteNavigationPolicyTest.kt could not be copied into the test source set"; exit 1; }
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteProfileOpsTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteWebViewSettingsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteWebViewSettingsTest.kt could not be copied into the test source set"; exit 1; }
+          # The shared navigation-policy vectors: the Kotlin suite loads this
+          # file from the test classpath and the Rust suite includes the very
+          # same path with include_str!. A missing copy fails here (and the test
+          # itself fails loudly) instead of quietly dropping 160 vectors.
+          mkdir -p src-tauri/gen/android/app/src/test/resources
+          cp tests/fixtures/navigation-policy.tsv src-tauri/gen/android/app/src/test/resources/ || { echo "::error::navigation-policy.tsv could not be copied into the test resources"; exit 1; }
           echo "=== isolating: move AnimeHubPlugin.kt + MainActivity.kt only; keep the real site controller chain ==="
           echo "=== before move, ls -l src/main ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
@@ -382,7 +389,7 @@ jobs:
             echo "::error::Kotlin test has FAILED in log"
             exit 1
           fi
-          echo "Kotlin tests passed via Gradle (SiteNavigationPolicyTest + SiteProfileOpsTest; production AnimeHubSiteController.kt type-checked in the same source set)"
+          echo "Kotlin tests passed via Gradle (SiteNavigationPolicyTest + SiteProfileOpsTest + SiteWebViewSettingsTest; production AnimeHubSiteController.kt type-checked in the same source set)"
 
       - name: Upload Kotlin test log
         if: always()
