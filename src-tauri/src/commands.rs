@@ -824,27 +824,17 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     Ok(n)
 }
 
-/// Read a site's stored cookie jar (used by the mobile swap and by tests).
-#[tauri::command]
-pub fn get_site_cookies(state: State<'_, AppState>, id: String) -> AppResult<CookieJar> {
-    match state.provider.get_secret(&format!("cookies-{id}"))? {
-        Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        None => Ok(CookieJar {
-            site_id: id,
-            cookies: vec![],
-            saved_at: 0,
-        }),
-    }
-}
-
-/// Replace a site's stored cookie jar.
-#[tauri::command]
-pub fn set_site_cookies(state: State<'_, AppState>, jar: CookieJar) -> AppResult<()> {
-    let bytes = serde_json::to_vec(&jar)?;
-    state
-        .provider
-        .put_secret(&format!("cookies-{}", jar.site_id), &bytes)
-}
+// The raw cookie-jar commands (`get_site_cookies` / `set_site_cookies`) are
+// GONE. Nothing in the frontend or any other production path called them: the
+// one-time 0.3.4 jar import reads `cookies-<site_id>` inside
+// `web::windows::run_mobile_open_protocol`, and the desktop profile flow never
+// touched them. What they did offer was an IPC surface that would read or
+// overwrite ANY site's encrypted cookie jar from the WebView — with no site
+// ownership, no profile generation and no quarantine check in the way. Keeping
+// unused authority "for tests" is exactly the surface a compromised launcher
+// page would use, and the storage behaviour they were said to cover is tested
+// directly against the provider (`cookie_jar_secret_roundtrips`) and through the
+// real protocol (`mobile_clear_protocol_*`).
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -1766,6 +1756,50 @@ mod tests {
         let back: CookieJar = serde_json::from_slice(&got).unwrap();
         assert_eq!(back.site_id, "builtin-openanime");
         assert_eq!(back.saved_at, 5);
+    }
+
+    /// The removed `get_site_cookies` / `set_site_cookies` commands took an
+    /// arbitrary `id` / jar from the WebView, so any page could read or
+    /// overwrite ANY site's encrypted cookie jar. Storage itself is per-site by
+    /// key: prove that, because it is the property the IPC surface must not
+    /// re-expose.
+    #[test]
+    fn cookie_jar_secrets_are_scoped_per_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+
+        let jar = |site_id: &str, saved_at: i64| CookieJar {
+            site_id: site_id.into(),
+            cookies: vec![],
+            saved_at,
+        };
+        let key = |site_id: &str| format!("cookies-{site_id}");
+        let put = |site_id: &str, saved_at: i64| {
+            let bytes = serde_json::to_vec(&jar(site_id, saved_at)).unwrap();
+            st.provider.put_secret(&key(site_id), &bytes).unwrap();
+        };
+        put("site-a", 11);
+        put("site-b", 22);
+
+        let read = |site_id: &str| -> CookieJar {
+            let got = st
+                .provider
+                .get_secret(&key(site_id))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{site_id} jar'ı yazılmıştı"));
+            serde_json::from_slice(&got).unwrap()
+        };
+        assert_eq!(read("site-a").saved_at, 11);
+        assert_eq!(read("site-b").saved_at, 22);
+
+        // A never leaks through B's key, and an unknown site has no jar at all
+        // (no implicit fallback to another site's data).
+        assert_eq!(read("site-a").site_id, "site-a");
+        assert!(st.provider.get_secret(&key("site-c")).unwrap().is_none());
+        // Overwriting A leaves B untouched.
+        put("site-a", 99);
+        assert_eq!(read("site-a").saved_at, 99);
+        assert_eq!(read("site-b").saved_at, 22);
     }
 
     #[test]

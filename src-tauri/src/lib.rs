@@ -51,8 +51,6 @@ pub fn run() {
             commands::open_site,
             commands::close_site,
             commands::clear_site_data,
-            commands::get_site_cookies,
-            commands::set_site_cookies,
             commands::get_settings,
             commands::update_settings,
             commands::reset_blocklist,
@@ -538,5 +536,97 @@ mod tests {
         let p2 = build_provider(dir.path()).unwrap();
         let (reg, _) = p2.load_registry();
         assert!(reg.sites.iter().any(|s| s.name == "Kalıcı"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC surface
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn frontend_sources() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../src")),
+        &mut out,
+    );
+    out
+}
+
+#[cfg(test)]
+mod ipc_surface_tests {
+    /// Commands that must stay OFF the invoke surface.
+    ///
+    /// Both were reachable from any page in the launcher WebView and took the
+    /// site id / whole jar from the caller, i.e. they let the frontend read or
+    /// overwrite every site's encrypted cookie jar with no site ownership,
+    /// profile-generation or quarantine check in the path. Nothing in `src/`,
+    /// the mobile plugin or any other Rust path called them (the 0.3.4 jar
+    /// import lives inside `web::windows`), so they are gone rather than
+    /// gated.
+    #[test]
+    fn raw_cookie_jar_commands_are_gone_from_the_ipc_surface() {
+        let handlers = include_str!("lib.rs");
+        let commands = include_str!("commands.rs");
+        let mut checked = 0usize;
+
+        for prefix in ["get", "set"] {
+            // Built at runtime on purpose: writing the literal name in this
+            // test would make `contains` match the assertion itself.
+            let name = format!("{prefix}_site_cookies");
+            checked += 1;
+
+            let registration = format!("commands::{name}");
+            assert!(
+                !handlers.contains(&registration),
+                "{name} hâlâ invoke_handler'da kayıtlı"
+            );
+            let definition = format!("pub fn {name}");
+            assert!(
+                !commands.contains(&definition),
+                "{name} hâlâ bir komut olarak tanımlı"
+            );
+            let frontend = frontend_sources();
+            assert!(!frontend.is_empty(), "frontend kaynakları bulunamadı");
+            for path in frontend {
+                let text = std::fs::read_to_string(&path).expect("kaynak okunabilmeli");
+                assert!(
+                    !text.contains(&name),
+                    "{} {name} komutuna başvuruyor (çağrı, alias, ne olursa)",
+                    path.display()
+                );
+            }
+        }
+        assert_eq!(checked, 2, "iki komut da denetlenmeli");
+    }
+
+    /// The jar itself is still used where it belongs: the 0.3.4 import and the
+    /// mobile open/clear/delete protocols read and write it directly through
+    /// the storage provider.
+    #[test]
+    fn cookie_jar_storage_keys_still_have_a_production_user() {
+        let windows = include_str!("web/windows.rs");
+        // Built at runtime so this assertion does not match its own text.
+        let needle = format!("cookies-{}", "{");
+        assert!(
+            windows.contains(&needle),
+            "web/windows.rs site çerez anahtarını üretmeli"
+        );
+        let jar = include_str!("web/session.rs");
+        assert!(jar.contains("pub struct CookieJar"), "CookieJar durmalı");
     }
 }
