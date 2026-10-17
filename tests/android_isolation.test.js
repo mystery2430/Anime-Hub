@@ -41,6 +41,24 @@ const code = (src) =>
     .filter((line) => !/^\s*\/\//.test(line))
     .join("\n");
 
+const KOTLIN = "src-tauri/android-plugin/kotlin/dev/animehub/app";
+/**
+ * The pure Kotlin side, split by responsibility (SiteProfileOps.kt's header
+ * lists the layout). `read` throws when a file is missing, so a dropped file
+ * fails this suite instead of silently shrinking what is pinned.
+ */
+const PURE_FILES = [
+  "SiteProfileOps.kt",
+  "ProfileQuarantine.kt",
+  "SiteCloseFlow.kt",
+  "SiteShutdownFlow.kt",
+  "SiteClearFlow.kt",
+  "SiteMigrationFlow.kt",
+  "SiteBackStatus.kt",
+];
+const pureKotlin = PURE_FILES.map((f) => read(`${KOTLIN}/${f}`)).join("\n");
+const pureFile = (f) => read(`${KOTLIN}/${f}`);
+
 const windowsRs = read("src-tauri/src/web/windows.rs");
 const commandsRs = read("src-tauri/src/commands.rs");
 const bridgeRs = read("src-tauri/src/android_bridge.rs");
@@ -72,7 +90,7 @@ test("profile names derive from site_id only, hashed, with a generation", () => 
   // default profile. The rule is defined ONCE — in SiteProfileOps.kt — and
   // shared by the controller's validation and the retirement decision.
   assert.match(
-    read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt"),
+    pureKotlin,
     /val SITE_PROFILE_NAME: Regex = Regex\("""site-\[0-9a-f\]\{32\}-g\\d\{1,10\}"""\)/,
     "Kotlin must validate profile names against the Rust derivation",
   );
@@ -83,7 +101,7 @@ test("profile names derive from site_id only, hashed, with a generation", () => 
     /fun profileNameIsValid\(name: String\): Boolean = SITE_PROFILE_NAME\.matches\(name\)/,
   );
   assert.match(
-    read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt"),
+    pureKotlin,
     /val SITE_PROFILE_NAME: Regex = Regex\("""site-\[0-9a-f\]\{32\}-g\\d\{1,10\}"""\)/,
   );
   assert.doesNotMatch(
@@ -369,7 +387,7 @@ test("remove_site deletes the profile, queues refusals, bumps the generation", (
 });
 
 test("the quarantine ledger is retired only AFTER the generation is durable", () => {
-  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  const ops = pureKotlin;
   // windows.rs: delete → (queue) → bump → retire, all on the derived name.
   const at = windowsRs.indexOf("pub fn run_mobile_delete_protocol");
   assert.ok(at > 0, "the delete protocol is missing");
@@ -537,9 +555,7 @@ test("the open is two-phased: site_migrate carries the jar, site_open carries no
 });
 
 test("every awaited flush is watchdog-bounded, in close and clear alike", () => {
-  const ops = read(
-    "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt",
-  );
+  const ops = pureKotlin;
   // Close: the port exposes a watchdog and the flow bounds the flush await.
   const closePortAt = ops.indexOf("interface SiteClosePort");
   assert.ok(closePortAt > 0);
@@ -600,9 +616,7 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
   // by SiteProfileOpsTest, which drives the production GeolocationWipe and
   // SiteClearFlow with a recording provider fake. This test pins the wiring
   // that makes those guarantees reach the real adapter.
-  const ops = read(
-    "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt",
-  );
+  const ops = pureKotlin;
 
   // The awaited geolocation step receives a validity token, and the pure
   // production wipe claims it BEFORE the first mutation.
@@ -720,7 +734,7 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
 });
 
 test("the cookie step reads a TYPED delivery: an empty jar succeeds, an unreachable store does not", () => {
-  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  const ops = pureKotlin;
   // Chromium's `removeAllCookies` callback reports whether ANY cookie was
   // deleted, so `false` over an empty jar is a successful wipe — and `false`
   // from a store that could not be reached is an error. One boolean cannot say
@@ -788,7 +802,7 @@ test("the cookie step reads a TYPED delivery: an empty jar succeeds, an unreacha
 });
 
 test("every awaited step cancels its watchdog, and an unarmable one fails fast", () => {
-  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  const ops = pureKotlin;
   const opsTest = read(
     "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt",
   );
@@ -976,6 +990,50 @@ test("navigation policy wraps the site client too", () => {
 // Build pipeline
 // ---------------------------------------------------------------------------
 
+test("the pure Kotlin split is packaged, pure, copied and homed", () => {
+  for (const f of PURE_FILES) {
+    const src = pureFile(f);
+    assert.match(src, /^\/\/ SPDX-License-Identifier: MIT/, `${f} lost its header`);
+    assert.match(src, /^package dev\.animehub\.app$/m, `${f} lost its package line`);
+    assert.doesNotMatch(src, /^import android\./m, `${f} must stay pure (no android.*)`);
+    assert.doesNotMatch(src, /^import app\.tauri/m, `${f} must stay pure (no Tauri)`);
+    // android_prepare.py hard-fails when one of them is missing, so the CI
+    // unit-test compile cannot silently lose a responsibility.
+    assert.ok(
+      preparePy.includes(`"${f.replace(/\.kt$/, "")}"`),
+      `android_prepare.py must copy ${f} into the generated project`,
+    );
+  }
+  const homes = {
+    "SiteProfileOps.kt": ["object SiteProfileErrors", "class SiteSessionState", "object GeolocationWipe"],
+    "ProfileQuarantine.kt": ["object ProfileQuarantine", "object SiteOpenGate", "object ProfileRetirement"],
+    "SiteCloseFlow.kt": ["interface SiteClosePort", "object SiteCloseFlow"],
+    "SiteShutdownFlow.kt": ["object ShutdownFlow", "sealed interface ShutdownFlush"],
+    "SiteClearFlow.kt": ["object SiteClearFlow", "object CookieWipes", "interface SiteClearPort"],
+    "SiteMigrationFlow.kt": ["object SiteMigrationFlow", "sealed class MigrationOutcome"],
+    "SiteBackStatus.kt": ["object SiteBackStatus"],
+  };
+  for (const [f, markers] of Object.entries(homes)) {
+    for (const m of markers) {
+      assert.ok(pureFile(f).includes(m), `${f} must be the home of ${m}`);
+    }
+  }
+  // The split must not duplicate a rule: each key contract has exactly one home.
+  for (const marker of [
+    "object ProfileQuarantine",
+    "object SiteOpenGate",
+    "object SiteClearFlow",
+    "object CookieWipes",
+    "object ShutdownFlow",
+    "object SiteMigrationFlow",
+    "object GeolocationWipe",
+    "val SITE_PROFILE_NAME",
+  ]) {
+    const count = PURE_FILES.filter((f) => pureFile(f).includes(marker)).length;
+    assert.equal(count, 1, `${marker} must live in exactly one file`);
+  }
+});
+
 test("android_prepare copies the site controller and pins androidx.webkit", () => {
   assert.match(preparePy, /SITE_CONTROLLER_CLASS = "AnimeHubSiteController"/);
   assert.match(preparePy, /raise SystemExit\(f"site controller not found at \{site_controller_src\}"\)/);
@@ -1000,7 +1058,7 @@ test("android_prepare copies the site controller and pins androidx.webkit", () =
 });
 
 test("the destroy-time site flush is awaited within a bounded budget", () => {
-  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  const ops = pureKotlin;
   // The protocol and its four honest outcomes.
   assert.match(ops, /sealed interface ShutdownFlush/);
   for (const outcome of ["NotNeeded", "Completed", "TimedOut"]) {

@@ -462,7 +462,20 @@ def prepare(root: Path, gen: Path) -> list[str]:
     # REQUIRED — without it neither the APK build nor the CI unit-test
     # compile (which type-checks AnimeHubSiteController.kt against them)
     # can resolve the references. Package-checked like the controller.
-    for aux in ("AnimeHubDebugLog", "SiteNavigationGuard", "SiteProfileOps"):
+    # SiteProfileOps.kt was split by responsibility (its header lists the
+    # layout); EVERY file is required, and the hard failure below is what keeps
+    # a dropped file from silently shrinking the CI unit-test compile.
+    for aux in (
+        "AnimeHubDebugLog",
+        "SiteNavigationGuard",
+        "SiteProfileOps",
+        "ProfileQuarantine",
+        "SiteCloseFlow",
+        "SiteShutdownFlow",
+        "SiteClearFlow",
+        "SiteMigrationFlow",
+        "SiteBackStatus",
+    ):
         aux_src = kotlin_source(root, package, aux)
         if not aux_src.is_file():
             raise SystemExit(f"auxiliary Kotlin file not found at {aux_src}")

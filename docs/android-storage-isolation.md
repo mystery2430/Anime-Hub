@@ -57,6 +57,21 @@ view has been shown yet", which makes retire-and-retry the safe resolution.
 covered by host-side behaviour tests with a scripted plugin and an injected
 storage write failure.
 
+* **Where the Kotlin guarantees live** (one package, no imports between them,
+  none of them touching `android.*` or Tauri — which is what lets CI compile and
+  *run* them): `SiteProfileOps.kt` holds the shared primitives (the error
+  vocabulary mirrored by Rust, the active-session slot, the one-shot step guard
+  and the gated geolocation wipe); `ProfileQuarantine.kt` the per-operation
+  ledger, the open gate and the retirement rule; `SiteCloseFlow.kt` the
+  flush-then-destroy close; `SiteShutdownFlow.kt` the destroy-time flush awaited
+  within a budget; `SiteClearFlow.kt` the verified in-place wipe including the
+  typed cookie delivery; `SiteMigrationFlow.kt` the one-time jar import;
+  `SiteBackStatus.kt` the launcher back-close handshake.
+  `AnimeHubSiteController.kt` adapts the real Android/androidx.webkit calls to
+  those ports and holds the WebView/PiP/back-button lifecycle.
+  `scripts/android_prepare.py` copies every one of them into the generated
+  project and **hard-fails** if a file is missing, so the CI unit-test compile
+  cannot silently shrink.
 * **Launcher**: default profile, `main` origin, IPC-restricted as before.
   Site clear/delete paths never address it (`Default` is rejected by name
   validation; the static `CookieManager.getInstance()` appears only in
@@ -144,7 +159,10 @@ either compile because of the metadata rule. The CI unit-test source-set
 isolation removes only the two Tauri-coupled files (`AnimeHubPlugin.kt` and
 the generated `MainActivity.kt`); the production chain —
 `AnimeHubSiteController.kt`, `AnimeHubPipController.kt`, the split
-`AnimeHubDebugLog.kt`/`SiteNavigationGuard.kt`, `SiteProfileOps.kt`,
+`AnimeHubDebugLog.kt`/`SiteNavigationGuard.kt`, the pure Kotlin flow files
+  (`SiteProfileOps.kt`, `ProfileQuarantine.kt`, `SiteCloseFlow.kt`,
+  `SiteShutdownFlow.kt`, `SiteClearFlow.kt`, `SiteMigrationFlow.kt`,
+  `SiteBackStatus.kt`),
 `SiteNavigationPolicy.kt`, `IpPolicy.kt` — **stays in the test compile**, so
 every CI run type-checks the real controller instead of trusting the
 APK-step logs.
@@ -285,7 +303,8 @@ remove, no legacy data remains (`delete_site_session` also drops the
 * **A timeout bounds the SIDE EFFECT too, not only the answer.** A
   once-latch decides who *reports*; it cannot un-run a mutation. Two
   mechanisms close that gap, one per kind of awaited step
-  (`SiteProfileOps.kt`, both executed by the CI unit tests):
+  (`SiteProfileOps.kt` and its split flow files, both executed by the CI unit
+  tests):
   * *Gated steps — validity token.* The geolocation wipe is the only step
     whose mutation the app performs itself (because `GeolocationPermissions`
     has no removeAll-with-callback, it awaits `getOrigins` and then calls
@@ -474,8 +493,8 @@ remove, no legacy data remains (`delete_site_session` also drops the
 
 **Behavioural coverage (mocks/injected callbacks, no new dependencies):**
 
-* `SiteProfileOpsTest.kt` (72 cases, executed by the CI Gradle unit-test
-  step against the real sequencing code in `SiteProfileOps.kt`): close
+* `SiteProfileOpsTest.kt` (87 cases, executed by the CI Gradle unit-test
+  step against the real sequencing code in the pure Kotlin flow files): close
   durability (flush failure keeps the view, resolve failure is an error,
   exactly-once completion, **flush watchdog on a lost callback, a late
   successful flush cannot rescue a timed-out close or destroy the view,

@@ -257,7 +257,10 @@ jobs:
           # TRUST MITIGATION (round 3): ONLY AnimeHubPlugin.kt (tauri types)
           # and the generated MainActivity leave the source set. The REAL
           # AnimeHubSiteController.kt, AnimeHubPipController.kt, the split
-          # AnimeHubDebugLog.kt / SiteNavigationGuard.kt, SiteProfileOps.kt,
+          # AnimeHubDebugLog.kt / SiteNavigationGuard.kt, the pure Kotlin flow
+          # files (SiteProfileOps.kt, ProfileQuarantine.kt, SiteCloseFlow.kt,
+          # SiteShutdownFlow.kt, SiteClearFlow.kt, SiteMigrationFlow.kt,
+          # SiteBackStatus.kt),
           # SiteNavigationPolicy.kt and IpPolicy.kt STAY — so
           # `:app:test*UnitTest` type-checks the production controller every
           # run instead of trusting the (unreadable) APK-step logs. Nothing

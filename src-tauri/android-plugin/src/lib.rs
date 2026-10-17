@@ -683,7 +683,18 @@ mod tests {
 
     #[test]
     fn kotlin_pins_the_late_callback_guard_and_quarantine_contract() {
-        let ops = include_str!("../kotlin/dev/animehub/app/SiteProfileOps.kt");
+        // The pure Kotlin side is split by responsibility (SiteProfileOps.kt's
+        // header lists the layout). `include_str!` fails the BUILD when a file
+        // goes missing, so a dropped file cannot silently shrink what is pinned.
+        let ops = concat!(
+            include_str!("../kotlin/dev/animehub/app/SiteProfileOps.kt"),
+            include_str!("../kotlin/dev/animehub/app/ProfileQuarantine.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteCloseFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteShutdownFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteClearFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteMigrationFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteBackStatus.kt"),
+        );
         let controller = include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
         // The literal Rust classifies is the one Kotlin produces.
         assert!(
@@ -826,7 +837,18 @@ mod tests {
 
     #[test]
     fn kotlin_pins_the_typed_cookie_wipe_contract() {
-        let ops = include_str!("../kotlin/dev/animehub/app/SiteProfileOps.kt");
+        // The pure Kotlin side is split by responsibility (SiteProfileOps.kt's
+        // header lists the layout). `include_str!` fails the BUILD when a file
+        // goes missing, so a dropped file cannot silently shrink what is pinned.
+        let ops = concat!(
+            include_str!("../kotlin/dev/animehub/app/SiteProfileOps.kt"),
+            include_str!("../kotlin/dev/animehub/app/ProfileQuarantine.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteCloseFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteShutdownFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteClearFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteMigrationFlow.kt"),
+            include_str!("../kotlin/dev/animehub/app/SiteBackStatus.kt"),
+        );
         let controller = include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
         // Chromium's `removeAllCookies` callback reports whether ANY cookie was
         // deleted — an outcome, not an error flag. An already-empty jar answers
@@ -979,6 +1001,103 @@ mod tests {
     }
 
     #[test]
+    fn kotlin_pure_files_stay_split_pure_and_packaged() {
+        // `SiteProfileOps.kt` was split by responsibility (its header lists the
+        // layout). Each file must keep its license header, its package line and
+        // the declarations it is the home of — and none of them may import
+        // Android or Tauri types, because the CI unit-test source set compiles
+        // them against the generated project and runs `SiteProfileOpsTest`
+        // through them. A file that disappears fails the build via
+        // `include_str!`, so the pinned surface cannot silently shrink.
+        let primitives = include_str!("../kotlin/dev/animehub/app/SiteProfileOps.kt");
+        let quarantine = include_str!("../kotlin/dev/animehub/app/ProfileQuarantine.kt");
+        let close = include_str!("../kotlin/dev/animehub/app/SiteCloseFlow.kt");
+        let shutdown = include_str!("../kotlin/dev/animehub/app/SiteShutdownFlow.kt");
+        let clear = include_str!("../kotlin/dev/animehub/app/SiteClearFlow.kt");
+        let migration = include_str!("../kotlin/dev/animehub/app/SiteMigrationFlow.kt");
+        let back = include_str!("../kotlin/dev/animehub/app/SiteBackStatus.kt");
+        for (name, src, homes) in [
+            (
+                "SiteProfileOps.kt",
+                primitives,
+                &[
+                    "object SiteProfileErrors",
+                    "class SiteSessionState",
+                    "object StepGuards",
+                    "object GeolocationWipe",
+                ][..],
+            ),
+            (
+                "ProfileQuarantine.kt",
+                quarantine,
+                &[
+                    "object ProfileQuarantine",
+                    "object SiteOpenGate",
+                    "object ProfileRetirement",
+                    "val SITE_PROFILE_NAME",
+                ][..],
+            ),
+            (
+                "SiteCloseFlow.kt",
+                close,
+                &["interface SiteClosePort", "object SiteCloseFlow"][..],
+            ),
+            (
+                "SiteShutdownFlow.kt",
+                shutdown,
+                &[
+                    "sealed interface ShutdownFlush",
+                    "interface ShutdownPort",
+                    "object ShutdownFlow",
+                ][..],
+            ),
+            (
+                "SiteClearFlow.kt",
+                clear,
+                &[
+                    "sealed interface CookieWipe",
+                    "object CookieWipes",
+                    "interface SiteClearPort",
+                    "object SiteClearFlow",
+                ][..],
+            ),
+            (
+                "SiteMigrationFlow.kt",
+                migration,
+                &[
+                    "interface SiteMigrationPort",
+                    "sealed class MigrationOutcome",
+                    "object SiteMigrationFlow",
+                ][..],
+            ),
+            ("SiteBackStatus.kt", back, &["object SiteBackStatus"][..]),
+        ] {
+            assert!(
+                src.starts_with("// SPDX-License-Identifier: MIT"),
+                "{name} lost its license header"
+            );
+            assert!(
+                src.contains("package dev.animehub.app"),
+                "{name} lost its package line"
+            );
+            assert!(
+                !src.contains("import android."),
+                "{name} must stay pure: no android.* import"
+            );
+            assert!(
+                !src.contains("import app.tauri"),
+                "{name} must stay pure: no Tauri import"
+            );
+            for marker in homes {
+                assert!(
+                    src.contains(marker),
+                    "{name} must be the home of `{marker}`"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn kotlin_file_declares_every_command() {
         // Command names must exist as `fun <name>` on the Kotlin side; a
         // missing method would fail only at runtime on a device.
@@ -1024,6 +1143,9 @@ mod tests {
     #[test]
     fn site_controller_enforces_the_multi_profile_contract() {
         let controller = include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
+        // Home of the shared profile-name rule and the retirement decision
+        // (split out of SiteProfileOps.kt).
+        let quarantine = include_str!("../kotlin/dev/animehub/app/ProfileQuarantine.kt");
         // Runtime support check before anything else happens on open.
         assert!(
             controller.contains("WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)"),
@@ -1061,10 +1183,18 @@ mod tests {
             "cookie work must go through Profile.getCookieManager()"
         );
         // Profile names are validated against the Rust derivation shape, so a
-        // stray call can never reach the Default profile.
+        // stray call can never reach the Default profile. The rule is defined
+        // ONCE — in ProfileQuarantine.kt — and the controller validates with it,
+        // so validation and the retirement decision cannot drift apart.
         assert!(
-            controller.contains("Regex(\"\"\"site-[0-9a-f]{32}-g\\d{1,10}\"\"\")"),
+            quarantine.contains(
+                "val SITE_PROFILE_NAME: Regex = Regex(\"\"\"site-[0-9a-f]{32}-g\\d{1,10}\"\"\")"
+            ),
             "profile names must be validated before use"
+        );
+        assert!(
+            controller.contains("SITE_PROFILE_NAME.matches(name)"),
+            "the controller must validate with the shared rule, not a copy of it"
         );
         // Orphan sweep support: enumeration exists and is feature-gated.
         assert!(
