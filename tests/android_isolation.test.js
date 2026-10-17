@@ -58,6 +58,12 @@ const PURE_FILES = [
 ];
 const pureKotlin = PURE_FILES.map((f) => read(`${KOTLIN}/${f}`)).join("\n");
 const pureFile = (f) => read(`${KOTLIN}/${f}`);
+/**
+ * The platform boundary: the single blocking-flush worker and the watchdog
+ * arming. Not pure (it touches Handler/Looper/Activity) — which is exactly why
+ * it lives outside the pure set.
+ */
+const flushWorkerKt = read(`${KOTLIN}/SiteFlushWorker.kt`);
 
 const windowsRs = read("src-tauri/src/web/windows.rs");
 const commandsRs = read("src-tauri/src/commands.rs");
@@ -599,10 +605,10 @@ test("every awaited flush is watchdog-bounded, in close and clear alike", () => 
   );
   // The adapters delegate to ONE helper, which posts on the main looper and
   // returns a removeCallbacks-based canceller (see the watchdog test below).
-  assert.match(closeBody, /scheduleWatchdog\(millis, onTimeout\)/);
-  const helperAt = controllerKt.indexOf("private fun scheduleWatchdog(");
-  assert.ok(helperAt > 0);
-  const helper = controllerKt.slice(helperAt, controllerKt.indexOf("\n  }\n", helperAt));
+  assert.match(closeBody, /SiteFlushWorker\.scheduleWatchdog\(millis, onTimeout\)/);
+  const helperAt = flushWorkerKt.indexOf("fun scheduleWatchdog(");
+  assert.ok(helperAt > 0, "the watchdog helper lives in SiteFlushWorker.kt");
+  const helper = flushWorkerKt.slice(helperAt, flushWorkerKt.indexOf("\n  }\n", helperAt));
   assert.match(helper, /mainHandler\.postDelayed\(task, millis\)/);
   assert.match(helper, /mainHandler\.removeCallbacks\(task\)/);
   // The doc's "every awaited step has a watchdog" claim is now backed by the
@@ -828,16 +834,16 @@ test("every awaited step cancels its watchdog, and an unarmable one fails fast",
   // watchdog never fires and whose provider never answers would otherwise leave
   // the caller — and the bridge call behind it — waiting forever).
   assert.match(
-    controllerKt,
-    /private fun scheduleWatchdog\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/,
+    flushWorkerKt,
+    /fun scheduleWatchdog\(millis: Long, onTimeout: \(\) -> Unit\): \(\) -> Unit/,
   );
-  assert.match(controllerKt, /mainHandler\.postDelayed\(task, millis\)/);
-  assert.match(controllerKt, /mainHandler\.removeCallbacks\(task\)/);
-  assert.match(controllerKt, /watchdog could not be armed/);
+  assert.match(flushWorkerKt, /mainHandler\.postDelayed\(task, millis\)/);
+  assert.match(flushWorkerKt, /mainHandler\.removeCallbacks\(task\)/);
+  assert.match(flushWorkerKt, /watchdog could not be armed/);
   assert.equal(
-    (controllerKt.match(/scheduleWatchdog\(millis, onTimeout\)/g) || []).length,
+    (controllerKt.match(/SiteFlushWorker\.scheduleWatchdog\(millis, onTimeout\)/g) || []).length,
     3,
-    "migration, close and clear adapters all share the helper",
+    "migration, close and clear adapters all share the one helper",
   );
   assert.doesNotMatch(
     code(controllerKt),
@@ -860,9 +866,10 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
   // Every AWAITED flush (migration, close, clear, the periodic sync) routes
   // through submitFlush — the single place that answers a caller and can
   // therefore notice a stuck worker.
-  assert.match(controllerKt, /private fun submitFlush\(/);
+  assert.match(flushWorkerKt, /object SiteFlushWorker/);
+  assert.match(flushWorkerKt, /fun submit\(\s*activity: Activity,/);
   assert.equal(
-    (controllerKt.match(/submitFlush\(activity, "/g) || []).length,
+    (controllerKt.match(/SiteFlushWorker\.submit\(activity, "/g) || []).length,
     4,
     "migration, close, clear and the periodic sync",
   );
@@ -870,10 +877,17 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
   // worker — no extra threads — and is awaited for a bounded budget, because
   // the generated Activity kills the process right after teardown: a
   // fire-and-forget flush there could be killed mid-write.
+  // ONE executor, in ONE file: nothing in the controller may queue flush work
+  // behind the worker's back (the destroy-time teardown goes through it too, so
+  // a stuck provider flush is observable there as well).
+  assert.equal((flushWorkerKt.match(/FLUSH_EXECUTOR\.execute/g) || []).length, 1);
+  // Only documentation may still name it; no controller CODE may queue behind
+  // the worker's back.
+  assert.doesNotMatch(code(controllerKt), /FLUSH_EXECUTOR/);
   assert.equal(
-    (controllerKt.match(/FLUSH_EXECUTOR\.execute/g) || []).length,
-    2,
-    "submitFlush plus the destroy-time flush",
+    (controllerKt.match(/SiteFlushWorker\.execute\("destroy"\)/g) || []).length,
+    1,
+    "the destroy-time flush uses the same worker",
   );
   const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity)");
   assert.ok(destroyAt > 0);
@@ -881,7 +895,7 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
     destroyAt,
     controllerKt.indexOf("private fun ensureBackCallback", destroyAt),
   );
-  assert.match(destroyBody, /FLUSH_EXECUTOR\.execute/);
+  assert.match(destroyBody, /SiteFlushWorker\.execute\("destroy"\)/);
   assert.match(
     destroyBody,
     /ShutdownFlow\.run\(/,
@@ -899,17 +913,19 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
   );
   // A watchdog answers the caller; it cannot cancel the blocking provider
   // call, so a stuck worker must be observable instead of hidden.
-  assert.match(controllerKt, /FLUSH_STUCK_WARN_MS/);
-  assert.match(controllerKt, /flush worker stuck/);
+  assert.match(flushWorkerKt, /FLUSH_STUCK_WARN_MS/);
+  assert.match(flushWorkerKt, /flush worker stuck/);
   assert.equal(
-    (controllerKt.match(/Executors\.newSingleThreadExecutor/g) || []).length,
+    (flushWorkerKt.match(/Executors\.newSingleThreadExecutor/g) || []).length,
     1,
   );
-  assert.doesNotMatch(
-    controllerKt,
-    /newCachedThreadPool|newFixedThreadPool|newWorkStealingPool/,
-    "no thread pool inflation to dodge a stuck flush",
-  );
+  for (const src of [controllerKt, flushWorkerKt, pureKotlin]) {
+    assert.doesNotMatch(
+      src,
+      /newCachedThreadPool|newFixedThreadPool|newWorkStealingPool/,
+      "no thread pool inflation to dodge a stuck flush",
+    );
+  }
 });
 
 test("back navigation: fullscreen first, then site history, then the launcher hook", () => {
@@ -1018,6 +1034,15 @@ test("the pure Kotlin split is packaged, pure, copied and homed", () => {
       assert.ok(pureFile(f).includes(m), `${f} must be the home of ${m}`);
     }
   }
+  // The worker file is part of the same split: copied into the generated
+  // project, packaged, and the ONLY home of the executor.
+  assert.match(flushWorkerKt, /^package dev\.animehub\.app$/m);
+  assert.ok(
+    preparePy.includes('"SiteFlushWorker"'),
+    "android_prepare.py must copy SiteFlushWorker.kt into the generated project",
+  );
+  assert.equal((flushWorkerKt.match(/object SiteFlushWorker/g) || []).length, 1);
+
   // The split must not duplicate a rule: each key contract has exactly one home.
   for (const marker of [
     "object ProfileQuarantine",
@@ -1090,7 +1115,7 @@ test("the destroy-time site flush is awaited within a bounded budget", () => {
   assert.match(destroy, /ShutdownFlow\.run\(/);
   assert.match(destroy, /val finished = CountDownLatch\(1\)/);
   assert.match(destroy, /val failure = AtomicReference<String\?>\(null\)/);
-  assert.match(destroy, /FLUSH_EXECUTOR\.execute \{/);
+  assert.match(destroy, /SiteFlushWorker\.execute\("destroy"\) \{/);
   assert.match(destroy, /finished\.await\(budgetMillis, TimeUnit\.MILLISECONDS\)/);
   assert.match(destroy, /finished\.countDown\(\)/);
   assert.doesNotMatch(

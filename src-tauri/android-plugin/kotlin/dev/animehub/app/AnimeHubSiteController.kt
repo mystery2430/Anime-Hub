@@ -82,9 +82,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.lang.ref.WeakReference
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONTokener
 
@@ -95,7 +93,8 @@ import org.json.JSONTokener
  *
  * All WebView and ProfileStore work runs on the UI thread (both APIs are
  * `@UiThread`); the blocking `CookieManager.flush()` always runs on
- * [FLUSH_EXECUTOR], never on the UI thread. Flow sequencing (close / clear /
+ * [SiteFlushWorker]'s single serialised worker, never on the UI thread. Flow
+ * sequencing (close / clear /
  * migration) lives in [SiteCloseFlow], [SiteClearFlow] and
  * [SiteMigrationFlow]; this file only wires the Android ports.
  */
@@ -123,102 +122,6 @@ object AnimeHubSiteController {
    */
   // The profile-name rule lives ONCE, in SiteProfileOps.kt (`SITE_PROFILE_NAME`),
   // and is shared with [ProfileRetirement.refusal] so the two cannot drift.
-
-  private val FLUSH_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
-    Thread(runnable, "AnimeHubSiteFlush").apply { isDaemon = true }
-  }
-
-  /**
-   * When the flush task currently running on [FLUSH_EXECUTOR] started, or 0
-   * while the worker is idle. Single-threaded on purpose: `CookieManager
-   * .flush()` is the blocking provider call, and serialising it keeps the
-   * profile cookie stores from being written concurrently.
-   */
-  private val flushBusySince = AtomicLong(0L)
-
-  /**
-   * How long a running flush may take before a newly queued one is logged as
-   * evidence of a stuck worker.
-   *
-   * A flow watchdog answers the CALLER — it never cancels the blocking
-   * `flush()` underneath, because the provider call offers no cancellation.
-   * So a genuinely stuck flush leaves its task occupying the worker; later
-   * flushes queue behind it and every later await is answered by its own
-   * watchdog. This counter makes that pileup observable in the in-app log
-   * instead of invisible (no unbounded thread spawning to paper over it).
-   */
-  private const val FLUSH_STUCK_WARN_MS = 10_000L
-
-  /**
-   * Arm one watchdog on the UI-thread handler and return its canceller.
-   *
-   * The canceller is the point: a step that answered normally used to leave its
-   * delayed runnable queued for the whole timeout window (10 s per step, 15 s
-   * for a flush), and that runnable holds the port — and through it the site
-   * WebView and the Activity — reachable until it fires. Every close, clear and
-   * migration step paid that. `removeCallbacks` is idempotent and thread-safe,
-   * so the flows cancel from whichever thread settles the step.
-   *
-   * If the watchdog cannot be armed at all, the step is failed IMMEDIATELY: a
-   * flow whose watchdog never fires and whose provider never answers would
-   * otherwise leave its caller — and the Tauri bridge call behind it — waiting
-   * forever. Silently ignoring the failure (as this used to) traded a hang for
-   * an unbounded wait.
-   */
-  private fun scheduleWatchdog(millis: Long, onTimeout: () -> Unit): () -> Unit {
-    val task = Runnable { onTimeout() }
-    return try {
-      mainHandler.postDelayed(task, millis)
-      // Named, not a bare lambda on its own line: Kotlin would otherwise parse
-      // it as a trailing lambda of `postDelayed`.
-      val cancel: () -> Unit = { mainHandler.removeCallbacks(task) }
-      cancel
-    } catch (e: Exception) {
-      Log.w(LOG_TAG, "watchdog could not be armed (${e.javaClass.simpleName}); failing the step now")
-      AnimeHubDebugLog.add("site", "watchdog not armed (${e.javaClass.simpleName}) - step failed now")
-      onTimeout()
-      val noop: () -> Unit = {}
-      noop
-    }
-  }
-
-  /**
-   * Run one blocking `flush()` on [FLUSH_EXECUTOR] and deliver its result on
-   * the UI thread. Warns (logcat + in-app log) when a previous flush has
-   * still been running for [FLUSH_STUCK_WARN_MS] or more — the caller has
-   * its watchdog; this is the evidence that the worker itself is stuck.
-   */
-  private fun submitFlush(
-    activity: Activity,
-    tag: String,
-    work: () -> Unit,
-    onDone: (Throwable?) -> Unit,
-  ) {
-    val since = flushBusySince.get()
-    if (since > 0L) {
-      val waited = System.currentTimeMillis() - since
-      if (waited >= FLUSH_STUCK_WARN_MS) {
-        Log.w(LOG_TAG, "flush worker stuck ${waited}ms while queueing '$tag'")
-        AnimeHubDebugLog.add("site", "flush worker stuck ${waited}ms ($tag)")
-      }
-    }
-    try {
-      FLUSH_EXECUTOR.execute {
-        flushBusySince.compareAndSet(0L, System.currentTimeMillis())
-        val error =
-          try {
-            work()
-            null
-          } catch (e: Exception) {
-            e
-          }
-        flushBusySince.set(0L)
-        activity.runOnUiThread { onDone(error) }
-      }
-    } catch (e: Exception) {
-      activity.runOnUiThread { onDone(e) }
-    }
-  }
 
   /** UI-thread scheduler for flow watchdogs and the back-status poll. */
   private val mainHandler = Handler(Looper.getMainLooper())
@@ -474,11 +377,11 @@ object AnimeHubSiteController {
           activity.runOnUiThread { onDone(IllegalStateException("profil cookie yöneticisi yok")) }
           return
         }
-        submitFlush(activity, "migration", { m.flush() }, onDone)
+        SiteFlushWorker.submit(activity, "migration", { m.flush() }, onDone)
       }
 
       override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
-        scheduleWatchdog(millis, onTimeout)
+        SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
     }
 
   /** Construct, configure, attach and navigate the site WebView. UI thread. */
@@ -613,11 +516,11 @@ object AnimeHubSiteController {
               onDone(IllegalStateException("profil çözümlenemedi"))
               return
             }
-            submitFlush(activity, "close", { profile.cookieManager.flush() }, onDone)
+            SiteFlushWorker.submit(activity, "close", { profile.cookieManager.flush() }, onDone)
           }
 
           override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
-            scheduleWatchdog(millis, onTimeout)
+            SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
 
           override fun destroyActiveView() {
             finishClose(activity)
@@ -673,7 +576,7 @@ object AnimeHubSiteController {
   /**
    * UI thread, from the generated `MainActivity.onDestroy`.
    *
-   * The site profile's cookie flush is submitted to [FLUSH_EXECUTOR] — disk I/O
+   * The site profile's cookie flush is submitted to [SiteFlushWorker] — disk I/O
    * never runs here — and then awaited for
    * [ShutdownFlow.DESTROY_FLUSH_BUDGET_MS], because the generated Activity ends
    * the process right after this when it is finishing: an unawaited flush could
@@ -715,8 +618,10 @@ object AnimeHubSiteController {
         object : ShutdownPort {
           override fun submitFlush(): Boolean {
             val target = profile ?: return false
-            // Disk I/O on the worker, never on this (UI) thread.
-            FLUSH_EXECUTOR.execute {
+            // Disk I/O on the single flush worker, never on this (UI) thread —
+            // and through the worker, so a stuck provider flush is observable
+            // here too instead of only on the awaited paths.
+            SiteFlushWorker.execute("destroy") {
               try {
                 target.cookieManager.flush()
                 AnimeHubDebugLog.add("site", "destroy-time flush completed")
@@ -1054,11 +959,11 @@ object AnimeHubSiteController {
               onDone(IllegalStateException("profil yok"))
               return
             }
-            submitFlush(activity, "clear", { profile.cookieManager.flush() }, onDone)
+            SiteFlushWorker.submit(activity, "clear", { profile.cookieManager.flush() }, onDone)
           }
 
           override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): () -> Unit =
-            scheduleWatchdog(millis, onTimeout)
+            SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
         }
       SiteClearFlow.run(isSupported(), profileName, port) { error ->
         when (error) {
@@ -1215,7 +1120,7 @@ object AnimeHubSiteController {
         onResult("profil çözümlenemedi: ${e.message}")
         return
       }
-    submitFlush(activity, "sync", { profile.cookieManager.flush() }) { error ->
+    SiteFlushWorker.submit(activity, "sync", { profile.cookieManager.flush() }) { error ->
       onResult(
         if (error == null) null else "çerez kalıcılığı başarısız: ${error.message}",
       )

@@ -68,7 +68,12 @@ storage write failure.
   typed cookie delivery; `SiteMigrationFlow.kt` the one-time jar import;
   `SiteBackStatus.kt` the launcher back-close handshake.
   `AnimeHubSiteController.kt` adapts the real Android/androidx.webkit calls to
-  those ports and holds the WebView/PiP/back-button lifecycle.
+  those ports and holds the WebView/PiP/back-button lifecycle, and
+  `SiteFlushWorker.kt` is the platform boundary both invariants live in: the ONE
+  serialised worker every blocking `flush()` runs on (with stuck-worker evidence
+  instead of extra threads) and the watchdog arming/cancellation. All five flush
+  call sites — migrate, close, clear, the periodic sync and the destroy-time
+  teardown — go through it.
   `scripts/android_prepare.py` copies every one of them into the generated
   project and **hard-fails** if a file is missing, so the CI unit-test compile
   cannot silently shrink.
