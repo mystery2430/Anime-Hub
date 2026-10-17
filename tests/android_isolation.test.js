@@ -394,21 +394,31 @@ test("remove_site deletes the profile, queues refusals, bumps the generation", (
 
 test("the quarantine ledger is retired only AFTER the generation is durable", () => {
   const ops = pureKotlin;
-  // windows.rs: delete → (queue) → bump → retire, all on the derived name.
+  // windows.rs: tombstone → delete → bump → lift → retire, all on the derived
+  // name. The tombstone is first because a process kill inside the (slow)
+  // provider call must not leave a name that is still derivable, still on disk
+  // and no longer remembered — see AH-04 / R-07.
   const at = windowsRs.indexOf("pub fn run_mobile_delete_protocol");
   assert.ok(at > 0, "the delete protocol is missing");
   const body = windowsRs.slice(at, windowsRs.indexOf("\n}\n", at));
-  const del = body.indexOf("delete_profile(&profile)?");
   const queue = body.indexOf("queue_pending_profile_delete(state, &profile)?");
+  const del = body.indexOf("delete_profile(&profile)");
   const bump = body.indexOf("bump_profile_generation(state, site_id)?");
+  const forget = body.indexOf("forget_pending_profile_delete(state, &profile)?");
   const retire = body.indexOf("retire_profile(&profile)?");
-  assert.ok(del > 0, "the deletion runs first");
-  assert.ok(queue > del, "a deferred deletion is queued before the bump");
-  assert.ok(bump > queue, "the durable bump follows the queue write");
-  assert.ok(retire > bump, "THE ORDER: retirement only after the bump is durable");
-  // A Pending profile still exists on disk → its ledger survives until the
-  // startup drain lands the deletion.
-  assert.match(body, /if !matches!\(action, SiteProfileAction::Pending\) \{[\s\S]*retire_profile/);
+  assert.ok(queue > 0, "the durable intent is written before anything else");
+  assert.ok(del > queue, "the provider is only called once the tombstone is durable");
+  assert.ok(bump > del, "the durable bump follows the deletion");
+  assert.ok(forget > bump, "the tombstone is lifted only after a confirmed deletion");
+  assert.ok(retire > forget, "THE ORDER: retirement last");
+  // A Pending profile still exists on disk → it returns before the lift, so
+  // tombstone and ledger both survive until the startup drain lands it.
+  const pendingAt = body.indexOf("SiteProfileAction::Pending");
+  assert.ok(pendingAt > del && pendingAt < forget, "a deferred deletion keeps its tombstone");
+  assert.match(body, /return Ok\(action\);/);
+  // A failed provider call propagates WITHOUT lifting the tombstone, so the
+  // deletion is retried at the next start instead of being forgotten.
+  assert.match(body, /Err\(e\) => \{[\s\S]{0,400}?return Err\(e\);/);
   // Host tests that execute the order itself.
   for (const name of [
     "mobile_delete_protocol_retires_only_after_the_generation_is_durable",
@@ -416,6 +426,8 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
     "mobile_delete_protocol_queues_a_deferred_deletion_and_keeps_its_ledger",
     "mobile_delete_protocol_is_safe_to_retry_after_a_failed_bump",
     "mobile_delete_protocol_retires_each_generation_exactly_once_on_repeat",
+    "mobile_delete_protocol_tombstones_the_name_before_the_provider_is_called",
+    "a_failed_provider_delete_keeps_the_tombstone_so_the_name_cannot_come_back",
   ]) {
     assert.match(windowsRs, new RegExp(`fn ${name}\\(\\)`), `missing host test ${name}`);
   }

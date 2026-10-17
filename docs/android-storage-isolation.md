@@ -476,9 +476,27 @@ outage cannot make every site unopenable.
   * *Verified deletion + generation bump, and the order between them.* The
     delete side is ONE host-tested protocol, `run_mobile_delete_protocol`
     (`web/windows.rs`): derive the name from the **current** generation →
-    delete → durably queue a deferred deletion → **durably bump the
-    generation** → and only then retire the name's ledger via the separate
-    `site_profile_retire` bridge call. Retirement last is the safety property:
+    **durably queue the name** (a tombstone: "this deletion was requested") →
+    delete → **durably bump the generation** → for a *confirmed* deletion,
+    durably lift the tombstone → and only then retire the name's ledger via the
+    separate `site_profile_retire` bridge call.
+
+    The tombstone comes first because of process death (AH-04 / R-07):
+    `deleteProfile` is a provider call that can take arbitrarily long — the
+    reason the watchdogs exist — and "accepted" does not mean Chromium has
+    removed the directory. Killing the process inside that call used to leave no
+    durable trace at all: the Kotlin ledger is in-memory and the generation had
+    not moved, so the next open derived the same name and `getOrCreateProfile`
+    reused the leftover directory — the session the user asked to delete came
+    back, and nothing said a deletion had ever been requested. Now the queue
+    entry survives the kill, `resolve_queued_free_generation` refuses to hand a
+    queued name to an open, and the startup drain re-runs the deletion until it
+    lands. A provider *failure* keeps the tombstone too, so the deletion is
+    finished at the next start instead of being forgotten with the data still on
+    disk; the cost of that false tombstone is one generation number and a site
+    that opens logged out — which is what the caller asked for.
+
+    Retirement last is the safety property:
     the bump is what makes the name underivable, so if it (or its storage
     write) fails, the command aborts with the ledger **intact** — the name is
     still reachable by a retry or a reopen, and it must therefore still be
@@ -490,9 +508,10 @@ outage cannot make every site unopenable.
     is the single retirement entry point (refusals decided by the pure
     `ProfileRetirement` rule: an underivable name, or a profile a live session
     is using), and `retire(name)` stays the only way a whole ledger is dropped.
-    A **deferred** (`Pending`) deletion keeps every record even after the bump,
-    because that profile still exists on disk: the startup drain retires it
-    only after it has durably forgotten the queued name. The orphan sweep
+    A **deferred** (`Pending`) deletion keeps every record even after the bump —
+    tombstone and ledger both — because that profile still exists on disk: the
+    startup drain retires it only after it has durably forgotten the queued
+    name. The orphan sweep
     retires what it deleted, and logs (rather than aborting "clear all") if a
     retirement call fails — keeping a ledger is the conservative direction.
     The new generation is a different string and starts unblocked, so an old

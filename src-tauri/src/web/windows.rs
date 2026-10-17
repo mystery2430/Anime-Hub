@@ -1148,18 +1148,35 @@ where
 /// still be in flight on it — the exact race the per-operation ledger exists to
 /// prevent, re-opened by the cleanup path.
 ///
-/// So the sequence is: derive the name from the CURRENT generation → delete →
-/// durably queue a deferred deletion → durably bump the generation → and only
-/// then retire. Every earlier failure propagates and leaves the ledger in
-/// place, i.e. the name stays blocked; a retry re-runs the whole protocol and
-/// is idempotent (the same name is derived again while the bump never landed).
+/// So the sequence is: derive the name from the CURRENT generation → **durably
+/// queue the name (tombstone)** → delete → durably bump the generation → and
+/// only for a confirmed deletion, lift the tombstone and retire. Every earlier
+/// failure propagates and leaves both the tombstone and the ledger in place,
+/// i.e. the name stays blocked; a retry re-runs the whole protocol and is
+/// idempotent (the same name is derived again while the bump never landed, and
+/// queueing a name that is already queued changes nothing).
 ///
-/// A `Pending` (deferred) deletion is deliberately NOT retired: the profile
-/// still exists on disk and is still loaded in this process, so its ledger
-/// stays until the deferred deletion actually lands — the startup drain
-/// retires it after durably forgetting the queued name. The bump still happens,
-/// so the next open of this site derives a DIFFERENT name and can never collide
-/// with a deletion that is still finishing.
+/// WHY THE TOMBSTONE COMES FIRST (AH-04 / R-07, process death): `deleteProfile`
+/// is a provider call that can take arbitrarily long — the reason the watchdogs
+/// exist — and "accepted" does not mean Chromium has removed the directory yet.
+/// If the process is killed during that call, or between it and the generation
+/// write, an in-memory-only ledger is gone with it: nothing durable says the
+/// deletion was ever requested, the generation never moved, so the next open
+/// derives the SAME name and `getOrCreateProfile` happily reuses the leftover
+/// directory — the session the user asked to delete comes back. Queueing the
+/// name before touching the provider closes that window with the two mechanisms
+/// that already survive a restart: `resolve_queued_free_generation` refuses to
+/// hand a queued name to an open, and the startup drain re-runs the deletion
+/// until it lands. The cost of a false tombstone (the provider call fails) is
+/// one generation number and a deletion that completes at the next start —
+/// which is what the caller asked for anyway.
+///
+/// A `Pending` (deferred) deletion is deliberately NOT retired and keeps its
+/// tombstone: the profile still exists on disk and is still loaded in this
+/// process, so its ledger stays until the deferred deletion actually lands —
+/// the startup drain retires it after durably forgetting the queued name. The
+/// bump still happens, so the next open of this site derives a DIFFERENT name
+/// and can never collide with a deletion that is still finishing.
 ///
 /// Host-testable on purpose: the platform calls are injected, so `cargo test`
 /// proves the order (and the failed-write cases) on every OS instead of leaving
@@ -1178,24 +1195,45 @@ where
 
     let generation = profile_generation(state, site_id)?;
     let profile = android_profile_name(site_id, generation);
-    let action = delete_profile(&profile)?;
-    if matches!(action, SiteProfileAction::Pending) {
-        // Durable BEFORE the bump: a crash between the two must not lose the
-        // deferred deletion, or the name would survive on disk unqueued.
-        queue_pending_profile_delete(state, &profile)?;
-    }
-    // Durable: after this write no future open can derive `profile` again.
-    bump_profile_generation(state, site_id)?;
-    if !matches!(action, SiteProfileAction::Pending) {
-        // Only now is dropping the ledger safe. A failure here is reported, not
-        // swallowed: keeping the ledger is the conservative direction (the name
-        // is already unreachable), and the retry re-runs the protocol cleanly.
-        let dropped = retire_profile(&profile)?;
-        if dropped > 0 {
-            log::info!(
-                "profil karantinası emekliye ayrıldı ({dropped} bekleyen işlem düştü): {profile}"
-            );
+
+    // 1. DURABLE INTENT, before the provider is touched. If this write fails
+    //    nothing has happened yet: no deletion was requested, the name is still
+    //    derivable and still clean, and the caller gets a retryable error.
+    queue_pending_profile_delete(state, &profile)?;
+
+    // 2. The provider call. Its outcome no longer decides whether the name is
+    //    remembered — only when the tombstone may be lifted.
+    let action = match delete_profile(&profile) {
+        Ok(action) => action,
+        Err(e) => {
+            // Keep the tombstone: the deletion is finished by the startup drain
+            // instead of being forgotten with the data still on disk, and the
+            // name cannot be handed to an open in the meantime.
+            log::warn!("profil silinemedi, bekleyenler kuyruğunda bırakıldı: {profile}");
+            return Err(e);
         }
+    };
+
+    // 3. Durable: after this write no future open can derive `profile` again
+    //    (and the queue already guaranteed it before this line).
+    bump_profile_generation(state, site_id)?;
+
+    if matches!(action, SiteProfileAction::Pending) {
+        // Deferred: the profile still exists and is still loaded in this
+        // process. Tombstone and ledger both stay until the drain lands it.
+        return Ok(action);
+    }
+
+    // 4. Confirmed deleted (or already absent): lift the tombstone, and only
+    //    then drop the ledger. A failure here is reported, not swallowed:
+    //    keeping both is the conservative direction (the name is already
+    //    unreachable), and the retry re-runs the protocol cleanly.
+    forget_pending_profile_delete(state, &profile)?;
+    let dropped = retire_profile(&profile)?;
+    if dropped > 0 {
+        log::info!(
+            "profil karantinası emekliye ayrıldı ({dropped} bekleyen işlem düştü): {profile}"
+        );
     }
     Ok(action)
 }
@@ -3226,18 +3264,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(action, SiteProfileAction::Deleted);
-        // THE ORDER IS THE SAFETY PROPERTY: the generation write lands between
-        // the deletion and the retirement, all on the same name.
+        // THE ORDER IS THE SAFETY PROPERTY: the tombstone is durable before the
+        // provider is called, the generation write lands between the deletion
+        // and the retirement, the tombstone is lifted only after a confirmed
+        // deletion, and all of it is about the same name.
         assert_eq!(
             *writes.lock().unwrap(),
             vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("delete:{name}"),
                 format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("retire:{name}"),
-            ]
+            ],
+            "tombstone → provider → durable bump → lift → retire"
         );
         assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(profile_generation(&state, id).unwrap(), 1);
+        // A confirmed deletion leaves nothing behind in the queue.
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
     }
 
     #[test]
@@ -3273,13 +3318,28 @@ mod tests {
         assert_eq!(
             *writes.lock().unwrap(),
             vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("delete:{name}"),
                 format!("put-failed:{PROFILE_GENERATION_PREFIX}{id}"),
             ],
-            "the refused write is visible and NOTHING durable landed after the delete"
+            "the tombstone is the only durable write, then the refused bump; nothing landed after it"
         );
         assert_eq!(profile_generation(&state, id).unwrap(), 0);
         assert_eq!(android_profile_name(id, 0), name);
+        // STRONGER THAN BEFORE: the generation write was refused, so the stored
+        // generation still derives the deleted name — but the tombstone is
+        // durable, and the open path resolves through the queue, so the name is
+        // never handed out again even without the bump.
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()]
+        );
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) =
+            resolve_queued_free_generation(id, profile_generation(&state, id).unwrap(), &queued)
+                .unwrap();
+        assert!(advanced, "a tombstoned name must not be reusable");
+        assert_ne!(android_profile_name(id, resolved), name);
     }
 
     #[test]
@@ -3317,10 +3377,11 @@ mod tests {
         assert_eq!(
             *writes.lock().unwrap(),
             vec![
-                format!("delete:{name}"),
                 format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{name}"),
                 format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
-            ]
+            ],
+            "the tombstone is written once (before the provider) and NOT lifted for a deferred deletion"
         );
         assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
         // The new generation is a DIFFERENT name, so the next open can never
@@ -3374,13 +3435,17 @@ mod tests {
         assert_eq!(
             *writes.lock().unwrap(),
             vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("delete:{name}"),
                 format!("put-failed:{PROFILE_GENERATION_PREFIX}{id}"),
+                // The retry re-queues the SAME name, which the deduped queue
+                // already holds, so it writes nothing.
                 format!("delete:{name}"),
                 format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("retire:{name}"),
             ],
-            "the retry re-derives the SAME name, and only its durable bump is followed by a retirement"
+            "the retry re-derives the SAME name, and only its durable bump is followed by a lifted tombstone and a retirement"
         );
         assert_eq!(profile_generation(&state, id).unwrap(), 1);
     }
@@ -3417,16 +3482,126 @@ mod tests {
         assert_eq!(
             *writes.lock().unwrap(),
             vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("delete:{first}"),
                 format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("retire:{first}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("delete:{second}"),
                 format!("put:{PROFILE_GENERATION_PREFIX}{id}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
                 format!("retire:{second}"),
-            ]
+            ],
+            "each generation: tombstone → provider → bump → lift → retire"
         );
         assert_eq!(profile_generation(&state, id).unwrap(), 2);
         assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mobile_delete_protocol_tombstones_the_name_before_the_provider_is_called() {
+        // AH-04 / R-07. `deleteProfile` is a provider call that can take
+        // arbitrarily long — the reason the watchdogs exist — and "accepted"
+        // does not mean Chromium removed the directory. A process kill inside
+        // that call used to leave NO durable trace: the Kotlin ledger is
+        // in-memory, the generation had not moved, so the next open derived the
+        // same name and `getOrCreateProfile` reused the leftover directory —
+        // the session the user asked to delete came back. The tombstone is what
+        // survives the kill, so it has to exist before the call, not after it.
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail) = ordering_state();
+        let id = "user-delete-tombstone";
+        let name = android_profile_name(id, 0);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let queued_during_call = seen.clone();
+
+        let action = run_mobile_delete_protocol(
+            &state,
+            id,
+            |profile| {
+                // Read the durable state AT THE MOMENT the provider is asked:
+                // this is exactly what a kill inside the call would leave.
+                *queued_during_call.lock().unwrap() = read_pending_profile_deletes(&state).unwrap();
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                Ok(0)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(action, SiteProfileAction::Deleted);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![name.clone()],
+            "the name must already be durably queued while the provider call is in flight"
+        );
+        let log = writes.lock().unwrap().clone();
+        assert_eq!(
+            log[0],
+            format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+            "the tombstone is the first durable write of the protocol"
+        );
+        assert_eq!(log[1], format!("delete:{name}"));
+    }
+
+    #[test]
+    fn a_failed_provider_delete_keeps_the_tombstone_so_the_name_cannot_come_back() {
+        // The kill scenario, expressed as the closest thing a host test can do:
+        // the deletion was requested, the provider never answered successfully,
+        // and nothing in memory survives. What a restart can see is the durable
+        // queue and the generation counter, so those are what is asserted.
+        let (state, writes, _fail) = ordering_state();
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let id = "user-delete-provider-failed";
+        let name = android_profile_name(id, 0);
+
+        let err = run_mobile_delete_protocol(
+            &state,
+            id,
+            |_profile| Err(AppError::Bridge("sağlayıcı yanıt vermedi".into())),
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Bridge(_)), "{err}");
+        assert_eq!(
+            retired.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the ledger must stay: the deletion is not confirmed"
+        );
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()],
+            "the tombstone survives, so the startup drain finishes the deletion instead of forgetting it"
+        );
+        // No bump — the deletion is unconfirmed — and none is needed, because
+        // the open path resolves the generation through the queue.
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) = resolve_queued_free_generation(id, 0, &queued).unwrap();
+        assert!(
+            advanced,
+            "a tombstoned name must never be handed to an open"
+        );
+        assert_ne!(
+            android_profile_name(id, resolved),
+            name,
+            "the reopened session gets a different profile, never the leftover directory"
+        );
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![format!("put:{PENDING_PROFILE_DELETES_KEY}")],
+            "only the tombstone landed"
+        );
     }
 
     #[test]
