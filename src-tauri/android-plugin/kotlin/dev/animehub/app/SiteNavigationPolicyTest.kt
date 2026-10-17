@@ -173,6 +173,85 @@ class SiteNavigationPolicyTest {
         assertFalse(SiteNavigationPolicy.hostAllowedForTest("example.0x7f"))
     }
 
+    // -----------------------------------------------------------------------
+    // Sub-resource checkpoint (AH-01 / AH-02 / AH-08 / AH-P7)
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `subresources refuse cleartext and private hosts but keep media and inline assets`() {
+        val cases =
+            listOf(
+                Triple("https://openani.me/segment-0007.ts", null, "public media segment"),
+                Triple("https://openani.me/api/episode?id=1", null, "public xhr"),
+                Triple("wss://openani.me/live", null, "secure websocket"),
+                Triple("data:image/png;base64,iVBORw0KGgo=", null, "inline asset"),
+                Triple("blob:https://openani.me/media-1", null, "MSE object URL"),
+                Triple("about:blank", null, "blank frame"),
+                Triple("https://192.168.1.1/admin", SiteNavigationPolicy.PRIVATE_HOST, "router"),
+                Triple("https://127.0.0.1:8080/", SiteNavigationPolicy.PRIVATE_HOST, "loopback"),
+                Triple(
+                    "https://169.254.169.254/latest/meta-data/",
+                    SiteNavigationPolicy.PRIVATE_HOST,
+                    "cloud metadata",
+                ),
+                Triple("https://[::1]/x", SiteNavigationPolicy.PRIVATE_HOST, "ipv6 loopback"),
+                Triple("https://tauri.localhost/", SiteNavigationPolicy.PRIVATE_HOST, "launcher origin"),
+                Triple("https://0x7f000001/", SiteNavigationPolicy.PRIVATE_HOST, "hex loopback"),
+                Triple("http://openani.me/image.png", SiteNavigationPolicy.INSECURE_SCHEME, "cleartext"),
+                Triple("ws://openani.me/live", SiteNavigationPolicy.INSECURE_SCHEME, "cleartext socket"),
+                Triple("file:///etc/passwd", SiteNavigationPolicy.UNSUPPORTED_SCHEME, "local file"),
+                Triple("javascript:alert(1)", SiteNavigationPolicy.UNSUPPORTED_SCHEME, "script url"),
+                Triple("intent://x/#Intent;end", SiteNavigationPolicy.UNSUPPORTED_SCHEME, "intent"),
+            )
+        for ((url, want, why) in cases) {
+            assertEquals("$why: $url", want, SiteNavigationPolicy.subresourceRejection(parseVector(url)))
+        }
+    }
+
+    @Test
+    fun `the two checkpoints differ exactly where they should`() {
+        // A data: DOCUMENT is a fake page; a data: image is a normal
+        // sub-resource. Same string family, opposite answers, by design.
+        assertEquals(
+            SiteNavigationPolicy.DATA_NAVIGATION,
+            SiteNavigationPolicy.rejection(parseVector("data:text/html,<b>x</b>")),
+        )
+        assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("data:text/html,<b>x</b>")))
+        assertNull(SiteNavigationPolicy.rejection(parseVector("blob:https://openani.me/m")))
+        assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("blob:https://openani.me/m")))
+        // Both checkpoints refuse a private host and cleartext.
+        for (url in listOf("https://10.0.0.1/", "http://openani.me/")) {
+            assertNotNull("top-level: $url", SiteNavigationPolicy.rejection(parseVector(url)))
+            assertNotNull("sub-resource: $url", SiteNavigationPolicy.subresourceRejection(parseVector(url)))
+        }
+        // A websocket is a sub-resource the top-level rule does not allow, which
+        // is fine: nothing navigates the main frame to wss:.
+        assertEquals(
+            SiteNavigationPolicy.UNSUPPORTED_SCHEME,
+            SiteNavigationPolicy.rejection(parseVector("wss://openani.me/live")),
+        )
+        assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("wss://openani.me/live")))
+    }
+
+    @Test
+    fun `subresource blocking is host and scheme only - no dns and no blocklist claims`() {
+        // A hostname that merely RESOLVES to a private address cannot be caught
+        // here, and the user blocklist is not plumbed to the WebView. The test
+        // pins that honest behaviour so nobody mistakes it for a firewall.
+        assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("https://router.local.evil.example/")))
+        assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("https://127.0.0.1.nip.io/")))
+        assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("https://ads.example-tracker.com/x.js")))
+        // ... while the literal forms ARE caught.
+        assertEquals(
+            SiteNavigationPolicy.PRIVATE_HOST,
+            SiteNavigationPolicy.subresourceRejection(parseVector("https://127.0.0.1/")),
+        )
+        assertEquals(
+            SiteNavigationPolicy.PRIVATE_HOST,
+            SiteNavigationPolicy.subresourceRejection(parseVector("https://printer.local/")),
+        )
+    }
+
     /**
      * Reads the shared fixture from the test classpath. CI copies
      * `tests/fixtures/navigation-policy.tsv` into `app/src/test/resources/`;

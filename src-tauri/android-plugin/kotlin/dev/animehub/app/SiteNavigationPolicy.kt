@@ -82,6 +82,53 @@ internal object SiteNavigationPolicy {
   fun allows(target: NavTarget): Boolean = rejection(target) == null
 
   /**
+   * SUB-RESOURCE checkpoint (`shouldInterceptRequest`), which is deliberately
+   * NOT the same rule as the top-level one above:
+   *
+   *  - `data:` stays ALLOWED here. An inline image, font or media source is
+   *    normal; only a top-level data: document is a fake page.
+   *  - `wss:` is allowed (live sites use WebSockets) and `ws:` refused as the
+   *    cleartext it is.
+   *  - private/loopback/reserved hosts and cleartext are refused for EVERY
+   *    request, main frame or not, so a page cannot make the WebView fetch
+   *    `https://192.168.1.1/admin` or `https://169.254.169.254/…`.
+   *
+   * WHAT THIS DOES **NOT** DO, and why (see docs/android-storage-isolation.md):
+   *
+   *  - No DNS. `shouldInterceptRequest` returning null hands the request back to
+   *    the engine, which resolves and connects on its own — so a lookup here
+   *    would be a TOCTOU check that a rebinding hostname trivially defeats, and
+   *    it would add latency to every request. Hostnames that resolve to private
+   *    addresses are NOT caught on Android; only IP literals and the host rules
+   *    are. The desktop side does resolve (`web::dns`), and even there the
+   *    answer is not pinned to the connection.
+   *  - No user blocklist. The Rust blocklist is not plumbed to the WebView yet;
+   *    until it is, this checkpoint enforces the private-host and scheme rules
+   *    only. Reported as deferred rather than claimed as done.
+   *  - `blob:` inherits its creator's origin and is allowed, because refusing it
+   *    stops MSE playback dead.
+   */
+  fun subresourceRejection(uri: Uri): String? =
+    subresourceRejection(NavTarget(uri.scheme, uri.host, uri.schemeSpecificPart))
+
+  fun subresourceRejection(target: NavTarget): String? {
+    val scheme = target.scheme?.lowercase() ?: return UNSUPPORTED_SCHEME
+    return when (scheme) {
+      "https",
+      "wss" -> if (hostAllowed(target.host)) null else PRIVATE_HOST
+
+      "http",
+      "ws" -> INSECURE_SCHEME
+      // Inline assets and object URLs: legitimate sub-resources.
+      "data",
+      "blob",
+      "about" -> null
+
+      else -> UNSUPPORTED_SCHEME
+    }
+  }
+
+  /**
    * The single log line for a blocked navigation: scheme, reason code and frame
    * kind — NO host, NO path, NO query. logcat is readable by any app holding
    * READ_LOGS on older releases and by anyone with adb, and the host alone says
