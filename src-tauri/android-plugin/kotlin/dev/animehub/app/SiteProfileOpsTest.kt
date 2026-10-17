@@ -286,6 +286,14 @@ class SiteProfileOpsTest {
     var cookiesNeverAnswer: Boolean = false,
     /** The final flush never answers: only its watchdog can settle the wipe. */
     var flushNeverAnswers: Boolean = false,
+    /**
+     * When set, [cookiesCleared] is computed EXACTLY like the production
+     * adapter computes it — [CookieWipes.emptinessOf] over a `hasCookies()`
+     * probe — instead of returning [cookieJarEmpty] directly, so the wiring
+     * (helper + flow), not only the helper, is under test. A probe that throws
+     * models an unreadable store.
+     */
+    var hasCookiesProbe: (() -> Boolean)? = null,
     /** The geolocation enumeration is held so a test can deliver it LATE. */
     geoHoldsCallback: Boolean = false,
     val geo: FakeGeolocationApi = FakeGeolocationApi(hold = geoHoldsCallback),
@@ -320,7 +328,8 @@ class SiteProfileOpsTest {
 
     override fun cookiesCleared(): Boolean? {
       emptinessChecks++
-      return cookieJarEmpty
+      val probe = hasCookiesProbe
+      return if (probe != null) CookieWipes.emptinessOf(probe) else cookieJarEmpty
     }
 
     override fun deleteAllStorage() {
@@ -918,6 +927,117 @@ class SiteProfileOpsTest {
     Assert.assertFalse(ProfileQuarantine.settle(profile, both[0]))
     Assert.assertFalse(ProfileQuarantine.settle(profile, 999_999L))
     Assert.assertEquals(listOf(both[1]), ProfileQuarantine.pendingOperations(profile))
+  }
+
+  // ------------------------------------------- adapter mapping (CookieWipes)
+
+  @Test
+  fun `the raw provider answer maps null-safely and never claims an unconfirmed deletion`() {
+    Assert.assertEquals(CookieWipe.Answered(true), CookieWipes.answered(true))
+    Assert.assertEquals(CookieWipe.Answered(false), CookieWipes.answered(false))
+    Assert.assertEquals(
+      "a null delivery is NOT a confirmed deletion",
+      CookieWipe.Answered(false),
+      CookieWipes.answered(null),
+    )
+    // So null goes down the indeterminate branch and is decided by the probe,
+    // never read as "the provider deleted cookies".
+    Assert.assertEquals(
+      CookieStep(false, SiteClearFlow.COOKIE_STATE_UNKNOWN_REASON),
+      SiteClearFlow.interpretCookieWipe(CookieWipes.answered(null)) { null },
+    )
+    Assert.assertEquals(
+      CookieStep(true, null),
+      SiteClearFlow.interpretCookieWipe(CookieWipes.answered(null)) { true },
+    )
+  }
+
+  @Test
+  fun `a thrown provider call and a vanished profile stay typed failures`() {
+    val thrown = CookieWipes.failed(IllegalStateException("store gone"))
+    Assert.assertTrue("a throw is a Failed, never an Answered", thrown is CookieWipe.Failed)
+    Assert.assertEquals("IllegalStateException: store gone", (thrown as CookieWipe.Failed).reason)
+    // An exception without a message must not crash the mapping either.
+    val messageless = CookieWipes.failed(IllegalStateException())
+    Assert.assertTrue(messageless is CookieWipe.Failed)
+    Assert.assertEquals("IllegalStateException: null", (messageless as CookieWipe.Failed).reason)
+
+    val noProfile = CookieWipes.noProfile()
+    Assert.assertTrue(noProfile is CookieWipe.Failed)
+    Assert.assertEquals(CookieWipes.NO_PROFILE_REASON, (noProfile as CookieWipe.Failed).reason)
+
+    // Neither may be readable as "the jar was empty", even when the probe would
+    // have said so: the failure TYPE decides before any probe is consulted.
+    for (wipe in listOf(thrown, messageless, noProfile)) {
+      val step = SiteClearFlow.interpretCookieWipe(wipe) { true }
+      Assert.assertFalse("must not become a success: $wipe", step.ok)
+      Assert.assertTrue(step.error!!.startsWith(SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX))
+    }
+  }
+
+  @Test
+  fun `the emptiness probe inverts hasCookies and stays indeterminate on a throw`() {
+    // `hasCookies()` asks the OPPOSITE question the flow asks, so the negation
+    // is the single most dangerous line in this path: inverted twice it would
+    // turn "cookies remain" into "empty → success".
+    Assert.assertEquals(
+      "hasCookies()=false means the jar IS empty",
+      java.lang.Boolean.TRUE,
+      CookieWipes.emptinessOf { false },
+    )
+    Assert.assertEquals(
+      "hasCookies()=true means cookies remain",
+      java.lang.Boolean.FALSE,
+      CookieWipes.emptinessOf { true },
+    )
+    Assert.assertNull(
+      "a throwing probe is indeterminate, never empty",
+      CookieWipes.emptinessOf { throw IllegalStateException("probe boom") },
+    )
+  }
+
+  @Test
+  fun `the probe verdicts map onto exactly one flow decision each`() {
+    fun verdict(hasCookies: () -> Boolean): CookieStep =
+      SiteClearFlow.interpretCookieWipe(CookieWipes.answered(false)) {
+        CookieWipes.emptinessOf(hasCookies)
+      }
+
+    Assert.assertEquals(CookieStep(true, null), verdict { false })
+    Assert.assertEquals(
+      CookieStep(false, SiteClearFlow.COOKIE_STILL_PRESENT_REASON),
+      verdict { true },
+    )
+    Assert.assertEquals(
+      CookieStep(false, SiteClearFlow.COOKIE_STATE_UNKNOWN_REASON),
+      verdict { throw IllegalStateException("probe boom") },
+    )
+  }
+
+  @Test
+  fun `the adapter probe wiring decides a real clear end to end`() {
+    // Same three provider store states, driven through the REAL flow with the
+    // fake answering the probe exactly like the production adapter does.
+    val empty = FakeClearPort(cookiesOk = false, hasCookiesProbe = { false })
+    var first = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = empty) { first = it ?: "ok" }
+    Assert.assertEquals("an empty jar is a verified success", "ok", first)
+    Assert.assertEquals(1, empty.emptinessChecks)
+    Assert.assertNull(SiteOpenGate.check(profile))
+
+    val full = FakeClearPort(cookiesOk = false, hasCookiesProbe = { true })
+    var second = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = full) { second = it ?: "ok" }
+    Assert.assertEquals(SiteClearFlow.COOKIE_STILL_PRESENT_REASON, second)
+    Assert.assertFalse("an answered wipe blocks nothing", ProfileQuarantine.isBlocked(profile))
+
+    val broken =
+      FakeClearPort(cookiesOk = false, hasCookiesProbe = { throw IllegalStateException("boom") })
+    var third = "unset"
+    SiteClearFlow.run(supported = true, profileName = profile, port = broken) { third = it ?: "ok" }
+    Assert.assertEquals(SiteClearFlow.COOKIE_STATE_UNKNOWN_REASON, third)
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull("all three stay retryable", SiteOpenGate.check(profile))
   }
 
   @Test

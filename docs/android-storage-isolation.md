@@ -263,7 +263,14 @@ remove, no legacy data remains (`delete_site_session` also drops the
     flight and no quarantine record is created.
   The decision lives in one pure function (`SiteClearFlow.interpretCookieWipe`)
   executed by the CI unit tests; the adapter only supplies the typed delivery
-  and the probe.
+  and the probe. The adapter side is pure too (`CookieWipes`), because two of
+  its rules are inversion-sensitive and a mistake in either would manufacture a
+  **false success**: a `ValueCallback<Boolean>` may deliver `null` (null is not
+  a confirmed deletion, so it becomes `Answered(false)` and the probe decides),
+  and `hasCookies()` asks the *opposite* question the flow asks ("are there
+  cookies?" vs "is the jar empty?"), so the negation and the throw handling
+  (`null` = indeterminate, never "empty") live in tested code instead of inline
+  in an adapter that no unit test can instantiate without new dependencies.
 * **A timeout bounds the SIDE EFFECT too, not only the answer.** A
   once-latch decides who *reports*; it cannot un-run a mutation. Two
   mechanisms close that gap, one per kind of awaited step
@@ -408,7 +415,7 @@ remove, no legacy data remains (`delete_site_session` also drops the
 
 **Behavioural coverage (mocks/injected callbacks, no new dependencies):**
 
-* `SiteProfileOpsTest.kt` (67 cases, executed by the CI Gradle unit-test
+* `SiteProfileOpsTest.kt` (72 cases, executed by the CI Gradle unit-test
   step against the real sequencing code in `SiteProfileOps.kt`): close
   durability (flush failure keeps the view, resolve failure is an error,
   exactly-once completion, **flush watchdog on a lost callback, a late
@@ -423,8 +430,13 @@ remove, no legacy data remains (`delete_site_session` also drops the
   **empty** jar it is a verified success that runs every step in order and
   leaves the gate open, over an unreadable store it stays a failure, a
   `Failed(…)` (no profile access / provider threw) is reported verbatim and
-  never consults the probe, a confirmed deletion never consults it either, and
-  `interpretCookieWipe`'s whole decision table is pinned as a pure function),
+  never consults the probe, a confirmed deletion never consults it either,
+  `interpretCookieWipe`'s whole decision table is pinned as a pure function, and
+  the adapter-side `CookieWipes` mapping is pinned too — null-safe `answered`
+  (null takes the indeterminate branch), `failed`/`noProfile` staying typed
+  failures even when the probe would say "empty", the `hasCookies()` inversion,
+  a throwing probe staying `null`, and all three provider store states driven
+  through the real flow end to end),
   the strict migration criterion (virgin-only, every cookie + flush,
   rejection/exception/flush/watchdog failures, exactly-once),
   session-slot rollback after a failed open (stale failure cannot clear a

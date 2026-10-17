@@ -650,9 +650,20 @@ test("the cookie step reads a TYPED delivery: an empty jar succeeds, an unreacha
     interp.indexOf("wipe.deleted") < interp.indexOf("cookiesCleared()"),
     "the probe runs inside the indeterminate branch",
   );
-  // The adapter hands the raw answer through and keeps real errors typed.
-  assert.match(controllerKt, /onDone\(CookieWipe\.Answered\(deleted == true\)\)/);
-  assert.match(controllerKt, /onDone\(CookieWipe\.Failed\(/);
+  // The adapter hands the raw answer through and keeps real errors typed — via
+  // the PURE mapping the CI unit tests execute, because two of its rules are
+  // inversion-sensitive: a null delivery is not a confirmed deletion, and
+  // `hasCookies()` asks the opposite of "is the jar empty?".
+  assert.match(ops, /object CookieWipes/);
+  assert.match(
+    ops,
+    /fun answered\(deleted: Boolean\?\): CookieWipe = CookieWipe\.Answered\(deleted == true\)/,
+  );
+  assert.match(ops, /fun noProfile\(\): CookieWipe = CookieWipe\.Failed\(NO_PROFILE_REASON\)/);
+  assert.match(ops, /runCatching \{ !hasCookies\(\) \}\.getOrNull\(\)/);
+  assert.match(controllerKt, /onDone\(CookieWipes\.answered\(deleted\)\)/);
+  assert.match(controllerKt, /onDone\(CookieWipes\.failed\(e\)\)/);
+  assert.match(controllerKt, /onDone\(CookieWipes\.noProfile\(\)\)/);
   assert.doesNotMatch(
     controllerKt,
     /onDone\(ok == true\)/,
@@ -661,8 +672,8 @@ test("the cookie step reads a TYPED delivery: an empty jar succeeds, an unreacha
   assert.match(controllerKt, /override fun cookiesCleared\(\): Boolean\?/);
   assert.match(
     controllerKt,
-    /runCatching \{ !profile\.cookieManager\.hasCookies\(\) \}\.getOrNull\(\)/,
-    "the probe reads the profile's own store and stays indeterminate on a throw",
+    /CookieWipes\.emptinessOf \{ profile\.cookieManager\.hasCookies\(\) \}/,
+    "the probe must go through the tested inversion of hasCookies()",
   );
   // Round 6 is untouched by this: the timeout still registers its own operation.
   assert.match(

@@ -787,13 +787,30 @@ mod tests {
             !ops.contains("fun removeAllCookies(onDone: (Boolean) -> Unit)"),
             "the boolean-shaped cookie port must not come back"
         );
-        // The adapter passes the raw answer through and keeps real errors typed.
+        // The adapter passes the raw answer through and keeps real errors
+        // typed — via the PURE mapping the CI unit tests execute, so the two
+        // inversion-sensitive rules (a null delivery is not a deletion, and
+        // `hasCookies()` is the opposite of "jar empty") cannot drift.
+        for marker in [
+            "object CookieWipes",
+            "fun answered(deleted: Boolean?): CookieWipe = CookieWipe.Answered(deleted == true)",
+            "fun failed(error: Throwable): CookieWipe =",
+            "fun noProfile(): CookieWipe = CookieWipe.Failed(NO_PROFILE_REASON)",
+            "fun emptinessOf(hasCookies: () -> Boolean): Boolean? =",
+            "runCatching { !hasCookies() }.getOrNull()",
+        ] {
+            assert!(
+                ops.contains(marker),
+                "the adapter mapping must keep: {marker}"
+            );
+        }
         assert!(
-            controller.contains("onDone(CookieWipe.Answered(deleted == true))"),
-            "the provider's raw answer must reach the flow uninterpreted"
+            controller.contains("onDone(CookieWipes.answered(deleted))"),
+            "the provider's raw answer must reach the flow through the tested mapping"
         );
         assert!(
-            controller.contains("onDone(CookieWipe.Failed("),
+            controller.contains("onDone(CookieWipes.failed(e))")
+                && controller.contains("onDone(CookieWipes.noProfile())"),
             "an unreachable store must arrive as a typed failure, not as false"
         );
         assert!(
@@ -805,8 +822,8 @@ mod tests {
             "the adapter must expose the emptiness probe"
         );
         assert!(
-            controller.contains("runCatching { !profile.cookieManager.hasCookies() }.getOrNull()"),
-            "the probe reads the profile's own store and stays indeterminate on a throw"
+            controller.contains("CookieWipes.emptinessOf { profile.cookieManager.hasCookies() }"),
+            "the probe must read the profile's own store through the tested inversion"
         );
         // Round 6 must survive this change: the timeout still registers its own
         // operation and a late callback still closes only that record.

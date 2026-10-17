@@ -606,6 +606,48 @@ sealed interface CookieWipe {
 /** One cookie step's verdict: [ok], plus the reason to aggregate when not. */
 data class CookieStep(val ok: Boolean, val error: String?)
 
+/**
+ * The adapter-side mapping between what the provider hands back and
+ * [CookieWipe] — pure, so the CI unit tests can pin it.
+ *
+ * WHY THIS IS NOT LEFT INLINE IN THE ADAPTER: the real adapter needs a live
+ * `Activity`, a `ProfileStore` profile and the provider's own `CookieManager`,
+ * and no unit test can build those without new test dependencies. Everything
+ * decidable without them lives here instead — in particular the two rules
+ * whose inversion would silently manufacture a FALSE SUCCESS:
+ *
+ *  * `ValueCallback<Boolean>` may deliver `null`. Null is NOT "cookies were
+ *    deleted", so it maps to `Answered(false)` and lets the emptiness probe
+ *    decide, instead of being read as a confirmed deletion;
+ *  * `CookieManager.hasCookies()` answers the OPPOSITE question the flow asks
+ *    ("are there cookies?" vs "is the jar empty?"). The negation therefore
+ *    lives here, in tested code, and a throwing probe stays `null` =
+ *    indeterminate — which [SiteClearFlow.interpretCookieWipe] reports as a
+ *    retryable failure rather than laundering into "empty, so success".
+ */
+object CookieWipes {
+  /** Reason used when the profile is gone by the time the cookie step runs. */
+  const val NO_PROFILE_REASON: String = "profil bu adımda erişilebilir değil"
+
+  /** The provider's raw `ValueCallback<Boolean>` delivery, mapped null-safely. */
+  fun answered(deleted: Boolean?): CookieWipe = CookieWipe.Answered(deleted == true)
+
+  /** A call that threw never reached the cookie store: a typed failure. */
+  fun failed(error: Throwable): CookieWipe =
+    CookieWipe.Failed("${error.javaClass.simpleName}: ${error.message}")
+
+  /** No profile access at this step — an error, never "nothing to delete". */
+  fun noProfile(): CookieWipe = CookieWipe.Failed(NO_PROFILE_REASON)
+
+  /**
+   * Turn the provider's `hasCookies()` into the flow's "is the jar empty?":
+   * `true` empty, `false` cookies remain, `null` when the probe itself could
+   * not answer (no profile, a throw) — indeterminate, never "empty".
+   */
+  fun emptinessOf(hasCookies: () -> Boolean): Boolean? =
+    runCatching { !hasCookies() }.getOrNull()
+}
+
 /** Operations [SiteClearFlow] sequences for an in-place profile wipe. */
 interface SiteClearPort {
   /** `ProfileStore.getProfile(name) != null` (false = already clean). */

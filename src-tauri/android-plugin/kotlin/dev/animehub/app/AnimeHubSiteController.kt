@@ -874,23 +874,23 @@ object AnimeHubSiteController {
               // A real error, NOT "nothing to delete": [profileExists] ran
               // before this step, so losing the profile here means it vanished
               // underneath the wipe. Handing the flow `Answered(false)` would
-              // let an unreachable store be read as a clean one.
-              onDone(CookieWipe.Failed("profil bu adımda erişilebilir değil"))
+              // let an unreachable store be read as a clean one. The mapping is
+              // [CookieWipes] — pure, CI-tested production code.
+              onDone(CookieWipes.noProfile())
               return
             }
             try {
               profile.cookieManager.removeAllCookies { deleted ->
                 // `deleted` is Chromium's "were ANY cookies deleted" — an
                 // outcome report, not an error flag: an already-empty jar
-                // answers false for a wipe that fully succeeded. Pass the raw
-                // answer through; [SiteClearFlow.interpretCookieWipe] decides,
-                // with [cookiesCleared] as the tie-breaker.
-                activity.runOnUiThread { onDone(CookieWipe.Answered(deleted == true)) }
+                // answers false for a wipe that fully succeeded, and the
+                // callback may even deliver null. [CookieWipes.answered] maps
+                // both null-safely; [SiteClearFlow.interpretCookieWipe] then
+                // decides, with [cookiesCleared] as the tie-breaker.
+                activity.runOnUiThread { onDone(CookieWipes.answered(deleted)) }
               }
             } catch (e: Exception) {
-              activity.runOnUiThread {
-                onDone(CookieWipe.Failed("${e.javaClass.simpleName}: ${e.message}"))
-              }
+              activity.runOnUiThread { onDone(CookieWipes.failed(e)) }
             }
           }
 
@@ -900,13 +900,15 @@ object AnimeHubSiteController {
             // `getCookie(url)` needs an origin and this path deliberately does
             // not carry the site URL. Read-only and synchronous, and consulted
             // ONLY when the provider said it deleted nothing — so it reads a
-            // stable store instead of racing the wipe it verifies. Anything
-            // unexpected (no profile, a throw) is `null` = indeterminate,
-            // which the flow reports as a retryable failure, never as success.
-            // Conservative in the other direction too: session cookies the
-            // provider counts but did not delete make this `false`, i.e. a
-            // visible failure the user can retry, not a silent claim.
-            return runCatching { !profile.cookieManager.hasCookies() }.getOrNull()
+            // stable store instead of racing the wipe it verifies. `hasCookies()`
+            // asks the opposite question ("are there cookies?"), so the
+            // negation and the throw handling live in [CookieWipes.emptinessOf],
+            // which the CI unit tests pin: an unexpected result stays `null` =
+            // indeterminate, which the flow reports as a retryable failure,
+            // never as success. Conservative in the other direction too: session
+            // cookies the provider counts but did not delete make this `false`,
+            // i.e. a visible failure the user can retry, not a silent claim.
+            return CookieWipes.emptinessOf { profile.cookieManager.hasCookies() }
           }
 
           override fun deleteAllStorage() {
