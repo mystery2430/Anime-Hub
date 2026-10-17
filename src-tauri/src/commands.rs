@@ -9,7 +9,7 @@ use crate::secure::master_key::Backend;
 use crate::secure::SecretProvider;
 use crate::sites::blocklist::{Blocklist, BlocklistState};
 use crate::sites::registry::{Category, Icon, Registry, Site, SiteDraft};
-use crate::web::session::{build_init_script, CookieJar, InjectedConfig};
+use crate::web::session::{build_init_script, InjectedConfig};
 use crate::web::windows;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;

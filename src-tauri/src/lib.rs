@@ -287,7 +287,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.deep_link().on_open_url(move |event| {
         for url in event.urls() {
             // Exact registered redirect only; see `is_registered_mobile_callback`.
-            if !is_registered_mobile_callback(&url.to_string()) {
+            if !is_registered_mobile_callback(url.as_ref()) {
                 log::warn!(
                     "kayıtlı olmayan deep-link yok sayıldı (şema: {})",
                     url.scheme()
@@ -600,7 +600,7 @@ mod ipc_surface_tests {
                 !commands.contains(&definition),
                 "{name} hâlâ bir komut olarak tanımlı"
             );
-            let frontend = frontend_sources();
+            let frontend = crate::frontend_sources();
             assert!(!frontend.is_empty(), "frontend kaynakları bulunamadı");
             for path in frontend {
                 let text = std::fs::read_to_string(&path).expect("kaynak okunabilmeli");

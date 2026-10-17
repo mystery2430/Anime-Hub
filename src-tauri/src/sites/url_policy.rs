@@ -279,7 +279,7 @@ pub fn is_private_host(host: &str) -> bool {
     // drift, and fail closed when it refuses the host: Android's `Uri` does
     // NOT normalise these, so `SiteNavigationPolicy` runs the same parser in
     // Kotlin and the shared vectors pin the two against each other.
-    if ends_in_a_number(&bare) {
+    if ends_in_a_number(bare) {
         return match Url::parse(&format!("https://{bare}/")) {
             Ok(parsed) => match parsed.host() {
                 Some(url::Host::Ipv4(v4)) => !ip_is_public(&std::net::IpAddr::V4(v4)),
@@ -936,7 +936,7 @@ mod tests {
                         .parse()
                         .unwrap_or_else(|e| panic!("{} ayrıştırılamadı: {e}", cols[1]));
                     let want_public = cols[2] == "public";
-                    assert_eq!(is_public_ip(&ip), want_public, "ip {}", cols[1]);
+                    assert_eq!(is_public_ip(ip), want_public, "ip {}", cols[1]);
                     ips += 1;
                 }
                 other => panic!("bilinmeyen vektör türü: {other} ({line})"),

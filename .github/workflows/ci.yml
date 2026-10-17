@@ -355,6 +355,13 @@ jobs:
               break
             fi
           done
+          # Back to the workspace root. Everything below this line uses
+          # repo-relative paths (the MainActivity/AnimeHubPlugin restore, the
+          # android_prepare.py re-run, the source-set listings) and used to run
+          # from `src-tauri/gen/android` instead, where none of them exist: the
+          # restore silently did nothing and prepare.py exited 2 ("can't open
+          # file"), which `| head || true` then hid.
+          cd "$GITHUB_WORKSPACE"
           echo "=== final TEST_TASK=$TEST_TASK status=$status ==="
           echo "=== Gradle tail 600 ==="
           cat /tmp/kotlin-test.log | tail -n 600
@@ -450,6 +457,28 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
+          # The unit-test step moves AnimeHubPlugin.kt out of the generated
+          # source set (it needs Tauri types, which that compile does not have)
+          # and android_prepare.py puts it back. Verify that really happened
+          # HERE, at the last moment it can still be fixed: an APK built without
+          # the plugin class compiles and links fine and only fails at runtime,
+          # so nothing else in this job would notice. A failed restore is a hard
+          # failure, not a warning.
+          python3 "$GITHUB_WORKSPACE/scripts/android_prepare.py" > /tmp/prepare-apk.log 2>&1 || {
+            echo "::error::android_prepare.py failed before the APK build"
+            tail -n 40 /tmp/prepare-apk.log
+            exit 1
+          }
+          tail -n 20 /tmp/prepare-apk.log
+          for required in AnimeHubPlugin AnimeHubSiteController AnimeHubPipController SiteNavigationGuard SiteNavigationPolicy SiteWebViewSettings IpPolicy MainActivity; do
+            test -f "src-tauri/gen/android/app/src/main/java/dev/animehub/app/$required.kt" || {
+              echo "::error::$required.kt is missing from the generated source set; the APK would build without it"
+              exit 1
+            }
+          done
+          echo "=== generated Kotlin source set ==="
+          ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/
+
           set +e
           npm run tauri android build -- --debug --apk --target aarch64 > /tmp/android-build.log 2>&1
           status=$?

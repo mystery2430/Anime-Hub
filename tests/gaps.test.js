@@ -475,7 +475,8 @@ test("Android navigation policy: numeric IPv4 spellings and documentation ranges
   // ... and the Rust side uses the same parser instead of its own rule.
   const rs = read(join(ROOT, "src-tauri/src/sites/url_policy.rs"));
   assert.match(rs, /fn ends_in_a_number\(host: &str\) -> bool/);
-  assert.match(rs, /if ends_in_a_number\(&bare\)/);
+  // (clippy: `bare` is already a &str, so no extra reference)
+  assert.match(rs, /if ends_in_a_number\(bare\)/);
   // Documentation ranges, as Rust url_policy::is_public_ip rejects them – now in IpPolicy.kt
   assert.match(kt, /\(a == 198 && b == 51 && c == 100\)/);
   assert.match(kt, /\(a == 203 && b == 0 && c == 113\)/);
@@ -696,4 +697,41 @@ test("CI keeps no workflow-wide token, no PR-comment dump and no masked prep fai
 
   // ... and nothing is skipped to make the job green.
   assert.equal(/continue-on-error:\s*true/.test(code), false, "no continue-on-error");
+});
+
+test("CI restores the Kotlin sources it moved out, from a path that exists", () => {
+  const yml = read(join(ROOT, ".github/workflows/ci.yml"));
+  const code = yml
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+
+  // The unit-test step cd's into the generated project for Gradle. Everything
+  // after that uses repo-relative paths, so it has to come back: the restore
+  // used to run from src-tauri/gen/android, where the MainActivity path does not
+  // exist and android_prepare.py cannot even be opened (exit 2), and `| head
+  // || true` hid both.
+  const cdIn = code.indexOf("cd src-tauri/gen/android");
+  const cdBack = code.indexOf('cd "$GITHUB_WORKSPACE"');
+  assert.ok(cdIn > 0, "the Gradle cd is missing");
+  assert.ok(cdBack > cdIn, "the step must return to the workspace root");
+  const prepareAt = code.indexOf("prepare_status=$?");
+  assert.ok(prepareAt > cdBack, "android_prepare.py must run from the workspace root");
+
+  // The APK step re-runs prepare through an absolute path and verifies the
+  // plugin sources are really in the generated source set. This is the last
+  // place it can be fixed: an APK built without AnimeHubPlugin.kt compiles and
+  // links fine, and only fails at runtime on a device.
+  const apkAt = code.indexOf("- name: Build installable debug APK");
+  assert.ok(apkAt > 0, "the APK step is missing");
+  const apkStep = code.slice(apkAt, code.indexOf("- name:", apkAt + 10));
+  assert.match(apkStep, /python3 "\$GITHUB_WORKSPACE\/scripts\/android_prepare\.py"/);
+  assert.match(apkStep, /for required in AnimeHubPlugin /);
+  assert.match(apkStep, /is missing from the generated source set/);
+  assert.match(apkStep, /exit 1/, "a missing source must fail the step");
+  assert.equal(
+    /android_prepare\.py[^\n]*\|\|\s*true/.test(apkStep),
+    false,
+    "the APK-step prepare must never be masked",
+  );
 });
