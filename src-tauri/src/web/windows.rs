@@ -3563,7 +3563,7 @@ mod tests {
         let err = run_mobile_delete_protocol(
             &state,
             id,
-            |_profile| Err(AppError::Bridge("sağlayıcı yanıt vermedi".into())),
+            |_profile| Err(AppError::Other("sağlayıcı yanıt vermedi".into())),
             |profile| {
                 writes.lock().unwrap().push(format!("retire:{profile}"));
                 retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3572,7 +3572,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, AppError::Bridge(_)), "{err}");
+        assert!(matches!(err, AppError::Other(_)), "{err}");
         assert_eq!(
             retired.load(std::sync::atomic::Ordering::SeqCst),
             0,

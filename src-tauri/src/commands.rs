@@ -1562,6 +1562,11 @@ mod tests {
     use super::*;
     use crate::secure::master_key::load_master_key;
     use crate::secure::store::SecureStore;
+    // Test-only: the raw cookie-jar COMMANDS are gone (§AH-03), the jar type
+    // itself stays — `web::windows` still reads `cookies-<site_id>`, and these
+    // tests prove the scoping. Importing it at module level would make it an
+    // unused import in the non-test build.
+    use crate::web::session::CookieJar;
 
     fn state_in(dir: &std::path::Path) -> AppState {
         let key = load_master_key(dir).expect("key");
