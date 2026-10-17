@@ -3109,7 +3109,7 @@ mod tests {
     struct OrderingStore {
         inner: SecureStore,
         fail_generation_writes: Arc<std::sync::atomic::AtomicUsize>,
-        writes: Arc<Mutex<Vec<String>>>,
+        writes: OrderLog,
     }
 
     impl SecretProvider for OrderingStore {
@@ -3161,12 +3161,12 @@ mod tests {
         }
     }
 
+    /// The ordered log a delete-protocol test asserts on: every durable write
+    /// the store performs, interleaved with the injected platform calls.
+    type OrderLog = Arc<Mutex<Vec<String>>>;
+
     /// `(state, ordered write/call log, remaining generation-write failures)`
-    fn ordering_state() -> (
-        AppState,
-        Arc<Mutex<Vec<String>>>,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
+    fn ordering_state() -> (AppState, OrderLog, Arc<std::sync::atomic::AtomicUsize>) {
         let dir = tempfile::tempdir().unwrap();
         let key = load_master_key(dir.path()).expect("key");
         let inner = SecureStore::new(&key, dir.path()).expect("store");
@@ -3295,7 +3295,10 @@ mod tests {
         // The queue write is durable BEFORE the bump, and the ledger survives:
         // a pending profile still exists on disk, so only the startup drain may
         // retire it (after it durably forgets the queued name).
-        assert_eq!(read_pending_profile_deletes(&state).unwrap(), vec![name]);
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()]
+        );
         assert_eq!(
             *writes.lock().unwrap(),
             vec![
@@ -3331,32 +3334,22 @@ mod tests {
             };
             Ok(action)
         };
-        assert!(run_mobile_delete_protocol(
-            &state,
-            id,
-            |p| delete(p),
-            |profile| {
-                writes.lock().unwrap().push(format!("retire:{profile}"));
-                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(1)
-            }
-        )
+        assert!(run_mobile_delete_protocol(&state, id, &delete, |profile| {
+            writes.lock().unwrap().push(format!("retire:{profile}"));
+            retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        })
         .is_err());
         assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // Retry with the storage fault healed: the SAME name is derived again
         // (the bump never landed), the protocol completes, and the ledger is
         // dropped exactly once — for that name.
-        let action = run_mobile_delete_protocol(
-            &state,
-            id,
-            |p| delete(p),
-            |profile| {
-                writes.lock().unwrap().push(format!("retire:{profile}"));
-                retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(1)
-            },
-        )
+        let action = run_mobile_delete_protocol(&state, id, &delete, |profile| {
+            writes.lock().unwrap().push(format!("retire:{profile}"));
+            retired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        })
         .unwrap();
         assert_eq!(action, SiteProfileAction::Absent);
         assert_eq!(retired.load(std::sync::atomic::Ordering::SeqCst), 1);
