@@ -213,6 +213,71 @@ local state; nothing is silently rewritten. After a user-initiated clear or
 remove, no legacy data remains (`delete_site_session` also drops the
 `profilemig-*` flag so a wiped jar can never be re-imported).
 
+## Site WebView settings and network checkpoints
+
+### Settings: one tested plan, one adapter
+
+`buildWebView` no longer assigns settings inline. The decision lives in
+`SiteWebViewSettings.kt` as a pure data class with a reason per field, and
+`applySiteSettings` writes exactly those fields through `WebSettingsSink` (the
+only place `android.webkit.WebSettings` is touched). `SiteWebViewSettingsTest`
+drives the real `applySiteSettings` with a recording sink, so the values below
+are asserted, not documented-and-hoped:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `javaScriptEnabled`, `domStorageEnabled`, `databaseEnabled` | on | sites are JS apps; logins and legacy players need storage |
+| `geolocationEnabled` | **off** (was `true`) | there is no consent flow: `onGeolocationPermissionsShowPrompt` was never implemented, so the WebView default denied every prompt and the setting only widened the surface. It is denied explicitly now as well |
+| `mediaPlaybackRequiresUserGesture` | off | autoplay + PiP; same value the launcher WebView uses |
+| `javaScriptCanOpenWindowsAutomatically` / `supportMultipleWindows` | on / **off** | with no `onCreateWindow` handler a popup becomes an ordinary same-view navigation that the policy polices; a second window we never police would be worse |
+| `allowFileAccess`, `allowContentAccess` | **off** | a site never needs `file://` or `content://`; there is no file-picker flow |
+| `allowFileAccessFromFileURLs`, `allowUniversalAccessFromFileURLs` | **off** | both escape hatches closed (the setters are deprecated no-ops from API 30 and are still written for older providers) |
+| `mixedContentMode` | `MIXED_CONTENT_NEVER_ALLOW` (=1) | explicit decision: the WebView default is `ALWAYS_ALLOW`. An HTTPS site can no longer pull HTTP sub-resources, matching the navigation policy. **Trade-off:** a site serving images or media segments over plain HTTP loses them; the fix for that is a per-site setting, not a global downgrade |
+| `safeBrowsingEnabled` | on | platform default, stated explicitly |
+| `cacheMode` | `LOAD_DEFAULT` | stated because the HTTP cache is the one thing a site clear does **not** remove (below) |
+
+`onPermissionRequest` (camera, microphone, protected media) and
+`onGeolocationPermissionsShowPrompt` are denied explicitly in
+`SiteChromeClient`, so a provider default change cannot start granting
+silently. Neither denial logs the origin. No download listener is installed and
+`onShowFileChooser` is not overridden: nothing hands a site storage access
+without the user driving it.
+
+The plan file pins its two integer constants against the platform values in a
+unit test — that pin caught a real bug while this change was being written:
+`MIXED_CONTENT_NEVER_ALLOW` is 1, and shipping 2 would have configured
+`COMPATIBILITY_MODE` under a "never allow" comment.
+
+### Network: what runs where
+
+Two checkpoints, deliberately different rules:
+
+| Check | Desktop top-level | Desktop sub-resource | Android top-level | Android sub-resource |
+| --- | --- | --- | --- | --- |
+| cleartext `http://` / `ws://` | blocked (`on_navigation`) | engine mixed-content policy | blocked (`SiteNavigationPolicy`) | blocked (`shouldInterceptRequest`) |
+| private/loopback/reserved **IP literals** and host rules | blocked | not checked | blocked | blocked |
+| user blocklist | blocked | not checked | **not enforced** | **not enforced** |
+| DNS answer resolving to a private address | checked at navigation time (fail-open) | not checked | **no DNS at all** | **no DNS at all** |
+| top-level `data:` document | refused | n/a (`data:` sub-resources stay allowed) | refused | allowed (sub-resource) |
+| `WebView.loadUrl` by the app itself | Rust validates the first URL | — | bypasses the guard | — |
+
+The Android sub-resource checkpoint is `SiteNavigationGuard.shouldInterceptRequest`:
+it returns an empty `403` (no body, no headers, nothing about the request or the
+reason handed back to the page) for a refused request and forwards everything
+else unchanged. It runs on the WebView's background thread.
+
+**Why no DNS on Android, and why that is not solved by docs:** resolving a
+hostname inside `shouldInterceptRequest` and returning `null` afterwards does not
+bind the engine's own resolution — the answer we checked is not the address it
+connects to, so a rebinding hostname defeats it while paying a lookup per
+request. Real protection needs connection-time pinning or a filtering proxy;
+Android exposes no per-WebView proxy and serving the bodies ourselves would mean
+terminating TLS. So a hostname that resolves to a private address **is not
+caught on Android**. This stays an open pre-merge security risk (see
+`## Verification status`), not a closed item. The desktop DNS check narrows the
+window but has the same TOCTOU shape and fails open on resolver errors so a DNS
+outage cannot make every site unopenable.
+
 ## Deletion / clear semantics
 
 | Action | Site view | Profile | Registry |
@@ -223,6 +288,18 @@ remove, no legacy data remains (`delete_site_session` also drops the
 | Clear all | active site closed | same in-place clear per registered site + orphan sweep over `ProfileStore.getAllProfileNames()`, restricted to `site-*` names not owned by the current registry | untouched |
 | App teardown | the site profile's flush is submitted to the background worker and **awaited within `ShutdownFlow.DESTROY_FLUSH_BUDGET_MS` (1 s)** before the generated Activity kills the process; the view is torn down whatever the outcome; a timeout/failure is logged as *durability not guaranteed* | — | — |
 
+* **What a clear does NOT remove (and what the UI says).** Android clears the
+  profile's cookie jar, geolocation permissions and Web Storage
+  (`localStorage`/IndexedDB/WebSQL) and then deletes the encrypted session
+  blobs. Chromium exposes no *profile-scoped* HTTP-cache or service-worker wipe
+  — `WebView.clearCache(true)` and `ServiceWorkerController` are app-wide, so
+  calling them from a site operation would also wipe the launcher's data, which
+  the isolation contract forbids. The success notice therefore says exactly
+  that on Android (`clearResultMessage` in `src/logic/storage_scope.js`, pinned
+  by `tests/storage_scope.test.js`), instead of the old platform-blind
+  "Site verileri temizlendi.". On desktop the whole per-site profile directory
+  is removed, cache and service workers included, and the desktop wording says
+  so. An unknown platform gets the conservative Android wording.
 * **One outcome vocabulary, backend to UI** (`remove_site` returns
   `{profile: …}`; `clear_site_data` returns only on a verified clear):
   * `deleted` — the provider accepted the deletion (disk work may still be
@@ -702,5 +779,19 @@ State-machine coverage that needs a real device/provider (actual
   happened — `destroy-time flush completed` vs `flush unfinished in 1000ms -
   durability not guaranteed` — and that a slow provider flush does not ANR the
   teardown).**
+* **One-time migration notice (in-app, not docs-only).** On boot the launcher
+  shows, once per launcher profile, that the legacy `localStorage`/IndexedDB
+  snapshots are not re-imported and that some sites will need a re-login
+  (`takeMigrationNotice`, flag `animehub.storage-migration-notice`). An
+  unreadable or unwritable flag repeats the notice rather than losing it.
+* Device checklist additions from the settings/network work: confirm the plan
+  is really applied by a live provider (`chrome://inspect` → the site WebView's
+  settings), that `MIXED_CONTENT_NEVER_ALLOW` does not break the two built-in
+  sites' players or images, that a blocked sub-resource (a page fetching
+  `https://127.0.0.1/`) returns the empty 403 without destabilising the player,
+  that `onPermissionRequest`/geolocation denials are invisible to the user
+  except for the site's own error UI, that autoplay and PiP still work with
+  `mediaPlaybackRequiresUserGesture = false`, and that the migration notice
+  appears exactly once.
 * iOS/macOS: out of scope; the iOS path keeps the shared-WebView flow minus
   the removed snapshot machinery and was not touched beyond that.

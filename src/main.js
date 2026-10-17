@@ -36,6 +36,7 @@ import {
   switchStates,
 } from "./logic/settings_flow.js";
 import { createBackSession } from "./logic/back_close.js";
+import { clearResultMessage, takeMigrationNotice } from "./logic/storage_scope.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -531,7 +532,9 @@ function showActionSheet(title, actions) {
 async function clearSiteData(id) {
   try {
     await call("clear_site_data", { id });
-    showNotice("Site verileri temizlendi.", "info");
+    // Platform-honest scope: on Android the HTTP cache and service workers are
+    // NOT profile-scoped and are not cleared. See src/logic/storage_scope.js.
+    showNotice(clearResultMessage(currentPlatform), "info");
   } catch (e) {
     showNotice(errMessage(e));
   }
@@ -729,15 +732,25 @@ function wireTheme() {
  * `data-platform="android"` (PiP, developer log) are hidden elsewhere. If the
  * platform is unknown, they stay hidden: the safe choice.
  */
-async function applyPlatformVisibility() {
-  let platform = "";
+/**
+ * `app_info().platform`, cached at boot and reused for anything platform
+ * dependent (settings visibility, the clear-site-data wording). Empty when the
+ * call failed: every consumer treats "" as "unknown" and answers conservatively.
+ */
+let currentPlatform = "";
+
+async function loadPlatform() {
   try {
     const info = await call("app_info");
-    platform = info && typeof info.platform === "string" ? info.platform : "";
+    currentPlatform = info && typeof info.platform === "string" ? info.platform : "";
   } catch {
-    platform = "";
+    currentPlatform = "";
   }
-  const isAndroid = platform === "android";
+  return currentPlatform;
+}
+
+async function applyPlatformVisibility() {
+  const isAndroid = (await loadPlatform()) === "android";
   document.querySelectorAll("[data-platform]").forEach((node) => {
     node.style.display = node.dataset.platform === "android" && isAndroid ? "" : "none";
   });
@@ -1096,8 +1109,14 @@ async function boot() {
   wireSettings();
   wireTheme();
   renderLauncher(CATEGORIES.map((c) => ({ id: c.id, title: c.title, tiles: [] })));
+  await loadPlatform();
   await refreshLauncher();
   await wireBackendEvents();
+  // One-time, in-app honesty about the 0.3.4 storage migration: the legacy
+  // localStorage/IndexedDB snapshots are deliberately not re-imported, and a
+  // doc page nobody opens is not a notice. Shown once per launcher profile.
+  const migrationNotice = takeMigrationNotice(window.localStorage);
+  if (migrationNotice) showNotice(migrationNotice, "info");
   void refreshHero();
 
   try {
