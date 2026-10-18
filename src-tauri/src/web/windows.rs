@@ -4881,7 +4881,11 @@ mod tests {
             vec![PendingProfileDelete::blocked_orphan(&name)],
             "the permanent block is durable and no success path drops it"
         );
-        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a permanent block is not a lifted tombstone: the queue entry stays, the ledger is not retired here — it is already gone or was never kept per-profile, and the block itself is what keeps the name out of every future open"
+        );
     }
 
     /// An orphan whose site id was re-registered derives a real site's name
