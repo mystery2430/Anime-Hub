@@ -192,12 +192,10 @@ pub fn oauth_error_message(code: &str) -> &'static str {
 // Callback URL parsing
 // ---------------------------------------------------------------------------
 
-/// Extract `code` and `state` from a redirect.
-///
-/// Accepts both the loopback (`http://127.0.0.1:PORT/callback?code=…`) and
-/// custom-scheme (`animehub://anilist/callback?code=…`) forms so the same code
 /// Split a callback URL into `(code, state)`, accepting ONLY the exact redirect
-/// URI the pending login was started with.
+/// URI the pending login was started with — the loopback
+/// (`http://127.0.0.1:PORT/callback?code=…`) and the custom-scheme
+/// (`animehub://anilist/callback?code=…`) forms alike.
 ///
 /// WHY "exact" AND NOT "is it loopback?": the old check accepted any
 /// `http://localhost:ANY_PORT/ANY_PATH` and, for the custom scheme, any
@@ -224,6 +222,27 @@ pub fn parse_callback(raw: &str, expected_redirect: &str) -> AppResult<(String, 
             url.scheme()
         )));
     }
+
+    // Uniform for EVERY accepted form, because a redirect URI carrying
+    // credentials or a fragment is not the redirect URI that was registered —
+    // even though its host and path still compare equal:
+    // `http://user:pass@127.0.0.1:17395/callback` and
+    // `animehub://anilist/callback#code=x` both did. The configured redirect is
+    // checked with the same rule, so a nonsense `ANILIST_REDIRECT_URI` fails
+    // closed instead of widening the comparison.
+    for candidate in [&url, &expected] {
+        if !candidate.username().is_empty() || candidate.password().is_some() {
+            return Err(AppError::AniList(
+                "dönüş adresinde kullanıcı bilgisi olamaz".into(),
+            ));
+        }
+        if candidate.fragment().is_some() {
+            return Err(AppError::AniList(
+                "dönüş adresinde parça (fragment) olamaz".into(),
+            ));
+        }
+    }
+
     let host = url.host_str().unwrap_or_default();
     let expected_host = expected.host_str().unwrap_or_default();
     match url.scheme() {
@@ -252,6 +271,16 @@ pub fn parse_callback(raw: &str, expected_redirect: &str) -> AppResult<(String, 
             if host != expected_host {
                 return Err(AppError::AniList(
                     "dönüş adresinin host'u beklenenden farklı".into(),
+                ));
+            }
+            // The port is compared here too: a non-special scheme has no
+            // default port, so the registered redirect has none and ANY
+            // explicit port (`animehub://anilist:1234/callback`) makes it a
+            // different URI. `port_or_known_default` would have hidden that by
+            // answering `None` for both sides.
+            if url.port() != expected.port() {
+                return Err(AppError::AniList(
+                    "dönüş adresinin port'u beklenenden farklı".into(),
                 ));
             }
         }
@@ -1423,6 +1452,76 @@ mod tests {
         assert!(err.to_string().contains("host'u beklenenden"), "{err}");
         assert!(parse_callback("animehub://anilist/other?code=abc&state=s1", SCHEME).is_err());
         assert!(parse_callback("ANIMEHUB://anilist/callback?code=abc&state=s1", SCHEME).is_ok());
+    }
+
+    #[test]
+    fn parse_callback_rejects_an_explicit_port_on_the_custom_scheme() {
+        // The loopback branch always compared ports; the custom-scheme branch
+        // did not, so `animehub://anilist:1234/callback` was "our" redirect.
+        let err =
+            parse_callback("animehub://anilist:1234/callback?code=a&state=s", SCHEME).unwrap_err();
+        assert!(err.to_string().contains("port'u beklenenden"), "{err}");
+        assert!(parse_callback("animehub://anilist:0/callback?code=a&state=s", SCHEME).is_err());
+        // The registered form still works, and the loopback port rule is
+        // unchanged in both directions.
+        assert!(parse_callback("animehub://anilist/callback?code=a&state=s", SCHEME).is_ok());
+        assert!(
+            parse_callback("http://127.0.0.1:17396/callback?code=a&state=s", LOOPBACK).is_err()
+        );
+        assert!(parse_callback("http://127.0.0.1:17395/callback?code=a&state=s", LOOPBACK).is_ok());
+    }
+
+    #[test]
+    fn parse_callback_rejects_userinfo_and_fragments() {
+        // Both forms carry the right host and path, which is exactly why the
+        // comparison has to look at the whole URI.
+        for raw in [
+            "http://user:pass@127.0.0.1:17395/callback?code=a&state=s",
+            "http://user@127.0.0.1:17395/callback?code=a&state=s",
+            "http://:@127.0.0.1:17395/callback?code=a&state=s",
+            "animehub://user:pass@anilist/callback?code=a&state=s",
+            "animehub://attacker@anilist/callback?code=a&state=s",
+        ] {
+            let expected = if raw.starts_with("animehub") {
+                SCHEME
+            } else {
+                LOOPBACK
+            };
+            let err = parse_callback(raw, expected).unwrap_err();
+            assert!(
+                err.to_string().contains("kullanıcı bilgisi"),
+                "{raw} → {err}"
+            );
+        }
+        for raw in [
+            "http://127.0.0.1:17395/callback?code=a&state=s#extra",
+            "http://127.0.0.1:17395/callback#code=a&state=s",
+            "animehub://anilist/callback?code=a&state=s#extra",
+            "animehub://anilist/callback#anything",
+        ] {
+            let expected = if raw.starts_with("animehub") {
+                SCHEME
+            } else {
+                LOOPBACK
+            };
+            let err = parse_callback(raw, expected).unwrap_err();
+            assert!(err.to_string().contains("fragment"), "{raw} → {err}");
+        }
+        // An empty fragment (`#`) is a fragment too: `Url::fragment()` answers
+        // Some("") and the registered redirect has none.
+        assert!(
+            parse_callback("http://127.0.0.1:17395/callback?code=a&state=s#", LOOPBACK).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_callback_refuses_a_configured_redirect_with_userinfo_or_fragment() {
+        // The same rule applies to the configured redirect: a hostile or merely
+        // broken ANILIST_REDIRECT_URI must fail closed, not widen the check.
+        let callback = "http://127.0.0.1:17395/callback?code=a&state=s";
+        assert!(parse_callback(callback, "http://u:p@127.0.0.1:17395/callback").is_err());
+        assert!(parse_callback(callback, "http://127.0.0.1:17395/callback#f").is_err());
+        assert!(parse_callback(callback, LOOPBACK).is_ok());
     }
 
     #[test]
