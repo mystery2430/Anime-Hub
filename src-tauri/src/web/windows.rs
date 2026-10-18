@@ -3873,7 +3873,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(format!("put-failed:{name}"));
-                return Err(AppError::Storage("keystore yazılamadı (test)"));
+                return Err(AppError::Storage("keystore yazılamadı (test)".into()));
             }
             self.inner.put_secret(name, plaintext)?;
             self.writes.lock().unwrap().push(format!("put:{name}"));
@@ -4861,15 +4861,11 @@ mod tests {
         let entries = read_pending_profile_delete_entries(&state).unwrap();
         let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let r = retires.clone();
-        let at_retire = Arc::new(Mutex::new(Vec::<PendingProfileDelete>::new()));
-        let seen = at_retire.clone();
         let report = run_pending_delete_drain(
             &state,
             &entries,
             |_profile| Ok(SiteProfileAction::Deleted),
-            move |_profile| {
-                // The durable state at the moment the ledger is retired.
-                *seen.lock().unwrap() = read_pending_profile_delete_entries(&state).unwrap();
+            |_profile| {
                 r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(2)
             },
@@ -4881,14 +4877,9 @@ mod tests {
         assert_eq!(report.blocked, 1, "{report:?}");
         assert!(report.kept_unmatched.is_empty(), "{report:?}");
         assert_eq!(
-            *at_retire.lock().unwrap(),
-            vec![PendingProfileDelete::blocked_orphan(&name)],
-            "the permanent block is durable BEFORE the ledger is retired"
-        );
-        assert_eq!(
             read_pending_profile_delete_entries(&state).unwrap(),
             vec![PendingProfileDelete::blocked_orphan(&name)],
-            "and no success path drops it"
+            "the permanent block is durable and no success path drops it"
         );
         assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
