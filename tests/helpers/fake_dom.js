@@ -272,7 +272,36 @@ export function createFakeDom(options = {}) {
     devicePixelRatio: options.devicePixelRatio === undefined ? 3 : options.devicePixelRatio,
     getComputedStyle: (el) => doc.getComputedStyle(el),
   });
+  // A top-level browsing context: `self === top === window`. A test that wants
+  // a subframe replaces `win.top` with a different object (see
+  // `asSubframe`), which is exactly how a real iframe differs.
+  win.self = win;
+  win.top = win;
   return { window: win, document: doc };
+}
+
+/**
+ * Make a fake DOM look like a cross-origin subframe: `window.top` points at
+ * another window object, so `self === top` is false — the only thing injected
+ * page scripts are allowed to learn about their embedding.
+ */
+export function asSubframe(dom) {
+  dom.window.top = { self: {}, top: {}, closed: false };
+  return dom;
+}
+
+/**
+ * Make reading `window.top` throw, the way an opaque-origin (sandboxed) frame
+ * can. Injected code has to fail closed instead of assuming it is the top.
+ */
+export function asOpaqueFrame(dom) {
+  Object.defineProperty(dom.window, "top", {
+    configurable: true,
+    get() {
+      throw new Error("SecurityError: blocked a frame with origin ...");
+    },
+  });
+  return dom;
 }
 
 /** Create an element and attach it to `parent` (documentElement by default). */

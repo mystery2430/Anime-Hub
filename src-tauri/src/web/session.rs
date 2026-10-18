@@ -280,6 +280,24 @@ pub fn decide_navigation_dns(
 /// Everything dynamic reaches the page through [`embed_json`], never string
 /// interpolation, so a hostile site name or blocklist entry cannot inject
 /// script.
+///
+/// **Frame scope (AH-P2).** On Android this text is registered with
+/// `WebViewCompat.addDocumentStartJavaScript(.., setOf("*"))`, i.e. it runs in
+/// EVERY frame of EVERY origin — the origin rule set has to stay wide, because
+/// the players these sites embed and the ad frames that call `window.open` are
+/// both third-party origins, and the API offers no "top frame only" rule. What
+/// is narrowed instead is what each part does:
+///
+/// * every frame gets the cosmetic `<style>` (selectors are data, not code) and
+///   the [`popup_guard.js`](popup_guard.js) override, which returns `null` and
+///   keeps no reference to the native `window.open`;
+/// * only the TOP frame installs the PiP controller — [`pip_controller.js`]
+///   returns early in a subframe, so a third-party frame is not handed
+///   `window.__animehubPip*` (the native side re-installs the controller in the
+///   main frame on demand, so PiP does not depend on the document-start copy);
+/// * no frame gets anything else: the payload is the three display settings,
+///   there is no site identity in it and no IPC bridge exists for a site
+///   WebView at all.
 pub fn build_init_script(cfg: &InjectedConfig) -> String {
     let payload = embed_json(cfg);
 
@@ -293,20 +311,11 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
     };
 
     // The popup guard is *omitted* rather than disabled when off, so the
-    // shipped script never contains the `window.open` override at all.
+    // shipped script never contains the `window.open` override at all. It lives
+    // in its own file so the injected text is executable under test
+    // (`tests/init_script.test.js`) instead of pinned only as source prose.
     let popup_guard = if cfg.block_popups {
-        r#"
-  // Neutralise attempts to open new windows from scripts. The Rust side
-  // already denies these; this stops the spinner/blank-tab artefact and the
-  // "popup blocked" retry loops some ad scripts fall into.
-  var nativeOpen = window.open;
-  window.open = function () { return null; };
-  // Keep the original reachable for first-party code that feature-detects.
-  Object.defineProperty(window.open, "__animehubNative", {
-    value: nativeOpen,
-    enumerable: false,
-  });
-"#
+        include_str!("popup_guard.js")
     } else {
         ""
     };
@@ -847,6 +856,39 @@ mod tests {
         assert!(js.contains("adsbygoogle"));
     }
 
+    /// AH-P2: the guard runs in every frame, so it must not hand any frame a
+    /// way back to the native `window.open`. It used to store the original on a
+    /// non-enumerable property of the replacement; nothing read it, and every
+    /// cross-origin ad frame could.
+    #[test]
+    fn init_script_never_keeps_the_native_window_open_reachable() {
+        let js = build_init_script(&InjectedConfig::default());
+        assert!(
+            js.contains("window.open = function"),
+            "the override itself must stay"
+        );
+        assert!(
+            !js.contains("__animehubNative"),
+            "no escape-hatch property on the override"
+        );
+        assert!(
+            !js.contains("nativeOpen"),
+            "no captured reference to the original function"
+        );
+        assert!(
+            !js.contains("defineProperty(window.open"),
+            "the override must not be decorated with extra properties"
+        );
+        // Turning popups off still removes the whole guard, escape hatch and
+        // all, rather than shipping a disabled copy.
+        let off = build_init_script(&InjectedConfig {
+            block_popups: false,
+            hide_selectors: vec![],
+            pip_controller: false,
+        });
+        assert!(!off.contains("window.open"));
+    }
+
     #[test]
     fn init_script_without_popup_blocking_leaves_open_alone() {
         let js = build_init_script(&InjectedConfig {
@@ -872,6 +914,45 @@ mod tests {
         // And the init script must not shadow-install a second overlay.
         let init = build_init_script(&InjectedConfig::default());
         assert!(!init.contains("__animehub-back"));
+    }
+
+    /// AH-P2: the document-start channel cannot be scoped to the top frame, so
+    /// the controller scopes itself. A subframe must not end up with the PiP
+    /// globals; the top frame must (that is the copy `pip_controller.js`'s own
+    /// tests exercise, and the native side re-installs it on demand anyway).
+    #[test]
+    fn init_script_scopes_the_pip_controller_to_the_top_frame() {
+        let js = build_init_script(&InjectedConfig {
+            pip_controller: true,
+            ..Default::default()
+        });
+        assert!(
+            js.contains("window.self === window.top"),
+            "the injected controller must check the frame it runs in"
+        );
+        assert!(
+            js.contains("if (!isTopFrame)"),
+            "a subframe must return before installing anything"
+        );
+        // The check has to fail closed: an opaque-origin frame whose `window.top`
+        // read throws must not be treated as the top frame.
+        let gate = js
+            .split("var isTopFrame")
+            .nth(1)
+            .unwrap_or_default()
+            .split("if (!isTopFrame)")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(gate.contains("catch"), "the frame check must be guarded");
+        assert!(
+            gate.contains("return false"),
+            "an unreadable window.top means: do not install"
+        );
+        // The popup guard and the cosmetic rules stay frame-agnostic — they are
+        // the parts that have to work inside third-party ad frames.
+        assert!(js.contains("window.open = function"));
+        assert!(js.contains("animehub-cosmetic"));
     }
 
     #[test]
@@ -1001,9 +1082,12 @@ mod tests {
     /// only acceptable because the script carries no capability and no secret —
     /// a site WebView has no Tauri IPC bridge at all, and the PiP controller's
     /// functions are called BY the native side, never the other way round.
-    /// Narrowing the origin set would break cross-origin players (very common
+    /// Narrowing the ORIGIN set would break cross-origin players (very common
     /// for anime sites) and the popup guard on ad-driven redirects, so the
-    /// requirement is that the payload stays inert, which this pins.
+    /// origin set stays "*" and the requirement is that the payload stays
+    /// inert, which this pins. What CAN be narrowed per frame is narrowed: see
+    /// `init_script_scopes_the_pip_controller_to_the_top_frame` and
+    /// `init_script_never_keeps_the_native_window_open_reachable`.
     #[test]
     fn init_script_is_inert_enough_to_run_for_every_origin() {
         let cfg = InjectedConfig {

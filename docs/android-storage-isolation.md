@@ -278,6 +278,75 @@ caught on Android**. This stays an open pre-merge security risk (see
 window but has the same TOCTOU shape and fails open on resolver errors so a DNS
 outage cannot make every site unopenable.
 
+### Injected script: origin and frame scope (AH-P2)
+
+`buildWebView` registers the injected script with
+`WebViewCompat.addDocumentStartJavaScript(webView, initScript, setOf("*"))`, so
+it runs at document start in **every frame of every origin** the site view
+loads, with an `onPageStarted` evaluation fallback for providers that lack
+`DOCUMENT_START_SCRIPT`. The script itself is generated in Rust
+(`build_init_script`, `src-tauri/src/web/session.rs`) from three pieces: the
+popup guard (`web/popup_guard.js`), the cosmetic rules, and - Android only - the
+PiP controller (`web/pip_controller.js`).
+
+**Why the origin rule set stays `"*"`, and why this item is NOT counted as
+fixed.** The API takes a set of origin rules; it has no "top frame only" and no
+"first-party only" rule. The two things the script does that matter run exactly
+where a narrow allowlist would drop them:
+
+* the players these sites embed are third-party origins, and PiP scores them
+  from the top document as opaque surfaces (`pip_controller.js` never touches
+  `contentDocument`/`contentWindow`);
+* the frames that call `window.open` are third-party ad frames. With
+  `supportMultipleWindows=false` and no `onCreateWindow` handler a script
+  `window.open` becomes an ordinary same-view navigation, so the guard has to
+  run inside those frames to stop the visible page being navigated away from
+  the player.
+
+Restricting the set to the site's own host would remove the guard where it is
+needed and keep only the part that is capability-free anyway - and there is no
+device or emulator matrix behind this code with which to prove which origins a
+given site really embeds, so narrowing it would trade a documented surface for
+an unverified functional risk (playback, login redirects, PiP). **AH-P2 is
+therefore recorded as partially fixed**: the surface was reduced where that is
+provable, and the remaining every-origin execution is documented, not claimed
+away.
+
+**What each frame gets after this round.**
+
+| Injected piece | Top frame | Cross-origin subframe | Capability? |
+| --- | --- | --- | --- |
+| Cosmetic `<style id="animehub-cosmetic">` built from `hideSelectors` | yes | yes | No. Selectors are data, not code; the worst case is an element hidden inside that frame's own document. |
+| `window.open = function () { return null; }` (`web/popup_guard.js`) | yes | yes | No. It returns `null` and keeps **no** reference to the original. The earlier escape hatch that stored the native `window.open` on a non-enumerable property of the replacement - readable by every cross-origin frame, and therefore a working bypass of the guard - is removed; nothing in the app ever read it. |
+| `window.__animehubInstalled` flag | yes | yes | No, but it (and the style element, and the overridden `window.open`) does let a frame detect that it is embedded in this app. |
+| PiP controller: `__animehubPreparePip`, `__animehubPip`, `__animehubPipReport`, `__animehubPipPlayback`, `__animehubPipVersion` | yes | **no** - the file returns early unless `window.self === window.top`, and fails CLOSED if reading `window.top` throws (opaque-origin frame) | In the top frame these are called *by* the native side through `WebView.evaluateJavascript`, never the other way round; a subframe copy could only advertise them to a third party, so it is not installed. |
+| Site identity, tokens, per-site values | no | no | The payload is exactly the three display settings, embedded through `embed_json` (never string interpolation). |
+| IPC | no | no | A site view gets no `JavascriptInterface`, and Tauri disables IPC for external URLs unless `dangerousRemoteDomainIpcAccess` opts in - which this app does not. |
+
+PiP never depended on the document-start copy: `AnimeHubPipController` embeds
+the same `pip_controller.js` and installs it in the main frame on demand before
+entering PiP, so a top document that somehow lacks it still works. The gate also
+cannot be pre-empted by the page, because document-start runs before any page
+script.
+
+**Remaining impact, stated plainly.** A cross-origin frame can still detect that
+it is inside AnimeHub and can hide ad containers in its own document. Neither
+reaches another origin's data, another site profile, or anything native: no
+injected piece holds a credential, a site identity, a native function reference
+or an IPC channel. What every-origin execution does mean is that this reasoning
+has to hold for the whole payload - which is why the payload is pinned inert
+(`session.rs`) and executed under test rather than only described.
+
+**Tests (host-side only).** `tests/init_script.test.js` runs the shipped guard
+and the composed script in a fake DOM, in the top frame and in a cross-origin
+subframe, and asserts the original `window.open` is unreachable through any
+property of the frame or of `window`; `tests/pip_controller.test.js` asserts a
+subframe and an opaque-origin frame install none of the PiP entry points and
+leave their document untouched, while the top frame still prepares a player;
+`session.rs` pins the composition order, the absence of the escape hatch and the
+frame gate. Both mutations - dropping the gate and restoring the hatch - were
+verified to fail these tests. **No physical device or emulator was used.**
+
 ## Deletion / clear semantics
 
 | Action | Site view | Profile | Registry |
@@ -793,6 +862,14 @@ State-machine coverage that needs a real device/provider (actual
   builds the debug APK (Kotlin + Rust + Gradle), which proves the code
   compiles and links; it proves nothing about runtime behaviour. No physical
   device has run this build.
+* **Injected-script scope (AH-P2): partially fixed, host-tested only.** The
+  every-origin document-start registration stays (see
+  `### Injected script: origin and frame scope`); what changed is that no frame
+  receives a capability any more - the popup guard keeps no reference to the
+  native `window.open`, and the PiP controller installs in the top frame only.
+  Proven by executing the shipped files under `npm test`, not on a device: no
+  emulator run has confirmed how a real provider scopes document-start scripts
+  across frames, or that a real cross-origin player still enters PiP.
 * Device checklist that remains: MULTI_PROFILE present/absent behaviour on two
   different WebView provider versions; A-write → B-absent → B-write →
   A-preserved at the same origin; cookie non-mixing across sites; launcher

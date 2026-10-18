@@ -423,6 +423,40 @@ object AnimeHubSiteController {
       // (5) Document-start script (cosmetic rules, popup guard, PiP
       // controller). Self-guarding, so the page-start fallback can never
       // double-apply it.
+      //
+      // ORIGIN SCOPE (AH-P2) - why this stays setOf("*"), and what a page
+      // actually gets from it:
+      //
+      //  * The rule set cannot honestly be narrowed to the site's own origin.
+      //    The players these sites embed and the ad frames that call
+      //    window.open are third-party origins, and this API has no
+      //    "top frame only" rule - an origin allowlist would drop the popup
+      //    guard and the cosmetic rules exactly where they are needed, and
+      //    could break playback, login redirects and PiP. There is no device
+      //    or emulator matrix behind this code, so narrowing it on a guess
+      //    would trade a documented, capability-free surface for an unverified
+      //    functional risk. This item is therefore NOT counted as fixed; it is
+      //    scoped and documented.
+      //  * What every frame gets is capability-free by construction: the
+      //    cosmetic style element (selectors are data, not code), a
+      //    window.open override that returns null and keeps no reference to
+      //    the original, and an install flag. No frame receives a site
+      //    identity, a credential or any per-site value (the payload is the
+      //    three display settings), and no frame receives an IPC bridge - this
+      //    view has no JavascriptInterface and Tauri disables IPC for external
+      //    URLs.
+      //  * Only the TOP frame installs the PiP controller: pip_controller.js
+      //    returns early in a subframe, so a third-party frame is not handed
+      //    the __animehubPip* entry points. PiP never depended on this copy -
+      //    AnimeHubPipController embeds the same file and installs it in the
+      //    main frame on demand before entering PiP.
+      //  * Residual impact, stated plainly: a cross-origin frame can still
+      //    detect that it is embedded in this app (the cosmetic style element,
+      //    the overridden window.open) and can hide ad containers inside its
+      //    own document. Neither is a capability, and neither reaches another
+      //    origin's data. Verified by unit tests on the injected text
+      //    (Rust session.rs, tests/init_script.test.js, tests/pip_controller
+      //    .test.js) - NOT on a physical device.
       if (!evalOnPageStart) {
         WebViewCompat.addDocumentStartJavaScript(webView, initScript, setOf("*"))
       }
