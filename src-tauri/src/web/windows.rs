@@ -1838,7 +1838,9 @@ pub struct OrphanSweepReport {
 /// that entry: the queue is the only mechanism standing between a restored
 /// registry (same site id, generation at or below the tombstone's) and the
 /// leftover directory of a deletion that `ProfileStore.deleteProfile` may still
-/// be finishing asynchronously.
+/// be finishing asynchronously. Existing `Blocked` entries are checked before
+/// the loop and skipped: provider enumeration can outlive the completed sweep,
+/// but that is not a reason to re-issue a delete or touch the durable block.
 ///
 /// Failures: a failed tombstone write returns BEFORE any provider call (an
 /// unrecorded deletion is the hole this closes); `Unsupported` keeps the entry
@@ -1858,9 +1860,28 @@ where
 {
     use crate::android_bridge::SiteProfileAction;
     let mut report = OrphanSweepReport::default();
+    if names.is_empty() {
+        return Ok(report);
+    }
+
+    // A provider may continue listing a profile after a previous sweep already
+    // confirmed its deletion. Snapshot the durable queue before doing any work:
+    // a permanent block is already the safety record, so it must not be sent
+    // through the provider delete path again. Keep newly blocked names in the
+    // same set too, so duplicate names in this input cannot be deleted twice.
+    let mut blocked_names: std::collections::HashSet<String> =
+        read_pending_profile_delete_entries(state)?
+            .into_iter()
+            .filter(PendingProfileDelete::is_blocked)
+            .map(|entry| entry.name)
+            .collect();
 
     for owned_name in names {
         let name = owned_name.as_str();
+        if blocked_names.contains(name) {
+            log::debug!("yetim profil zaten kalıcı olarak engelli, yeniden silme atlandı ({name})");
+            continue;
+        }
 
         // (1) Tombstone first. A failed write means the provider is never
         // asked: better an undeleted profile than an unrecorded deletion.
@@ -1895,6 +1916,7 @@ where
         // (3) Confirmed (`Deleted` or `Absent`): make the name permanently
         // unreachable BEFORE the ledger goes.
         block_pending_profile_delete(state, name)?;
+        blocked_names.insert(owned_name.clone());
         report.blocked += 1;
 
         // (4) Quarantine ledger last.
@@ -4929,6 +4951,125 @@ mod tests {
         format!("{ANDROID_PROFILE_PREFIX}{seed}-g{generation}")
     }
 
+    /// A provider can keep listing a profile after an earlier sweep confirmed
+    /// its deletion. A durable block is already the final safety record: do not
+    /// ask the provider again, rewrite/retire anything, or advance a site's
+    /// generation during a repeated orphan sweep.
+    #[test]
+    fn orphan_sweep_skips_a_preexisting_block_without_advancing_generation() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail_gen, _fail_queue) = ordering_state_with_queue_failures();
+        let id = "user-blocked-orphan-sweep";
+        let name = android_profile_name(id, 0);
+        write_generation(&state, id, 0);
+        let blocked = PendingProfileDelete::blocked_orphan(&name);
+        write_queue(&state, vec![blocked.clone()]);
+        writes.lock().unwrap().clear();
+        let before = read_pending_profile_delete_entries(&state).unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+        let report = run_orphan_profile_sweep(
+            &state,
+            std::slice::from_ref(&name),
+            move |_profile| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(SiteProfileAction::Deleted)
+            },
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "a skipped block is untouched"
+        );
+        assert_eq!(report.queued, 0, "{report:?}");
+        assert_eq!(report.blocked, 0, "no new block was created: {report:?}");
+        assert_eq!(read_pending_profile_delete_entries(&state).unwrap(), before);
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![blocked],
+            "the permanent block remains in the queue"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+
+        // The unchanged block still prevents the next open from reusing this
+        // exact generation; resolving it chooses a distinct name without the
+        // sweep itself persisting a generation change.
+        let queued_names = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) = resolve_queued_free_generation(id, 0, &queued_names).unwrap();
+        assert!(advanced);
+        assert_eq!(resolved, 1);
+        assert_ne!(android_profile_name(id, resolved), name);
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+    }
+
+    /// An existing Owed tombstone is NOT a permanent block: the normal provider
+    /// delete → durable block → ledger-retirement path still runs.
+    #[test]
+    fn orphan_sweep_still_deletes_an_existing_owed_entry() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail_gen, _fail_queue) = ordering_state_with_queue_failures();
+        let id = "user-owed-orphan-sweep";
+        let name = android_profile_name(id, 0);
+        write_generation(&state, id, 0);
+        let owed = PendingProfileDelete::orphan(&name);
+        write_queue(&state, vec![owed.clone()]);
+        writes.lock().unwrap().clear();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let in_flight = Arc::new(Mutex::new(Vec::<PendingProfileDelete>::new()));
+        let seen = in_flight.clone();
+        let delete_log = writes.clone();
+        let retire_log = writes.clone();
+        let report = run_orphan_profile_sweep(
+            &state,
+            std::slice::from_ref(&name),
+            |profile| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *seen.lock().unwrap() = read_pending_profile_delete_entries(&state).unwrap();
+                delete_log.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            move |profile| {
+                retire_log.lock().unwrap().push(format!("retire:{profile}"));
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*in_flight.lock().unwrap(), vec![owed]);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("delete:{name}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("retire:{name}"),
+            ],
+            "the existing Owed tombstone is kept through provider confirmation"
+        );
+        assert_eq!(report.queued, 1, "{report:?}");
+        assert_eq!(report.blocked, 1, "{report:?}");
+        assert_eq!(report.retired, 1, "{report:?}");
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::blocked_orphan(&name)]
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+    }
+
     /// THE ORDER IS THE SAFETY PROPERTY, asserted as the exact interleaving of
     /// durable writes and injected platform calls: tombstone -> provider ->
     /// permanent block -> ledger.
@@ -5418,7 +5559,11 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(report.blocked, 1, "round {round}: {report:?}");
+            assert_eq!(
+                report.blocked,
+                usize::from(round == 0),
+                "round {round}: only the first sweep creates the block: {report:?}"
+            );
             assert_eq!(
                 read_pending_profile_delete_entries(&state).unwrap(),
                 vec![PendingProfileDelete::blocked_orphan(&name)],
@@ -5430,8 +5575,16 @@ mod tests {
                 "round {round}: an orphan never touches a generation"
             );
         }
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "after the first confirmed block the provider is never asked again"
+        );
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the permanent block's ledger is retired only once"
+        );
 
         // The startup drain asks nothing more of it, and still consumes nothing.
         let entries = read_pending_profile_delete_entries(&state).unwrap();
