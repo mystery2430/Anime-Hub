@@ -4596,8 +4596,6 @@ mod tests {
     /// for a retry.
     #[test]
     fn drain_survives_an_unsupported_provider_and_an_unready_bridge() {
-        use crate::android_bridge::SiteProfileAction;
-
         let state = state_with_current_site(None);
         let first = "user-unsupported-a";
         let second = "user-unsupported-b";
