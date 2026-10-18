@@ -394,23 +394,35 @@ test("remove_site deletes the profile, queues refusals, bumps the generation", (
 
 test("the quarantine ledger is retired only AFTER the generation is durable", () => {
   const ops = pureKotlin;
-  // windows.rs: tombstone → delete → bump → lift → retire, all on the derived
-  // name. The tombstone is first because a process kill inside the (slow)
-  // provider call must not leave a name that is still derivable, still on disk
-  // and no longer remembered — see AH-04 / R-07.
+  // windows.rs: tombstone (WITH ITS OWNER) → delete → secure the generation →
+  // lift → retire, all on the derived name. The tombstone is first because a
+  // process kill inside the (slow) provider call must not leave a name that is
+  // still derivable, still on disk and no longer remembered — see AH-04 / R-07.
   const at = windowsRs.indexOf("pub fn run_mobile_delete_protocol");
   assert.ok(at > 0, "the delete protocol is missing");
   const body = windowsRs.slice(at, windowsRs.indexOf("\n}\n", at));
-  const queue = body.indexOf("queue_pending_profile_delete(state, &profile)?");
+  const queue = body.indexOf("queue_site_profile_delete(state, site_id, &profile)?");
   const del = body.indexOf("delete_profile(&profile)");
-  const bump = body.indexOf("bump_profile_generation(state, site_id)?");
+  const bump = body.indexOf("secure_generation_past_name(state, site_id, &profile)?");
   const forget = body.indexOf("forget_pending_profile_delete(state, &profile)?");
   const retire = body.indexOf("retire_profile(&profile)?");
   assert.ok(queue > 0, "the durable intent is written before anything else");
   assert.ok(del > queue, "the provider is only called once the tombstone is durable");
-  assert.ok(bump > del, "the durable bump follows the deletion");
+  assert.ok(bump > del, "the durable generation follows the deletion");
   assert.ok(forget > bump, "the tombstone is lifted only after a confirmed deletion");
   assert.ok(retire > forget, "THE ORDER: retirement last");
+  // The tombstone carries the site id: a profile name is a one-way digest, so
+  // an ownerless record can never secure a generation at the next start.
+  assert.doesNotMatch(
+    body,
+    /queue_pending_profile_delete\(/,
+    "the delete protocol must record the owner, not queue a bare name",
+  );
+  assert.doesNotMatch(
+    body,
+    /bump_profile_generation\(/,
+    "a blind bump is not idempotent; the generation is secured past THIS name",
+  );
   // A Pending profile still exists on disk → it returns before the lift, so
   // tombstone and ledger both survive until the startup drain lands it.
   const pendingAt = body.indexOf("SiteProfileAction::Pending");
@@ -428,6 +440,24 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
     "mobile_delete_protocol_retires_each_generation_exactly_once_on_repeat",
     "mobile_delete_protocol_tombstones_the_name_before_the_provider_is_called",
     "a_failed_provider_delete_keeps_the_tombstone_so_the_name_cannot_come_back",
+    // The startup half of the same protocol (P1: the kill between the
+    // tombstone and the generation write).
+    "drain_after_a_kill_before_the_provider_ran_finishes_the_deletion",
+    "drain_after_a_kill_between_the_delete_and_the_generation_write_never_reopens_the_name",
+    "drain_after_a_kill_between_the_generation_write_and_the_lift_does_not_bump_again",
+    "drain_lifts_the_tombstone_when_retirement_fails_afterwards",
+    "every_kill_point_leaves_the_next_open_with_a_different_name",
+    "a_failed_generation_write_keeps_the_tombstone_queued",
+    "repeated_drains_do_not_consume_another_generation",
+    "a_legacy_names_only_queue_is_read_and_matched_against_the_registry",
+    "an_unmatched_tombstone_is_kept_and_reported_not_silently_dropped",
+    "an_orphan_tombstone_lifts_after_a_confirmed_deletion",
+    "an_orphan_tombstone_whose_site_came_back_secures_the_generation",
+    "a_conflicting_owner_keeps_the_tombstone",
+    "drain_survives_an_unsupported_provider_and_an_unready_bridge",
+    "generation_past_name_is_monotone_idempotent_and_overflow_safe",
+    "match_queued_name_to_site_needs_exactly_one_owner",
+    "queue_records_the_owner_and_upgrades_a_legacy_entry",
   ]) {
     assert.match(windowsRs, new RegExp(`fn ${name}\\(\\)`), `missing host test ${name}`);
   }
@@ -508,6 +538,8 @@ test("clear_site_data clears profiles in place and sweeps orphans, never the lau
 test("deferred deletions are persisted, drained at startup, and deduped", () => {
   assert.match(windowsRs, /pub const PENDING_PROFILE_DELETES_KEY: &str = "android-pending-profile-deletes"/);
   assert.match(windowsRs, /pub fn queue_pending_profile_delete/);
+  assert.match(windowsRs, /pub fn queue_site_profile_delete/);
+  assert.match(windowsRs, /pub fn queue_orphan_profile_delete/);
   assert.match(windowsRs, /pub fn forget_pending_profile_delete/);
   // lib.rs drains before the frontend can open a site.
   const libRs = read("src-tauri/src/lib.rs");
@@ -517,8 +549,71 @@ test("deferred deletions are persisted, drained at startup, and deduped", () => 
   assert.ok(manageAt > 0 && drainAt > manageAt, "drain must start after the state is managed");
   assert.ok(drainAt < routeAt, "drain spawns during setup, not later");
   assert.match(libRs, /fn drain_pending_profile_deletes/);
-  // A pending result is never reported as deleted.
-  assert.match(libRs, /Ok\(SiteProfileAction::Pending\) => \{\s*\/\/ Still in use/);
+  // A pending result is never reported as deleted — the rule now lives in the
+  // host-tested drain, so pin it there (where `cargo test` executes it).
+  assert.match(
+    windowsRs,
+    /if matches!\(action, SiteProfileAction::Pending\) \{\s*\/\/ Still in use/,
+  );
+});
+
+test("the startup drain proves a name is underivable before lifting its tombstone", () => {
+  // P1 / R-07: a kill between the tombstone write and the generation write used
+  // to leave the stored generation behind — the drain deleted the profile,
+  // lifted the tombstone, and the next open derived the SAME name.
+  const at = windowsRs.indexOf("pub fn run_pending_delete_drain");
+  assert.ok(at > 0, "the drain is missing from windows.rs");
+  const body = windowsRs.slice(at, windowsRs.indexOf("\n}\n", at));
+  const del = body.indexOf("delete_profile(&entry.name)");
+  const secure = body.indexOf("secure_tombstone_generation(");
+  const forget = body.indexOf("forget_pending_profile_delete(state, &entry.name)?");
+  const retire = body.indexOf("retire_profile(&entry.name)");
+  assert.ok(del > 0, "the provider delete comes first");
+  assert.ok(secure > del, "the generation is secured after a confirmed deletion");
+  assert.ok(forget > secure, "THE ORDER: the tombstone is lifted only once the name is unreachable");
+  assert.ok(retire > forget, "the ledger is retired last");
+  // A deferred deletion returns before the lift.
+  const pending = body.indexOf("SiteProfileAction::Pending");
+  assert.ok(pending > del && pending < forget, "a deferred deletion keeps its tombstone");
+  // An owner that cannot be established is never dropped and never assumed safe.
+  assert.match(body, /PendingOwner::Unknown => match &matched \{/);
+  assert.match(body, /kept_unmatched\.push\(entry\.name\.clone\(\)\)/);
+  assert.match(body, /report\.kept_unmatched/);
+  // Overflow keeps the tombstone instead of making the profile reachable again.
+  assert.match(windowsRs, /checked_add\(1\)/);
+  assert.match(
+    windowsRs,
+    /profil nesli taştı, tombstone korunuyor/,
+    "u32::MAX must refuse, not wrap",
+  );
+  // The owner is part of the durable record, because a name cannot be reversed
+  // into the site id that derives it.
+  assert.match(windowsRs, /pub enum PendingOwner/);
+  assert.match(windowsRs, /pub struct PendingProfileDelete/);
+  assert.match(windowsRs, /pub fn match_queued_name_to_site/);
+  assert.match(windowsRs, /pub fn generation_past_name/);
+  assert.match(windowsRs, /pub fn secure_generation_past_name/);
+  // Backward compatibility: the older names-only queue is still read.
+  assert.match(windowsRs, /serde_json::from_slice::<Vec<String>>\(raw\)/);
+  assert.match(windowsRs, /pub fn recover_pending_profile_delete_entries/);
+  // lib.rs delegates instead of re-implementing the order (where no host test
+  // could reach it), and re-matches ownerless tombstones against the registry.
+  const libRs = read("src-tauri/src/lib.rs");
+  const drain = libRs.slice(libRs.indexOf("fn drain_pending_profile_deletes"));
+  assert.match(drain, /w::run_pending_delete_drain\(/);
+  assert.match(drain, /w::read_pending_profile_delete_entries\(state\)\?/);
+  assert.match(drain, /w::match_queued_name_to_site\(name, &site_ids\)/);
+  assert.match(drain, /report\.kept_unmatched/);
+  assert.doesNotMatch(
+    code(drain),
+    /forget_pending_profile_delete/,
+    "the drain order lives in ONE host-tested function, not in lib.rs",
+  );
+  assert.doesNotMatch(code(drain), /site_profile_retire\(name\)/);
+  // The orphan sweep records that it owns no site for the name.
+  const commandsRs = read("src-tauri/src/commands.rs");
+  const sweep = commandsRs.slice(commandsRs.indexOf('orphan sweep for "clear all"'));
+  assert.match(sweep, /windows::queue_orphan_profile_delete\(&state, &name\)\?/);
 });
 
 // ---------------------------------------------------------------------------

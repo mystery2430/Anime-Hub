@@ -476,10 +476,11 @@ outage cannot make every site unopenable.
   * *Verified deletion + generation bump, and the order between them.* The
     delete side is ONE host-tested protocol, `run_mobile_delete_protocol`
     (`web/windows.rs`): derive the name from the **current** generation →
-    **durably queue the name** (a tombstone: "this deletion was requested") →
-    delete → **durably bump the generation** → for a *confirmed* deletion,
-    durably lift the tombstone → and only then retire the name's ledger via the
-    separate `site_profile_retire` bridge call.
+    **durably queue the name together with the site id that derives it** (a
+    tombstone: "this deletion was requested") → delete → **durably move the
+    generation past that name** → for a *confirmed* deletion, durably lift the
+    tombstone → and only then retire the name's ledger via the separate
+    `site_profile_retire` bridge call.
 
     The tombstone comes first because of process death (AH-04 / R-07):
     `deleteProfile` is a provider call that can take arbitrarily long — the
@@ -495,6 +496,44 @@ outage cannot make every site unopenable.
     finished at the next start instead of being forgotten with the data still on
     disk; the cost of that false tombstone is one generation number and a site
     that opens logged out — which is what the caller asked for.
+
+    **The startup drain keeps the same order (P1 / R-07, second half).** A kill
+    *between* the tombstone write and the generation write used to be drained
+    unsafely: the drain deleted the profile, lifted the tombstone, and left the
+    stored generation at `N` — so the next open derived `site-…-gN` again, the
+    very name whose deletion had just been confirmed.
+    `run_pending_delete_drain` (host-tested, `web/windows.rs`; `lib.rs` only
+    wires the platform calls into it) therefore proves the name is underivable
+    *before* it lifts anything: delete → **secure the generation durably**
+    (`secure_generation_past_name` — monotone, so a repeated drain burns no
+    second generation, idempotent when the stored counter is already past the
+    tombstone, and refusing at `u32::MAX` instead of wrapping the profile back
+    into reach) → lift → retire. A refused generation write keeps the tombstone.
+
+    Securing a generation needs the site id, and a profile name is a one-way
+    digest of it — so the queue records an **owner** next to each name
+    (`PendingProfileDelete { name, owner }`; `owner` is `site:<id>`, `orphan`, or
+    unknown). The names-only format an older build wrote is still read
+    (`recover_pending_profile_delete_entries` accepts both, and a clean legacy
+    list is never flagged corrupt), and such an entry is re-matched against the
+    registered site ids (`match_queued_name_to_site`, which refuses to guess when
+    zero **or more than one** id derives the name). An ownerless tombstone that
+    matches nothing is **kept**: the deletion is retried at every start, the name
+    is reported in `DrainReport::kept_unmatched` and logged, and
+    `resolve_queued_free_generation` never hands it to an open — a name nobody
+    can be attributed is never assumed to sit at a safe generation. An
+    orphan-sweep entry (recorded ownerless on purpose, because no registered site
+    derived it) lifts after a confirmed deletion; if that site id is
+    re-registered later, the re-match secures its generation like any owned
+    tombstone.
+
+    What a host test proves here is the *ordering and the durable state*, driven
+    through a real encrypted store and a scripted provider — including the three
+    kill points (before the provider ran, after the delete but before the
+    generation write, after the generation write but before the lift), a refused
+    generation write, repeated drains, a legacy queue, an unmatched tombstone and
+    an orphan. What it cannot prove is when the real Android provider finishes
+    removing the directory from disk; that stays in the device checklist below.
 
     Retirement last is the safety property:
     the bump is what makes the name underivable, so if it (or its storage

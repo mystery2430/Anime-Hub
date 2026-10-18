@@ -735,7 +735,12 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
             }
             match crate::android_bridge::site_profile_delete(&name)? {
                 SiteProfileAction::Pending => {
-                    windows::queue_pending_profile_delete(&state, &name)?;
+                    // Orphan: no registered site derives this name, which is
+                    // exactly why the sweep owns it. Recorded as such, so the
+                    // startup drain can lift it after a confirmed deletion
+                    // instead of keeping an ownerless tombstone forever — and
+                    // still secures the generation if the id was re-registered.
+                    windows::queue_orphan_profile_delete(&state, &name)?;
                 }
                 SiteProfileAction::Deleted | SiteProfileAction::Absent => {
                     // Same rule as `run_mobile_delete_protocol`: the ledger goes

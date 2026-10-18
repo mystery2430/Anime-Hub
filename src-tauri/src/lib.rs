@@ -330,55 +330,54 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 /// `clear_site_data` is the second safety net.
 #[cfg(target_os = "android")]
 fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult<bool> {
-    use crate::android_bridge::SiteProfileAction;
+    use crate::error::AppError;
     use crate::web::windows as w;
-    let pending = w::read_pending_profile_deletes(state)?;
-    if pending.is_empty() {
+
+    let entries = w::read_pending_profile_delete_entries(state)?;
+    if entries.is_empty() {
         return Ok(true);
     }
-    log::info!("ertelenen profil silmeleri deneniyor: {}", pending.len());
-    for name in &pending {
-        match crate::android_bridge::site_profile_delete(name) {
-            Ok(SiteProfileAction::Deleted) | Ok(SiteProfileAction::Absent) => {
-                // Durable queue removal FIRST, then the quarantine ledger — the
-                // same order `run_mobile_delete_protocol` keeps for the direct
-                // path. A retire failure must not undo the fact that the
-                // deletion landed, so it is logged: keeping the ledger only
-                // blocks a name nothing can derive any more.
-                w::forget_pending_profile_delete(state, name)?;
-                match crate::android_bridge::site_profile_retire(name) {
-                    Ok(dropped) if dropped > 0 => log::info!(
-                        "ertelenen profil karantinası emekliye ayrıldı ({dropped} bekleyen kayıt)"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("ertelenen profil karantinası emekliye ayrılamadı ({name}): {e}")
-                    }
-                }
-                log::info!("ertelenen profil verisi silindi");
-            }
-            Ok(SiteProfileAction::Pending) => {
-                // Still in use or still unsupported: keep it queued for a
-                // later start. Never reported to the user as deleted.
-                log::warn!("ertelenen profil silme bir kez daha ertelendi");
-            }
-            Err(crate::error::AppError::Unsupported(_)) => {
-                // The provider has no profile API on this device: nothing
-                // will delete here until it does. Keep the name queued (so a
-                // later provider update can drain it) and continue — a
-                // feature gap must not abort the remaining names or be
-                // reported as success.
-                log::warn!(
-                    "ertelenen profil silme atlandı: sağlayıcı profilleri desteklemiyor ({name})"
-                );
-            }
-            Err(e) => {
-                log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
-                return Ok(false);
-            }
-        }
+    log::info!("ertelenen profil silmeleri deneniyor: {}", entries.len());
+
+    // Registered site ids, collected once and WITHOUT holding the lock across
+    // a provider call. A tombstone an older build wrote as a bare name has no
+    // recorded owner, and a profile name is a one-way digest of the site id —
+    // so re-matching against the registry is the only way to find out whose
+    // generation has to be secured before the tombstone may be lifted.
+    let site_ids: Vec<String> = {
+        let reg = state
+            .registry
+            .lock()
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        reg.sites.iter().map(|site| site.id.clone()).collect()
+    };
+
+    // The order (delete → prove the name is underivable → lift → retire) lives
+    // in the host-tested `run_pending_delete_drain`, not here: `cargo test`
+    // proves it on every OS instead of leaving it to the aarch64 compile.
+    let report = w::run_pending_delete_drain(
+        state,
+        &entries,
+        crate::android_bridge::site_profile_delete,
+        crate::android_bridge::site_profile_retire,
+        |name| w::match_queued_name_to_site(name, &site_ids),
+    )?;
+
+    for name in &report.kept_unmatched {
+        log::warn!(
+            "ertelenen profil silmesi kuyrukta korundu (sahibi belirsiz veya nesil güvenceye alınamadı): {name}"
+        );
     }
-    Ok(true)
+    if report.lifted > 0 || report.deferred > 0 || report.unsupported > 0 {
+        log::info!(
+            "ertelenen profil silmeleri: {} kaldırıldı, {} ertelendi, {} desteklenmiyor, {} korundu",
+            report.lifted,
+            report.deferred,
+            report.unsupported,
+            report.kept_unmatched.len()
+        );
+    }
+    Ok(!report.bridge_not_ready)
 }
 
 /// Choose the secret backend for this platform.

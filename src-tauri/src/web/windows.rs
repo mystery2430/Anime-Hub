@@ -619,10 +619,73 @@ const MIGRATION_FLAG_PREFIX: &str = "profilemig-";
 /// any site WebView can open.
 pub const PENDING_PROFILE_DELETES_KEY: &str = "android-pending-profile-deletes";
 
-/// Secret key where the RAW bytes of a corrupt pending-delete list are
-/// kept before the working copy is salvaged/overwritten — the names inside
-/// are the only record of on-disk profile data still awaiting deletion.
+/// Secret key where the RAW bytes of a pending-delete queue are kept before
+/// the working copy is salvaged/overwritten — the names inside are the only
+/// record of on-disk profile data still awaiting deletion. Written for a
+/// corrupt document and for a list with entries dropped, never for a clean
+/// queue in the older (names-only) format.
 pub const CORRUPT_QUEUE_BACKUP_KEY: &str = "android-pending-profile-deletes-corrupt";
+
+/// Who owns a tombstoned (queued-for-deletion) profile name.
+///
+/// A profile name is `site-<SHA-256(site_id)[..32]>-g<N>`: the digest is
+/// one-way, so the name alone can NEVER be turned back into the site id that
+/// derives it. That matters because lifting a tombstone has to be preceded by
+/// durable proof that no open can derive the name again — a kill between the
+/// tombstone write and the generation write used to leave the stored
+/// generation behind, so the drained name came straight back on the next open
+/// (P1 / R-07).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingOwner {
+    /// Recorded by a path that knew the site: [`run_mobile_delete_protocol`]
+    /// and the migration retirement.
+    Site(String),
+    /// Recorded by the "clear all" orphan sweep: no registered site derived
+    /// this name when it was queued.
+    Orphan,
+    /// An entry written by an older build (names-only list) or salvaged from
+    /// corrupt bytes. Never assumed safe: the drain re-matches it against the
+    /// registry, and an entry that matches nothing stays queued.
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
+/// One deferred profile deletion: the name, plus its owner when one is known.
+///
+/// Wire format is a JSON array of these objects. A names-only array (the
+/// format older builds wrote) is still read — see
+/// [`recover_pending_profile_delete_entries`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingProfileDelete {
+    pub name: String,
+    #[serde(default)]
+    pub owner: PendingOwner,
+}
+
+impl PendingProfileDelete {
+    pub fn site(site_id: &str, name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            owner: PendingOwner::Site(site_id.to_string()),
+        }
+    }
+
+    pub fn orphan(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            owner: PendingOwner::Orphan,
+        }
+    }
+
+    pub fn unknown(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            owner: PendingOwner::Unknown,
+        }
+    }
+}
 
 /// Deterministic Android WebView profile name for a site.
 ///
@@ -722,21 +785,46 @@ pub fn scan_valid_profile_names(raw: &[u8]) -> Vec<String> {
     found
 }
 
-/// Pure recovery rule for the pending-delete queue. A JSON list that parses
-/// keeps only structurally valid names (corrupt if any were dropped); a
-/// broken document is salvaged name-by-name from the raw bytes (always
-/// corrupt). Returns `(names, was_corrupt)`.
-pub fn recover_pending_profile_deletes(raw: &[u8]) -> (Vec<String>, bool) {
+/// Pure recovery rule for the pending-delete queue.
+///
+/// BOTH wire formats are accepted: the current array of
+/// [`PendingProfileDelete`] objects and the older array of plain names, whose
+/// entries come back as [`PendingOwner::Unknown`] (an older build could not
+/// record an owner, and a name cannot be reversed into one). A document that
+/// parses keeps only structurally valid names; a broken document is salvaged
+/// name-by-name from the raw bytes.
+///
+/// Returns `(entries, needs_repair)`. `needs_repair` is true for a corrupt
+/// document and for a list with entries dropped — i.e. when the stored bytes
+/// no longer say exactly what is owed. A clean names-only list is NOT flagged:
+/// backward compatibility means it stays readable as it is, and the next write
+/// upgrades it.
+pub fn recover_pending_profile_delete_entries(raw: &[u8]) -> (Vec<PendingProfileDelete>, bool) {
+    if let Ok(list) = serde_json::from_slice::<Vec<PendingProfileDelete>>(raw) {
+        let total = list.len();
+        let kept: Vec<PendingProfileDelete> = list
+            .into_iter()
+            .filter(|entry| is_valid_site_profile_name(&entry.name))
+            .collect();
+        let dropped = total - kept.len();
+        if dropped > 0 {
+            log::warn!("bekleyen profil silme listesinden {dropped} geçersiz ad çıkarıldı");
+        }
+        return (kept, dropped > 0);
+    }
     match serde_json::from_slice::<Vec<String>>(raw) {
         Ok(list) => {
             let total = list.len();
-            let kept: Vec<String> = list
+            let kept: Vec<PendingProfileDelete> = list
                 .into_iter()
                 .filter(|name| is_valid_site_profile_name(name))
+                .map(|name| PendingProfileDelete::unknown(&name))
                 .collect();
             let dropped = total - kept.len();
             if dropped > 0 {
-                log::warn!("bekleyen profil silme listesinden {dropped} geçersiz ad çıkarıldı");
+                log::warn!(
+                    "eski biçimli bekleyen silme listesinden {dropped} geçersiz ad çıkarıldı"
+                );
             }
             (kept, dropped > 0)
         }
@@ -746,9 +834,24 @@ pub fn recover_pending_profile_deletes(raw: &[u8]) -> (Vec<String>, bool) {
                 "bekleyen profil silme listesi bozuk ({e}); {} ad ham kopyadan kurtarıldı",
                 salvaged.len()
             );
-            (salvaged, true)
+            let entries = salvaged
+                .iter()
+                .map(|name| PendingProfileDelete::unknown(name))
+                .collect();
+            (entries, true)
         }
     }
+}
+
+/// Name-only view of [`recover_pending_profile_delete_entries`], for the paths
+/// that compare names (the open protocol's collision resolution and the
+/// generation recovery).
+pub fn recover_pending_profile_deletes(raw: &[u8]) -> (Vec<String>, bool) {
+    let (entries, needs_repair) = recover_pending_profile_delete_entries(raw);
+    (
+        entries.into_iter().map(|entry| entry.name).collect(),
+        needs_repair,
+    )
 }
 
 /// Pure recovery rule for a corrupt generation counter: take the highest
@@ -858,7 +961,87 @@ pub fn resolve_queued_free_generation(
     Ok((next, true))
 }
 
-/// Read the deferred profile-deletion queue.
+/// The generation `site_id` must be stored at for `name` to be underivable
+/// (pure, monotone, idempotent).
+///
+/// `Ok((generation, advanced))`; `advanced == false` means the stored
+/// generation is ALREADY past this tombstone, so a repeated drain must not
+/// consume another one. Ownership is proved by recomputation
+/// (`android_profile_name(site_id, g) == name`) rather than by trusting the
+/// digits after the prefix: a tombstone of another site must never move this
+/// site's counter. `u32::MAX` has no next value — the error keeps the
+/// tombstone durable instead of making the profile reachable again.
+pub fn generation_past_name(site_id: &str, stored: u32, name: &str) -> AppResult<(u32, bool)> {
+    let prefix = queued_site_profile_prefix(site_id);
+    let not_owned = || {
+        AppError::Storage(format!(
+            "tombstone bu sitenin adını türetmiyor ({site_id}): {name}"
+        ))
+    };
+    let Some(digits) = name.strip_prefix(&prefix) else {
+        return Err(not_owned());
+    };
+    let Ok(generation) = digits.parse::<u32>() else {
+        return Err(not_owned());
+    };
+    if android_profile_name(site_id, generation) != name {
+        return Err(not_owned());
+    }
+    if stored > generation {
+        return Ok((stored, false));
+    }
+    let next = generation.checked_add(1).ok_or_else(|| {
+        AppError::Storage(format!(
+            "profil nesli taştı, tombstone korunuyor ({site_id})"
+        ))
+    })?;
+    Ok((next, true))
+}
+
+/// Durable form of [`generation_past_name`]: read the stored generation,
+/// decide, and persist BEFORE the caller lifts the tombstone. A failed write
+/// propagates, so the tombstone survives it.
+pub fn secure_generation_past_name(
+    state: &AppState,
+    site_id: &str,
+    name: &str,
+) -> AppResult<(u32, bool)> {
+    let stored = profile_generation(state, site_id)?;
+    let (next, advanced) = generation_past_name(site_id, stored, name)?;
+    if advanced {
+        state.provider.put_secret(
+            &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
+            next.to_string().as_bytes(),
+        )?;
+    }
+    Ok((next, advanced))
+}
+
+/// Re-match a tombstone whose owner was not recorded against the registered
+/// site ids.
+///
+/// `None` when no registered site derives this name — and also when MORE THAN
+/// ONE would, because a digest collision is not something to guess about.
+pub fn match_queued_name_to_site(name: &str, site_ids: &[String]) -> Option<String> {
+    let mut hits = site_ids.iter().filter(|site_id| {
+        let prefix = queued_site_profile_prefix(site_id);
+        match name
+            .strip_prefix(&prefix)
+            .and_then(|digits| digits.parse::<u32>().ok())
+        {
+            Some(generation) => android_profile_name(site_id, generation) == name,
+            None => false,
+        }
+    });
+    let first = hits.next()?.clone();
+    if hits.next().is_some() {
+        log::warn!("tombstone birden fazla kayıtlı siteyle eşleşti, sahibi belirsiz: {name}");
+        return None;
+    }
+    Some(first)
+}
+
+/// Read the deferred profile-deletion queue (names and owners).
 ///
 /// A corrupt list is never treated as empty: valid names are salvaged from
 /// the raw bytes, the original bytes are backed up under
@@ -866,18 +1049,20 @@ pub fn resolve_queued_free_generation(
 /// Dropping the queue silently would strand those profile deletions (best
 /// case the orphan sweep collects them — worst case a re-open races a
 /// deletion nobody recorded any more).
-pub fn read_pending_profile_deletes(state: &AppState) -> AppResult<Vec<String>> {
+pub fn read_pending_profile_delete_entries(
+    state: &AppState,
+) -> AppResult<Vec<PendingProfileDelete>> {
     let Some(bytes) = state.provider.get_secret(PENDING_PROFILE_DELETES_KEY)? else {
         return Ok(Vec::new());
     };
-    let (list, corrupt) = recover_pending_profile_deletes(&bytes);
-    if corrupt {
+    let (entries, needs_repair) = recover_pending_profile_delete_entries(&bytes);
+    if needs_repair {
         // Best effort both ways: a failed backup or repair only means the
         // salvage repeats on the next read; never block open behind it.
         if let Err(e) = state.provider.put_secret(CORRUPT_QUEUE_BACKUP_KEY, &bytes) {
             log::warn!("bozuk silme kuyruğu yedeği yazılamadı: {e}");
         }
-        match serde_json::to_vec(&list) {
+        match serde_json::to_vec(&entries) {
             Ok(repaired) => {
                 if let Err(e) = state
                     .provider
@@ -889,26 +1074,68 @@ pub fn read_pending_profile_deletes(state: &AppState) -> AppResult<Vec<String>> 
             Err(e) => log::warn!("bozuk silme kuyruğu yeniden yazılamadı: {e}"),
         }
     }
-    Ok(list)
+    Ok(entries)
 }
 
-/// Queue a profile name for deletion at the next process start (deduped).
-pub fn queue_pending_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
-    let mut list = read_pending_profile_deletes(state)?;
-    if list.iter().any(|existing| existing == name) {
-        return Ok(());
+/// Name-only view of the queue (the open protocol and the generation recovery
+/// compare names, and every existing caller keeps working).
+pub fn read_pending_profile_deletes(state: &AppState) -> AppResult<Vec<String>> {
+    Ok(read_pending_profile_delete_entries(state)?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect())
+}
+
+/// Queue a tombstone, deduped BY NAME.
+///
+/// An entry that is already queued keeps its place and nothing is written —
+/// except when the queued entry's owner is still [`PendingOwner::Unknown`] and
+/// the caller knows it: then the owner is recorded, so a queue written by an
+/// older build gains the information the drain needs to secure a generation.
+fn queue_entry(state: &AppState, entry: PendingProfileDelete) -> AppResult<()> {
+    let mut list = read_pending_profile_delete_entries(state)?;
+    if let Some(existing) = list.iter_mut().find(|queued| queued.name == entry.name) {
+        if existing.owner != PendingOwner::Unknown || existing.owner == entry.owner {
+            return Ok(());
+        }
+        existing.owner = entry.owner;
+    } else {
+        list.push(entry);
     }
-    list.push(name.to_string());
     let bytes = serde_json::to_vec(&list)?;
     state
         .provider
         .put_secret(PENDING_PROFILE_DELETES_KEY, &bytes)
 }
 
-/// Drop a name from the deferred deletion queue once it is gone.
+/// Queue a profile whose site the caller knows — the direct delete protocol
+/// and the migration retirement. This is the form the startup drain can secure
+/// a generation for without re-matching.
+pub fn queue_site_profile_delete(state: &AppState, site_id: &str, name: &str) -> AppResult<()> {
+    queue_entry(state, PendingProfileDelete::site(site_id, name))
+}
+
+/// Queue a profile with no registered owner (the "clear all" orphan sweep).
+pub fn queue_orphan_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
+    queue_entry(state, PendingProfileDelete::orphan(name))
+}
+
+/// Queue a profile whose owner is NOT known. The drain re-matches such an
+/// entry against the registry and keeps it queued when nothing matches, so it
+/// is never silently dropped and never assumed safe.
+pub fn queue_pending_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
+    queue_entry(state, PendingProfileDelete::unknown(name))
+}
+
+/// Drop a name from the deferred deletion queue. Callers must have made the
+/// name underivable durably first — see [`run_pending_delete_drain`] and
+/// [`run_mobile_delete_protocol`].
 pub fn forget_pending_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
-    let list = read_pending_profile_deletes(state)?;
-    let kept: Vec<String> = list.into_iter().filter(|n| n != name).collect();
+    let list = read_pending_profile_delete_entries(state)?;
+    let kept: Vec<PendingProfileDelete> = list
+        .into_iter()
+        .filter(|entry| entry.name != name)
+        .collect();
     let bytes = serde_json::to_vec(&kept)?;
     state
         .provider
@@ -1055,18 +1282,18 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
                 log::warn!(
                     "profil göçü tamamlanamadı ({site_id})={message}; profil emekliye ayrılıyor"
                 );
-                queue_pending_profile_delete(state, &profile)?;
-                let retry_generation = bump_profile_generation(state, site_id)?;
+                queue_site_profile_delete(state, site_id, &profile)?;
+                let (retry_generation, _) = secure_generation_past_name(state, site_id, &profile)?;
                 profile = android_profile_name(site_id, retry_generation);
                 migrate_result = ops.migrate(url, &profile, &cookie_headers);
                 if let Err(AppError::Other(retry_message)) = &migrate_result {
                     if retry_message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) {
                         // Retire this attempt too and surface a retryable error.
-                        if let Err(e) = queue_pending_profile_delete(state, &profile) {
+                        if let Err(e) = queue_site_profile_delete(state, site_id, &profile) {
                             log::warn!("ikinci göç profili kuyruğa alınamadı: {e}");
                         }
-                        if let Err(e) = bump_profile_generation(state, site_id) {
-                            log::warn!("göç sonrası nesil artırılamadı: {e}");
+                        if let Err(e) = secure_generation_past_name(state, site_id, &profile) {
+                            log::warn!("göç sonrası nesil güvenceye alınamadı: {e}");
                         }
                         return Err(AppError::Other(format!(
                             "site çerezleri profiline taşınamadı: {retry_message}. Çerezler saklandı; sonraki açılışta yeniden denenecek."
@@ -1149,8 +1376,12 @@ where
 /// prevent, re-opened by the cleanup path.
 ///
 /// So the sequence is: derive the name from the CURRENT generation → **durably
-/// queue the name (tombstone)** → delete → durably bump the generation → and
-/// only for a confirmed deletion, lift the tombstone and retire. Every earlier
+/// queue the name (tombstone), with the site id that derives it** → delete →
+/// durably move the generation past the name → and only for a confirmed
+/// deletion, lift the tombstone and retire. The startup drain keeps the very
+/// same order for a deletion this process never finished
+/// ([`run_pending_delete_drain`]), which is what closes the kill-between-
+/// tombstone-and-generation window end to end. Every earlier
 /// failure propagates and leaves both the tombstone and the ledger in place,
 /// i.e. the name stays blocked; a retry re-runs the whole protocol and is
 /// idempotent (the same name is derived again while the bump never landed, and
@@ -1196,10 +1427,13 @@ where
     let generation = profile_generation(state, site_id)?;
     let profile = android_profile_name(site_id, generation);
 
-    // 1. DURABLE INTENT, before the provider is touched. If this write fails
-    //    nothing has happened yet: no deletion was requested, the name is still
-    //    derivable and still clean, and the caller gets a retryable error.
-    queue_pending_profile_delete(state, &profile)?;
+    // 1. DURABLE INTENT, before the provider is touched, WITH THE OWNER: a
+    //    name cannot be reversed into the site id that derives it, so a
+    //    tombstone without an owner cannot secure a generation at the next
+    //    start. If this write fails nothing has happened yet: no deletion was
+    //    requested, the name is still derivable and still clean, and the
+    //    caller gets a retryable error.
+    queue_site_profile_delete(state, site_id, &profile)?;
 
     // 2. The provider call. Its outcome no longer decides whether the name is
     //    remembered — only when the tombstone may be lifted.
@@ -1215,8 +1449,11 @@ where
     };
 
     // 3. Durable: after this write no future open can derive `profile` again
-    //    (and the queue already guaranteed it before this line).
-    bump_profile_generation(state, site_id)?;
+    //    (and the queue already guaranteed it before this line). Monotone and
+    //    idempotent — it moves the counter past THIS name, so a repeated run
+    //    never burns a second generation, and a failed write propagates with
+    //    the tombstone still in place.
+    secure_generation_past_name(state, site_id, &profile)?;
 
     if matches!(action, SiteProfileAction::Pending) {
         // Deferred: the profile still exists and is still loaded in this
@@ -1236,6 +1473,191 @@ where
         );
     }
     Ok(action)
+}
+
+/// What one startup drain round did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    /// Tombstones lifted: the deletion was confirmed AND the name is provably
+    /// underivable (generation secured, or a name nothing owns).
+    pub lifted: usize,
+    /// The provider still refuses (the profile is loaded in this process):
+    /// kept queued, never reported as deleted.
+    pub deferred: usize,
+    /// The provider has no profile API on this device: kept queued, and the
+    /// remaining names were still tried.
+    pub unsupported: usize,
+    /// Kept because the owner could not be established or the generation could
+    /// not be made durable. Such a name is never handed to an open and the
+    /// deletion is retried at the next start.
+    pub kept_unmatched: Vec<String>,
+    /// The bridge was not ready yet: the caller should retry the drain.
+    pub bridge_not_ready: bool,
+}
+
+/// Secure a confirmed tombstone's generation. `false` — plus a
+/// `kept_unmatched` record — when the generation could not be made durable or
+/// the name does not belong to this site: the tombstone then stays, which is
+/// the conservative direction (the deletion is retried, the name stays
+/// blocked).
+fn secure_tombstone_generation(
+    state: &AppState,
+    site_id: &str,
+    entry: &PendingProfileDelete,
+    report: &mut DrainReport,
+) -> bool {
+    match secure_generation_past_name(state, site_id, &entry.name) {
+        Ok((generation, advanced)) => {
+            if advanced {
+                log::info!(
+                    "ertelenen silme sonrası nesil güvenceye alındı ({site_id} → g{generation})"
+                );
+            }
+            true
+        }
+        Err(e) => {
+            log::warn!(
+                "ertelenen silme: nesil güvenceye alınamadı, tombstone korunuyor ({}): {e}",
+                entry.name
+            );
+            report.kept_unmatched.push(entry.name.clone());
+            false
+        }
+    }
+}
+
+/// Drain the deferred profile-deletion queue — the startup half of the
+/// tombstone protocol, host-testable (platform calls and the owner re-match
+/// are injected, so `cargo test` proves the order on every OS).
+///
+/// THE ORDER, per tombstone: provider delete → **prove durably that no open can
+/// derive the name again** → lift the tombstone → retire the quarantine ledger.
+///
+/// "Prove" means one of exactly two things:
+///
+///  * the owner is known — recorded when the tombstone was written, or
+///    re-matched against the registered site ids for an entry an older build
+///    wrote as a bare name — and the site's stored generation is now PAST the
+///    tombstone's generation ([`secure_generation_past_name`]: monotone, so a
+///    repeated drain does not consume another generation, and durable, so a
+///    failed write keeps the tombstone); or
+///  * the entry was recorded as an orphan AND still matches no registered site,
+///    so nothing derives the name and the confirmed deletion is what makes it
+///    unreachable.
+///
+/// Anything else keeps the tombstone and is reported in
+/// [`DrainReport::kept_unmatched`]: a name whose owner cannot be established is
+/// never silently dropped and never assumed to be at a safe generation. That is
+/// the P1 hole this closes — a kill between the tombstone write and the
+/// generation write used to leave the stored generation behind, the drain
+/// deleted the profile and lifted the tombstone anyway, and the next open
+/// derived the SAME `site-…-gN` name.
+pub fn run_pending_delete_drain<D, R, M>(
+    state: &AppState,
+    entries: &[PendingProfileDelete],
+    mut delete_profile: D,
+    mut retire_profile: R,
+    match_owner: M,
+) -> AppResult<DrainReport>
+where
+    D: FnMut(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
+    R: FnMut(&str) -> AppResult<u32>,
+    M: Fn(&str) -> Option<String>,
+{
+    use crate::android_bridge::SiteProfileAction;
+    let mut report = DrainReport::default();
+
+    for entry in entries {
+        let action = match delete_profile(&entry.name) {
+            Ok(action) => action,
+            Err(AppError::Unsupported(_)) => {
+                // No profile API on this device: nothing deletes here until
+                // there is one. Keep it queued so a later provider update can
+                // drain it, and keep going — a feature gap must not abort the
+                // remaining names or be reported as a success.
+                log::warn!(
+                    "ertelenen profil silme atlandı: sağlayıcı profilleri desteklemiyor ({})",
+                    entry.name
+                );
+                report.unsupported += 1;
+                continue;
+            }
+            Err(e) => {
+                log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
+                report.bridge_not_ready = true;
+                return Ok(report);
+            }
+        };
+        if matches!(action, SiteProfileAction::Pending) {
+            // Still in use or still unsupported: keep it queued for a later
+            // start. Never reported to the user as deleted.
+            log::warn!(
+                "ertelenen profil silme bir kez daha ertelendi ({})",
+                entry.name
+            );
+            report.deferred += 1;
+            continue;
+        }
+
+        // Deleted (or already absent): the bytes are gone. Now make the NAME
+        // unreachable durably, BEFORE the record of the deletion is dropped.
+        let matched = match_owner(&entry.name);
+        let secured = match &entry.owner {
+            PendingOwner::Site(site_id) => match &matched {
+                Some(other) if other != site_id => {
+                    log::warn!(
+                        "ertelenen silme: tombstone sahibi çelişiyor (kayıt {site_id}, eşleşen {other}), korunuyor: {}",
+                        entry.name
+                    );
+                    report.kept_unmatched.push(entry.name.clone());
+                    false
+                }
+                _ => secure_tombstone_generation(state, site_id, entry, &mut report),
+            },
+            PendingOwner::Orphan => match &matched {
+                // A site id that was removed and later re-registered derives
+                // this name again, so it is secured like an owned tombstone.
+                Some(site_id) => secure_tombstone_generation(state, site_id, entry, &mut report),
+                None => true,
+            },
+            PendingOwner::Unknown => match &matched {
+                Some(site_id) => secure_tombstone_generation(state, site_id, entry, &mut report),
+                None => {
+                    log::warn!(
+                        "ertelenen silme: tombstone sahibi belirlenemedi, kuyrukta korunuyor ve hiçbir açılışa verilmiyor: {}",
+                        entry.name
+                    );
+                    report.kept_unmatched.push(entry.name.clone());
+                    false
+                }
+            },
+        };
+        if !secured {
+            continue;
+        }
+
+        // Durable queue removal FIRST, then the quarantine ledger — the same
+        // order `run_mobile_delete_protocol` keeps for the direct path. A
+        // retire failure must not undo the fact that the deletion landed and
+        // the name is unreachable, so it is logged: keeping the ledger only
+        // blocks a name nothing can derive any more.
+        forget_pending_profile_delete(state, &entry.name)?;
+        report.lifted += 1;
+        match retire_profile(&entry.name) {
+            Ok(dropped) if dropped > 0 => log::info!(
+                "ertelenen profil karantinası emekliye ayrıldı ({dropped} bekleyen kayıt): {}",
+                entry.name
+            ),
+            Ok(_) => {}
+            Err(e) => log::warn!(
+                "ertelenen profil karantinası emekliye ayrılamadı ({}): {e}",
+                entry.name
+            ),
+        }
+        log::info!("ertelenen profil verisi silindi ({})", entry.name);
+    }
+
+    Ok(report)
 }
 
 /// Android: open the site in a fresh native WebView bound to its own profile.
@@ -3602,6 +4024,733 @@ mod tests {
             vec![format!("put:{PENDING_PROFILE_DELETES_KEY}")],
             "only the tombstone landed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The startup drain: a tombstone is lifted ONLY once the name it records is
+    // provably underivable. Each test starts from the durable state a restart
+    // would actually see after a kill at one point of the delete protocol —
+    // nothing in memory survives a kill, so the queue and the generation
+    // counter are the whole truth.
+    //
+    // What a host test CANNOT prove: when the real Android provider finishes
+    // removing the directory from disk. `Deleted` here means "the provider
+    // confirmed", which is the same assumption the direct path makes; the
+    // device-side behaviour stays an open item in
+    // docs/android-storage-isolation.md.
+    // -----------------------------------------------------------------------
+
+    /// Write the queue in the CURRENT format (objects with an owner).
+    fn write_queue(state: &AppState, entries: Vec<PendingProfileDelete>) {
+        let bytes = serde_json::to_vec(&entries).unwrap();
+        state
+            .provider
+            .put_secret(PENDING_PROFILE_DELETES_KEY, &bytes)
+            .unwrap();
+    }
+
+    /// Write the queue in the LEGACY format an older build produced: a plain
+    /// JSON array of names, with no owner recorded anywhere.
+    fn write_legacy_queue(state: &AppState, names: Vec<String>) {
+        let bytes = serde_json::to_vec(&names).unwrap();
+        state
+            .provider
+            .put_secret(PENDING_PROFILE_DELETES_KEY, &bytes)
+            .unwrap();
+    }
+
+    /// Owner re-match that finds nothing — the shape a drain sees when no
+    /// registered site derives the tombstoned name.
+    fn no_owner(_name: &str) -> Option<String> {
+        None
+    }
+
+    fn write_generation(state: &AppState, site_id: &str, generation: u32) {
+        state
+            .provider
+            .put_secret(
+                &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
+                generation.to_string().as_bytes(),
+            )
+            .unwrap();
+    }
+
+    /// Scenario 1: the tombstone is durable, the provider was never called.
+    #[test]
+    fn drain_after_a_kill_before_the_provider_ran_finishes_the_deletion() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-drain-before-provider";
+        let name = android_profile_name(id, 0);
+        write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+
+        let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (d, r) = (deletes.clone(), retires.clone());
+        let expected = name.clone();
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            move |profile| {
+                assert_eq!(
+                    profile,
+                    expected.as_str(),
+                    "the queued name is the one deleted"
+                );
+                d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(SiteProfileAction::Deleted)
+            },
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+            no_owner,
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 1, "{report:?}");
+        assert!(report.kept_unmatched.is_empty(), "{report:?}");
+        assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The generation moved past the deleted name BEFORE the tombstone was
+        // lifted, so the next open cannot derive it.
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_ne!(
+            android_profile_name(id, profile_generation(&state, id).unwrap()),
+            name
+        );
+    }
+
+    /// Scenario 2 — THE P1 BUG: the provider accepted the deletion and the
+    /// process died before the generation write landed. The old drain deleted
+    /// the profile, lifted the tombstone and left the stored generation at N,
+    /// so the next open derived the very same `site-…-gN` name.
+    #[test]
+    fn drain_after_a_kill_between_the_delete_and_the_generation_write_never_reopens_the_name() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-drain-before-bump";
+        let name = android_profile_name(id, 0);
+        // Durable state after the kill: tombstone present, generation never
+        // bumped, profile already gone from the provider's point of view.
+        write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+        write_generation(&state, id, 0);
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let expected = name.clone();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            move |profile| {
+                assert_eq!(profile, expected.as_str());
+                Ok(SiteProfileAction::Absent)
+            },
+            |_profile| Ok(0),
+            no_owner,
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 1, "{report:?}");
+        // The stored generation is now PAST the drained name, and that write is
+        // durable before the tombstone was lifted.
+        assert_eq!(
+            profile_generation(&state, id).unwrap(),
+            1,
+            "the drain must secure the generation the killed process never wrote"
+        );
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        let next_open = android_profile_name(id, profile_generation(&state, id).unwrap());
+        assert_ne!(
+            next_open, name,
+            "the deleted profile name must never come back"
+        );
+    }
+
+    /// Scenario 3: the generation write landed, the process died before the
+    /// tombstone was lifted. The drain must NOT consume a second generation.
+    #[test]
+    fn drain_after_a_kill_between_the_generation_write_and_the_lift_does_not_bump_again() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-drain-after-bump";
+        let name = android_profile_name(id, 0);
+        write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+        write_generation(&state, id, 1);
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Absent),
+            |_profile| Ok(0),
+            no_owner,
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 1, "{report:?}");
+        assert_eq!(
+            profile_generation(&state, id).unwrap(),
+            1,
+            "already past the tombstone: idempotent, no extra generation burned"
+        );
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+    }
+
+    /// Scenario 4: retirement fails AFTER the tombstone was lifted. The
+    /// deletion landed and the name is unreachable, so the drain does not undo
+    /// either; the surviving ledger only blocks a name nothing can derive.
+    #[test]
+    fn drain_lifts_the_tombstone_when_retirement_fails_afterwards() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-drain-retire-failed";
+        let name = android_profile_name(id, 0);
+        write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            |_profile| Err(AppError::Other("karantina defteri düşürülemedi".into())),
+            no_owner,
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 1, "{report:?}");
+        assert!(!report.bridge_not_ready);
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+    }
+
+    /// Scenario 5: whichever point the process died at, the name the NEXT open
+    /// derives is different from the drained one, and the queue is empty.
+    #[test]
+    fn every_kill_point_leaves_the_next_open_with_a_different_name() {
+        use crate::android_bridge::SiteProfileAction;
+
+        // (tombstoned generation, stored generation after the kill, provider
+        //  answer at the next start)
+        let kill_points = [
+            ("before the provider ran", 0u32, 0u32, false),
+            ("after the delete, before the generation write", 0, 0, true),
+            ("after the generation write, before the lift", 0, 1, true),
+        ];
+        for (label, tombstoned, stored, already_gone) in kill_points {
+            let state = state_with_current_site(None);
+            let id = "user-drain-matrix";
+            let name = android_profile_name(id, tombstoned);
+            write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+            write_generation(&state, id, stored);
+
+            let entries = read_pending_profile_delete_entries(&state).unwrap();
+            let report = run_pending_delete_drain(
+                &state,
+                &entries,
+                |_profile| {
+                    Ok(if already_gone {
+                        SiteProfileAction::Absent
+                    } else {
+                        SiteProfileAction::Deleted
+                    })
+                },
+                |_profile| Ok(0),
+                no_owner,
+            )
+            .unwrap();
+
+            assert_eq!(report.lifted, 1, "{label}: {report:?}");
+            assert!(
+                read_pending_profile_deletes(&state).unwrap().is_empty(),
+                "{label}: the tombstone must be lifted once the name is unreachable"
+            );
+            let next = android_profile_name(id, profile_generation(&state, id).unwrap());
+            assert_ne!(next, name, "{label}: the drained name came back");
+            // And the open protocol's own collision resolution agrees.
+            let queued = read_pending_profile_deletes(&state).unwrap();
+            let (resolved, advanced) = resolve_queued_free_generation(
+                id,
+                profile_generation(&state, id).unwrap(),
+                &queued,
+            )
+            .unwrap();
+            assert!(!advanced, "{label}: nothing is queued any more");
+            assert_ne!(android_profile_name(id, resolved), name, "{label}");
+        }
+    }
+
+    /// Scenario 6: the generation write is refused. The tombstone MUST survive
+    /// it — lifting without the durable generation is exactly the P1 hole.
+    #[test]
+    fn a_failed_generation_write_keeps_the_tombstone_queued() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, fail) = ordering_state();
+        fail.store(1, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-drain-failed-generation";
+        let name = android_profile_name(id, 0);
+        write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+            no_owner,
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 0, "{report:?}");
+        assert_eq!(report.kept_unmatched, vec![name.clone()], "{report:?}");
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()],
+            "the tombstone survives a refused generation write"
+        );
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the ledger is never dropped for a name that is still derivable"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        assert!(
+            writes
+                .lock()
+                .unwrap()
+                .contains(&format!("put-failed:{PROFILE_GENERATION_PREFIX}{id}")),
+            "the refused write must be visible in the ordered log"
+        );
+        // The name is still blocked for an open, through the queue.
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) = resolve_queued_free_generation(id, 0, &queued).unwrap();
+        assert!(advanced);
+        assert_ne!(android_profile_name(id, resolved), name);
+    }
+
+    /// Scenario 7: draining twice (deferred first, confirmed later, then a
+    /// stale re-read of the same entries) consumes exactly ONE generation.
+    #[test]
+    fn repeated_drains_do_not_consume_another_generation() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-drain-repeat";
+        let name = android_profile_name(id, 0);
+        write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        // The drain takes its provider closure BY VALUE, so each round gets its
+        // own closure over the same attempt counter: round 1 is still deferred,
+        // every later round confirms.
+        let scripted = |counter: Arc<std::sync::atomic::AtomicUsize>| {
+            move |_profile: &str| {
+                let attempt = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(if attempt == 0 {
+                    SiteProfileAction::Pending
+                } else {
+                    SiteProfileAction::Deleted
+                })
+            }
+        };
+
+        // Round 1: still loaded in this process → deferred, tombstone kept.
+        let first = run_pending_delete_drain(
+            &state,
+            &entries,
+            scripted(attempts.clone()),
+            |_p| Ok(0),
+            no_owner,
+        )
+        .unwrap();
+        assert_eq!(first.deferred, 1, "{first:?}");
+        assert_eq!(first.lifted, 0);
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()]
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+
+        // Round 2 (next start): confirmed → generation secured once, lifted.
+        let entries2 = read_pending_profile_delete_entries(&state).unwrap();
+        let second = run_pending_delete_drain(
+            &state,
+            &entries2,
+            scripted(attempts.clone()),
+            |_p| Ok(0),
+            no_owner,
+        )
+        .unwrap();
+        assert_eq!(second.lifted, 1, "{second:?}");
+        assert_eq!(profile_generation(&state, id).unwrap(), 1);
+
+        // Round 3: a stale copy of the same entries (a restart that read the
+        // queue before the lift landed). The generation must NOT move again.
+        let third = run_pending_delete_drain(
+            &state,
+            &entries2,
+            scripted(attempts.clone()),
+            |_p| Ok(0),
+            no_owner,
+        )
+        .unwrap();
+        assert_eq!(third.lifted, 1, "{third:?}");
+        assert_eq!(
+            profile_generation(&state, id).unwrap(),
+            1,
+            "a repeated drain is idempotent: one generation, not two"
+        );
+        assert_ne!(android_profile_name(id, 1), name);
+    }
+
+    /// Backward compatibility: a queue written by an older build (names only)
+    /// is read, its owner is re-matched against the registry, and the drained
+    /// tombstone still secures the generation.
+    #[test]
+    fn a_legacy_names_only_queue_is_read_and_matched_against_the_registry() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-legacy-queue";
+        let name = android_profile_name(id, 2);
+        write_legacy_queue(&state, vec![name.clone()]);
+
+        // The legacy bytes stay readable and are NOT flagged as corrupt (only
+        // a broken document or dropped entries are).
+        let raw = state
+            .provider
+            .get_secret(PENDING_PROFILE_DELETES_KEY)
+            .unwrap()
+            .unwrap();
+        let (entries, needs_repair) = recover_pending_profile_delete_entries(&raw);
+        assert!(!needs_repair, "a clean legacy list must not be rewritten");
+        assert_eq!(entries, vec![PendingProfileDelete::unknown(&name)]);
+
+        // The owner comes back from the registered site ids.
+        let ids = vec![id.to_string(), "some-other-site".to_string()];
+        assert_eq!(match_queued_name_to_site(&name, &ids).as_deref(), Some(id));
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            |_profile| Ok(1),
+            |profile| match_queued_name_to_site(profile, &ids),
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 1, "{report:?}");
+        assert_eq!(profile_generation(&state, id).unwrap(), 3);
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_ne!(android_profile_name(id, 3), name);
+    }
+
+    /// An ownerless tombstone that matches no registered site is NEVER dropped
+    /// silently: it stays queued, is reported, and the ledger survives.
+    #[test]
+    fn an_unmatched_tombstone_is_kept_and_reported_not_silently_dropped() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-unmatched";
+        let name = android_profile_name(id, 1);
+        write_legacy_queue(&state, vec![name.clone()]);
+
+        let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = deletes.clone();
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            move |_profile| {
+                d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(SiteProfileAction::Deleted)
+            },
+            |_profile| Ok(1),
+            |_profile| None, // nothing in the registry derives this name
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 0, "{report:?}");
+        assert_eq!(report.kept_unmatched, vec![name.clone()], "{report:?}");
+        assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()],
+            "the deletion record survives: it is retried, never forgotten"
+        );
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
+        // And the name is still never handed to an open.
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) = resolve_queued_free_generation(id, 0, &queued).unwrap();
+        assert!(advanced);
+        assert_ne!(android_profile_name(id, resolved), name);
+    }
+
+    /// An orphan (the "clear all" sweep owns no site for it) lifts after a
+    /// confirmed deletion — nothing derives the name, so there is no generation
+    /// to secure.
+    #[test]
+    fn an_orphan_tombstone_lifts_after_a_confirmed_deletion() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let name = format!("{ANDROID_PROFILE_PREFIX}{}-g4", "c".repeat(32));
+        write_queue(&state, vec![PendingProfileDelete::orphan(&name)]);
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(2)
+            },
+            |_profile| None,
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 1, "{report:?}");
+        assert!(report.kept_unmatched.is_empty(), "{report:?}");
+        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An orphan whose site id was re-registered derives a real site's name
+    /// again — so it is secured like an owned tombstone instead of lifted.
+    #[test]
+    fn an_orphan_tombstone_whose_site_came_back_secures_the_generation() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-orphan-came-back";
+        let name = android_profile_name(id, 4);
+        write_queue(&state, vec![PendingProfileDelete::orphan(&name)]);
+        write_generation(&state, id, 4);
+
+        let ids = vec![id.to_string()];
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Absent),
+            |_profile| Ok(0),
+            |profile| match_queued_name_to_site(profile, &ids),
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 1, "{report:?}");
+        assert_eq!(
+            profile_generation(&state, id).unwrap(),
+            5,
+            "the re-registered site must not derive the drained name"
+        );
+        assert_ne!(android_profile_name(id, 5), name);
+    }
+
+    /// A recorded owner that contradicts the registry is ambiguous: keep the
+    /// tombstone rather than pick one of the two.
+    #[test]
+    fn a_conflicting_owner_keeps_the_tombstone() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-conflict";
+        let name = android_profile_name(id, 0);
+        write_queue(&state, vec![PendingProfileDelete::site(id, &name)]);
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            |_profile| Ok(1),
+            |_profile| Some("a-completely-different-site".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 0, "{report:?}");
+        assert_eq!(report.kept_unmatched, vec![name.clone()], "{report:?}");
+        assert_eq!(read_pending_profile_deletes(&state).unwrap(), vec![name]);
+    }
+
+    /// A provider without the profile API keeps every tombstone and still tries
+    /// the remaining names; a bridge that is not ready stops the round and asks
+    /// for a retry.
+    #[test]
+    fn drain_survives_an_unsupported_provider_and_an_unready_bridge() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let first = "user-unsupported-a";
+        let second = "user-unsupported-b";
+        let name_a = android_profile_name(first, 0);
+        let name_b = android_profile_name(second, 1);
+        write_queue(
+            &state,
+            vec![
+                PendingProfileDelete::site(first, &name_a),
+                PendingProfileDelete::site(second, &name_b),
+            ],
+        );
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let unsupported = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Err(AppError::Unsupported("MULTI_PROFILE yok".into())),
+            |_profile| Ok(1),
+            no_owner,
+        )
+        .unwrap();
+        assert_eq!(unsupported.unsupported, 2, "{unsupported:?}");
+        assert_eq!(unsupported.lifted, 0);
+        assert!(!unsupported.bridge_not_ready);
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name_a.clone(), name_b.clone()],
+            "a feature gap must not strand or drop the owed deletions"
+        );
+
+        let not_ready = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Err(AppError::Other("köprü hazır değil".into())),
+            |_profile| Ok(1),
+            no_owner,
+        )
+        .unwrap();
+        assert!(not_ready.bridge_not_ready, "{not_ready:?}");
+        assert_eq!(not_ready.lifted, 0);
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name_a, name_b],
+            "nothing is lifted when the bridge never answered"
+        );
+    }
+
+    /// The pure generation rule: monotone, idempotent, owner-checked and
+    /// overflow-safe.
+    #[test]
+    fn generation_past_name_is_monotone_idempotent_and_overflow_safe() {
+        let id = "user-generation-rule";
+        let name = android_profile_name(id, 3);
+
+        // Stored behind the tombstone → advance to g+1.
+        assert_eq!(generation_past_name(id, 3, &name).unwrap(), (4, true));
+        assert_eq!(generation_past_name(id, 0, &name).unwrap(), (4, true));
+        // Stored already past it → no bump, no generation burned.
+        assert_eq!(generation_past_name(id, 4, &name).unwrap(), (4, false));
+        assert_eq!(generation_past_name(id, 9, &name).unwrap(), (9, false));
+        // Another site's tombstone must never move this counter.
+        let foreign = android_profile_name("another-site", 3);
+        assert!(generation_past_name(id, 0, &foreign).is_err());
+        // Neither does a name that merely shares the prefix shape.
+        assert!(generation_past_name(id, 0, "site-not-a-profile").is_err());
+        assert!(generation_past_name(id, 0, "").is_err());
+        // u32::MAX has no next value: refuse instead of making the profile
+        // reachable again.
+        let maxed = android_profile_name(id, u32::MAX);
+        let err = generation_past_name(id, u32::MAX, &maxed).unwrap_err();
+        assert!(matches!(err, AppError::Storage(_)), "{err}");
+        assert!(err.to_string().contains("taştı"), "{err}");
+        // A stored generation past MAX cannot exist, but the rule still holds.
+        assert_eq!(
+            generation_past_name(id, u32::MAX, &name).unwrap(),
+            (u32::MAX, false)
+        );
+    }
+
+    /// Owner re-matching needs EXACTLY one registered site: none means
+    /// unmatched, two means ambiguous — both refuse to guess.
+    #[test]
+    fn match_queued_name_to_site_needs_exactly_one_owner() {
+        let id = "user-match";
+        let name = android_profile_name(id, 7);
+        assert_eq!(
+            match_queued_name_to_site(&name, &[id.to_string()]).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            match_queued_name_to_site(&name, &["other".to_string(), id.to_string()]).as_deref(),
+            Some(id)
+        );
+        assert_eq!(match_queued_name_to_site(&name, &[]), None);
+        assert_eq!(
+            match_queued_name_to_site(&name, &["other".to_string()]),
+            None
+        );
+        // A different generation of the same site still matches (the owner is
+        // the site, not the generation).
+        assert_eq!(
+            match_queued_name_to_site(&android_profile_name(id, 0), &[id.to_string()]).as_deref(),
+            Some(id)
+        );
+        // Two ids deriving the same name would be a digest collision: refuse.
+        let collide = format!("{ANDROID_PROFILE_PREFIX}{}-g1", "d".repeat(32));
+        assert_eq!(match_queued_name_to_site(&collide, &[]), None);
+        // Names outside the namespace never match, however close they look.
+        assert_eq!(
+            match_queued_name_to_site("Default", &[id.to_string()]),
+            None
+        );
+        assert_eq!(match_queued_name_to_site("", &[id.to_string()]), None);
+    }
+
+    /// Queueing records the owner, dedupes by name, and upgrades a legacy
+    /// entry once a path knows whose profile it is.
+    #[test]
+    fn queue_records_the_owner_and_upgrades_a_legacy_entry() {
+        let state = state_with_current_site(None);
+        let id = "user-queue-owner";
+        let name = android_profile_name(id, 0);
+
+        // Legacy bytes → unknown owner.
+        write_legacy_queue(&state, vec![name.clone()]);
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::unknown(&name)]
+        );
+
+        // Queueing the same name for a known site upgrades the owner (and the
+        // stored bytes become the current format).
+        queue_site_profile_delete(&state, id, &name).unwrap();
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::site(id, &name)]
+        );
+        // Dedupe by name: queueing again writes nothing new.
+        queue_site_profile_delete(&state, id, &name).unwrap();
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![name.clone()]
+        );
+        // A known owner is never downgraded or overwritten by another claim.
+        queue_orphan_profile_delete(&state, &name).unwrap();
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::site(id, &name)]
+        );
+        // The name-only wrapper still sees a plain list.
+        queue_pending_profile_delete(&state, &android_profile_name("other", 1)).unwrap();
+        assert_eq!(read_pending_profile_deletes(&state).unwrap().len(), 2);
     }
 
     #[test]
