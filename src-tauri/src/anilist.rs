@@ -1478,7 +1478,6 @@ mod tests {
         for raw in [
             "http://user:pass@127.0.0.1:17395/callback?code=a&state=s",
             "http://user@127.0.0.1:17395/callback?code=a&state=s",
-            "http://:@127.0.0.1:17395/callback?code=a&state=s",
             "animehub://user:pass@anilist/callback?code=a&state=s",
             "animehub://attacker@anilist/callback?code=a&state=s",
         ] {
@@ -1511,6 +1510,16 @@ mod tests {
         // Some("") and the registered redirect has none.
         assert!(
             parse_callback("http://127.0.0.1:17395/callback?code=a&state=s#", LOOPBACK).is_err()
+        );
+
+        // Empty userinfo is deliberately NOT in the rejected list above:
+        // WHATWG parsing drops a `:@` whose username and password are both
+        // empty, so the URL that reaches the comparison is byte-for-byte the
+        // registered redirect. Asserting a rejection would pin a difference
+        // that does not exist; asserting acceptance documents what the parser
+        // actually hands us.
+        assert!(
+            parse_callback("http://:@127.0.0.1:17395/callback?code=a&state=s", LOOPBACK).is_ok()
         );
     }
 

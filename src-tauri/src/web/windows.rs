@@ -4496,9 +4496,20 @@ mod tests {
         assert_eq!(profile_generation(&state, id).unwrap(), 0);
         // And the name is still never handed to an open.
         let queued = read_pending_profile_deletes(&state).unwrap();
+        // The stored generation (0) does not derive the tombstone (g1), so an
+        // open needs no bump at all: it takes g0 and the owed deletion stays
+        // queued. Consuming a generation here would be the blind bump this
+        // round removed.
         let (resolved, advanced) = resolve_queued_free_generation(id, 0, &queued).unwrap();
-        assert!(advanced);
+        assert!(!advanced, "an already-free generation must not be consumed");
         assert_ne!(android_profile_name(id, resolved), name);
+        // Had the stored generation been the tombstone's own (an older build
+        // bumped nothing), the open resolves past it instead of reusing the
+        // name whose deletion is still owed.
+        let (bumped, advanced) = resolve_queued_free_generation(id, 1, &queued).unwrap();
+        assert!(advanced);
+        assert!(bumped > 1, "{bumped}");
+        assert_ne!(android_profile_name(id, bumped), name);
     }
 
     /// An orphan (the "clear all" sweep owns no site for it) lifts after a
