@@ -5,7 +5,7 @@
 
 # AnimeHub
 
-**Anime takip ve izleme sitelerini tek yerde toplayan; masaüstünde profilleri ayıran, Android'de çerez kavanozlarını site geçişlerinde değiştiren Tauri 2 başlatıcısı.**
+**Anime takip ve izleme sitelerini tek yerde toplayan; masaüstünde ve Android'de her siteyi kendi WebView profilinde açan Tauri 2 başlatıcısı.**
 
 <br/>
 
@@ -63,9 +63,19 @@ motorunda açar. Sitelerin kullanım koşullarına uymak size aittir.
 
 ## 🏗️&nbsp; Mimari Genel Bakış
 
-Tüm güvenlik politikası **Rust tarafında** uygulanır. Site WebView'ları hiçbir
-Tauri komutuna erişemez; başlatıcı arayüzü ise yalnızca beyaz listelenmiş
-komutları çağırabilir.
+Güvenlik politikasının **çekirdeği Rust tarafındadır**: URL/gezinti politikası,
+şifreli depo, IPC beyaz listesi ve OAuth. Android'de site WebView'ının kendi
+kontrol noktaları Kotlin'de çalışır — üst düzey ve alt kaynak gezinti filtreleri
+(`SiteNavigationPolicy` + `SiteNavigationGuard`) ile WebView ayar planı
+(`SiteWebViewSettings`) — ve Rust'taki kuralla **ortak bir vektör dosyası**
+üzerinden (`tests/fixtures/navigation-policy.tsv`) birebir aynı kararı verir.
+Site WebView'ları hiçbir Tauri komutuna erişemez; başlatıcı arayüzü ise yalnızca
+beyaz listelenmiş komutları çağırabilir.
+
+Politikanın her platformda **nerede çalıştığı ve nerede çalışmadığı** aşağıdaki
+"Hangi kontrol nerede çalışıyor? (dürüst tablo)" bölümünde: kullanıcı engel
+listesi ve DNS çözümlemesine dayalı özel adres kontrolü Android'de
+uygulanmıyor.
 
 ```mermaid
 flowchart TB
@@ -104,7 +114,7 @@ flowchart TB
 | **Rust çekirdeği** | `src-tauri/src/*.rs` | Komutlar, site kaydı, URL politikası, şifreli depo, AniList OAuth, site görünümünü barındırma |
 | **Güvenlik katmanı** | `secure/`, `sites/`, `web/` | AES-256-GCM depo, HTTPS zorunluluğu, alan adı engelleme, gezinti/yeni pencere reddi |
 | **Başlatıcı arayüzü** | `src/` | Izgara, site ekleme/düzenleme, Ayarlar ve Hakkında ekranları — `innerHTML` kullanmadan |
-| **Android köprüsü** | `src-tauri/android-plugin/` | CookieManager çerez takası + AndroidKeyStore (şifreleme) + Picture-in-Picture |
+| **Android köprüsü** | `src-tauri/android-plugin/` | Site başına WebView profili (androidx.webkit `MULTI_PROFILE`), profil bazlı temizleme/silme + karantina, Kotlin gezinti filtresi ve WebView ayar planı, AndroidKeyStore (şifreleme), Picture-in-Picture |
 | **CI/CD** | `.github/workflows/` | Test matrisi, Android APK ve masaüstü paketlerinin otomatik derlenmesi |
 
 ---
@@ -154,10 +164,12 @@ ulaşamaz.
 ### 🔒&nbsp; Diskte şifreli duran veriler
 
 AnimeHub'ın şifreli deposuna yazılan oturum anlık görüntüleri ve API anahtarları
-AES-256-GCM ile şifrelenir (`AHB1` zarf biçimi). Android'in etkin ortak
-`CookieManager` kavanozu WebView tarafından ayrı yönetilir ve bu uygulama
-şifreli depo sarmalayıcısına dahil değildir. Anahtar hiçbir zaman düz metin
-saklanmaz, platformun kendi anahtar kaynağından gelir:
+AES-256-GCM ile şifrelenir (`AHB1` zarf biçimi). Android'de site çerezleri
+artık o sitenin **kendi WebView profilinde** durur (sağlayıcının yönettiği
+profil çerez deposu) ve şifreli depo sarmalayıcısına dahil değildir; depodaki
+`cookies-<site>` kavanozu yalnızca 0.3.4'ten geçişte **bir kez** içe aktarılır.
+Anahtar hiçbir zaman düz metin saklanmaz, platformun kendi anahtar kaynağından
+gelir:
 
 | Platform | Anahtar kaynağı |
 |---|---|
@@ -166,12 +178,13 @@ saklanmaz, platformun kendi anahtar kaynağından gelir:
 | Android | AndroidKeyStore (donanım destekli) |
 | Hiçbiri yoksa | `0600` izinli dosya — **ve Hakkında ekranında bu açıkça yazar** |
 
-**Oturum anlık görüntüleri:** açık oturumların çerezleri 30 saniyede bir
-şifreli depoya eşitlenir; Android'de `localStorage`/IndexedDB anlık görüntüleri
-5 dakikada bir denenir ve en iyi çaba niteliğindedir. Kapanış anında son bir
-kayıt alınır. Android depolama köprüsü, aynı-origin `localStorage`/IndexedDB
-verisini sağlayıcı bazında güvenilir biçimde ayırmaz; bu anlık görüntüler tam
-izolasyon garantisi değildir.
+**Oturum anlık görüntüleri:** masaüstünde açık oturumun çerezleri 30 saniyede
+bir şifreli depoya eşitlenir ve kapanışta son bir kayıt alınır. Android'de
+`localStorage`/IndexedDB anlık görüntüsü **alınmaz** — o aktarım mekanizması
+kaldırıldı: sitenin çerezleri, `localStorage`/IndexedDB verisi ve konum izinleri
+kendi profilinde durur, 30 saniyelik tik yalnızca aktif site profilinin çerez
+deposunu diske yazdırır (`flush`). Başlatıcının kendi (default profil) verisine
+site yolları hiç dokunmaz.
 
 ### 🛡️&nbsp; Sıkı gezinti politikası
 

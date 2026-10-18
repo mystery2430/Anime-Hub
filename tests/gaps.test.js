@@ -34,6 +34,78 @@ test("README points at this repository, not the animehub/animehub placeholder", 
   assert.equal(readme.includes("https://github.com/mystery2430/Anime-Hub.git"), true);
 });
 
+test("README and the packaged description describe the profile model, not the 0.3.4 cookie swap", () => {
+  // R-03: at f9e0acb the tagline, the architecture table and
+  // `bundle.longDescription` still described the model this PR replaced
+  // (swapping a shared CookieManager jar between sites, "same-origin
+  // localStorage/IndexedDB isolation is unsolved"), while another README
+  // section correctly described per-site WebView profiles. Both texts ship to
+  // users — the packaged description lands in the .deb/.rpm/AppImage metadata —
+  // so a stale claim there is a stale claim in the product.
+  const readme = read(join(ROOT, "README.md"));
+  const conf = read(join(ROOT, "src-tauri/tauri.conf.json"));
+  // Collapse whitespace: the claim must not come back in ANY line wrapping.
+  const flat = (text) => text.replace(/\s+/g, " ");
+  const readmeFlat = flat(readme);
+  const confFlat = flat(conf);
+
+  // The stale sentences, verbatim. These are NEGATIVE pins: if any of them
+  // returns (reworded wrapping included), this test fails.
+  for (const stale of [
+    "Android'de çerez kavanozlarını site geçişlerinde değiştiren",
+    "CookieManager çerez takası",
+    "Tüm güvenlik politikası **Rust tarafında** uygulanır",
+    "Android'in etkin ortak `CookieManager` kavanozu WebView tarafından ayrı yönetilir",
+    "Android'de `localStorage`/IndexedDB anlık görüntüleri 5 dakikada bir denenir",
+    "Android depolama köprüsü, aynı-origin `localStorage`/IndexedDB verisini sağlayıcı bazında güvenilir biçimde ayırmaz",
+  ]) {
+    assert.ok(
+      !readmeFlat.includes(flat(stale)),
+      `README hâlâ kaldırılmış mimariyi anlatıyor: "${stale}"`,
+    );
+  }
+  for (const stale of [
+    "Android'de CookieManager çerez kavanozu site geçişlerinde değiştirilir",
+    "Aynı kaynaklı localStorage/IndexedDB için sağlayıcılar arası yalıtım henüz çözülmemiştir",
+    "Android'in etkin CookieManager kavanozu WebView tarafından ayrı yönetilir",
+  ]) {
+    assert.ok(
+      !confFlat.includes(flat(stale)),
+      `paket açıklaması hâlâ kaldırılmış mimariyi anlatıyor: "${stale}"`,
+    );
+  }
+  // A cookie-jar SWAP is not a migration: the one-time 0.3.4 import may be
+  // described, the swap may not.
+  assert.ok(!readmeFlat.includes("çerez takası"), "README çerez takasından söz etmemeli");
+  assert.ok(!confFlat.includes("çerez takası"), "paket açıklaması çerez takasından söz etmemeli");
+
+  // The current model has to be stated in both places, including the limits
+  // that are NOT solved (network policy on Android, no device test).
+  assert.match(readmeFlat, /her siteyi kendi WebView profilinde açan/);
+  assert.match(readmeFlat, /SiteNavigationPolicy/);
+  assert.match(readmeFlat, /SiteWebViewSettings/);
+  assert.match(
+    readmeFlat,
+    /kullanıcı engel listesi ve DNS çözümlemesine dayalı özel adres kontrolü Android'de uygulanmıyor/,
+  );
+  assert.match(readmeFlat, /androidx\.webkit `MULTI_PROFILE`/);
+  assert.match(confFlat, /MULTI_PROFILE ile site başına kendi WebView profilinde açılır/);
+  assert.match(
+    confFlat,
+    /Android'de kullanıcı engel listesi ve DNS çözümlemesine dayalı özel adres kontrolü uygulanmaz/,
+  );
+  assert.match(confFlat, /fiziksel bir Android cihazında test edilmemiştir/);
+
+  // The config stays parseable and the deep-link registration the OAuth
+  // callback check compares against is untouched by the wording fix.
+  const parsed = JSON.parse(conf);
+  assert.deepEqual(parsed.plugins["deep-link"].mobile, [
+    { scheme: ["animehub"], host: "anilist", pathPrefix: ["/callback"], appLink: false },
+  ]);
+  assert.ok(parsed.bundle.longDescription.length > 200);
+  assert.ok(parsed.bundle.shortDescription.length > 10);
+});
+
 test("android release workflow prepares the project before signing", () => {
   const yml = read(join(ROOT, ".github/workflows/release-android.yml"));
   for (const line of yml.split("\n")) {
