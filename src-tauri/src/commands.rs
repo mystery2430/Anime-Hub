@@ -713,11 +713,16 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     // Android orphan sweep for "clear all": profile names that no registered
     // site currently owns (an interrupted remove, an old generation, an
     // imported registry). Mirrors the desktop `profiles/site-*` sweep — only
-    // names in our namespace are ever addressed, the live site view was
-    // closed above, and `Pending` results are queued instead of dropped.
+    // names in our namespace are ever addressed, and the live site view was
+    // closed above.
+    //
+    // The ORDER — durable tombstone, then the provider call, then the permanent
+    // reuse block, then the quarantine ledger — lives in the host-tested
+    // `windows::run_orphan_profile_sweep`, because this block is
+    // `#[cfg(target_os = "android")]` and `cargo test` would never see it here.
+    // This side only decides WHICH names are orphans: it holds the registry.
     #[cfg(target_os = "android")]
     if is_all {
-        use crate::android_bridge::SiteProfileAction;
         let mut owned = std::collections::HashSet::new();
         {
             let reg = state
@@ -729,39 +734,28 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                 owned.insert(windows::android_profile_name(&site.id, generation));
             }
         }
-        for name in crate::android_bridge::site_profile_names()? {
-            if !name.starts_with(windows::ANDROID_PROFILE_PREFIX) || owned.contains(&name) {
-                continue;
-            }
-            match crate::android_bridge::site_profile_delete(&name)? {
-                SiteProfileAction::Pending => {
-                    // Orphan: no registered site derives this name, which is
-                    // exactly why the sweep owns it. Recorded as such, so the
-                    // startup drain can lift it after a confirmed deletion
-                    // instead of keeping an ownerless tombstone forever — and
-                    // still secures the generation if the id was re-registered.
-                    windows::queue_orphan_profile_delete(&state, &name)?;
-                }
-                SiteProfileAction::Deleted | SiteProfileAction::Absent => {
-                    // Same rule as `run_mobile_delete_protocol`: the ledger goes
-                    // only once the name cannot come back. An orphan has no
-                    // registered owner and no generation to bump — the deletion
-                    // itself is what makes it unreachable — while a deferred
-                    // deletion keeps its ledger until the startup drain lands it.
-                    // A retire failure is NOT a data-safety failure (keeping the
-                    // ledger is the conservative direction), so it is logged
-                    // instead of aborting the whole "clear all".
-                    match crate::android_bridge::site_profile_retire(&name) {
-                        Ok(dropped) => log::info!(
-                            "yetim site profili temizlendi (düşen karantina kaydı: {dropped})"
-                        ),
-                        Err(e) => {
-                            log::warn!("yetim profil karantinası emekliye ayrılamadı ({name}): {e}")
-                        }
-                    }
-                }
-            }
-        }
+        let orphans: Vec<String> = crate::android_bridge::site_profile_names()?
+            .into_iter()
+            .filter(|name| {
+                name.starts_with(windows::ANDROID_PROFILE_PREFIX) && !owned.contains(name)
+            })
+            .collect();
+        let report = windows::run_orphan_profile_sweep(
+            &state,
+            &orphans,
+            crate::android_bridge::site_profile_delete,
+            crate::android_bridge::site_profile_retire,
+        )?;
+        log::info!(
+            "yetim profil süpürmesi: {} ad kuyruğa alındı, {} kalıcı ad engeli, {} ertelendi, \
+             {} desteklenmiyor, {} karantina kaydı düştü, {} kayıt düşürülemedi",
+            report.queued,
+            report.blocked,
+            report.deferred,
+            report.unsupported,
+            report.retired,
+            report.retire_failed
+        );
     }
     // Desktop profile directories hold the real cookie DB. A missing
     // directory is success; a failed delete is not. This runs only on

@@ -368,12 +368,13 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
             "ertelenen profil silmesi kuyrukta korundu (sahibi belirsiz veya nesil güvenceye alınamadı): {name}"
         );
     }
-    if report.lifted > 0 || report.deferred > 0 || report.unsupported > 0 {
+    if report.lifted > 0 || report.deferred > 0 || report.unsupported > 0 || report.blocked > 0 {
         log::info!(
-            "ertelenen profil silmeleri: {} kaldırıldı, {} ertelendi, {} desteklenmiyor, {} korundu",
+            "ertelenen profil silmeleri: {} kaldırıldı, {} ertelendi, {} desteklenmiyor, {} kalıcı ad engeli, {} korundu",
             report.lifted,
             report.deferred,
             report.unsupported,
+            report.blocked,
             report.kept_unmatched.len()
         );
     }

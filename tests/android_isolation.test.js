@@ -451,8 +451,19 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
     "repeated_drains_do_not_consume_another_generation",
     "a_legacy_names_only_queue_is_read_and_matched_against_the_registry",
     "an_unmatched_tombstone_is_kept_and_reported_not_silently_dropped",
-    "an_orphan_tombstone_lifts_after_a_confirmed_deletion",
+    "an_orphan_tombstone_becomes_a_permanent_block_instead_of_lifting",
     "an_orphan_tombstone_whose_site_came_back_secures_the_generation",
+    "orphan_sweep_tombstones_before_the_provider_and_blocks_before_retiring",
+    "orphan_sweep_never_calls_the_provider_when_the_tombstone_write_fails",
+    "orphan_sweep_keeps_the_tombstone_when_the_bridge_never_answers",
+    "orphan_sweep_keeps_a_deferred_orphan_owed_for_the_startup_drain",
+    "orphan_sweep_blocks_a_confirmed_name_for_deleted_and_absent_alike",
+    "orphan_sweep_keeps_names_owed_when_the_provider_has_no_profile_api",
+    "a_blocked_orphan_is_never_asked_again_and_never_dropped",
+    "a_blocked_orphan_whose_site_id_comes_back_secures_a_new_generation",
+    "a_failed_block_write_keeps_the_orphan_tombstone_owed",
+    "repeated_orphan_sweeps_and_drains_consume_no_generation",
+    "a_queue_object_written_before_the_block_state_reads_as_owed",
     "a_conflicting_owner_keeps_the_tombstone",
     "drain_survives_an_unsupported_provider_and_an_unready_bridge",
     "generation_past_name_is_monotone_idempotent_and_overflow_safe",
@@ -491,9 +502,19 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
   assert.match(pluginLibRs, /pub struct SiteProfileRetireResult/);
   assert.match(pluginKt, /fun site_profile_retire\(invoke: Invoke\)/);
   assert.match(pluginKt, /AnimeHubSiteController\.retireProfileQuarantine\(profileName\)/);
-  // The other two deletion paths keep the same rule: durable step first.
+  // The other two deletion paths keep the same rule: durable step first. The
+  // orphan sweep no longer retires inline — it hands both provider calls to the
+  // host-tested `run_orphan_profile_sweep`, which retires ONLY after the
+  // permanent reuse block is durable (pinned by the ordering assertions in the
+  // queue test below and driven by
+  // `orphan_sweep_tombstones_before_the_provider_and_blocks_before_retiring`).
   const sweep = commandsRs.slice(commandsRs.indexOf('orphan sweep for "clear all"'));
-  assert.match(sweep, /site_profile_retire\(&name\)/, "the orphan sweep retires what it deleted");
+  assert.match(
+    sweep,
+    /windows::run_orphan_profile_sweep\(/,
+    "the orphan sweep still retires what it deleted, through the ordered helper",
+  );
+  assert.match(sweep, /report\.retired/, "the sweep reports what it retired");
   const libRs = read("src-tauri/src/lib.rs");
   const drain = libRs.slice(libRs.indexOf("fn drain_pending_profile_deletes"));
   assert.ok(
@@ -530,7 +551,7 @@ test("clear_site_data clears profiles in place and sweeps orphans, never the lau
   const sweepAt = body.indexOf("site_profile_names");
   assert.ok(sweepAt > 0, "android orphan sweep missing");
   assert.match(body.slice(sweepAt), /name\.starts_with\(windows::ANDROID_PROFILE_PREFIX\)/);
-  assert.match(body.slice(sweepAt), /owned\.contains\(&name\)/);
+  assert.match(body.slice(sweepAt), /owned\.contains\(name\)/);
   // No shared/default-jar clearing call anywhere in the command.
   assert.doesNotMatch(body, /webview_cookies_clear/);
 });
@@ -540,6 +561,7 @@ test("deferred deletions are persisted, drained at startup, and deduped", () => 
   assert.match(windowsRs, /pub fn queue_pending_profile_delete/);
   assert.match(windowsRs, /pub fn queue_site_profile_delete/);
   assert.match(windowsRs, /pub fn queue_orphan_profile_delete/);
+  assert.match(windowsRs, /pub fn block_pending_profile_delete/);
   assert.match(windowsRs, /pub fn forget_pending_profile_delete/);
   // lib.rs drains before the frontend can open a site.
   const libRs = read("src-tauri/src/lib.rs");
@@ -610,10 +632,96 @@ test("the startup drain proves a name is underivable before lifting its tombston
     "the drain order lives in ONE host-tested function, not in lib.rs",
   );
   assert.doesNotMatch(code(drain), /site_profile_retire\(name\)/);
-  // The orphan sweep records that it owns no site for the name.
+  // The third deletion path — the "clear all" orphan sweep — must run the SAME
+  // order as the other two, and that order has to live where `cargo test` can
+  // see it: the sweep block in commands.rs is #[cfg(target_os = "android")] and
+  // is only type-checked by the aarch64 job.
+  const sweepFn = windowsRs.slice(
+    windowsRs.indexOf("pub fn run_orphan_profile_sweep"),
+    windowsRs.indexOf("/// Android: open the site in a fresh native WebView"),
+  );
+  assert.ok(sweepFn.length > 500, "the host-tested orphan sweep is missing");
+  assert.match(
+    sweepFn,
+    /pub fn run_orphan_profile_sweep<D, R>\(/,
+    "the sweep takes injected provider calls so its order is host-tested",
+  );
+  const tombstoneAt = sweepFn.indexOf("queue_orphan_profile_delete(state, name)?");
+  const deleteAt = sweepFn.indexOf("delete_profile(name)");
+  const blockAt = sweepFn.indexOf("block_pending_profile_delete(state, name)?");
+  const retireAt = sweepFn.indexOf("retire_profile(name)");
+  assert.ok(tombstoneAt > 0, "the sweep must write the durable tombstone");
+  assert.ok(deleteAt > tombstoneAt, "the provider call must start AFTER the tombstone is durable");
+  assert.ok(blockAt > deleteAt, "the permanent reuse block must follow a confirmed deletion");
+  assert.ok(retireAt > blockAt, "the quarantine ledger is retired LAST");
+  assert.doesNotMatch(
+    code(sweepFn),
+    /forget_pending_profile_delete/,
+    "no path in the sweep may drop the durable record of a confirmed deletion",
+  );
+  // The durable block itself: a confirmed orphan has no site id, so there is no
+  // generation to secure and the queue entry becomes the block the open
+  // protocol consults.
+  assert.match(
+    windowsRs,
+    /pub fn block_pending_profile_delete\(state: &AppState, name: &str\) -> AppResult<\(\)>/,
+  );
+  assert.match(windowsRs, /pub enum PendingDeleteState \{/);
+  assert.match(windowsRs, /#\[serde\(default\)\]\s+pub state: PendingDeleteState,/);
+  assert.match(windowsRs, /pub blocked: usize,/);
+  // The drain consults the block: a blocked entry is not re-deleted, and an
+  // orphan without an owner is held, never lifted.
+  assert.match(
+    windowsRs,
+    /let action = if entry\.is_blocked\(\) \{\s+SiteProfileAction::Absent/,
+    "a permanent block must not be sent to the provider again",
+  );
+  assert.match(windowsRs, /None => hold_as_block\(state, entry, &mut report\),/);
+  const holdFn = windowsRs.slice(
+    windowsRs.indexOf("fn hold_as_block("),
+    windowsRs.indexOf("/// Drain the deferred profile-deletion queue"),
+  );
+  assert.ok(
+    holdFn.length > 200 && holdFn.length < 4000,
+    `hold_as_block slice looks wrong: ${holdFn.length}`,
+  );
+  assert.match(
+    code(holdFn).trimEnd(),
+    /false\s*\}\s*$/,
+    "hold_as_block returns false on EVERY path: an unmatched orphan is never lifted",
+  );
+  assert.match(holdFn, /report\.blocked \+= 1;/);
+  assert.match(
+    holdFn,
+    /report\.kept_unmatched\.push\(entry\.name\.clone\(\)\);/,
+    "a refused block write is reported, not swallowed",
+  );
+  assert.doesNotMatch(
+    code(holdFn),
+    /forget_pending_profile_delete/,
+    "holding a block must not drop the queue entry",
+  );
+
+  // commands.rs only decides WHICH names are orphans; it must not call the
+  // provider or write the tombstone itself, or the order would be untestable.
   const commandsRs = read("src-tauri/src/commands.rs");
   const sweep = commandsRs.slice(commandsRs.indexOf('orphan sweep for "clear all"'));
-  assert.match(sweep, /windows::queue_orphan_profile_delete\(&state, &name\)\?/);
+  assert.match(sweep, /windows::run_orphan_profile_sweep\(/);
+  assert.match(
+    sweep,
+    /crate::android_bridge::site_profile_delete,\s+crate::android_bridge::site_profile_retire,/,
+    "the sweep is handed the real provider calls, not a reordered copy",
+  );
+  assert.doesNotMatch(
+    code(sweep),
+    /site_profile_delete\(&name\)/,
+    "the orphan sweep must not call the provider directly",
+  );
+  assert.doesNotMatch(
+    code(sweep),
+    /queue_orphan_profile_delete/,
+    "the tombstone write belongs to the host-tested sweep",
+  );
 });
 
 // ---------------------------------------------------------------------------

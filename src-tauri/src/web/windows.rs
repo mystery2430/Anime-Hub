@@ -652,16 +652,44 @@ pub enum PendingOwner {
     Unknown,
 }
 
-/// One deferred profile deletion: the name, plus its owner when one is known.
+/// What a queued tombstone still owes.
+///
+/// The queue is the ONLY durable mechanism the open protocol consults before
+/// deriving a profile name ([`resolve_queued_free_generation`]), so an entry
+/// that must stay unreachable stays in the queue: dropping it is what would
+/// make the name derivable again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingDeleteState {
+    /// The provider deletion is not confirmed yet, so the startup drain has to
+    /// ask again.
+    #[default]
+    Owed,
+    /// The provider confirmed the deletion (`Deleted`/`Absent`) and NO
+    /// registered site derives the name — so there is no site id whose
+    /// generation could be secured, a profile name being a one-way digest of
+    /// it. The entry becomes a permanent NAME BLOCK instead of being lifted:
+    /// it keeps that name out of every future open without asking the provider
+    /// again. Should the site id ever come back (a registry restore), the drain
+    /// re-matches it, secures the generation durably and only then lifts the
+    /// entry.
+    Blocked,
+}
+
+/// One deferred profile deletion: the name, its owner when one is known, and
+/// what it still owes.
 ///
 /// Wire format is a JSON array of these objects. A names-only array (the
-/// format older builds wrote) is still read — see
+/// format older builds wrote) is still read, and an object written before
+/// `state` existed reads as [`PendingDeleteState::Owed`] — see
 /// [`recover_pending_profile_delete_entries`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingProfileDelete {
     pub name: String,
     #[serde(default)]
     pub owner: PendingOwner,
+    #[serde(default)]
+    pub state: PendingDeleteState,
 }
 
 impl PendingProfileDelete {
@@ -669,6 +697,7 @@ impl PendingProfileDelete {
         Self {
             name: name.to_string(),
             owner: PendingOwner::Site(site_id.to_string()),
+            state: PendingDeleteState::Owed,
         }
     }
 
@@ -676,6 +705,7 @@ impl PendingProfileDelete {
         Self {
             name: name.to_string(),
             owner: PendingOwner::Orphan,
+            state: PendingDeleteState::Owed,
         }
     }
 
@@ -683,7 +713,22 @@ impl PendingProfileDelete {
         Self {
             name: name.to_string(),
             owner: PendingOwner::Unknown,
+            state: PendingDeleteState::Owed,
         }
+    }
+
+    /// A confirmed deletion whose name has no owner: the entry stays in the
+    /// queue as the durable block that keeps the name underivable.
+    pub fn blocked_orphan(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            owner: PendingOwner::Orphan,
+            state: PendingDeleteState::Blocked,
+        }
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        self.state == PendingDeleteState::Blocked
     }
 }
 
@@ -1088,17 +1133,34 @@ pub fn read_pending_profile_deletes(state: &AppState) -> AppResult<Vec<String>> 
 
 /// Queue a tombstone, deduped BY NAME.
 ///
-/// An entry that is already queued keeps its place and nothing is written —
-/// except when the queued entry's owner is still [`PendingOwner::Unknown`] and
-/// the caller knows it: then the owner is recorded, so a queue written by an
-/// older build gains the information the drain needs to secure a generation.
+/// An entry that is already queued keeps its place and nothing is written,
+/// except when the call would ADD information:
+///
+/// * the queued owner is still [`PendingOwner::Unknown`] and the caller knows
+///   it, so a queue written by an older build gains what the drain needs to
+///   secure a generation;
+/// * the queued entry is still [`PendingDeleteState::Owed`] and the caller has
+///   a confirmed deletion, so the permanent block is recorded.
+///
+/// Neither direction is ever reversed: a known owner is not overwritten by
+/// another claim, and a permanent block is not downgraded back to "owed" (that
+/// would ask the provider to delete a profile it already confirmed gone, and
+/// could then lift an entry whose name nothing else keeps unreachable).
 fn queue_entry(state: &AppState, entry: PendingProfileDelete) -> AppResult<()> {
     let mut list = read_pending_profile_delete_entries(state)?;
     if let Some(existing) = list.iter_mut().find(|queued| queued.name == entry.name) {
-        if existing.owner != PendingOwner::Unknown || existing.owner == entry.owner {
+        let mut changed = false;
+        if existing.owner == PendingOwner::Unknown && entry.owner != PendingOwner::Unknown {
+            existing.owner = entry.owner.clone();
+            changed = true;
+        }
+        if existing.state == PendingDeleteState::Owed && entry.is_blocked() {
+            existing.state = PendingDeleteState::Blocked;
+            changed = true;
+        }
+        if !changed {
             return Ok(());
         }
-        existing.owner = entry.owner;
     } else {
         list.push(entry);
     }
@@ -1125,6 +1187,21 @@ pub fn queue_orphan_profile_delete(state: &AppState, name: &str) -> AppResult<()
 /// is never silently dropped and never assumed safe.
 pub fn queue_pending_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
     queue_entry(state, PendingProfileDelete::unknown(name))
+}
+
+/// Turn a CONFIRMED, ownerless tombstone into a permanent name block.
+///
+/// This is the orphan half of "prove the name is underivable before lifting the
+/// tombstone": a site-owned tombstone is proved by advancing that site's
+/// generation, and an orphan has no site id to advance (the name is a one-way
+/// digest of it), so the queue entry itself becomes the durable block. It is
+/// written BEFORE the quarantine ledger is retired, and a failed write leaves
+/// the entry owed — the deletion is simply retried at the next start.
+///
+/// Idempotent through [`queue_entry`]: re-blocking an already blocked name
+/// writes nothing, and a blocked entry is never downgraded.
+pub fn block_pending_profile_delete(state: &AppState, name: &str) -> AppResult<()> {
+    queue_entry(state, PendingProfileDelete::blocked_orphan(name))
 }
 
 /// Drop a name from the deferred deletion queue. Callers must have made the
@@ -1487,6 +1564,11 @@ pub struct DrainReport {
     /// The provider has no profile API on this device: kept queued, and the
     /// remaining names were still tried.
     pub unsupported: usize,
+    /// Names held as PERMANENT blocks in this round: already blocked before it,
+    /// or blocked by it. A block is not a lifted tombstone — the entry stays in
+    /// the queue forever (or until a re-matched owner lets the drain secure a
+    /// generation), and the provider is not asked again.
+    pub blocked: usize,
     /// Kept because the owner could not be established or the generation could
     /// not be made durable. Such a name is never handed to an open and the
     /// deletion is retried at the next start.
@@ -1524,6 +1606,46 @@ fn secure_tombstone_generation(
             false
         }
     }
+}
+
+/// Keep a confirmed tombstone whose name has no owner: never lift it.
+///
+/// Returns `false` in EVERY case, because no outcome here is allowed to lift
+/// the entry — the caller's `if !secured { continue; }` therefore keeps the
+/// name queued, which is what stops an open from deriving it again:
+///
+/// * already [`PendingDeleteState::Blocked`]: counted, nothing written, nothing
+///   logged as a warning (this is the steady state, not a hazard);
+/// * newly confirmed: the permanent block is written durably. If that write
+///   fails the entry stays owed, so the deletion is retried at the next start
+///   and the name stays queued either way.
+///
+/// "No registered site derives this name today" is deliberately NOT treated as
+/// proof that none ever will: a registry backup can restore the site id, whose
+/// stored generation may sit at or below this tombstone's, and the name is a
+/// one-way digest so there is no generation to advance without that id.
+fn hold_as_block(state: &AppState, entry: &PendingProfileDelete, report: &mut DrainReport) -> bool {
+    if entry.is_blocked() {
+        report.blocked += 1;
+        return false;
+    }
+    match block_pending_profile_delete(state, &entry.name) {
+        Ok(()) => {
+            log::info!(
+                "ertelenen profil silmesi kalıcı ad engeline dönüştü (sahibi yok, güvenceye alınacak nesil yok): {}",
+                entry.name
+            );
+            report.blocked += 1;
+        }
+        Err(e) => {
+            log::warn!(
+                "ertelenen profil silmesi kalıcı engele çevrilemedi, borçlu olarak korunuyor ({}): {e}",
+                entry.name
+            );
+            report.kept_unmatched.push(entry.name.clone());
+        }
+    }
+    false
 }
 
 /// Drain the deferred profile-deletion queue — the startup half of the
@@ -1568,24 +1690,34 @@ where
     let mut report = DrainReport::default();
 
     for entry in entries {
-        let action = match delete_profile(&entry.name) {
-            Ok(action) => action,
-            Err(AppError::Unsupported(_)) => {
-                // No profile API on this device: nothing deletes here until
-                // there is one. Keep it queued so a later provider update can
-                // drain it, and keep going — a feature gap must not abort the
-                // remaining names or be reported as a success.
-                log::warn!(
-                    "ertelenen profil silme atlandı: sağlayıcı profilleri desteklemiyor ({})",
-                    entry.name
-                );
-                report.unsupported += 1;
-                continue;
-            }
-            Err(e) => {
-                log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
-                report.bridge_not_ready = true;
-                return Ok(report);
+        // A permanent block is not a deletion still owed: the provider already
+        // confirmed it, so it is not asked again (no provider call and no
+        // warning per start, forever). The entry IS still re-matched against
+        // the registry below — an orphan gains an owner when a registry backup
+        // restores its site id, and only a durably secured generation may lift
+        // it after that.
+        let action = if entry.is_blocked() {
+            SiteProfileAction::Absent
+        } else {
+            match delete_profile(&entry.name) {
+                Ok(action) => action,
+                Err(AppError::Unsupported(_)) => {
+                    // No profile API on this device: nothing deletes here until
+                    // there is one. Keep it queued so a later provider update can
+                    // drain it, and keep going — a feature gap must not abort the
+                    // remaining names or be reported as a success.
+                    log::warn!(
+                        "ertelenen profil silme atlandı: sağlayıcı profilleri desteklemiyor ({})",
+                        entry.name
+                    );
+                    report.unsupported += 1;
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
+                    report.bridge_not_ready = true;
+                    return Ok(report);
+                }
             }
         };
         if matches!(action, SiteProfileAction::Pending) {
@@ -1618,7 +1750,10 @@ where
                 // A site id that was removed and later re-registered derives
                 // this name again, so it is secured like an owned tombstone.
                 Some(site_id) => secure_tombstone_generation(state, site_id, entry, &mut report),
-                None => true,
+                // No owner today, and no site id means no generation to secure.
+                // That is NOT proof the name stays underivable, so the entry is
+                // held as a permanent block instead of lifted.
+                None => hold_as_block(state, entry, &mut report),
             },
             PendingOwner::Unknown => match &matched {
                 Some(site_id) => secure_tombstone_generation(state, site_id, entry, &mut report),
@@ -1655,6 +1790,126 @@ where
             ),
         }
         log::info!("ertelenen profil verisi silindi ({})", entry.name);
+    }
+
+    Ok(report)
+}
+
+/// What one "clear all" orphan sweep did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OrphanSweepReport {
+    /// Tombstones written BEFORE the provider was asked anything.
+    pub queued: usize,
+    /// Confirmed deletions turned into permanent name blocks (no owner, so no
+    /// generation could be secured). These entries stay in the queue.
+    pub blocked: usize,
+    /// The provider still has the profile loaded: kept owed, the startup drain
+    /// finishes it. Never reported as deleted.
+    pub deferred: usize,
+    /// No profile API on this device: kept owed, the remaining names were still
+    /// tried.
+    pub unsupported: usize,
+    /// Quarantine ledgers retired — always AFTER the durable block was written.
+    pub retired: usize,
+    /// A retirement failed. Not a data-safety failure (keeping a ledger is the
+    /// conservative direction), so it is counted and logged, not propagated.
+    pub retire_failed: usize,
+}
+
+/// The "clear all" orphan sweep, in the SAME order as the other two deletion
+/// paths ([`run_mobile_delete_protocol`] for a registered site,
+/// [`run_pending_delete_drain`] at startup):
+///
+/// 1. write the durable tombstone;
+/// 2. only then ask the provider to delete;
+/// 3. on a confirmed deletion, make the name permanently unreachable;
+/// 4. only then retire the quarantine ledger.
+///
+/// The caller (`clear_site_data`, which is `#[cfg(target_os = "android")]` and
+/// therefore invisible to `cargo test`) decides WHICH names are orphans: this
+/// function is handed the already-filtered list and owns the order, so the
+/// sequence is host-tested on every OS instead of only type-checked by the
+/// aarch64 compile.
+///
+/// An orphan has no registered site id and a profile name is a one-way digest
+/// of it, so step 3 cannot be a generation bump — it is
+/// [`block_pending_profile_delete`], which keeps the entry in the queue as the
+/// durable block the open protocol consults. Nothing on a success path drops
+/// that entry: the queue is the only mechanism standing between a restored
+/// registry (same site id, generation at or below the tombstone's) and the
+/// leftover directory of a deletion that `ProfileStore.deleteProfile` may still
+/// be finishing asynchronously.
+///
+/// Failures: a failed tombstone write returns BEFORE any provider call (an
+/// unrecorded deletion is the hole this closes); `Unsupported` keeps the entry
+/// owed and continues with the remaining names; any other bridge error or
+/// timeout keeps the tombstone — the provider may already have started or
+/// accepted the work — and is propagated, so the caller surfaces a retryable
+/// failure instead of a success.
+pub fn run_orphan_profile_sweep<D, R>(
+    state: &AppState,
+    names: &[String],
+    mut delete_profile: D,
+    mut retire_profile: R,
+) -> AppResult<OrphanSweepReport>
+where
+    D: FnMut(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
+    R: FnMut(&str) -> AppResult<u32>,
+{
+    use crate::android_bridge::SiteProfileAction;
+    let mut report = OrphanSweepReport::default();
+
+    for owned_name in names {
+        let name = owned_name.as_str();
+
+        // (1) Tombstone first. A failed write means the provider is never
+        // asked: better an undeleted profile than an unrecorded deletion.
+        queue_orphan_profile_delete(state, name)?;
+        report.queued += 1;
+
+        // (2) Provider delete — only now.
+        let action = match delete_profile(name) {
+            Ok(action) => action,
+            Err(AppError::Unsupported(_)) => {
+                log::warn!(
+                    "yetim profil silinemedi: sağlayıcı profilleri desteklemiyor, kuyrukta borçlu kalıyor ({name})"
+                );
+                report.unsupported += 1;
+                continue;
+            }
+            Err(e) => {
+                log::warn!(
+                    "yetim profil silme köprüsü cevap vermedi, tombstone korunuyor ({name}): {e}"
+                );
+                return Err(e);
+            }
+        };
+        if matches!(action, SiteProfileAction::Pending) {
+            // Still loaded in this process: the tombstone and its ledger stay,
+            // and the startup drain finishes the deletion.
+            log::info!("yetim profil hâlâ kullanımda, silme ertelendi ({name})");
+            report.deferred += 1;
+            continue;
+        }
+
+        // (3) Confirmed (`Deleted` or `Absent`): make the name permanently
+        // unreachable BEFORE the ledger goes.
+        block_pending_profile_delete(state, name)?;
+        report.blocked += 1;
+
+        // (4) Quarantine ledger last.
+        match retire_profile(name) {
+            Ok(dropped) => {
+                report.retired += 1;
+                log::info!(
+                    "yetim site profili temizlendi (düşen karantina kaydı: {dropped}): {name}"
+                );
+            }
+            Err(e) => {
+                report.retire_failed += 1;
+                log::warn!("yetim profil karantinası emekliye ayrılamadı ({name}): {e}");
+            }
+        }
     }
 
     Ok(report)
@@ -3569,6 +3824,9 @@ mod tests {
     struct OrderingStore {
         inner: SecureStore,
         fail_generation_writes: Arc<std::sync::atomic::AtomicUsize>,
+        /// Remaining refusals of the tombstone queue itself: what a kill or a
+        /// full keystore looks like for the FIRST durable step of a deletion.
+        fail_queue_writes: Arc<std::sync::atomic::AtomicUsize>,
         writes: OrderLog,
     }
 
@@ -3603,6 +3861,20 @@ mod tests {
                     .push(format!("put-failed:{name}"));
                 return Err(AppError::Storage("keystore yazılamadı (test)".into()));
             }
+            if name == PENDING_PROFILE_DELETES_KEY
+                && self
+                    .fail_queue_writes
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+            {
+                self.fail_queue_writes
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .push(format!("put-failed:{name}"));
+                return Err(AppError::Storage("keystore yazılamadı (test)"));
+            }
             self.inner.put_secret(name, plaintext)?;
             self.writes.lock().unwrap().push(format!("put:{name}"));
             Ok(())
@@ -3635,15 +3907,30 @@ mod tests {
 
     /// `(state, ordered write/call log, remaining generation-write failures)`
     fn ordering_state() -> (AppState, OrderLog, Arc<std::sync::atomic::AtomicUsize>) {
+        let (state, writes, fail_generation_writes, _fail_queue_writes) =
+            ordering_state_with_queue_failures();
+        (state, writes, fail_generation_writes)
+    }
+
+    /// `(state, ordered log, remaining generation-write failures, remaining
+    /// tombstone-queue write failures)`
+    fn ordering_state_with_queue_failures() -> (
+        AppState,
+        OrderLog,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let key = load_master_key(dir.path()).expect("key");
         let inner = SecureStore::new(&key, dir.path()).expect("store");
         let (registry, warning) = inner.load_registry();
         let writes = Arc::new(Mutex::new(Vec::new()));
         let fail_generation_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fail_queue_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = OrderingStore {
             inner,
             fail_generation_writes: fail_generation_writes.clone(),
+            fail_queue_writes: fail_queue_writes.clone(),
             writes: writes.clone(),
         };
         let state = AppState {
@@ -3658,7 +3945,7 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
         };
-        (state, writes, fail_generation_writes)
+        (state, writes, fail_generation_writes, fail_queue_writes)
     }
 
     #[test]
@@ -4416,6 +4703,50 @@ mod tests {
         assert_ne!(android_profile_name(id, 1), name);
     }
 
+    /// Backward compatibility for the OBJECT format as well: a queue written
+    /// after owners were recorded but before `state` existed reads as OWED, so
+    /// an unfinished deletion is never mistaken for a confirmed one (which
+    /// would skip the provider call and strand the profile).
+    #[test]
+    fn a_queue_object_written_before_the_block_state_reads_as_owed() {
+        let state = state_with_current_site(None);
+        let name = android_profile_name("user-pre-state", 1);
+        let raw = format!("[{{\"name\":\"{name}\",\"owner\":\"orphan\"}}]");
+        state
+            .provider
+            .put_secret(PENDING_PROFILE_DELETES_KEY, raw.as_bytes())
+            .unwrap();
+
+        let (entries, needs_repair) = recover_pending_profile_delete_entries(raw.as_bytes());
+        assert!(
+            !needs_repair,
+            "a pre-state object list is valid JSON, not corrupt bytes"
+        );
+        assert_eq!(
+            entries,
+            vec![PendingProfileDelete::orphan(&name)],
+            "a missing state field reads as OWED"
+        );
+        assert!(!entries[0].is_blocked());
+
+        // Blocking writes the field, and the entry stays a plain object an
+        // older build can still read (name + owner are unchanged).
+        block_pending_profile_delete(&state, &name).unwrap();
+        let bytes = state
+            .provider
+            .get_secret(PENDING_PROFILE_DELETES_KEY)
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains(&format!("\"name\":\"{name}\"")), "{text}");
+        assert!(text.contains("\"owner\":\"orphan\""), "{text}");
+        assert!(text.contains("\"state\":\"blocked\""), "{text}");
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::blocked_orphan(&name)]
+        );
+    }
+
     /// Backward compatibility: a queue written by an older build (names only)
     /// is read, its owner is re-matched against the registry, and the drained
     /// tombstone still secures the generation.
@@ -4512,11 +4843,15 @@ mod tests {
         assert_ne!(android_profile_name(id, bumped), name);
     }
 
-    /// An orphan (the "clear all" sweep owns no site for it) lifts after a
-    /// confirmed deletion — nothing derives the name, so there is no generation
-    /// to secure.
+    /// An orphan (the "clear all" sweep owns no site for it) whose deletion is
+    /// confirmed is NOT lifted. With no site id there is no generation to
+    /// secure, and "no registered site derives this name today" is not proof
+    /// that none ever will: a registry backup can restore the id, whose stored
+    /// generation may sit at or below the tombstone's. So the entry becomes a
+    /// PERMANENT block, durably, before the ledger is retired — and the
+    /// provider is not asked again on later starts.
     #[test]
-    fn an_orphan_tombstone_lifts_after_a_confirmed_deletion() {
+    fn an_orphan_tombstone_becomes_a_permanent_block_instead_of_lifting() {
         use crate::android_bridge::SiteProfileAction;
 
         let state = state_with_current_site(None);
@@ -4526,21 +4861,35 @@ mod tests {
         let entries = read_pending_profile_delete_entries(&state).unwrap();
         let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let r = retires.clone();
+        let at_retire = Arc::new(Mutex::new(Vec::<PendingProfileDelete>::new()));
+        let seen = at_retire.clone();
         let report = run_pending_delete_drain(
             &state,
             &entries,
             |_profile| Ok(SiteProfileAction::Deleted),
             move |_profile| {
+                // The durable state at the moment the ledger is retired.
+                *seen.lock().unwrap() = read_pending_profile_delete_entries(&state).unwrap();
                 r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(2)
             },
-            |_profile| None,
+            no_owner,
         )
         .unwrap();
 
-        assert_eq!(report.lifted, 1, "{report:?}");
+        assert_eq!(report.lifted, 0, "{report:?}");
+        assert_eq!(report.blocked, 1, "{report:?}");
         assert!(report.kept_unmatched.is_empty(), "{report:?}");
-        assert!(read_pending_profile_deletes(&state).unwrap().is_empty());
+        assert_eq!(
+            *at_retire.lock().unwrap(),
+            vec![PendingProfileDelete::blocked_orphan(&name)],
+            "the permanent block is durable BEFORE the ledger is retired"
+        );
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::blocked_orphan(&name)],
+            "and no success path drops it"
+        );
         assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -4574,6 +4923,534 @@ mod tests {
             "the re-registered site must not derive the drained name"
         );
         assert_ne!(android_profile_name(id, 5), name);
+    }
+
+    // ---------------------------------------------------------------------
+    // The "clear all" orphan sweep: the third path through the same protocol.
+    // ---------------------------------------------------------------------
+
+    /// A name the provider still lists but no registered site owns.
+    fn orphan_name(seed: &str, generation: u32) -> String {
+        format!("{ANDROID_PROFILE_PREFIX}{seed}-g{generation}")
+    }
+
+    /// THE ORDER IS THE SAFETY PROPERTY, asserted as the exact interleaving of
+    /// durable writes and injected platform calls: tombstone -> provider ->
+    /// permanent block -> ledger.
+    #[test]
+    fn orphan_sweep_tombstones_before_the_provider_and_blocks_before_retiring() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail_gen, _fail_queue) = ordering_state_with_queue_failures();
+        let name = format!("{}{}-g4", ANDROID_PROFILE_PREFIX, "c".repeat(32));
+        let names = vec![name.clone()];
+        let in_flight = Arc::new(Mutex::new(Vec::<PendingProfileDelete>::new()));
+        let seen = in_flight.clone();
+
+        let report = run_orphan_profile_sweep(
+            &state,
+            &names,
+            |profile| {
+                // What a kill inside the provider call would leave behind.
+                *seen.lock().unwrap() = read_pending_profile_delete_entries(&state).unwrap();
+                writes.lock().unwrap().push(format!("delete:{profile}"));
+                Ok(SiteProfileAction::Deleted)
+            },
+            |profile| {
+                writes.lock().unwrap().push(format!("retire:{profile}"));
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("delete:{name}"),
+                format!("put:{PENDING_PROFILE_DELETES_KEY}"),
+                format!("retire:{name}"),
+            ],
+            "tombstone -> provider -> permanent block -> ledger"
+        );
+        assert_eq!(
+            *in_flight.lock().unwrap(),
+            vec![PendingProfileDelete::orphan(&name)],
+            "the tombstone is durable, as ORPHAN and still OWED, while the provider call is in flight"
+        );
+        assert_eq!(
+            report,
+            OrphanSweepReport {
+                queued: 1,
+                blocked: 1,
+                retired: 1,
+                ..Default::default()
+            },
+            "{report:?}"
+        );
+        // The success path leaves the name blocked, never dropped.
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::blocked_orphan(&name)]
+        );
+        assert_eq!(read_pending_profile_deletes(&state).unwrap(), vec![name]);
+    }
+
+    /// Requirement: a failed tombstone write means the provider is never asked.
+    /// An unrecorded deletion is exactly the hole this closes.
+    #[test]
+    fn orphan_sweep_never_calls_the_provider_when_the_tombstone_write_fails() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, writes, _fail_gen, fail_queue) = ordering_state_with_queue_failures();
+        fail_queue.store(1, std::sync::atomic::Ordering::SeqCst);
+        let names = vec![
+            format!("{}{}-g2", ANDROID_PROFILE_PREFIX, "d".repeat(32)),
+            format!("{}{}-g3", ANDROID_PROFILE_PREFIX, "e".repeat(32)),
+        ];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+
+        let err = run_orphan_profile_sweep(
+            &state,
+            &names,
+            move |_profile| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(SiteProfileAction::Deleted)
+            },
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("yazılamadı"), "{err}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no provider call before the tombstone is durable"
+        );
+        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            read_pending_profile_deletes(&state).unwrap().is_empty(),
+            "nothing was recorded, so nothing may be claimed as deleted"
+        );
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![format!("put-failed:{PENDING_PROFILE_DELETES_KEY}")]
+        );
+    }
+
+    /// A bridge error or timeout can arrive AFTER the provider started or
+    /// accepted the deletion, so the tombstone must survive it — and the sweep
+    /// stops instead of marching on without a bridge.
+    #[test]
+    fn orphan_sweep_keeps_the_tombstone_when_the_bridge_never_answers() {
+        let (state, _writes, _fail_gen, _fail_queue) = ordering_state_with_queue_failures();
+        let first = format!("{}{}-g1", ANDROID_PROFILE_PREFIX, "a".repeat(32));
+        let second = format!("{}{}-g2", ANDROID_PROFILE_PREFIX, "b".repeat(32));
+        let names = vec![first.clone(), second.clone()];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+
+        let err = run_orphan_profile_sweep(
+            &state,
+            &names,
+            move |_profile| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(AppError::Other("köprü hazır değil".into()))
+            },
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("köprü hazır değil"), "{err}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the sweep stops at the first dead bridge"
+        );
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no ledger is retired for an unconfirmed deletion"
+        );
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::orphan(&first)],
+            "the tombstone survives, still OWED, so the startup drain finishes it"
+        );
+    }
+
+    /// `Pending` means the profile is loaded in this process: kept owed, ledger
+    /// kept, and the next start's drain lands it as a permanent block.
+    #[test]
+    fn orphan_sweep_keeps_a_deferred_orphan_owed_for_the_startup_drain() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let name = orphan_name(&"f".repeat(32), 5);
+        let names = vec![name.clone()];
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+
+        let report = run_orphan_profile_sweep(
+            &state,
+            &names,
+            |_profile| Ok(SiteProfileAction::Pending),
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.deferred, 1, "{report:?}");
+        assert_eq!(report.blocked, 0, "{report:?}");
+        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::orphan(&name)],
+            "still owed, never reported as deleted"
+        );
+
+        // The next start finishes it: delete, block, retire — in that order.
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let drain = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            |_profile| Ok(1),
+            no_owner,
+        )
+        .unwrap();
+        assert_eq!(drain.blocked, 1, "{drain:?}");
+        assert_eq!(drain.lifted, 0, "{drain:?}");
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::blocked_orphan(&name)]
+        );
+    }
+
+    /// `Absent` is a confirmed deletion too: the name becomes unreachable
+    /// durably instead of becoming reusable.
+    #[test]
+    fn orphan_sweep_blocks_a_confirmed_name_for_deleted_and_absent_alike() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let first = orphan_name(&"1".repeat(32), 1);
+        let second = orphan_name(&"2".repeat(32), 2);
+        let names = vec![first.clone(), second.clone()];
+        let answer = first.clone();
+
+        let report = run_orphan_profile_sweep(
+            &state,
+            &names,
+            move |profile| {
+                if profile == answer {
+                    Ok(SiteProfileAction::Deleted)
+                } else {
+                    Ok(SiteProfileAction::Absent)
+                }
+            },
+            |_profile| Ok(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.blocked, 2, "{report:?}");
+        assert_eq!(report.retired, 2, "{report:?}");
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![
+                PendingProfileDelete::blocked_orphan(&first),
+                PendingProfileDelete::blocked_orphan(&second)
+            ],
+            "both confirmed answers leave a permanent block"
+        );
+        // The open protocol consults exactly this list, so neither name can be
+        // handed to an open again.
+        assert_eq!(
+            read_pending_profile_deletes(&state).unwrap(),
+            vec![first, second]
+        );
+    }
+
+    /// A provider without the profile API deletes nothing: the names stay OWED
+    /// (so a later provider update can drain them) and the remaining names are
+    /// still tried — a feature gap is not a success and not an abort.
+    #[test]
+    fn orphan_sweep_keeps_names_owed_when_the_provider_has_no_profile_api() {
+        let state = state_with_current_site(None);
+        let first = orphan_name(&"3".repeat(32), 1);
+        let second = orphan_name(&"4".repeat(32), 2);
+        let names = vec![first.clone(), second.clone()];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+
+        let report = run_orphan_profile_sweep(
+            &state,
+            &names,
+            move |_profile| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(AppError::Unsupported("MULTI_PROFILE yok".into()))
+            },
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.unsupported, 2, "{report:?}");
+        assert_eq!(report.blocked, 0, "{report:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![
+                PendingProfileDelete::orphan(&first),
+                PendingProfileDelete::orphan(&second)
+            ]
+        );
+    }
+
+    /// A permanent block is not re-deleted, not re-retired, not dropped and not
+    /// reported as a hazard — across repeated starts.
+    #[test]
+    fn a_blocked_orphan_is_never_asked_again_and_never_dropped() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let name = orphan_name(&"5".repeat(32), 7);
+        write_queue(&state, vec![PendingProfileDelete::blocked_orphan(&name)]);
+
+        for round in 0..3 {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let c = calls.clone();
+            let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let r = retires.clone();
+            let entries = read_pending_profile_delete_entries(&state).unwrap();
+            let report = run_pending_delete_drain(
+                &state,
+                &entries,
+                move |_profile| {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(SiteProfileAction::Deleted)
+                },
+                move |_profile| {
+                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(1)
+                },
+                no_owner,
+            )
+            .unwrap();
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "round {round}: a confirmed block is not re-deleted"
+            );
+            assert_eq!(
+                retires.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "round {round}: nothing left to retire"
+            );
+            assert_eq!(report.blocked, 1, "round {round}: {report:?}");
+            assert_eq!(report.lifted, 0, "round {round}: {report:?}");
+            assert!(
+                report.kept_unmatched.is_empty(),
+                "round {round}: a steady-state block is not a hazard: {report:?}"
+            );
+            assert_eq!(
+                read_pending_profile_delete_entries(&state).unwrap(),
+                vec![PendingProfileDelete::blocked_orphan(&name)],
+                "round {round}: the block survives"
+            );
+        }
+    }
+
+    /// The case "no owner right now" cannot prove away: a registry backup
+    /// restores the site id WITHOUT its generation key, so the stored
+    /// generation sits below the tombstone's and an open would derive the very
+    /// name whose directory was deleted. A blocked entry is therefore still
+    /// re-matched, and lifted only after the generation is durable.
+    #[test]
+    fn a_blocked_orphan_whose_site_id_comes_back_secures_a_new_generation() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-restored-from-backup";
+        let name = android_profile_name(id, 4);
+        write_queue(&state, vec![PendingProfileDelete::blocked_orphan(&name)]);
+        write_generation(&state, id, 0);
+
+        let ids = vec![id.to_string()];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            move |_profile| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(SiteProfileAction::Deleted)
+            },
+            |_profile| Ok(1),
+            |profile| match_queued_name_to_site(profile, &ids),
+        )
+        .unwrap();
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "already confirmed: the provider is not asked again"
+        );
+        assert_eq!(report.lifted, 1, "{report:?}");
+        assert_eq!(report.blocked, 0, "{report:?}");
+        assert_eq!(
+            profile_generation(&state, id).unwrap(),
+            5,
+            "the restored site must not derive the blocked name"
+        );
+        assert!(
+            read_pending_profile_deletes(&state).unwrap().is_empty(),
+            "lifted only after the generation was durable"
+        );
+        // And the next open of the restored site derives a DIFFERENT name.
+        let stored = profile_generation(&state, id).unwrap();
+        let queued = read_pending_profile_deletes(&state).unwrap();
+        let (resolved, advanced) = resolve_queued_free_generation(id, stored, &queued).unwrap();
+        assert!(!advanced, "nothing is queued, nothing to step over");
+        assert_eq!(resolved, 5);
+        assert_ne!(android_profile_name(id, resolved), name);
+    }
+
+    /// Requirement: a failed durable write keeps the tombstone. For an orphan
+    /// the block IS the durable record, so a refused block write leaves the
+    /// entry owed (and the ledger untouched) until a later start lands it.
+    #[test]
+    fn a_failed_block_write_keeps_the_orphan_tombstone_owed() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let (state, _writes, _fail_gen, fail_queue) = ordering_state_with_queue_failures();
+        let name = orphan_name(&"9".repeat(32), 9);
+        write_queue(&state, vec![PendingProfileDelete::orphan(&name)]);
+        fail_queue.store(1, std::sync::atomic::Ordering::SeqCst);
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = retires.clone();
+
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            move |_profile| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+            no_owner,
+        )
+        .unwrap();
+
+        assert_eq!(report.lifted, 0, "{report:?}");
+        assert_eq!(report.blocked, 0, "{report:?}");
+        assert_eq!(report.kept_unmatched, vec![name.clone()], "{report:?}");
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no ledger retirement without the durable block"
+        );
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::orphan(&name)],
+            "still owed, still keeping the name out of every open"
+        );
+
+        // The next start, with the store writable again, lands the block.
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Absent),
+            |_profile| Ok(0),
+            no_owner,
+        )
+        .unwrap();
+        assert_eq!(report.blocked, 1, "{report:?}");
+        assert_eq!(
+            read_pending_profile_delete_entries(&state).unwrap(),
+            vec![PendingProfileDelete::blocked_orphan(&name)]
+        );
+    }
+
+    /// Repeated sweeps of the same stale name and repeated drains consume no
+    /// generation and change nothing: the block is idempotent.
+    #[test]
+    fn repeated_orphan_sweeps_and_drains_consume_no_generation() {
+        use crate::android_bridge::SiteProfileAction;
+
+        let state = state_with_current_site(None);
+        let id = "user-orphan-idempotent";
+        let name = android_profile_name(id, 3);
+        let names = vec![name.clone()];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for round in 0..3 {
+            let c = calls.clone();
+            let r = retires.clone();
+            let report = run_orphan_profile_sweep(
+                &state,
+                &names,
+                move |_profile| {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(SiteProfileAction::Absent)
+                },
+                move |_profile| {
+                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(0)
+                },
+            )
+            .unwrap();
+            assert_eq!(report.blocked, 1, "round {round}: {report:?}");
+            assert_eq!(
+                read_pending_profile_delete_entries(&state).unwrap(),
+                vec![PendingProfileDelete::blocked_orphan(&name)],
+                "round {round}: exactly one entry, blocked, never duplicated"
+            );
+            assert_eq!(
+                profile_generation(&state, id).unwrap(),
+                0,
+                "round {round}: an orphan never touches a generation"
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // The startup drain asks nothing more of it, and still consumes nothing.
+        let entries = read_pending_profile_delete_entries(&state).unwrap();
+        let report = run_pending_delete_drain(
+            &state,
+            &entries,
+            |_profile| Ok(SiteProfileAction::Deleted),
+            |_profile| Ok(1),
+            |profile| match_queued_name_to_site(profile, &[]),
+        )
+        .unwrap();
+        assert_eq!(report.blocked, 1, "{report:?}");
+        assert_eq!(report.lifted, 0, "{report:?}");
+        assert_eq!(profile_generation(&state, id).unwrap(), 0);
     }
 
     /// A recorded owner that contradicts the registry is ambiguous: keep the
