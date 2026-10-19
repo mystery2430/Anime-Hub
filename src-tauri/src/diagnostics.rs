@@ -12,41 +12,171 @@ const RING_CAPACITY: usize = DEBUG_LOG_CAPACITY as usize;
 const COMBINED_CAPACITY: u32 = DEBUG_LOG_CAPACITY * 2;
 
 const AREAS: &[&str] = &[
-    "app", "back", "bridge", "clear", "close", "delete", "devlog", "flush", "ipc",
-    "migration", "open", "pip", "profile", "queue", "shutdown", "site", "startup", "webview",
+    "app",
+    "back",
+    "bridge",
+    "clear",
+    "close",
+    "delete",
+    "devlog",
+    "flush",
+    "ipc",
+    "migration",
+    "open",
+    "pip",
+    "profile",
+    "queue",
+    "shutdown",
+    "site",
+    "startup",
+    "webview",
 ];
 const PHASES: &[&str] = &[
-    "back_pressed", "back_step", "capability", "clear", "close", "complete", "cookie_verify",
-    "cookie_wipe", "cookie_write", "destroy", "destroy_flush", "drain", "enumerate",
-    "flag_write", "flush", "fullscreen", "gate", "generation", "geolocation",
-    "geolocation_origins", "geolocation_wipe", "ipc_dispatch", "ipc_setup", "late_callback",
-    "launcher_close", "migration", "native_close", "native_fallback", "navigation_start",
-    "open", "orphan_sweep", "pip_enter", "pip_playback", "pip_prepare", "pip_restore",
-    "pip_transfer", "poll", "profile_bind", "profile_check", "profile_create", "profile_delete",
-    "profile_flush", "profile_list", "provider_delete", "quarantine", "quarantine_retire",
-    "queue_remove", "reset", "resolve", "retire", "script", "slot_claim", "start", "storage",
-    "sync", "tombstone", "transfer_to_launcher", "view_attach", "view_create", "web_history",
-    "verified", "watchdog", "watchdog_arm", "worker_start", "worker_wait",
+    "back_pressed",
+    "back_step",
+    "capability",
+    "clear",
+    "close",
+    "complete",
+    "cookie_verify",
+    "cookie_wipe",
+    "cookie_write",
+    "destroy",
+    "destroy_flush",
+    "drain",
+    "enumerate",
+    "flag_write",
+    "flush",
+    "fullscreen",
+    "gate",
+    "generation",
+    "geolocation",
+    "geolocation_origins",
+    "geolocation_wipe",
+    "ipc_dispatch",
+    "ipc_setup",
+    "late_callback",
+    "launcher_close",
+    "migration",
+    "native_close",
+    "native_fallback",
+    "navigation_start",
+    "open",
+    "orphan_sweep",
+    "pip_enter",
+    "pip_playback",
+    "pip_prepare",
+    "pip_restore",
+    "pip_transfer",
+    "poll",
+    "profile_bind",
+    "profile_check",
+    "profile_create",
+    "profile_delete",
+    "profile_flush",
+    "profile_list",
+    "provider_delete",
+    "quarantine",
+    "quarantine_retire",
+    "queue_remove",
+    "reset",
+    "resolve",
+    "retire",
+    "script",
+    "slot_claim",
+    "start",
+    "storage",
+    "sync",
+    "tombstone",
+    "transfer_to_launcher",
+    "view_attach",
+    "view_create",
+    "web_history",
+    "verified",
+    "watchdog",
+    "watchdog_arm",
+    "worker_start",
+    "worker_wait",
 ];
 const RESULTS: &[&str] = &[
-    "accepted", "absent", "armed", "attached", "available", "blocked", "closed", "copied", "deferred",
-    "deleted", "disabled", "duplicate", "empty", "enabled", "entered", "error", "failed",
-    "failed_closed", "fallback", "flow_failed", "handled", "intercepted", "late", "lifted",
-    "not_entered", "not_needed", "not_restored", "not_empty", "ok", "owed", "paused", "pending",
-    "playing", "present", "passed", "quarantined", "queued", "rejected", "refused", "reset", "restored",
-    "retired", "settled", "skipped", "started", "stuck", "timeout", "unknown", "unsupported",
-    "unsupported_provider", "unavailable", "verified", "watchdog_refused", "supported", "invalid",
+    "accepted",
+    "absent",
+    "armed",
+    "attached",
+    "available",
+    "blocked",
+    "closed",
+    "copied",
+    "deferred",
+    "deleted",
+    "disabled",
+    "duplicate",
+    "empty",
+    "enabled",
+    "entered",
+    "error",
+    "failed",
+    "failed_closed",
+    "fallback",
+    "flow_failed",
+    "handled",
+    "intercepted",
+    "late",
+    "lifted",
+    "not_entered",
+    "not_needed",
+    "not_restored",
+    "not_empty",
+    "ok",
+    "owed",
+    "paused",
+    "pending",
+    "playing",
+    "present",
+    "passed",
+    "quarantined",
+    "queued",
+    "rejected",
+    "refused",
+    "reset",
+    "restored",
+    "retired",
+    "settled",
+    "skipped",
+    "started",
+    "stuck",
+    "timeout",
+    "unknown",
+    "unsupported",
+    "unsupported_provider",
+    "unavailable",
+    "verified",
+    "watchdog_refused",
+    "supported",
+    "invalid",
 ];
 const WATCHDOGS: &[&str] = &["armed", "cancelled", "fired", "late", "refused", "unknown"];
 const ERROR_CLASSES: &[&str] = &[
-    "active_site", "activity_gone", "cookie_unverified", "in_use", "ipc", "invalid_profile",
-    "migration_partial", "permission", "provider", "quarantined", "storage", "timeout",
-    "unknown", "unavailable", "unsupported", "watchdog_refused",
+    "active_site",
+    "activity_gone",
+    "cookie_unverified",
+    "in_use",
+    "ipc",
+    "invalid_profile",
+    "migration_partial",
+    "permission",
+    "provider",
+    "quarantined",
+    "storage",
+    "timeout",
+    "unknown",
+    "unavailable",
+    "unsupported",
+    "watchdog_refused",
 ];
 
 static BUFFER: OnceLock<Mutex<EventBuffer>> = OnceLock::new();
-static NEXT_OPERATION_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static NEXT_OPERATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// Operation correlation only spans synchronous protocol bodies. Async
@@ -98,16 +228,7 @@ impl EventBuffer {
             return;
         }
         self.push(
-            "rust",
-            "devlog",
-            "gate",
-            "enabled",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            "rust", "devlog", "gate", "enabled", None, None, None, None, None, None,
         );
     }
 
@@ -179,7 +300,10 @@ fn safe_code(value: &str, allowed: &[&str], fallback: &str) -> String {
 }
 
 fn valid_operation_id(value: &str) -> bool {
-    let Some(digits) = value.strip_prefix("r-").or_else(|| value.strip_prefix("k-")) else {
+    let Some(digits) = value
+        .strip_prefix("r-")
+        .or_else(|| value.strip_prefix("k-"))
+    else {
         return false;
     };
     !digits.is_empty()
@@ -351,16 +475,7 @@ pub fn reset() {
         if state.enabled {
             state.clear();
             state.push(
-                "rust",
-                "devlog",
-                "reset",
-                "reset",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                "rust", "devlog", "reset", "reset", None, None, None, None, None, None,
             );
         }
     }
@@ -369,7 +484,11 @@ pub fn reset() {
 /// Merge the two process-local rings into one ordered timeline.
 pub fn snapshot(kotlin: DebugLogSnapshot) -> DebugLogSnapshot {
     let (mut events, rust_dropped, enabled) = match buffer().lock() {
-        Ok(state) => (state.events.iter().cloned().collect::<Vec<_>>(), state.dropped_events, state.enabled),
+        Ok(state) => (
+            state.events.iter().cloned().collect::<Vec<_>>(),
+            state.dropped_events,
+            state.enabled,
+        ),
         Err(_) => (Vec::new(), 0, false),
     };
     if !enabled {
@@ -383,8 +502,12 @@ pub fn snapshot(kotlin: DebugLogSnapshot) -> DebugLogSnapshot {
         event.phase = safe_code(&event.phase, PHASES, "complete");
         event.result = safe_code(&event.result, RESULTS, "unknown");
         event.operation_id = event.operation_id.filter(|id| valid_operation_id(id));
-        event.watchdog = event.watchdog.map(|value| safe_code(&value, WATCHDOGS, "unknown"));
-        event.error_class = event.error_class.map(|value| safe_code(&value, ERROR_CLASSES, "unknown"));
+        event.watchdog = event
+            .watchdog
+            .map(|value| safe_code(&value, WATCHDOGS, "unknown"));
+        event.error_class = event
+            .error_class
+            .map(|value| safe_code(&value, ERROR_CLASSES, "unknown"));
         event.duration_ms = event.duration_ms.map(|value| value.min(86_400_000));
         event.count = event.count.map(|value| value.min(1_000_000_000));
         event.step_id = event.step_id.map(|value| value.min(u64::MAX - 1));
@@ -434,7 +557,9 @@ pub fn empty_snapshot() -> DebugLogSnapshot {
 pub fn error_class(error: &crate::error::AppError) -> &'static str {
     use crate::error::AppError;
     match error {
-        AppError::InvalidUrl(_) | AppError::InsecureScheme | AppError::Blocked(_) => "invalid_profile",
+        AppError::InvalidUrl(_) | AppError::InsecureScheme | AppError::Blocked(_) => {
+            "invalid_profile"
+        }
         AppError::SiteNotFound(_) | AppError::DuplicateName | AppError::DuplicateUrl => "unknown",
         AppError::Storage(_) | AppError::Crypto(_) | AppError::Keyring(_) => "storage",
         AppError::AniList(_) | AppError::Network(_) | AppError::Unauthorized => "provider",
@@ -453,7 +578,9 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_tests() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn event(source: &str, sequence: u64, timestamp_ms: u64, operation_id: &str) -> DebugEvent {
@@ -499,9 +626,19 @@ mod tests {
         assert!(rust.events.len() >= 2);
         assert_eq!(rust.dropped_events, 2);
         assert_eq!(rust.capacity, COMBINED_CAPACITY);
-        assert!(rust.events.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
-        assert!(rust.events.iter().any(|item| item.source == "kotlin" && item.operation_id.as_deref() == Some(op.as_str())));
-        assert!(rust.events.iter().any(|item| item.source == "rust" && item.operation_id.as_deref() == Some(op.as_str())));
+        assert!(rust
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(rust.events.iter().any(
+            |item| item.source == "kotlin" && item.operation_id.as_deref() == Some(op.as_str())
+        ));
+        assert!(
+            rust.events
+                .iter()
+                .any(|item| item.source == "rust"
+                    && item.operation_id.as_deref() == Some(op.as_str()))
+        );
         set_enabled(false);
     }
 
@@ -513,7 +650,16 @@ mod tests {
         {
             let _scope = begin_operation_with_id("back", "k-42");
             assert_eq!(current_or_new_operation_id().as_str(), "k-42");
-            record_current("back", "back_pressed", "started", None, None, None, None, None);
+            record_current(
+                "back",
+                "back_pressed",
+                "started",
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
         {
             let _scope = begin_operation_with_id("open", "site-private-profile");
@@ -575,10 +721,32 @@ mod tests {
     #[test]
     fn disabled_gate_collects_no_events_and_disabling_clears_memory() {
         let mut ring = EventBuffer::default();
-        ring.push("rust", "profile", "profile_check", "present", None, None, None, None, None, None);
+        ring.push(
+            "rust",
+            "profile",
+            "profile_check",
+            "present",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(ring.events.is_empty());
         ring.enable(true);
-        ring.push("rust", "profile", "profile_check", "present", None, None, None, None, None, None);
+        ring.push(
+            "rust",
+            "profile",
+            "profile_check",
+            "present",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(!ring.events.is_empty());
         ring.enable(false);
         assert!(ring.events.is_empty());
@@ -590,7 +758,12 @@ mod tests {
         let _guard = lock_tests();
         set_enabled(false);
         set_enabled(true);
-        let mut unsafe_event = event("kotlin", 1, now_ms(), "site-0123456789abcdef0123456789abcdef-g8");
+        let mut unsafe_event = event(
+            "kotlin",
+            1,
+            now_ms(),
+            "site-0123456789abcdef0123456789abcdef-g8",
+        );
         unsafe_event.area = "https://private.example/path?token=secret".into();
         unsafe_event.phase = "profile-name: secret".into();
         unsafe_event.result = "Cookie: secret".into();

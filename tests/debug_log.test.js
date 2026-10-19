@@ -6,6 +6,17 @@ import {
   sanitizeDebugLogSnapshot,
   serializeDebugLogSnapshot,
 } from "../src/logic/debug_log.js";
+import { createDeveloperLogReader } from "../src/logic/dev_log_refresh.js";
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 function event({
   sequence,
@@ -183,4 +194,156 @@ test("malformed snapshots produce an empty bounded schema", () => {
     capacity: 4_000,
   });
   assert.equal(serializeDebugLogSnapshot(null), '{\n  "events": [],\n  "droppedEvents": 0,\n  "capacity": 4000\n}\n');
+});
+
+test("a late diagnostics reply is discarded after the gate closes and the panel reopens", async () => {
+  const oldRead = deferred();
+  const currentRead = deferred();
+  const reads = [oldRead, currentRead];
+  const applied = [];
+  const errors = [];
+  let enabled = true;
+  let visible = true;
+  const reader = createDeveloperLogReader({
+    isEnabled: () => enabled,
+    isVisible: () => visible,
+    read: () => reads.shift().promise,
+    reset: async () => {},
+    onSnapshot: (snapshot) => applied.push(snapshot),
+    onError: (_error, operation) => errors.push(operation),
+  });
+
+  const oldRequest = reader.refresh();
+  await Promise.resolve(); // let the allowed native read start
+  enabled = false;
+  visible = false;
+  reader.invalidate();
+  oldRead.resolve("stale snapshot");
+  assert.equal(await oldRequest, false);
+  assert.deepEqual(applied, []);
+
+  enabled = true;
+  visible = true;
+  const currentRequest = reader.refresh();
+  currentRead.resolve("current snapshot");
+  assert.equal(await currentRequest, true);
+  assert.deepEqual(applied, ["current snapshot"]);
+  assert.deepEqual(errors, []);
+});
+
+test("overlapping diagnostics reads are latest-request-wins", async () => {
+  const first = deferred();
+  const second = deferred();
+  const reads = [first, second];
+  const applied = [];
+  const reader = createDeveloperLogReader({
+    isEnabled: () => true,
+    isVisible: () => true,
+    read: () => reads.shift().promise,
+    reset: async () => {},
+    onSnapshot: (snapshot) => applied.push(snapshot),
+    onError: () => assert.fail("unexpected diagnostics read error"),
+  });
+
+  const older = reader.refresh();
+  await Promise.resolve(); // let the first native read start
+  const newer = reader.refresh();
+  await Promise.resolve(); // let the second native read start
+  second.resolve("newer");
+  assert.equal(await newer, true);
+  first.resolve("older");
+  assert.equal(await older, false);
+  assert.deepEqual(applied, ["newer"]);
+});
+
+test("reset publishes only the fresh snapshot after its reset call succeeds", async () => {
+  const calls = [];
+  const applied = [];
+  const reader = createDeveloperLogReader({
+    isEnabled: () => true,
+    isVisible: () => true,
+    reset: async () => calls.push("reset"),
+    read: async () => {
+      calls.push("read");
+      return "fresh snapshot";
+    },
+    onSnapshot: (snapshot, operation) => applied.push([snapshot, operation]),
+    onError: () => assert.fail("unexpected diagnostics operation error"),
+  });
+
+  assert.equal(await reader.resetAndRefresh(), true);
+  assert.deepEqual(calls, ["reset", "read"]);
+  assert.deepEqual(applied, [["fresh snapshot", "reset"]]);
+});
+
+test("a reset that completes after gate closure does not start a diagnostics read", async () => {
+  const resetResult = deferred();
+  const calls = [];
+  const applied = [];
+  let enabled = true;
+  let visible = true;
+  const reader = createDeveloperLogReader({
+    isEnabled: () => enabled,
+    isVisible: () => visible,
+    reset: () => {
+      calls.push("reset");
+      return resetResult.promise;
+    },
+    read: async () => {
+      calls.push("read");
+      return "should not be read";
+    },
+    onSnapshot: (snapshot) => applied.push(snapshot),
+    onError: () => assert.fail("unexpected diagnostics operation error"),
+  });
+
+  const request = reader.resetAndRefresh();
+  await Promise.resolve();
+  enabled = false;
+  visible = false;
+  reader.invalidate();
+  resetResult.resolve();
+
+  assert.equal(await request, false);
+  assert.deepEqual(calls, ["reset"]);
+  assert.deepEqual(applied, []);
+});
+
+test("a refresh started during reset reads only after reset settles", async () => {
+  const resetResult = deferred();
+  const readResult = deferred();
+  const calls = [];
+  const applied = [];
+  let readStarted;
+  const didReadStart = new Promise((resolve) => {
+    readStarted = resolve;
+  });
+  const reader = createDeveloperLogReader({
+    isEnabled: () => true,
+    isVisible: () => true,
+    reset: () => {
+      calls.push("reset");
+      return resetResult.promise;
+    },
+    read: () => {
+      calls.push("read");
+      readStarted();
+      return readResult.promise;
+    },
+    onSnapshot: (snapshot, operation) => applied.push([snapshot, operation]),
+    onError: () => assert.fail("unexpected diagnostics operation error"),
+  });
+
+  const resetRequest = reader.resetAndRefresh();
+  await Promise.resolve();
+  const refreshRequest = reader.refresh();
+  assert.deepEqual(calls, ["reset"]);
+
+  resetResult.resolve();
+  await didReadStart;
+  assert.deepEqual(calls, ["reset", "read"]);
+  readResult.resolve("after reset");
+  assert.equal(await refreshRequest, true);
+  assert.equal(await resetRequest, false, "superseded reset must not publish a stale snapshot");
+  assert.deepEqual(applied, [["after reset", "refresh"]]);
 });

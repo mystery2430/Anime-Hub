@@ -42,6 +42,7 @@ import {
   sanitizeDebugLogSnapshot,
   serializeDebugLogSnapshot,
 } from "./logic/debug_log.js";
+import { createDeveloperLogReader } from "./logic/dev_log_refresh.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -583,6 +584,7 @@ async function removeSite(tile) {
  * clicks and screen readers cannot reach background controls.
  */
 const overlayStack = [];
+let developerLogReader = null;
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
@@ -626,6 +628,7 @@ function openModal(modal) {
 }
 
 function closeModal(modal) {
+  if (modal === el.modalSettings) developerLogReader?.invalidate();
   hideOverlay(modal);
 }
 
@@ -810,9 +813,18 @@ function renderDevLog(snapshot) {
   el.dev.log.textContent = serializeDebugLogSnapshot(currentDevLog);
 }
 
+function canUseDeveloperLog() {
+  return (
+    Boolean(currentSettings?.developerOptions) &&
+    !el.modalSettings.hidden &&
+    !el.dev.panel.hidden
+  );
+}
+
 function setDeveloperPanel(open) {
   el.dev.panel.hidden = !open;
   if (!open) {
+    developerLogReader?.invalidate();
     currentDevLog = sanitizeDebugLogSnapshot(null);
     el.dev.summary.textContent = "";
     el.dev.status.textContent = "";
@@ -820,25 +832,38 @@ function setDeveloperPanel(open) {
   }
 }
 
-/** Read only when the saved developer_options gate is enabled. */
+developerLogReader = createDeveloperLogReader({
+  isEnabled: () => Boolean(currentSettings?.developerOptions),
+  isVisible: () => !el.modalSettings.hidden && !el.dev.panel.hidden,
+  read: () => call("debug_log"),
+  reset: () => call("debug_log_reset"),
+  onSnapshot: (snapshot, operation) => {
+    renderDevLog(snapshot);
+    el.dev.status.textContent =
+      operation === "reset"
+        ? "Tanılama belleği sıfırlandı; yeni olaylar yeniden kaydediliyor."
+        : "Tanılama belleği yenilendi.";
+  },
+  // Never surface native/provider error details in the developer panel.
+  onError: (_error, operation) => {
+    el.dev.status.textContent =
+      operation === "reset"
+        ? "Tanılama belleği sıfırlanamadı. Daha sonra tekrar deneyin."
+        : "Kayıt okunamadı. Ayarı kapatıp yeniden açtıktan sonra tekrar deneyin.";
+  },
+});
+
+/** Read only while the saved gate is enabled and the settings panel is visible. */
 async function refreshDevLog() {
   if (!currentSettings?.developerOptions) {
     setDeveloperPanel(false);
     return false;
   }
-  try {
-    const snapshot = await call("debug_log");
-    renderDevLog(snapshot);
-    el.dev.status.textContent = "Tanılama belleği yenilendi.";
-    return true;
-  } catch {
-    el.dev.status.textContent = "Kayıt okunamadı. Ayarı kapatıp yeniden açtıktan sonra tekrar deneyin.";
-    return false;
-  }
+  return developerLogReader.refresh();
 }
 
 async function copyDebugLog() {
-  if (!(await refreshDevLog())) return;
+  if (!(await refreshDevLog()) || !canUseDeveloperLog()) return;
   const text = serializeDebugLogSnapshot(currentDevLog);
   try {
     if (navigator.clipboard?.writeText) {
@@ -847,18 +872,24 @@ async function copyDebugLog() {
       throw new Error("clipboard_unavailable");
     }
   } catch {
+    // Clipboard permission can resolve after the saved gate is closed.
+    if (!canUseDeveloperLog()) return;
     try {
       if (!copyTextFallback(text)) throw new Error("clipboard_unavailable");
     } catch {
-      el.dev.status.textContent = "Panoya kopyalanamadı. JSON indirme düğmesini kullanabilirsiniz.";
+      if (canUseDeveloperLog()) {
+        el.dev.status.textContent = "Panoya kopyalanamadı. JSON indirme düğmesini kullanabilirsiniz.";
+      }
       return;
     }
   }
-  el.dev.status.textContent = "Güncel güvenli tanılama kaydı panoya kopyalandı.";
+  if (canUseDeveloperLog()) {
+    el.dev.status.textContent = "Güncel güvenli tanılama kaydı panoya kopyalandı.";
+  }
 }
 
 async function downloadDebugLog() {
-  if (!(await refreshDevLog())) return;
+  if (!(await refreshDevLog()) || !canUseDeveloperLog()) return;
   let objectUrl = null;
   let link = null;
   let downloadStarted = false;
@@ -905,14 +936,8 @@ async function downloadDebugLog() {
 }
 
 async function resetDevLog() {
-  if (!currentSettings?.developerOptions) return;
-  try {
-    await call("debug_log_reset");
-    renderDevLog(await call("debug_log"));
-    el.dev.status.textContent = "Tanılama belleği sıfırlandı; yeni olaylar yeniden kaydediliyor.";
-  } catch {
-    el.dev.status.textContent = "Tanılama belleği sıfırlanamadı. Daha sonra tekrar deneyin.";
-  }
+  if (!canUseDeveloperLog()) return;
+  await developerLogReader.resetAndRefresh();
 }
 
 /** Draw the switches from the saved settings (used after a failed change). */

@@ -99,7 +99,15 @@ fn plugin_error_class(error: &animehub_android::Error) -> &'static str {
 #[cfg(target_os = "android")]
 fn record_bridge_start(operation_id: &crate::diagnostics::OperationId, area: &str, phase: &str) {
     crate::diagnostics::record_for_operation(
-        Some(operation_id), area, phase, "started", None, None, None, None, None,
+        Some(operation_id),
+        area,
+        phase,
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
     );
 }
 
@@ -272,7 +280,10 @@ pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
     let operation_id = crate::diagnostics::current_or_new_operation_id();
     record_bridge_start(&operation_id, "bridge", "profile_delete");
     let started = std::time::Instant::now();
-    match animehub_android::site_profile_delete(operation_id.as_str().to_owned(), profile.to_string()) {
+    match animehub_android::site_profile_delete(
+        operation_id.as_str().to_owned(),
+        profile.to_string(),
+    ) {
         Ok(reply) => {
             let (action, result) = if reply.deleted {
                 (SiteProfileAction::Deleted, "deleted")
@@ -281,7 +292,14 @@ pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
             } else {
                 (SiteProfileAction::Absent, "absent")
             };
-            record_bridge_result(&operation_id, "bridge", "profile_delete", started, result, None);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "profile_delete",
+                started,
+                result,
+                None,
+            );
             Ok(action)
         }
         Err(error) if animehub_android::is_unsupported_multi_profile(&error) => {
@@ -293,7 +311,9 @@ pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
                 "unsupported",
                 Some("unsupported"),
             );
-            Err(AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string()))
+            Err(AppError::Unsupported(
+                MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
+            ))
         }
         Err(error) => {
             let class = plugin_error_class(&error);
@@ -324,16 +344,12 @@ pub fn site_profile_retire(profile: &str) -> AppResult<u32> {
     let operation_id = crate::diagnostics::current_or_new_operation_id();
     record_bridge_start(&operation_id, "bridge", "retire");
     let started = std::time::Instant::now();
-    match animehub_android::site_profile_retire(operation_id.as_str().to_owned(), profile.to_string()) {
+    match animehub_android::site_profile_retire(
+        operation_id.as_str().to_owned(),
+        profile.to_string(),
+    ) {
         Ok(reply) => {
-            record_bridge_result(
-                &operation_id,
-                "bridge",
-                "retire",
-                started,
-                "retired",
-                None,
-            );
+            record_bridge_result(&operation_id, "bridge", "retire", started, "retired", None);
             Ok(reply.dropped)
         }
         Err(error) => {
@@ -346,7 +362,9 @@ pub fn site_profile_retire(profile: &str) -> AppResult<u32> {
                 "failed",
                 Some(class),
             );
-            Err(AppError::Other("profile quarantine retirement failed".into()))
+            Err(AppError::Other(
+                "profile quarantine retirement failed".into(),
+            ))
         }
     }
 }
@@ -380,11 +398,17 @@ pub fn site_clear_data(profile: &str) -> AppResult<()> {
                 "unsupported",
                 Some("unsupported"),
             );
-            Err(AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string()))
+            Err(AppError::Unsupported(
+                MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
+            ))
         }
         Err(error) => {
             let class = plugin_error_class(&error);
-            let result = if class == "quarantined" { "quarantined" } else { "failed" };
+            let result = if class == "quarantined" {
+                "quarantined"
+            } else {
+                "failed"
+            };
             record_bridge_result(
                 &operation_id,
                 "bridge",
@@ -795,7 +819,10 @@ mod tests {
             "site açılamadı: private.example token=secret".to_string(),
         ));
         assert_eq!(other.code(), "other");
-        assert_eq!(other.to_string(), "Beklenmeyen hata: Android site profile operation failed");
+        assert_eq!(
+            other.to_string(),
+            "Beklenmeyen hata: Android site profile operation failed"
+        );
         assert!(!other.to_string().contains("private.example"));
         assert!(!other.to_string().contains("secret"));
 

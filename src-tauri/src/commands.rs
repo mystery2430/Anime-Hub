@@ -533,10 +533,8 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     // string policy already passed, and failing closed would make every site
     // unopenable during a DNS outage.
     let host = safe.host().to_string();
-    let dns_result = tauri::async_runtime::spawn_blocking(move || {
-        crate::web::dns::classify_host(&host)
-    })
-    .await;
+    let dns_result =
+        tauri::async_runtime::spawn_blocking(move || crate::web::dns::classify_host(&host)).await;
 
     // Async command continuations may resume on a different thread; establish
     // synchronous bridge correlation immediately after the DNS await, before
@@ -544,14 +542,27 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     let _operation_scope = crate::diagnostics::scope_if_missing("open");
     let dns = dns_result.map_err(|_| {
         crate::diagnostics::record_current(
-            "open", "resolve", "failed", None, None, Some("unknown"), None, None,
+            "open",
+            "resolve",
+            "failed",
+            None,
+            None,
+            Some("unknown"),
+            None,
+            None,
         );
         AppError::Other("adres çözümlenemedi".into())
     })?;
     if matches!(dns, crate::web::dns::DnsClass::Answered { private: true }) {
         crate::diagnostics::record_current(
-            "open", "resolve", "rejected", None, None,
-            Some("invalid_profile"), None, None,
+            "open",
+            "resolve",
+            "rejected",
+            None,
+            None,
+            Some("invalid_profile"),
+            None,
+            None,
         );
         return Err(AppError::InvalidUrl(
             "alan adı yerel/ağ içi bir adrese çözümlendi".into(),
@@ -1021,7 +1032,14 @@ pub fn update_settings(
     );
     if native_disable_failed || native_restore_failed {
         crate::diagnostics::record(
-            "devlog", "gate", "failed", None, None, Some("provider"), None, None,
+            "devlog",
+            "gate",
+            "failed",
+            None,
+            None,
+            Some("provider"),
+            None,
+            None,
         );
     }
     commit_result?;
@@ -1032,8 +1050,14 @@ pub fn update_settings(
             #[cfg(target_os = "android")]
             if crate::android_bridge::set_debug_logging(true).is_err() {
                 crate::diagnostics::record(
-                    "devlog", "gate", "failed", None, None,
-                    Some("provider"), None, None,
+                    "devlog",
+                    "gate",
+                    "failed",
+                    None,
+                    None,
+                    Some("provider"),
+                    None,
+                    None,
                 );
             }
         } else {

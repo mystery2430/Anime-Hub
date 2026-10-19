@@ -95,9 +95,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
 
     crate::diagnostics::set_enabled(settings.developer_options);
-    crate::diagnostics::record(
-        "startup", "start", "started", None, None, None, None, None,
-    );
+    crate::diagnostics::record("startup", "start", "started", None, None, None, None, None);
 
     let blocklist = Blocklist::from_rules(&settings.blocklist.rules, settings.blocklist.enabled);
     // Captured before `settings` moves into the managed state; applied to
@@ -242,16 +240,28 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(()) => {
                                 if enabled {
                                     crate::diagnostics::record(
-                                        "startup", "capability", "enabled", None, None,
-                                        None, None, None,
+                                        "startup",
+                                        "capability",
+                                        "enabled",
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
                                     );
                                 }
                                 retry = false;
                             }
                             Err(_) if attempt == 7 => {
                                 crate::diagnostics::record(
-                                    "startup", "capability", "failed", None, None,
-                                    Some("provider"), None, None,
+                                    "startup",
+                                    "capability",
+                                    "failed",
+                                    None,
+                                    None,
+                                    Some("provider"),
+                                    None,
+                                    None,
                                 );
                                 retry = false;
                             }
@@ -300,8 +310,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     None => (false, "unavailable", Some("unavailable")),
                 };
                 crate::diagnostics::record_current(
-                    "startup", "worker_wait", round_result, None, None,
-                    error_class, Some(attempt as u64), None,
+                    "startup",
+                    "worker_wait",
+                    round_result,
+                    None,
+                    None,
+                    error_class,
+                    Some(attempt as u64),
+                    None,
                 );
                 if stop {
                     return;
@@ -314,8 +330,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 "ertelenen profil silmeleri bu açılışta işlenemedi; sonraki açılışta yeniden denenecek"
             );
             crate::diagnostics::record_current(
-                "startup", "drain", "timeout", None, Some("fired"),
-                Some("timeout"), Some(8), None,
+                "startup",
+                "drain",
+                "timeout",
+                None,
+                Some("fired"),
+                Some("timeout"),
+                Some(8),
+                None,
             );
         });
     }
@@ -403,8 +425,14 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
         Ok(entries) => entries,
         Err(error) => {
             crate::diagnostics::record_current(
-                "startup", "drain", "failed", None, None,
-                Some("storage"), None, None,
+                "startup",
+                "drain",
+                "failed",
+                None,
+                None,
+                Some("storage"),
+                None,
+                None,
             );
             return Err(error);
         }
@@ -412,20 +440,45 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
     let blocked = entries.iter().filter(|entry| entry.is_blocked()).count();
     let owed = entries.len().saturating_sub(blocked);
     crate::diagnostics::record_current(
-        "queue", "profile_list", "ok", None, None, None,
-        Some(entries.len() as u64), None,
+        "queue",
+        "profile_list",
+        "ok",
+        None,
+        None,
+        None,
+        Some(entries.len() as u64),
+        None,
     );
     crate::diagnostics::record_current(
-        "queue", "resolve", if blocked == 0 { "skipped" } else { "blocked" },
-        None, None, None, Some(blocked as u64), None,
+        "queue",
+        "resolve",
+        if blocked == 0 { "skipped" } else { "blocked" },
+        None,
+        None,
+        None,
+        Some(blocked as u64),
+        None,
     );
     crate::diagnostics::record_current(
-        "queue", "resolve", if owed == 0 { "skipped" } else { "owed" },
-        None, None, None, Some(owed as u64), None,
+        "queue",
+        "resolve",
+        if owed == 0 { "skipped" } else { "owed" },
+        None,
+        None,
+        None,
+        Some(owed as u64),
+        None,
     );
     if entries.is_empty() {
         crate::diagnostics::record_current(
-            "startup", "drain", "empty", None, None, None, Some(0), None,
+            "startup",
+            "drain",
+            "empty",
+            None,
+            None,
+            None,
+            Some(0),
+            None,
         );
         return Ok(true);
     }
@@ -441,8 +494,14 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
             Ok(registry) => registry,
             Err(_) => {
                 crate::diagnostics::record_current(
-                    "startup", "drain", "failed", None, None,
-                    Some("storage"), None, None,
+                    "startup",
+                    "drain",
+                    "failed",
+                    None,
+                    None,
+                    Some("storage"),
+                    None,
+                    None,
                 );
                 return Err(AppError::Storage("kilit alınamadı".into()));
             }

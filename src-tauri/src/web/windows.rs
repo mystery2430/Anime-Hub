@@ -319,9 +319,7 @@ fn open_in_main_window_inner(
                     let _ = app.emit("animehub://navigation-blocked", msg.to_string());
                     false
                 }
-                NavDecision::BlockedHost => {
-                    false
-                }
+                NavDecision::BlockedHost => false,
             }
         })
         // Every new-window request is denied. Legit external links (payment
@@ -880,7 +878,9 @@ pub fn recover_pending_profile_delete_entries(raw: &[u8]) -> (Vec<PendingProfile
         }
         Err(_) => {
             let salvaged = scan_valid_profile_names(raw);
-            log::warn!("bekleyen profil silme listesi bozuk; ham kopyadan güvenli kayıtlar kurtarıldı");
+            log::warn!(
+                "bekleyen profil silme listesi bozuk; ham kopyadan güvenli kayıtlar kurtarıldı"
+            );
             let entries = salvaged
                 .iter()
                 .map(|name| PendingProfileDelete::unknown(name))
@@ -952,8 +952,14 @@ pub fn profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
         _ => {
             log::warn!("profil nesli bozuk; tombstone kuyruğundan geri yükleniyor");
             crate::diagnostics::record_current(
-                "profile", "generation", "fallback", None, None,
-                Some("storage"), None, None,
+                "profile",
+                "generation",
+                "fallback",
+                None,
+                None,
+                Some("storage"),
+                None,
+                None,
             );
             let queued = read_pending_profile_deletes(state)?;
             let recovered = recover_generation_for(site_id, &queued)?;
@@ -961,8 +967,14 @@ pub fn profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
                 .provider
                 .put_secret(&key, recovered.to_string().as_bytes())?;
             crate::diagnostics::record_current(
-                "profile", "generation", "ok", None, None,
-                None, Some(recovered as u64), None,
+                "profile",
+                "generation",
+                "ok",
+                None,
+                None,
+                None,
+                Some(recovered as u64),
+                None,
             );
             Ok(recovered)
         }
@@ -1310,7 +1322,16 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
 ) -> AppResult<String> {
     let _scope = crate::diagnostics::scope_if_missing("open");
     let started = std::time::Instant::now();
-    crate::diagnostics::record_current("open", "profile_check", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "open",
+        "profile_check",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let result = run_mobile_open_protocol_inner(state, site_id, url, init_script, ops);
     crate::diagnostics::record_current(
         "open",
@@ -1340,32 +1361,77 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
     let stored_generation = profile_generation(state, site_id)?;
     let queued = read_pending_profile_deletes(state)?;
     crate::diagnostics::record_current(
-        "open", "resolve", "started", None, None, None, Some(queued.len() as u64), None,
+        "open",
+        "resolve",
+        "started",
+        None,
+        None,
+        None,
+        Some(queued.len() as u64),
+        None,
     );
-    let (generation, advanced) = match resolve_queued_free_generation(site_id, stored_generation, &queued) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            crate::diagnostics::record_current(
-                "open", "resolve", "failed", None, None,
-                Some(diagnostic_error_class(&error)), None, None,
-            );
-            return Err(error);
-        }
-    };
+    let (generation, advanced) =
+        match resolve_queued_free_generation(site_id, stored_generation, &queued) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                crate::diagnostics::record_current(
+                    "open",
+                    "resolve",
+                    "failed",
+                    None,
+                    None,
+                    Some(diagnostic_error_class(&error)),
+                    None,
+                    None,
+                );
+                return Err(error);
+            }
+        };
     crate::diagnostics::record_current(
-        "open", "resolve", if advanced { "fallback" } else { "skipped" },
-        None, None, None, Some(generation as u64), None,
+        "open",
+        "resolve",
+        if advanced { "fallback" } else { "skipped" },
+        None,
+        None,
+        None,
+        Some(generation as u64),
+        None,
     );
     if advanced {
-        crate::diagnostics::record_current("open", "generation", "started", None, None, None, Some(generation as u64), None);
+        crate::diagnostics::record_current(
+            "open",
+            "generation",
+            "started",
+            None,
+            None,
+            None,
+            Some(generation as u64),
+            None,
+        );
         state.provider.put_secret(
             &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
             generation.to_string().as_bytes(),
         )?;
-        crate::diagnostics::record_current("open", "generation", "ok", None, None, None, Some(generation as u64), None);
+        crate::diagnostics::record_current(
+            "open",
+            "generation",
+            "ok",
+            None,
+            None,
+            None,
+            Some(generation as u64),
+            None,
+        );
     }
     crate::diagnostics::record_current(
-        "open", "profile_check", "ok", None, None, None, Some(generation as u64), None,
+        "open",
+        "profile_check",
+        "ok",
+        None,
+        None,
+        None,
+        Some(generation as u64),
+        None,
     );
     let mut profile = android_profile_name(site_id, generation);
 
@@ -1395,7 +1461,11 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
     crate::diagnostics::record_current(
         "migration",
         "migration",
-        if pending_migration { "started" } else { "skipped" },
+        if pending_migration {
+            "started"
+        } else {
+            "skipped"
+        },
         None,
         None,
         None,
@@ -1419,7 +1489,11 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
         crate::diagnostics::record_current(
             "migration",
             "migration",
-            if migrate_result.is_ok() { "ok" } else { "failed" },
+            if migrate_result.is_ok() {
+                "ok"
+            } else {
+                "failed"
+            },
             None,
             None,
             migrate_result.as_ref().err().map(diagnostic_error_class),
@@ -1432,45 +1506,95 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
             {
                 log::warn!("cookie migration incomplete; retiring the partial profile");
                 crate::diagnostics::record_current(
-                    "migration", "tombstone", "started", None, None, None, None, None,
+                    "migration",
+                    "tombstone",
+                    "started",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 );
                 if let Err(error) = queue_site_profile_delete(state, site_id, &profile) {
                     crate::diagnostics::record_current(
-                        "migration", "tombstone", "failed", None, None,
-                        Some("storage"), None, None,
+                        "migration",
+                        "tombstone",
+                        "failed",
+                        None,
+                        None,
+                        Some("storage"),
+                        None,
+                        None,
                     );
                     return Err(error);
                 }
                 crate::diagnostics::record_current(
-                    "migration", "tombstone", "queued", None, None, None, None, None,
+                    "migration",
+                    "tombstone",
+                    "queued",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 );
                 crate::diagnostics::record_current(
-                    "migration", "generation", "started", None, None, None, None, None,
+                    "migration",
+                    "generation",
+                    "started",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 );
-                let (retry_generation, advanced) = match secure_generation_past_name(state, site_id, &profile) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        crate::diagnostics::record_current(
-                            "migration", "generation", "failed", None, None,
-                            Some(diagnostic_error_class(&error)), None, None,
-                        );
-                        return Err(error);
-                    }
-                };
+                let (retry_generation, advanced) =
+                    match secure_generation_past_name(state, site_id, &profile) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            crate::diagnostics::record_current(
+                                "migration",
+                                "generation",
+                                "failed",
+                                None,
+                                None,
+                                Some(diagnostic_error_class(&error)),
+                                None,
+                                None,
+                            );
+                            return Err(error);
+                        }
+                    };
                 crate::diagnostics::record_current(
-                    "migration", "generation", if advanced { "ok" } else { "skipped" },
-                    None, None, None, Some(retry_generation as u64), None,
+                    "migration",
+                    "generation",
+                    if advanced { "ok" } else { "skipped" },
+                    None,
+                    None,
+                    None,
+                    Some(retry_generation as u64),
+                    None,
                 );
                 profile = android_profile_name(site_id, retry_generation);
                 crate::diagnostics::record_current(
-                    "migration", "migration", "fallback", None, None,
-                    Some("migration_partial"), Some(cookie_headers.len() as u64), None,
+                    "migration",
+                    "migration",
+                    "fallback",
+                    None,
+                    None,
+                    Some("migration_partial"),
+                    Some(cookie_headers.len() as u64),
+                    None,
                 );
                 migrate_result = ops.migrate(url, &profile, &cookie_headers);
                 crate::diagnostics::record_current(
                     "migration",
                     "migration",
-                    if migrate_result.is_ok() { "ok" } else { "failed" },
+                    if migrate_result.is_ok() {
+                        "ok"
+                    } else {
+                        "failed"
+                    },
                     None,
                     None,
                     migrate_result.as_ref().err().map(diagnostic_error_class),
@@ -1481,29 +1605,68 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
                     if retry_message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) {
                         // Retire this attempt too and surface a retryable error.
                         crate::diagnostics::record_current(
-                            "migration", "tombstone", "started", None, None, None, None, None,
+                            "migration",
+                            "tombstone",
+                            "started",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
                         );
                         if queue_site_profile_delete(state, site_id, &profile).is_err() {
                             crate::diagnostics::record_current(
-                                "migration", "tombstone", "failed", None, None,
-                                Some("storage"), None, None,
+                                "migration",
+                                "tombstone",
+                                "failed",
+                                None,
+                                None,
+                                Some("storage"),
+                                None,
+                                None,
                             );
                         } else {
                             crate::diagnostics::record_current(
-                                "migration", "tombstone", "queued", None, None, None, None, None,
+                                "migration",
+                                "tombstone",
+                                "queued",
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
                             );
                         }
                         crate::diagnostics::record_current(
-                            "migration", "generation", "started", None, None, None, None, None,
+                            "migration",
+                            "generation",
+                            "started",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
                         );
                         match secure_generation_past_name(state, site_id, &profile) {
                             Ok((generation, advanced)) => crate::diagnostics::record_current(
-                                "migration", "generation", if advanced { "ok" } else { "skipped" },
-                                None, None, None, Some(generation as u64), None,
+                                "migration",
+                                "generation",
+                                if advanced { "ok" } else { "skipped" },
+                                None,
+                                None,
+                                None,
+                                Some(generation as u64),
+                                None,
                             ),
                             Err(error) => crate::diagnostics::record_current(
-                                "migration", "generation", "failed", None, None,
-                                Some(diagnostic_error_class(&error)), None, None,
+                                "migration",
+                                "generation",
+                                "failed",
+                                None,
+                                None,
+                                Some(diagnostic_error_class(&error)),
+                                None,
+                                None,
                             ),
                         }
                         return Err(AppError::Other(
@@ -1523,19 +1686,37 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
         // orphan view and no ownership to unwind; the jar and the (missing)
         // flag stay exactly as they were and the next open re-imports.
         crate::diagnostics::record_current(
-            "migration", "flag_write", "started", None, None, None, None, None,
+            "migration",
+            "flag_write",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         mark_migration_done(state, site_id).map_err(|_| {
             crate::diagnostics::record_current(
-                "migration", "flag_write", "failed", None, None,
-                Some("storage"), None, None,
+                "migration",
+                "flag_write",
+                "failed",
+                None,
+                None,
+                Some("storage"),
+                None,
+                None,
             );
-            AppError::Other(
-                "site migration state could not be stored; site was not opened".into(),
-            )
+            AppError::Other("site migration state could not be stored; site was not opened".into())
         })?;
         crate::diagnostics::record_current(
-            "migration", "flag_write", "ok", None, None, None, None, None,
+            "migration",
+            "flag_write",
+            "ok",
+            None,
+            None,
+            None,
+            None,
+            None,
         );
     }
 
@@ -1603,26 +1784,74 @@ fn run_mobile_clear_protocol_inner<C>(
 where
     C: FnOnce(&str) -> AppResult<()>,
 {
-    crate::diagnostics::record_current("clear", "profile_check", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "clear",
+        "profile_check",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let generation = profile_generation(state, site_id)?;
     let profile = android_profile_name(site_id, generation);
-    crate::diagnostics::record_current("clear", "profile_check", "ok", None, None, None, Some(generation as u64), None);
+    crate::diagnostics::record_current(
+        "clear",
+        "profile_check",
+        "ok",
+        None,
+        None,
+        None,
+        Some(generation as u64),
+        None,
+    );
 
-    crate::diagnostics::record_current("clear", "cookie_wipe", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "clear",
+        "cookie_wipe",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     if let Err(error) = clear_profile(&profile) {
         crate::diagnostics::record_current(
-            "clear", "cookie_wipe", "failed", None, None,
-            Some(diagnostic_error_class(&error)), None, None,
+            "clear",
+            "cookie_wipe",
+            "failed",
+            None,
+            None,
+            Some(diagnostic_error_class(&error)),
+            None,
+            None,
         );
         return Err(error);
     }
     crate::diagnostics::record_current("clear", "cookie_wipe", "ok", None, None, None, None, None);
 
-    crate::diagnostics::record_current("clear", "cookie_write", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "clear",
+        "cookie_write",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     if let Err(error) = state.provider.delete_site_session(site_id) {
         crate::diagnostics::record_current(
-            "clear", "cookie_write", "failed", None, None,
-            Some(diagnostic_error_class(&error)), None, None,
+            "clear",
+            "cookie_write",
+            "failed",
+            None,
+            None,
+            Some(diagnostic_error_class(&error)),
+            None,
+            None,
         );
         return Err(error);
     }
@@ -1717,10 +1946,28 @@ where
 {
     use crate::android_bridge::SiteProfileAction;
 
-    crate::diagnostics::record_current("delete", "profile_check", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "profile_check",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let generation = profile_generation(state, site_id)?;
     let profile = android_profile_name(site_id, generation);
-    crate::diagnostics::record_current("delete", "profile_check", "ok", None, None, None, Some(generation as u64), None);
+    crate::diagnostics::record_current(
+        "delete",
+        "profile_check",
+        "ok",
+        None,
+        None,
+        None,
+        Some(generation as u64),
+        None,
+    );
 
     // 1. DURABLE INTENT, before the provider is touched, WITH THE OWNER: a
     //    name cannot be reversed into the site id that derives it, so a
@@ -1728,22 +1975,64 @@ where
     //    start. If this write fails nothing has happened yet: no deletion was
     //    requested, the name is still derivable and still clean, and the
     //    caller gets a retryable error.
-    crate::diagnostics::record_current("delete", "tombstone", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "tombstone",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     if let Err(error) = queue_site_profile_delete(state, site_id, &profile) {
-        crate::diagnostics::record_current("delete", "tombstone", "failed", None, None, Some("storage"), None, None);
+        crate::diagnostics::record_current(
+            "delete",
+            "tombstone",
+            "failed",
+            None,
+            None,
+            Some("storage"),
+            None,
+            None,
+        );
         return Err(error);
     }
-    crate::diagnostics::record_current("delete", "tombstone", "queued", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "tombstone",
+        "queued",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 
     // 2. The provider call. Its outcome no longer decides whether the name is
     //    remembered — only when the tombstone may be lifted.
-    crate::diagnostics::record_current("delete", "provider_delete", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "provider_delete",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let action = match delete_profile(&profile) {
         Ok(action) => action,
         Err(error) => {
             crate::diagnostics::record_current(
-                "delete", "provider_delete", "failed", None, None,
-                Some(diagnostic_error_class(&error)), None, None,
+                "delete",
+                "provider_delete",
+                "failed",
+                None,
+                None,
+                Some(diagnostic_error_class(&error)),
+                None,
+                None,
             );
             // Keep the tombstone: startup drain finishes deletion; the profile
             // name cannot be handed to an open in the meantime.
@@ -1756,22 +2045,58 @@ where
         SiteProfileAction::Absent => "absent",
         SiteProfileAction::Pending => "deferred",
     };
-    crate::diagnostics::record_current("delete", "provider_delete", provider_result, None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "provider_delete",
+        provider_result,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 
     // 3. Durable: after this write no future open can derive `profile` again
     //    (and the queue already guaranteed it before this line). Monotone and
     //    idempotent — it moves the counter past THIS name, so a repeated run
     //    never burns a second generation, and a failed write propagates with
     //    the tombstone still in place.
-    crate::diagnostics::record_current("delete", "generation", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "generation",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let next_generation = match secure_generation_past_name(state, site_id, &profile) {
         Ok((next_generation, _)) => next_generation,
         Err(error) => {
-            crate::diagnostics::record_current("delete", "generation", "failed", None, None, Some("storage"), None, None);
+            crate::diagnostics::record_current(
+                "delete",
+                "generation",
+                "failed",
+                None,
+                None,
+                Some("storage"),
+                None,
+                None,
+            );
             return Err(error);
         }
     };
-    crate::diagnostics::record_current("delete", "generation", "ok", None, None, None, Some(next_generation as u64), None);
+    crate::diagnostics::record_current(
+        "delete",
+        "generation",
+        "ok",
+        None,
+        None,
+        None,
+        Some(next_generation as u64),
+        None,
+    );
 
     if matches!(action, SiteProfileAction::Pending) {
         // Deferred: the profile still exists and is still loaded in this
@@ -1783,26 +2108,75 @@ where
     //    then drop the ledger. A failure here is reported, not swallowed:
     //    keeping both is the conservative direction (the name is already
     //    unreachable), and the retry re-runs the protocol cleanly.
-    crate::diagnostics::record_current("delete", "queue_remove", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "queue_remove",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     if let Err(error) = forget_pending_profile_delete(state, &profile) {
-        crate::diagnostics::record_current("delete", "queue_remove", "failed", None, None, Some("storage"), None, None);
+        crate::diagnostics::record_current(
+            "delete",
+            "queue_remove",
+            "failed",
+            None,
+            None,
+            Some("storage"),
+            None,
+            None,
+        );
         return Err(error);
     }
-    crate::diagnostics::record_current("delete", "queue_remove", "ok", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "queue_remove",
+        "ok",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 
-    crate::diagnostics::record_current("delete", "quarantine_retire", "started", None, None, None, None, None);
+    crate::diagnostics::record_current(
+        "delete",
+        "quarantine_retire",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let dropped = match retire_profile(&profile) {
         Ok(dropped) => dropped,
         Err(error) => {
             crate::diagnostics::record_current(
-                "delete", "quarantine_retire", "failed", None, None,
-                Some(diagnostic_error_class(&error)), None, None,
+                "delete",
+                "quarantine_retire",
+                "failed",
+                None,
+                None,
+                Some(diagnostic_error_class(&error)),
+                None,
+                None,
             );
             return Err(error);
         }
     };
     crate::diagnostics::record_current(
-        "delete", "quarantine_retire", "retired", None, None, None, Some(dropped as u64), None,
+        "delete",
+        "quarantine_retire",
+        "retired",
+        None,
+        None,
+        None,
+        Some(dropped as u64),
+        None,
     );
     if dropped > 0 {
         log::info!("quarantine ledger retired after profile delete");
@@ -1849,8 +2223,14 @@ fn secure_tombstone_generation(
     match secure_generation_past_name(state, site_id, &entry.name) {
         Ok((generation, advanced)) => {
             crate::diagnostics::record_current(
-                "delete", "generation", if advanced { "ok" } else { "skipped" },
-                None, None, None, Some(generation as u64), None,
+                "delete",
+                "generation",
+                if advanced { "ok" } else { "skipped" },
+                None,
+                None,
+                None,
+                Some(generation as u64),
+                None,
             );
             if advanced {
                 log::info!("deferred profile generation advanced");
@@ -1859,8 +2239,14 @@ fn secure_tombstone_generation(
         }
         Err(error) => {
             crate::diagnostics::record_current(
-                "delete", "generation", "failed", None, None,
-                Some(diagnostic_error_class(&error)), None, None,
+                "delete",
+                "generation",
+                "failed",
+                None,
+                None,
+                Some(diagnostic_error_class(&error)),
+                None,
+                None,
             );
             log::warn!("deferred profile generation could not be secured; tombstone retained");
             report.kept_unmatched.push(entry.name.clone());
@@ -1888,7 +2274,14 @@ fn secure_tombstone_generation(
 fn hold_as_block(state: &AppState, entry: &PendingProfileDelete, report: &mut DrainReport) -> bool {
     if entry.is_blocked() {
         crate::diagnostics::record_current(
-            "queue", "tombstone", "blocked", None, None, None, None, None,
+            "queue",
+            "tombstone",
+            "blocked",
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         report.blocked += 1;
         return false;
@@ -1896,15 +2289,28 @@ fn hold_as_block(state: &AppState, entry: &PendingProfileDelete, report: &mut Dr
     match block_pending_profile_delete(state, &entry.name) {
         Ok(()) => {
             crate::diagnostics::record_current(
-                "queue", "tombstone", "blocked", None, None, None, None, None,
+                "queue",
+                "tombstone",
+                "blocked",
+                None,
+                None,
+                None,
+                None,
+                None,
             );
             log::info!("orphan tombstone became a permanent name block");
             report.blocked += 1;
         }
         Err(_) => {
             crate::diagnostics::record_current(
-                "queue", "tombstone", "owed", None, None,
-                Some("storage"), None, None,
+                "queue",
+                "tombstone",
+                "owed",
+                None,
+                None,
+                Some("storage"),
+                None,
+                None,
             );
             log::warn!("orphan tombstone block could not be stored; deletion remains owed");
             report.kept_unmatched.push(entry.name.clone());
@@ -1954,29 +2360,67 @@ where
     let _scope = crate::diagnostics::scope_if_missing("startup");
     let started = std::time::Instant::now();
     crate::diagnostics::record_current(
-        "startup", "drain", "started", None, None, None, Some(entries.len() as u64), None,
+        "startup",
+        "drain",
+        "started",
+        None,
+        None,
+        None,
+        Some(entries.len() as u64),
+        None,
     );
-    let result = run_pending_delete_drain_inner(state, entries, delete_profile, retire_profile, match_owner);
+    let result =
+        run_pending_delete_drain_inner(state, entries, delete_profile, retire_profile, match_owner);
     if let Ok(report) = &result {
         crate::diagnostics::record_current(
-            "queue", "resolve", "lifted", None, None, None,
-            Some(report.lifted as u64), None,
+            "queue",
+            "resolve",
+            "lifted",
+            None,
+            None,
+            None,
+            Some(report.lifted as u64),
+            None,
         );
         crate::diagnostics::record_current(
-            "queue", "resolve", "owed", None, None, None,
-            Some(report.deferred as u64), None,
+            "queue",
+            "resolve",
+            "owed",
+            None,
+            None,
+            None,
+            Some(report.deferred as u64),
+            None,
         );
         crate::diagnostics::record_current(
-            "queue", "resolve", "blocked", None, None, None,
-            Some(report.blocked as u64), None,
+            "queue",
+            "resolve",
+            "blocked",
+            None,
+            None,
+            None,
+            Some(report.blocked as u64),
+            None,
         );
         crate::diagnostics::record_current(
-            "queue", "resolve", "unsupported", None, None, Some("unsupported"),
-            Some(report.unsupported as u64), None,
+            "queue",
+            "resolve",
+            "unsupported",
+            None,
+            None,
+            Some("unsupported"),
+            Some(report.unsupported as u64),
+            None,
         );
         crate::diagnostics::record_current(
-            "queue", "resolve", "unknown", None, None, None,
-            Some(report.kept_unmatched.len() as u64), None,
+            "queue",
+            "resolve",
+            "unknown",
+            None,
+            None,
+            None,
+            Some(report.kept_unmatched.len() as u64),
+            None,
         );
     }
     crate::diagnostics::record_current(
@@ -1991,7 +2435,9 @@ where
         None,
         result.as_ref().err().map(diagnostic_error_class),
         result.as_ref().ok().map(|report| {
-            report.lifted.saturating_add(report.deferred)
+            report
+                .lifted
+                .saturating_add(report.deferred)
                 .saturating_add(report.unsupported)
                 .saturating_add(report.blocked)
                 .saturating_add(report.kept_unmatched.len()) as u64
@@ -2019,7 +2465,14 @@ where
     for (index, entry) in entries.iter().enumerate() {
         let step_id = Some(index as u64);
         crate::diagnostics::record_current(
-            "delete", "profile_delete", "started", None, None, None, None, step_id,
+            "delete",
+            "profile_delete",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         // A permanent block is not a deletion still owed: the provider already
         // confirmed it, so it is not asked again (no provider call and no
@@ -2029,12 +2482,26 @@ where
         // it after that.
         let action = if entry.is_blocked() {
             crate::diagnostics::record_current(
-                "delete", "provider_delete", "blocked", None, None, None, None, step_id,
+                "delete",
+                "provider_delete",
+                "blocked",
+                None,
+                None,
+                None,
+                None,
+                step_id,
             );
             SiteProfileAction::Absent
         } else {
             crate::diagnostics::record_current(
-                "delete", "provider_delete", "started", None, None, None, None, step_id,
+                "delete",
+                "provider_delete",
+                "started",
+                None,
+                None,
+                None,
+                None,
+                step_id,
             );
             match delete_profile(&entry.name) {
                 Ok(action) => {
@@ -2044,31 +2511,58 @@ where
                         SiteProfileAction::Pending => "deferred",
                     };
                     crate::diagnostics::record_current(
-                        "delete", "provider_delete", result, None, None, None, None, step_id,
+                        "delete",
+                        "provider_delete",
+                        result,
+                        None,
+                        None,
+                        None,
+                        None,
+                        step_id,
                     );
                     action
                 }
                 Err(AppError::Unsupported(_)) => {
                     crate::diagnostics::record_current(
-                        "delete", "provider_delete", "unsupported", None, None,
-                        Some("unsupported"), None, step_id,
+                        "delete",
+                        "provider_delete",
+                        "unsupported",
+                        None,
+                        None,
+                        Some("unsupported"),
+                        None,
+                        step_id,
                     );
                     // No profile API on this device: nothing deletes here until
                     // there is one. Keep it queued so a later provider update can
                     // drain it, and keep going — a feature gap must not abort the
                     // remaining names or be reported as a success.
-                    log::warn!("deferred profile delete skipped: provider unsupported; tombstone retained");
+                    log::warn!(
+                        "deferred profile delete skipped: provider unsupported; tombstone retained"
+                    );
                     crate::diagnostics::record_current(
-                        "delete", "profile_delete", "unsupported", None, None,
-                        Some("unsupported"), None, step_id,
+                        "delete",
+                        "profile_delete",
+                        "unsupported",
+                        None,
+                        None,
+                        Some("unsupported"),
+                        None,
+                        step_id,
                     );
                     report.unsupported += 1;
                     continue;
                 }
                 Err(error) => {
                     crate::diagnostics::record_current(
-                        "delete", "provider_delete", "failed", None, None,
-                        Some(diagnostic_error_class(&error)), None, step_id,
+                        "delete",
+                        "provider_delete",
+                        "failed",
+                        None,
+                        None,
+                        Some(diagnostic_error_class(&error)),
+                        None,
+                        step_id,
                     );
                     log::warn!("deferred profile delete did not complete; tombstone retained");
                     report.bridge_not_ready = true;
@@ -2081,7 +2575,14 @@ where
             // start. Never reported to the user as deleted.
             log::warn!("deferred profile delete remains owed");
             crate::diagnostics::record_current(
-                "delete", "profile_delete", "deferred", None, None, None, None, step_id,
+                "delete",
+                "profile_delete",
+                "deferred",
+                None,
+                None,
+                None,
+                None,
+                step_id,
             );
             report.deferred += 1;
             continue;
@@ -2091,7 +2592,14 @@ where
         // unreachable durably, BEFORE the record of the deletion is dropped.
         let matched = match_owner(&entry.name);
         crate::diagnostics::record_current(
-            "delete", "generation", "started", None, None, None, None, step_id,
+            "delete",
+            "generation",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         let secured = match &entry.owner {
             PendingOwner::Site(site_id) => match &matched {
@@ -2121,12 +2629,25 @@ where
             },
         };
         crate::diagnostics::record_current(
-            "delete", "generation", if secured { "ok" } else { "blocked" },
-            None, None, None, None, step_id,
+            "delete",
+            "generation",
+            if secured { "ok" } else { "blocked" },
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         if !secured {
             crate::diagnostics::record_current(
-                "delete", "profile_delete", "blocked", None, None, None, None, step_id,
+                "delete",
+                "profile_delete",
+                "blocked",
+                None,
+                None,
+                None,
+                None,
+                step_id,
             );
             continue;
         }
@@ -2137,40 +2658,86 @@ where
         // the name is unreachable, so it is logged: keeping the ledger only
         // blocks a name nothing can derive any more.
         crate::diagnostics::record_current(
-            "delete", "queue_remove", "started", None, None, None, None, step_id,
+            "delete",
+            "queue_remove",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         if let Err(error) = forget_pending_profile_delete(state, &entry.name) {
             crate::diagnostics::record_current(
-                "delete", "queue_remove", "failed", None, None,
-                Some(diagnostic_error_class(&error)), None, step_id,
+                "delete",
+                "queue_remove",
+                "failed",
+                None,
+                None,
+                Some(diagnostic_error_class(&error)),
+                None,
+                step_id,
             );
             return Err(error);
         }
         crate::diagnostics::record_current(
-            "delete", "queue_remove", "ok", None, None, None, None, step_id,
+            "delete",
+            "queue_remove",
+            "ok",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         report.lifted += 1;
 
         crate::diagnostics::record_current(
-            "delete", "quarantine_retire", "started", None, None, None, None, step_id,
+            "delete",
+            "quarantine_retire",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         match retire_profile(&entry.name) {
             Ok(dropped) => {
                 crate::diagnostics::record_current(
-                    "delete", "quarantine_retire", "retired", None, None,
-                    None, Some(dropped as u64), step_id,
+                    "delete",
+                    "quarantine_retire",
+                    "retired",
+                    None,
+                    None,
+                    None,
+                    Some(dropped as u64),
+                    step_id,
                 );
             }
             Err(error) => {
                 crate::diagnostics::record_current(
-                    "delete", "quarantine_retire", "failed", None, None,
-                    Some(diagnostic_error_class(&error)), None, step_id,
+                    "delete",
+                    "quarantine_retire",
+                    "failed",
+                    None,
+                    None,
+                    Some(diagnostic_error_class(&error)),
+                    None,
+                    step_id,
                 );
                 log::warn!("deferred profile quarantine cleanup did not complete");
             }
         }
         crate::diagnostics::record_current(
-            "delete", "profile_delete", "deleted", None, None, None, None, step_id,
+            "delete",
+            "profile_delete",
+            "deleted",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
     }
 
@@ -2243,7 +2810,14 @@ where
     let _scope = crate::diagnostics::scope_if_missing("clear");
     let started = std::time::Instant::now();
     crate::diagnostics::record_current(
-        "clear", "orphan_sweep", "started", None, None, None, Some(names.len() as u64), None,
+        "clear",
+        "orphan_sweep",
+        "started",
+        None,
+        None,
+        None,
+        Some(names.len() as u64),
+        None,
     );
     let result = run_orphan_profile_sweep_inner(state, names, delete_profile, retire_profile);
     crate::diagnostics::record_current(
@@ -2254,7 +2828,9 @@ where
         None,
         result.as_ref().err().map(diagnostic_error_class),
         result.as_ref().ok().map(|report| {
-            report.queued.saturating_add(report.blocked)
+            report
+                .queued
+                .saturating_add(report.blocked)
                 .saturating_add(report.deferred)
                 .saturating_add(report.unsupported) as u64
         }),
@@ -2295,12 +2871,26 @@ where
         let name = owned_name.as_str();
         let step_id = Some(index as u64);
         crate::diagnostics::record_current(
-            "clear", "profile_delete", "started", None, None, None, None, step_id,
+            "clear",
+            "profile_delete",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         if blocked_names.contains(name) {
             log::debug!("orphan profile already blocked; repeated delete skipped");
             crate::diagnostics::record_current(
-                "clear", "profile_delete", "blocked", None, None, None, None, step_id,
+                "clear",
+                "profile_delete",
+                "blocked",
+                None,
+                None,
+                None,
+                None,
+                step_id,
             );
             continue;
         }
@@ -2308,22 +2898,50 @@ where
         // (1) Tombstone first. A failed write means the provider is never
         // asked: better an undeleted profile than an unrecorded deletion.
         crate::diagnostics::record_current(
-            "clear", "tombstone", "started", None, None, None, None, step_id,
+            "clear",
+            "tombstone",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         if let Err(error) = queue_orphan_profile_delete(state, name) {
             crate::diagnostics::record_current(
-                "clear", "tombstone", "failed", None, None, Some("storage"), None, step_id,
+                "clear",
+                "tombstone",
+                "failed",
+                None,
+                None,
+                Some("storage"),
+                None,
+                step_id,
             );
             return Err(error);
         }
         crate::diagnostics::record_current(
-            "clear", "tombstone", "queued", None, None, None, None, step_id,
+            "clear",
+            "tombstone",
+            "queued",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         report.queued += 1;
 
         // (2) Provider delete — only after the durable tombstone.
         crate::diagnostics::record_current(
-            "clear", "provider_delete", "started", None, None, None, None, step_id,
+            "clear",
+            "provider_delete",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         let action = match delete_profile(name) {
             Ok(action) => {
@@ -2333,27 +2951,52 @@ where
                     SiteProfileAction::Pending => "deferred",
                 };
                 crate::diagnostics::record_current(
-                    "clear", "provider_delete", result, None, None, None, None, step_id,
+                    "clear",
+                    "provider_delete",
+                    result,
+                    None,
+                    None,
+                    None,
+                    None,
+                    step_id,
                 );
                 action
             }
             Err(AppError::Unsupported(_)) => {
                 crate::diagnostics::record_current(
-                    "clear", "provider_delete", "unsupported", None, None,
-                    Some("unsupported"), None, step_id,
+                    "clear",
+                    "provider_delete",
+                    "unsupported",
+                    None,
+                    None,
+                    Some("unsupported"),
+                    None,
+                    step_id,
                 );
                 log::warn!("orphan profile delete unsupported; durable tombstone retained");
                 crate::diagnostics::record_current(
-                    "clear", "profile_delete", "unsupported", None, None,
-                    Some("unsupported"), None, step_id,
+                    "clear",
+                    "profile_delete",
+                    "unsupported",
+                    None,
+                    None,
+                    Some("unsupported"),
+                    None,
+                    step_id,
                 );
                 report.unsupported += 1;
                 continue;
             }
             Err(error) => {
                 crate::diagnostics::record_current(
-                    "clear", "provider_delete", "failed", None, None,
-                    Some(diagnostic_error_class(&error)), None, step_id,
+                    "clear",
+                    "provider_delete",
+                    "failed",
+                    None,
+                    None,
+                    Some(diagnostic_error_class(&error)),
+                    None,
+                    step_id,
                 );
                 log::warn!("orphan profile delete did not complete; tombstone retained");
                 return Err(error);
@@ -2364,7 +3007,14 @@ where
             // and the startup drain finishes the deletion.
             log::info!("orphan profile delete deferred; durable tombstone retained");
             crate::diagnostics::record_current(
-                "clear", "profile_delete", "deferred", None, None, None, None, step_id,
+                "clear",
+                "profile_delete",
+                "deferred",
+                None,
+                None,
+                None,
+                None,
+                step_id,
             );
             report.deferred += 1;
             continue;
@@ -2373,44 +3023,90 @@ where
         // (3) Confirmed (`Deleted` or `Absent`): make the name permanently
         // unreachable BEFORE the ledger goes.
         crate::diagnostics::record_current(
-            "clear", "tombstone", "started", None, None, None, None, step_id,
+            "clear",
+            "tombstone",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         if let Err(error) = block_pending_profile_delete(state, name) {
             crate::diagnostics::record_current(
-                "clear", "tombstone", "failed", None, None,
-                Some(diagnostic_error_class(&error)), None, step_id,
+                "clear",
+                "tombstone",
+                "failed",
+                None,
+                None,
+                Some(diagnostic_error_class(&error)),
+                None,
+                step_id,
             );
             return Err(error);
         }
         crate::diagnostics::record_current(
-            "clear", "tombstone", "blocked", None, None, None, None, step_id,
+            "clear",
+            "tombstone",
+            "blocked",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         blocked_names.insert(owned_name.clone());
         report.blocked += 1;
 
         // (4) Quarantine ledger last.
         crate::diagnostics::record_current(
-            "clear", "quarantine_retire", "started", None, None, None, None, step_id,
+            "clear",
+            "quarantine_retire",
+            "started",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
         match retire_profile(name) {
             Ok(dropped) => {
                 crate::diagnostics::record_current(
-                    "clear", "quarantine_retire", "retired", None, None,
-                    None, Some(dropped as u64), step_id,
+                    "clear",
+                    "quarantine_retire",
+                    "retired",
+                    None,
+                    None,
+                    None,
+                    Some(dropped as u64),
+                    step_id,
                 );
                 report.retired += 1;
             }
             Err(error) => {
                 crate::diagnostics::record_current(
-                    "clear", "quarantine_retire", "failed", None, None,
-                    Some(diagnostic_error_class(&error)), None, step_id,
+                    "clear",
+                    "quarantine_retire",
+                    "failed",
+                    None,
+                    None,
+                    Some(diagnostic_error_class(&error)),
+                    None,
+                    step_id,
                 );
                 report.retire_failed += 1;
                 log::warn!("orphan profile quarantine retirement did not complete");
             }
         }
         crate::diagnostics::record_current(
-            "clear", "profile_delete", "deleted", None, None, None, None, step_id,
+            "clear",
+            "profile_delete",
+            "deleted",
+            None,
+            None,
+            None,
+            None,
+            step_id,
         );
     }
 

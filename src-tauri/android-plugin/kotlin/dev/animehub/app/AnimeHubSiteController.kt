@@ -86,6 +86,7 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import org.json.JSONObject
 import org.json.JSONTokener
 
 /**

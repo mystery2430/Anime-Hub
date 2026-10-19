@@ -383,7 +383,13 @@ pub fn site_open(
 pub fn site_close(operation_id: String, flush: bool) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SITE_CLOSE, SiteClosePayload { operation_id, flush })
+        call_plugin(
+            CMD_SITE_CLOSE,
+            SiteClosePayload {
+                operation_id,
+                flush,
+            },
+        )
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -402,7 +408,10 @@ pub fn site_profile_delete(
     {
         call_plugin(
             CMD_SITE_PROFILE_DELETE,
-            SiteProfilePayload { operation_id, profile },
+            SiteProfilePayload {
+                operation_id,
+                profile,
+            },
         )
     }
     #[cfg(not(target_os = "android"))]
@@ -431,7 +440,10 @@ pub fn site_profile_retire(
     {
         call_plugin(
             CMD_SITE_PROFILE_RETIRE,
-            SiteProfilePayload { operation_id, profile },
+            SiteProfilePayload {
+                operation_id,
+                profile,
+            },
         )
     }
     #[cfg(not(target_os = "android"))]
@@ -447,7 +459,10 @@ pub fn site_clear_data(operation_id: String, profile: String) -> Result<OkResult
     {
         call_plugin(
             CMD_SITE_CLEAR_DATA,
-            SiteProfilePayload { operation_id, profile },
+            SiteProfilePayload {
+                operation_id,
+                profile,
+            },
         )
     }
     #[cfg(not(target_os = "android"))]
@@ -489,11 +504,7 @@ pub fn site_profile_names(operation_id: String) -> Result<SiteProfileNamesResult
 /// calls the site's `window.__animehubPreparePip()` and waits for its answer),
 /// so the PiP window shows the active player instead of the whole site. The
 /// ratio here is only used when the page could not report the player's own.
-pub fn enter_pip(
-    operation_id: String,
-    aspect_num: u32,
-    aspect_den: u32,
-) -> Result<bool> {
+pub fn enter_pip(operation_id: String, aspect_num: u32, aspect_den: u32) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
         call_plugin::<_, OkResult>(
@@ -561,11 +572,8 @@ pub fn debug_log_reset() -> Result<()> {
 pub fn set_debug_logging(enabled: bool) -> Result<()> {
     #[cfg(target_os = "android")]
     {
-        call_plugin::<_, OkResult>(
-            CMD_SET_DEBUG_LOGGING,
-            DebugLoggingPayload { enabled },
-        )
-        .map(|_| ())
+        call_plugin::<_, OkResult>(CMD_SET_DEBUG_LOGGING, DebugLoggingPayload { enabled })
+            .map(|_| ())
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -584,7 +592,10 @@ pub fn set_pip_auto_enter(operation_id: String, enabled: bool) -> Result<bool> {
     {
         call_plugin::<_, OkResult>(
             CMD_SET_PIP_AUTO_ENTER,
-            AutoEnterPayload { operation_id, enabled },
+            AutoEnterPayload {
+                operation_id,
+                enabled,
+            },
         )
         .map(|r| r.ok)
     }
@@ -771,7 +782,10 @@ mod tests {
                 Err(Error::Unsupported)
             ));
             assert!(matches!(site_flush("r-1".into()), Err(Error::Unsupported)));
-            assert!(matches!(site_profile_names("r-1".into()), Err(Error::Unsupported)));
+            assert!(matches!(
+                site_profile_names("r-1".into()),
+                Err(Error::Unsupported)
+            ));
         }
     }
 
