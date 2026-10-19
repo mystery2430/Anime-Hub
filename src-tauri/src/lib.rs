@@ -187,7 +187,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    if let Some(w) = &warning {
+    if warning.is_some() {
         log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü");
     }
     // The user-facing notice is fixed text; parser details stay out of logs.
@@ -348,7 +348,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // at startup from the `plugins.deep-link` config; on Android the
     // intent-filter in AndroidManifest.xml handles it instead.
     #[cfg(desktop)]
-    if let Err(e) = app.deep_link().register_all() {
+    if app.deep_link().register_all().is_err() {
         log::warn!("deep-link şeması kaydedilemedi");
     }
 
@@ -365,7 +365,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             commands::ThemePref::Dark => Some(tauri::Theme::Dark),
             commands::ThemePref::Light => Some(tauri::Theme::Light),
         };
-        if let Err(e) = w.set_theme(target) {
+        if w.set_theme(target).is_err() {
             log::warn!("kayıtlı tema uygulanamadı");
         }
     }

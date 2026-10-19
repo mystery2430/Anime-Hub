@@ -497,8 +497,13 @@ class SiteProfileOpsTest {
     }
 
     Assert.assertNull("the cookie call is still pending", result)
-    Assert.assertEquals(1, ProfileQuarantine.pendingOperations(profile).size)
+    Assert.assertTrue("no quarantine before timeout", ProfileQuarantine.pendingOperations(profile).isEmpty())
     port.timeouts[0].invoke()
+    Assert.assertEquals(
+      "the timeout owns one outstanding deletion",
+      1,
+      ProfileQuarantine.pendingOperations(profile).size,
+    )
     Assert.assertEquals(1, results)
     Assert.assertNotNull("timeout is not reported as a successful clear", result)
     Assert.assertTrue("the profile remains blocked", ProfileQuarantine.isBlocked(profile))
@@ -1343,7 +1348,8 @@ class SiteProfileOpsTest {
   fun `no site profile means nothing to flush, but the view is still torn down`() {
     val port = FakeShutdownPort(submissions = 0)
     Assert.assertEquals(ShutdownFlush.NotNeeded, ShutdownFlow.run(port, 50))
-    Assert.assertEquals(listOf("submit", "teardown"), port.log)
+    // The safe failure-class check distinguishes no profile from a failed profile lookup.
+    Assert.assertEquals(listOf("submit", "teardown", "failure?"), port.log)
     Assert.assertNull("it never waits for work it never submitted", port.awaitedBudget)
   }
 
@@ -2175,7 +2181,8 @@ class SiteProfileOpsTest {
     SiteMigrationFlow.run(listOf("a=1"), port) { outcome = it }
     val failed = outcome as? MigrationOutcome.Failed
     Assert.assertNotNull("flush failure must not be success, got $outcome", failed)
-    Assert.assertTrue(failed!!.reason.contains("kalıcı"))
+    Assert.assertEquals("provider", failed!!.reason)
+    Assert.assertEquals("provider", failed!!.errorClass)
   }
 
   @Test

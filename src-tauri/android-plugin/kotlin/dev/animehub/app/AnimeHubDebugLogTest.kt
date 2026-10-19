@@ -97,6 +97,7 @@ class AnimeHubDebugLogTest {
       operationId = "site-secret-profile-name",
       watchdog = privateText,
       errorClass = privateText,
+      durationMs = -1,
       count = -1,
       stepId = -1,
     )
@@ -113,6 +114,7 @@ class AnimeHubDebugLogTest {
     Assert.assertNull(event.operationId)
     Assert.assertEquals("unknown", event.watchdog)
     Assert.assertEquals("unknown", event.errorClass)
+    Assert.assertNull(event.durationMs)
     Assert.assertNull(event.count)
     Assert.assertNull(event.stepId)
   }

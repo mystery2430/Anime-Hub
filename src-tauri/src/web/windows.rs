@@ -235,7 +235,7 @@ fn open_in_main_window_inner(
 
     // Already showing this exact site: nothing to stack, just focus.
     if app.get_webview(&label).is_some() {
-        window.set_focus().map_err(|e| {
+        window.set_focus().map_err(|_| {
             log::error!("pencere öne alınamadı");
             AppError::Other("pencere öne alınamadı".into())
         })?;
@@ -250,7 +250,7 @@ fn open_in_main_window_inner(
     // Per-site profile directory: WebKitGTK's data directory on Linux, and on
     // Windows the WebView2 user-data folder. This is what makes cookies,
     // localStorage, IndexedDB and cache independent per site.
-    let base = app.path().app_data_dir().map_err(|e| {
+    let base = app.path().app_data_dir().map_err(|_| {
         log::error!("uygulama veri dizini alınamadı");
         AppError::Storage("uygulama veri dizini alınamadı".into())
     })?;
@@ -263,7 +263,7 @@ fn open_in_main_window_inner(
     // for its own lifetime, so the closure cannot also move out of it.
     let nav_app = app.clone();
 
-    let size = window.inner_size().map_err(|e| {
+    let size = window.inner_size().map_err(|_| {
         log::error!("pencere boyutu okunamadı");
         AppError::Other("pencere boyutu okunamadı".into())
     })?;
@@ -285,7 +285,7 @@ fn open_in_main_window_inner(
                     let app = nav_app.clone();
                     let label = nav_label.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) = close_site_window(&app, &label) {
+                        if close_site_window(&app, &label).is_err() {
                             log::error!("site oturumu kapatılamadı");
                         }
                     });
@@ -349,7 +349,7 @@ fn open_in_main_window_inner(
             Position::Logical(LogicalPosition::new(0.0, 0.0)),
             Size::Physical(size),
         )
-        .map_err(|e| {
+        .map_err(|_| {
             log::error!("WebView pencereye eklenemedi");
             AppError::Other("WebView pencereye eklenemedi".into())
         })?;
@@ -360,11 +360,11 @@ fn open_in_main_window_inner(
     let already_fs = window.is_fullscreen().unwrap_or(false);
     let entered_fullscreen = fullscreen && !already_fs;
     if entered_fullscreen {
-        if let Err(e) = window.set_fullscreen(true) {
+        if window.set_fullscreen(true).is_err() {
             log::warn!("tam ekrana geçilemedi");
         }
     }
-    if let Err(e) = window.set_title(&site.name) {
+    if window.set_title(&site.name).is_err() {
         log::warn!("pencere başlığı ayarlanamadı");
     }
 
@@ -439,10 +439,13 @@ pub fn install_main_window_handlers(app: &AppHandle) {
         };
         if let Some(label) = label {
             if let Some(child) = app.get_webview(&label) {
-                if let Err(e) = child.set_bounds(tauri::Rect {
-                    position: Position::Physical(PhysicalPosition::new(0, 0)),
-                    size: Size::Physical(*size),
-                }) {
+                if child
+                    .set_bounds(tauri::Rect {
+                        position: Position::Physical(PhysicalPosition::new(0, 0)),
+                        size: Size::Physical(*size),
+                    })
+                    .is_err()
+                {
                     log::warn!("site görünümü yeniden boyutlandırılamadı");
                 }
             }
@@ -494,7 +497,7 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
             // sees it as gone and exits without resurrecting the jar.
             let _guard = match lock_desktop_session() {
                 Ok(g) => g,
-                Err(e) => {
+                Err(_) => {
                     log::error!("masaüstü oturum eşitlemesi kilitlenemedi");
                     return;
                 }
@@ -508,7 +511,7 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
             let Some(child) = app.get_webview(&label) else {
                 return;
             };
-            if let Err(e) = export_cookies_webview(&child, &site_id) {
+            if export_cookies_webview(&child, &site_id).is_err() {
                 log::warn!("dönemsel çerez eşitlemesi başarısız");
             }
         }
@@ -536,7 +539,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
             }
             let _guard = match lock_android_session() {
                 Ok(guard) => guard,
-                Err(e) => {
+                Err(_) => {
                     log::error!("Android oturum eşitlemesi kilitlenemedi");
                     return;
                 }
@@ -547,7 +550,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
                     return;
                 }
             }
-            if let Err(e) = crate::android_bridge::site_flush() {
+            if crate::android_bridge::site_flush().is_err() {
                 log::warn!("dönemsel profil çerez eşitlemesi başarısız");
             }
         }
@@ -585,7 +588,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
             if !loaded {
                 continue;
             }
-            if let Err(e) = export_cookies(&window, &site_id, &host) {
+            if export_cookies(&window, &site_id, &host).is_err() {
                 log::warn!("dönemsel çerez eşitlemesi başarısız");
             }
         }
@@ -1126,14 +1129,19 @@ pub fn read_pending_profile_delete_entries(
     if needs_repair {
         // Best effort both ways: a failed backup or repair only means the
         // salvage repeats on the next read; never block open behind it.
-        if let Err(e) = state.provider.put_secret(CORRUPT_QUEUE_BACKUP_KEY, &bytes) {
+        if state
+            .provider
+            .put_secret(CORRUPT_QUEUE_BACKUP_KEY, &bytes)
+            .is_err()
+        {
             log::warn!("bozuk silme kuyruğu yedeği yazılamadı");
         }
         match serde_json::to_vec(&entries) {
             Ok(repaired) => {
-                if let Err(e) = state
+                if state
                     .provider
                     .put_secret(PENDING_PROFILE_DELETES_KEY, &repaired)
+                    .is_err()
                 {
                     log::warn!("bozuk silme kuyruğu onarılamadı");
                 }
@@ -3229,7 +3237,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         export_cookies(&window, &current.site_id, &current.host)?;
     }
 
-    window.clear_all_browsing_data().map_err(|e| {
+    window.clear_all_browsing_data().map_err(|_| {
         log::error!("çerezler temizlenemedi");
         AppError::Other("çerezler temizlenemedi".into())
     })?;
@@ -3238,12 +3246,12 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         return Err(e);
     }
 
-    if let Err(e) = window.eval(init_script) {
+    if window.eval(init_script).is_err() {
         log::error!("script yüklenemedi");
         return Err(AppError::Other("script yüklenemedi".into()));
     }
 
-    if let Err(e) = window.navigate(url.clone()) {
+    if window.navigate(url.clone()).is_err() {
         log::error!("sayfa açılamadı");
         return Err(AppError::Other("sayfa açılamadı".into()));
     }
@@ -3276,7 +3284,7 @@ fn export_cookies(
     expected_host: &str,
 ) -> AppResult<()> {
     let _ = expected_host;
-    let live = window.cookies().map_err(|e| {
+    let live = window.cookies().map_err(|_| {
         log::error!("çerezler okunamadı");
         AppError::Other("çerezler okunamadı".into())
     })?;
@@ -3286,7 +3294,7 @@ fn export_cookies(
 /// Same as [`export_cookies`] but for a bare child `Webview` (desktop).
 #[cfg(desktop)]
 fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<()> {
-    let live = webview.cookies().map_err(|e| {
+    let live = webview.cookies().map_err(|_| {
         log::error!("çerezler okunamadı");
         AppError::Other("çerezler okunamadı".into())
     })?;
@@ -3333,7 +3341,7 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> Ap
     let now = crate::anilist::now_unix();
     for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
         if let Some(cookie) = restore(stored) {
-            if let Err(e) = window.set_cookie(cookie) {
+            if window.set_cookie(cookie).is_err() {
                 log::debug!("site cookie restore did not complete");
             }
         }
@@ -3396,7 +3404,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
             .expect("launcher_url lock")
             .clone();
         if let Some(url) = back {
-            window.navigate(url).map_err(|e| {
+            window.navigate(url).map_err(|_| {
                 log::error!("başlatıcıya dönülemedi");
                 AppError::Other("başlatıcıya dönülemedi".into())
             })?;
@@ -3438,7 +3446,7 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
 
     if let Some(child) = app.get_webview(&child_label) {
         // Intentionally skip `export_cookies_webview` — the caller is wiping.
-        child.close().map_err(|e| {
+        child.close().map_err(|_| {
             log::error!("site görünümü kapatılamadı");
             AppError::Other("site görünümü kapatılamadı".into())
         })?;
@@ -3458,15 +3466,15 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     }
 
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-        if let Err(e) = window.set_title(LAUNCHER_TITLE) {
+        if window.set_title(LAUNCHER_TITLE).is_err() {
             log::warn!("pencere başlığı geri alınamadı");
         }
         if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
-            if let Err(e) = window.set_fullscreen(false) {
+            if window.set_fullscreen(false).is_err() {
                 log::warn!("tam ekrandan çıkılamadı");
             }
         }
-        if let Err(e) = window.set_focus() {
+        if window.set_focus().is_err() {
             log::debug!("pencere odaklanamadı");
         }
     }
@@ -3533,7 +3541,7 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
         };
         if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
             if let Some(url) = back {
-                window.navigate(url).map_err(|e| {
+                window.navigate(url).map_err(|_| {
                     log::error!("başlatıcıya dönülemedi");
                     AppError::Other("başlatıcıya dönülemedi".into())
                 })?;
@@ -3594,7 +3602,7 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
         if let Some(cur) = current.as_ref().filter(|c| c.window_label == child_label) {
             export_cookies_webview(&child, &cur.site_id)?;
         }
-        child.close().map_err(|e| {
+        child.close().map_err(|_| {
             log::error!("site görünümü kapatılamadı");
             AppError::Other("site görünümü kapatılamadı".into())
         })?;
@@ -3616,15 +3624,15 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
     // Restore the launcher's chrome: own title again, and leave fullscreen
     // only when *we* were the ones who entered it.
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-        if let Err(e) = window.set_title(LAUNCHER_TITLE) {
+        if window.set_title(LAUNCHER_TITLE).is_err() {
             log::warn!("pencere başlığı geri alınamadı");
         }
         if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
-            if let Err(e) = window.set_fullscreen(false) {
+            if window.set_fullscreen(false).is_err() {
                 log::warn!("tam ekrandan çıkılamadı");
             }
         }
-        if let Err(e) = window.set_focus() {
+        if window.set_focus().is_err() {
             log::debug!("pencere odaklanamadı");
         }
     }
@@ -3650,7 +3658,7 @@ pub fn open_externally(app: &AppHandle, raw: &str) -> AppResult<()> {
     if blocked {
         return Err(AppError::Blocked(safe.host().to_string()));
     }
-    tauri_plugin_opener::open_url(safe.as_str(), None::<&str>).map_err(|e| {
+    tauri_plugin_opener::open_url(safe.as_str(), None::<&str>).map_err(|_| {
         log::error!("adres tarayıcıda açılamadı");
         AppError::Other("adres tarayıcıda açılamadı".into())
     })

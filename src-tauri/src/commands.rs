@@ -352,7 +352,7 @@ pub fn remove_site(
             crate::web::windows::close_site_window_for_clear(&app, &label)?;
         }
         state.provider.delete_site_session(&id)?;
-        let base = app.path().app_data_dir().map_err(|e| {
+        let base = app.path().app_data_dir().map_err(|_| {
             log::error!("profil dizini bulunamadı");
             AppError::Storage("profil dizini bulunamadı".into())
         })?;
@@ -360,7 +360,7 @@ pub fn remove_site(
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
+            Err(_) => {
                 log::error!("profil dizini silinemedi");
                 return Err(AppError::Storage("site verisi silinemedi".into()));
             }
@@ -801,7 +801,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     // desktop — on Android there is no per-site directory to remove.
     #[cfg(desktop)]
     {
-        let base = app.path().app_data_dir().map_err(|e| {
+        let base = app.path().app_data_dir().map_err(|_| {
             log::error!("profil dizini bulunamadı");
             AppError::Storage("profil dizini bulunamadı".into())
         })?;
@@ -810,7 +810,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
+                Err(_) => {
                     log::error!("profil dizini silinemedi");
                     return Err(AppError::Storage("site verisi silinemedi".into()));
                 }
@@ -844,7 +844,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                                 log::info!("yetim profil dizini temizlendi");
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
+                            Err(_) => {
                                 log::error!("yetim profil dizini silinemedi");
                                 return Err(AppError::Storage("site verisi silinemedi".into()));
                             }
@@ -852,7 +852,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
+                Err(_) => {
                     log::error!("profil dizini listelenemedi");
                     return Err(AppError::Storage("site verisi silinemedi".into()));
                 }
@@ -1282,14 +1282,14 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
                 }
                 // Refresh rejected => the session is over.
                 Err(_) => {
-                    if let Err(e) = state.provider.delete_secret("anilist-token") {
+                    if state.provider.delete_secret("anilist-token").is_err() {
                         log::error!("süresi dolmuş AniList oturumu silinemedi");
                     }
                     return Ok(None);
                 }
             },
             None => {
-                if let Err(e) = state.provider.delete_secret("anilist-token") {
+                if state.provider.delete_secret("anilist-token").is_err() {
                     log::error!("yenilenemeyen AniList oturumu silinemedi");
                 }
                 return Ok(None);
@@ -1304,7 +1304,7 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
 
 /// Clears a token the server rejected outright.
 fn drop_rejected_token(state: &AppState) {
-    if let Err(e) = state.provider.delete_secret("anilist-token") {
+    if state.provider.delete_secret("anilist-token").is_err() {
         log::error!("geçersiz AniList oturumu silinemedi");
     }
 }
@@ -1437,7 +1437,7 @@ pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppRe
         ThemePref::Dark => Some(tauri::Theme::Dark),
         ThemePref::Light => Some(tauri::Theme::Light),
     };
-    window.set_theme(target).map_err(|e| {
+    window.set_theme(target).map_err(|_| {
         log::error!("tema uygulanamadı");
         AppError::Other("tema uygulanamadı".into())
     })

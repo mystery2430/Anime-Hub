@@ -122,10 +122,10 @@ object AnimeHubDebugLog {
       phase = phase,
       result = result,
       operationId = safeOperationId(operationId),
-      durationMs = durationMs?.coerceAtLeast(0),
+      durationMs = durationMs?.takeIf { it >= 0 },
       watchdog = watchdog?.let { if (it in watchdogStates) it else "unknown" },
       errorClass = errorClass?.let { if (it in errorClasses) it else "unknown" },
-      count = count?.coerceAtLeast(0),
+      count = count?.takeIf { it >= 0 },
       stepId = stepId?.takeIf { it >= 0 },
     )
   }
