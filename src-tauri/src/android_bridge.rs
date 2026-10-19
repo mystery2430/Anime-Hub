@@ -22,7 +22,7 @@ pub fn keystore_seal(purpose: &str, plaintext: &[u8]) -> AppResult<String> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(plaintext);
     let r = animehub_android::keystore_seal(purpose.into(), b64)
-        .map_err(|e| AppError::Keyring(e.to_string()))?;
+        .map_err(|_| AppError::Keyring("Android Keystore operation failed".into()))?;
     Ok(r.value)
 }
 
@@ -31,7 +31,7 @@ pub fn keystore_seal(purpose: &str, plaintext: &[u8]) -> AppResult<String> {
 pub fn keystore_open(purpose: &str, sealed: &str) -> AppResult<Vec<u8>> {
     use base64::Engine as _;
     let r = animehub_android::keystore_open(purpose.into(), sealed.to_string())
-        .map_err(|e| AppError::Keyring(e.to_string()))?;
+        .map_err(|_| AppError::Keyring("Android Keystore operation failed".into()))?;
     base64::engine::general_purpose::STANDARD
         .decode(r.value)
         .map_err(|_| AppError::Crypto("base64 çözülemedi".into()))
@@ -58,34 +58,71 @@ pub const MULTI_PROFILE_UNSUPPORTED_MSG: &str = "Bu cihazın WebView sağlayıc�
 /// state, not a dead end.
 pub const PROFILE_QUARANTINED_MSG: &str = "Bu sitenin verileri temizlenirken çerez silme işlemi zaman aşımına uğradı ve tamamlanıp tamamlanmadığı doğrulanamadı. İşlem arka planda hâlâ sürüyor olabileceği için site, bekleyen tüm silme işlemleri sonuçlanıp temizlik doğrulanana kadar açılmadı: açılsaydı yeni oturumun çerezleri silinebilirdi. Sonradan yapılan başarılı bir temizlik, daha önce zaman aşımına uğrayan silme işlemini beklemekten vazgeçirmez. Site verilerini yeniden temizlemeyi deneyin; sonuç değişmezse siteyi kaldırıp yeniden ekleyin. Kayıtlı oturum verileriniz korunuyor.";
 
-/// Map a Kotlin refusal from the two-phase open onto a user-facing error.
-///
-/// Host-compiled (and host-tested) on the plugin crate's error type alone —
-/// deciding what the user reads needs no Android runtime:
-///
-///  * `unsupported-multi-profile` → [`AppError::Unsupported`] carrying
-///    [`MULTI_PROFILE_UNSUPPORTED_MSG`]: a feature gap, never retried on the
-///    shared default profile;
-///  * `profile-quarantined` → [`AppError::Quarantined`] carrying
-///    [`PROFILE_QUARANTINED_MSG`]: the sentinel is an internal contract
-///    between Kotlin and Rust, so the user gets the explanation and the
-///    recovery step instead of the raw token (and not `Other`'s "unexpected
-///    error" wording either — this refusal is designed, transient and
-///    retryable);
-///  * anything else → the bridge message unchanged (the frontend renders
-///    `to_string()` directly).
-///
-/// A quarantine is deliberately NOT routed through the `migration-partial`
-/// retirement path: the profile is the user's live one, and the answer is to
-/// verify the wipe — not to delete the name and re-import the legacy jar.
+/// Map Kotlin's closed protocol sentinels to actionable errors without ever
+/// forwarding provider exception text, profile names or other bridge payloads.
 pub fn classify_site_open_error(error: animehub_android::Error) -> AppError {
     if animehub_android::is_unsupported_multi_profile(&error) {
         AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string())
     } else if animehub_android::is_profile_quarantined(&error) {
         AppError::Quarantined(PROFILE_QUARANTINED_MSG.to_string())
+    } else if animehub_android::is_migration_retry(&error) {
+        // The protocol checks this sentinel to retire the incomplete virgin
+        // profile and retry exactly once. Keep the code, discard the provider
+        // text: it can contain cookie/header details.
+        AppError::Other(format!(
+            "{}: site cookie migration did not complete",
+            animehub_android::MIGRATION_RETRY_SENTINEL
+        ))
     } else {
-        AppError::Other(error.to_string())
+        AppError::Other("Android site profile operation failed".into())
     }
+}
+
+#[cfg(target_os = "android")]
+fn plugin_error_class(error: &animehub_android::Error) -> &'static str {
+    if animehub_android::is_unsupported_multi_profile(error) {
+        "unsupported"
+    } else if animehub_android::is_profile_quarantined(error) {
+        "quarantined"
+    } else if animehub_android::is_migration_retry(error) {
+        "migration_partial"
+    } else {
+        match error {
+            animehub_android::Error::Bridge(_) => "ipc",
+            animehub_android::Error::Unsupported => "unsupported",
+            animehub_android::Error::Keystore(_) => "storage",
+            animehub_android::Error::Pip(_) => "provider",
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn record_bridge_start(operation_id: &crate::diagnostics::OperationId, area: &str, phase: &str) {
+    crate::diagnostics::record_for_operation(
+        Some(operation_id), area, phase, "started", None, None, None, None, None,
+    );
+}
+
+#[cfg(target_os = "android")]
+fn record_bridge_result(
+    operation_id: &crate::diagnostics::OperationId,
+    area: &str,
+    phase: &str,
+    started: std::time::Instant,
+    result: &str,
+    error_class: Option<&str>,
+) {
+    crate::diagnostics::record_for_operation(
+        Some(operation_id),
+        area,
+        phase,
+        result,
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        None,
+        error_class,
+        None,
+        None,
+    );
 }
 
 /// What happened to a profile deletion request.
@@ -120,9 +157,37 @@ pub enum SiteProfileAction {
 /// the profile and the caller never persists its migration flag.
 #[cfg(target_os = "android")]
 pub fn site_migrate(url: &str, profile: &str, cookies: &[String]) -> AppResult<()> {
-    animehub_android::site_migrate(url.to_string(), profile.to_string(), cookies.to_vec())
-        .map(|_| ())
-        .map_err(classify_site_open_error)
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "migration");
+    let started = std::time::Instant::now();
+    match animehub_android::site_migrate(
+        operation_id.as_str().to_owned(),
+        url.to_string(),
+        profile.to_string(),
+        cookies.to_vec(),
+    ) {
+        Ok(_) => {
+            record_bridge_result(&operation_id, "bridge", "migration", started, "ok", None);
+            Ok(())
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            let result = if matches!(class, "unsupported" | "quarantined") {
+                class
+            } else {
+                "failed"
+            };
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "migration",
+                started,
+                result,
+                Some(class),
+            );
+            Err(classify_site_open_error(error))
+        }
+    }
 }
 
 /// Phase 2: open `url` in a new site WebView bound to `profile`.
@@ -137,21 +202,64 @@ pub fn site_migrate(url: &str, profile: &str, cookies: &[String]) -> AppResult<(
 /// the caller claims no session and the refusal is simply retryable.
 #[cfg(target_os = "android")]
 pub fn site_open(url: &str, profile: &str, init_script: &str) -> AppResult<()> {
-    animehub_android::site_open(
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "open");
+    let started = std::time::Instant::now();
+    match animehub_android::site_open(
+        operation_id.as_str().to_owned(),
         url.to_string(),
         profile.to_string(),
         init_script.to_string(),
-    )
-    .map(|_| ())
-    .map_err(classify_site_open_error)
+    ) {
+        Ok(_) => {
+            record_bridge_result(&operation_id, "bridge", "open", started, "ok", None);
+            Ok(())
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            let result = if matches!(class, "unsupported" | "quarantined") {
+                class
+            } else {
+                "failed"
+            };
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "open",
+                started,
+                result,
+                Some(class),
+            );
+            Err(classify_site_open_error(error))
+        }
+    }
 }
 
 /// Close the active site WebView (flushing its profile cookies unless
 /// `flush=false`). Idempotent on the Kotlin side.
 #[cfg(target_os = "android")]
 pub fn site_close(flush: bool) -> AppResult<()> {
-    animehub_android::site_close(flush).map_err(|e| AppError::Other(e.to_string()))?;
-    Ok(())
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "close");
+    let started = std::time::Instant::now();
+    match animehub_android::site_close(operation_id.as_str().to_owned(), flush) {
+        Ok(_) => {
+            record_bridge_result(&operation_id, "bridge", "close", started, "ok", None);
+            Ok(())
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "close",
+                started,
+                "failed",
+                Some(class),
+            );
+            Err(AppError::Other("site close did not complete".into()))
+        }
+    }
 }
 
 /// Delete one site profile's data — never the default profile: Kotlin
@@ -161,20 +269,44 @@ pub fn site_close(flush: bool) -> AppResult<()> {
 /// callers can distinguish "feature gap" from "try again later".
 #[cfg(target_os = "android")]
 pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
-    match animehub_android::site_profile_delete(profile.to_string()) {
-        Ok(r) => {
-            if r.deleted {
-                Ok(SiteProfileAction::Deleted)
-            } else if r.pending {
-                Ok(SiteProfileAction::Pending)
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "profile_delete");
+    let started = std::time::Instant::now();
+    match animehub_android::site_profile_delete(operation_id.as_str().to_owned(), profile.to_string()) {
+        Ok(reply) => {
+            let (action, result) = if reply.deleted {
+                (SiteProfileAction::Deleted, "deleted")
+            } else if reply.pending {
+                (SiteProfileAction::Pending, "deferred")
             } else {
-                Ok(SiteProfileAction::Absent)
-            }
+                (SiteProfileAction::Absent, "absent")
+            };
+            record_bridge_result(&operation_id, "bridge", "profile_delete", started, result, None);
+            Ok(action)
         }
-        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
-            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
-        )),
-        Err(e) => Err(AppError::Other(e.to_string())),
+        Err(error) if animehub_android::is_unsupported_multi_profile(&error) => {
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "profile_delete",
+                started,
+                "unsupported",
+                Some("unsupported"),
+            );
+            Err(AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string()))
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "profile_delete",
+                started,
+                "failed",
+                Some(class),
+            );
+            Err(AppError::Other("site profile deletion failed".into()))
+        }
     }
 }
 
@@ -189,9 +321,33 @@ pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
 /// with a `removeAllCookies` deletion possibly still in flight on it.
 #[cfg(target_os = "android")]
 pub fn site_profile_retire(profile: &str) -> AppResult<u32> {
-    match animehub_android::site_profile_retire(profile.to_string()) {
-        Ok(r) => Ok(r.dropped),
-        Err(e) => Err(AppError::Other(e.to_string())),
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "retire");
+    let started = std::time::Instant::now();
+    match animehub_android::site_profile_retire(operation_id.as_str().to_owned(), profile.to_string()) {
+        Ok(reply) => {
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "retire",
+                started,
+                "retired",
+                None,
+            );
+            Ok(reply.dropped)
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "retire",
+                started,
+                "failed",
+                Some(class),
+            );
+            Err(AppError::Other("profile quarantine retirement failed".into()))
+        }
     }
 }
 
@@ -207,20 +363,63 @@ pub fn site_profile_retire(profile: &str) -> AppResult<u32> {
 /// [`AppError::Unsupported`] with the user-facing MULTI_PROFILE guidance.
 #[cfg(target_os = "android")]
 pub fn site_clear_data(profile: &str) -> AppResult<()> {
-    match animehub_android::site_clear_data(profile.to_string()) {
-        Ok(_) => Ok(()),
-        Err(e) if animehub_android::is_unsupported_multi_profile(&e) => Err(AppError::Unsupported(
-            MULTI_PROFILE_UNSUPPORTED_MSG.to_string(),
-        )),
-        Err(e) => Err(AppError::Other(e.to_string())),
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "clear");
+    let started = std::time::Instant::now();
+    match animehub_android::site_clear_data(operation_id.as_str().to_owned(), profile.to_string()) {
+        Ok(_) => {
+            record_bridge_result(&operation_id, "bridge", "clear", started, "ok", None);
+            Ok(())
+        }
+        Err(error) if animehub_android::is_unsupported_multi_profile(&error) => {
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "clear",
+                started,
+                "unsupported",
+                Some("unsupported"),
+            );
+            Err(AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string()))
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            let result = if class == "quarantined" { "quarantined" } else { "failed" };
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "clear",
+                started,
+                result,
+                Some(class),
+            );
+            Err(AppError::Other(
+                "site data clear failed; encrypted session data was retained".into(),
+            ))
+        }
     }
 }
 
 /// Flush the active site profile's cookie jar (periodic durability sync).
 #[cfg(target_os = "android")]
 pub fn site_flush() -> AppResult<()> {
-    animehub_android::site_flush().map_err(|e| AppError::Other(e.to_string()))?;
-    Ok(())
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    let started = std::time::Instant::now();
+    match animehub_android::site_flush(operation_id.as_str().to_owned()) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "flush",
+                started,
+                "failed",
+                Some(class),
+            );
+            Err(AppError::Other("site profile flush failed".into()))
+        }
+    }
 }
 
 /// Every profile name in the provider store (unfiltered — callers restrict
@@ -231,11 +430,50 @@ pub fn site_flush() -> AppResult<()> {
 /// docs record as the provider-downgrade edge case.
 #[cfg(target_os = "android")]
 pub fn site_profile_names() -> AppResult<Vec<String>> {
-    let r = animehub_android::site_profile_names().map_err(|e| AppError::Other(e.to_string()))?;
-    if r.unsupported {
-        log::warn!("profil listesi alınamadı: sağlayıcı çoklu profili desteklemiyor");
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "profile_list");
+    let started = std::time::Instant::now();
+    match animehub_android::site_profile_names(operation_id.as_str().to_owned()) {
+        Ok(reply) => {
+            if reply.unsupported {
+                record_bridge_result(
+                    &operation_id,
+                    "bridge",
+                    "capability",
+                    started,
+                    "unsupported_provider",
+                    Some("unsupported"),
+                );
+                return Ok(Vec::new());
+            }
+            let count = reply.names.len() as u64;
+            record_bridge_result(&operation_id, "bridge", "profile_list", started, "ok", None);
+            crate::diagnostics::record_for_operation(
+                Some(&operation_id),
+                "profile",
+                "profile_list",
+                "ok",
+                None,
+                None,
+                None,
+                Some(count),
+                None,
+            );
+            Ok(reply.names)
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "profile_list",
+                started,
+                "failed",
+                Some(class),
+            );
+            Err(AppError::Other("site profile enumeration failed".into()))
+        }
     }
-    Ok(r.names)
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +563,34 @@ pub fn site_profile_names() -> AppResult<Vec<String>> {
 /// reports unsupported rather than faking a floating window.
 #[cfg(target_os = "android")]
 pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> AppResult<bool> {
-    animehub_android::enter_pip(aspect_num, aspect_den).map_err(|e| AppError::Other(e.to_string()))
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "pip_prepare");
+    let started = std::time::Instant::now();
+    match animehub_android::enter_pip(operation_id.as_str().to_owned(), aspect_num, aspect_den) {
+        Ok(entered) => {
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "pip_enter",
+                started,
+                if entered { "entered" } else { "not_entered" },
+                None,
+            );
+            Ok(entered)
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "pip_enter",
+                started,
+                "failed",
+                Some(class),
+            );
+            Err(AppError::Other("PiP entry failed".into()))
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -345,7 +610,34 @@ pub fn enter_pip(_aspect_num: u32, _aspect_den: u32) -> AppResult<bool> {
 /// whole idea does not apply).
 #[cfg(target_os = "android")]
 pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
-    animehub_android::set_pip_auto_enter(enabled).map_err(|e| AppError::Other(e.to_string()))
+    let operation_id = crate::diagnostics::current_or_new_operation_id();
+    record_bridge_start(&operation_id, "bridge", "capability");
+    let started = std::time::Instant::now();
+    match animehub_android::set_pip_auto_enter(operation_id.as_str().to_owned(), enabled) {
+        Ok(applied) => {
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "capability",
+                started,
+                if applied { "supported" } else { "unsupported" },
+                if applied { None } else { Some("unsupported") },
+            );
+            Ok(applied)
+        }
+        Err(error) => {
+            let class = plugin_error_class(&error);
+            record_bridge_result(
+                &operation_id,
+                "bridge",
+                "capability",
+                started,
+                "failed",
+                Some(class),
+            );
+            Err(AppError::Other("PiP auto-enter setting failed".into()))
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -353,15 +645,39 @@ pub fn set_pip_auto_enter(_enabled: bool) -> AppResult<bool> {
     Ok(false)
 }
 
-/// The PiP diagnostic lines for the developer panel. Empty off Android.
+/// The merged Rust+Kotlin diagnostic timeline, empty when collection is gated off.
 #[cfg(target_os = "android")]
-pub fn debug_log() -> AppResult<Vec<String>> {
-    animehub_android::debug_log().map_err(|e| AppError::Other(e.to_string()))
+pub fn debug_log() -> AppResult<animehub_android::DebugLogSnapshot> {
+    let kotlin = animehub_android::debug_log()
+        .map_err(|_| AppError::Other("diagnostic bridge read failed".into()))?;
+    Ok(crate::diagnostics::snapshot(kotlin))
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn debug_log() -> AppResult<Vec<String>> {
-    Ok(Vec::new())
+pub fn debug_log() -> AppResult<animehub_android::DebugLogSnapshot> {
+    Ok(crate::diagnostics::empty_snapshot())
+}
+
+#[cfg(target_os = "android")]
+pub fn debug_log_reset() -> AppResult<()> {
+    animehub_android::debug_log_reset()
+        .map_err(|_| AppError::Other("diagnostic reset failed".into()))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn debug_log_reset() -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn set_debug_logging(enabled: bool) -> AppResult<()> {
+    animehub_android::set_debug_logging(enabled)
+        .map_err(|_| AppError::Other("diagnostic setting could not be applied".into()))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_debug_logging(_enabled: bool) -> AppResult<()> {
+    Ok(())
 }
 
 /// Clamp a video aspect ratio into the range Android accepts for PiP.
@@ -473,23 +789,27 @@ mod tests {
             );
         }
 
-        // Anything else passes through unchanged (the bridge's own prefix
-        // included), so no Kotlin detail is lost for unclassified failures.
+        // Unclassified provider text is never forwarded to the UI or the
+        // diagnostics panel.
         let other = classify_site_open_error(animehub_android::Error::Bridge(
-            "site açılamadı: patladı".to_string(),
+            "site açılamadı: private.example token=secret".to_string(),
         ));
         assert_eq!(other.code(), "other");
-        assert!(other.to_string().contains("patladı"), "{other}");
+        assert_eq!(other.to_string(), "Beklenmeyen hata: Android site profile operation failed");
+        assert!(!other.to_string().contains("private.example"));
+        assert!(!other.to_string().contains("secret"));
 
-        // A migration retry is NOT a quarantine: it must keep its own meaning
-        // (retire the profile name and re-import), so it stays unclassified
-        // here and is handled by the open protocol instead.
+        // Migration retry retains only its stable sentinel so the generation
+        // retirement/re-import protocol remains unchanged, never the provider
+        // exception detail.
         let retry = classify_site_open_error(animehub_android::Error::Bridge(format!(
-            "{}: profil zaten mevcut",
+            "{}: cookie=secret private.example",
             animehub_android::MIGRATION_RETRY_SENTINEL
         )));
         assert_eq!(retry.code(), "other");
         assert!(retry.to_string().contains("migration-partial"), "{retry}");
+        assert!(!retry.to_string().contains("private.example"));
+        assert!(!retry.to_string().contains("secret"));
     }
 
     #[cfg(not(target_os = "android"))]

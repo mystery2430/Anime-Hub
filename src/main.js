@@ -36,7 +36,12 @@ import {
   switchStates,
 } from "./logic/settings_flow.js";
 import { createBackSession } from "./logic/back_close.js";
+import { copyTextFallback } from "./logic/copy_text.js";
 import { clearResultMessage, takeMigrationNotice } from "./logic/storage_scope.js";
+import {
+  sanitizeDebugLogSnapshot,
+  serializeDebugLogSnapshot,
+} from "./logic/debug_log.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -60,6 +65,11 @@ const el = {
   dev: {
     panel: document.getElementById("dev-panel"),
     refresh: document.getElementById("dev-refresh"),
+    copy: document.getElementById("dev-copy"),
+    download: document.getElementById("dev-download"),
+    reset: document.getElementById("dev-reset"),
+    summary: document.getElementById("dev-summary"),
+    status: document.getElementById("dev-status"),
     log: document.getElementById("dev-log"),
   },
   settings: {
@@ -361,7 +371,7 @@ export async function backToLauncher() {
  * sit behind the site view), or `idle` when there was nothing to close and
  * it should fall back to a native close.
  */
-window.__animehubBackToLauncher = () => backSession.requestClose().accepted;
+window.__animehubBackToLauncher = (operationId) => backSession.requestClose(operationId).accepted;
 
 /** Status string consumed by Kotlin's `SiteBackStatus` poll. */
 window.__animehubBackStatus = () => backSession.statusString();
@@ -675,6 +685,7 @@ function applyTheme(pref) {
 applyTheme(themePref);
 
 let currentSettings = null;
+let currentDevLog = sanitizeDebugLogSnapshot(null);
 
 // Theme flow: optimistic draw + queue + rollback. `applyTheme` updates DOM +
 // themePref + selector/buttons; cache is the localStorage mirror.
@@ -768,7 +779,7 @@ async function openSettings() {
     el.settings.fullscreen.checked = Boolean(s.fullscreenSites);
     el.settings.pip.checked = Boolean(s.pipAutoEnter);
     el.settings.developer.checked = Boolean(s.developerOptions);
-    el.dev.panel.hidden = !s.developerOptions;
+    setDeveloperPanel(Boolean(s.developerOptions));
     applyTheme(s.theme);
     el.settings.anilistId.value = s.anilist.clientId || "";
     el.settings.anilistSecret.value = "";
@@ -785,21 +796,122 @@ async function openSettings() {
     el.btnAnilistLogin.disabled = !s.anilist.configured;
     openModal(el.modalSettings);
     await refreshAniListStatus();
+    if (s.developerOptions) await refreshDevLog();
   } catch (e) {
     showNotice(errMessage(e));
   }
 }
 
-/** Developer panel: fill the log box with the native PiP lines (textContent only). */
+function renderDevLog(snapshot) {
+  currentDevLog = sanitizeDebugLogSnapshot(snapshot);
+  const { events, droppedEvents, capacity } = currentDevLog;
+  el.dev.summary.textContent =
+    `${events.length} olay / ${capacity} kapasite · ${droppedEvents} olay düşürüldü`;
+  el.dev.log.textContent = serializeDebugLogSnapshot(currentDevLog);
+}
+
+function setDeveloperPanel(open) {
+  el.dev.panel.hidden = !open;
+  if (!open) {
+    currentDevLog = sanitizeDebugLogSnapshot(null);
+    el.dev.summary.textContent = "";
+    el.dev.status.textContent = "";
+    el.dev.log.textContent = "";
+  }
+}
+
+/** Read only when the saved developer_options gate is enabled. */
 async function refreshDevLog() {
+  if (!currentSettings?.developerOptions) {
+    setDeveloperPanel(false);
+    return false;
+  }
   try {
-    const lines = await call("debug_log");
-    const list = Array.isArray(lines) ? lines : [];
-    el.dev.log.textContent = list.length
-      ? list.join("\n")
-      : "Henüz Android kaydı yok (kayıtlar yalnızca Android'de tutulur).";
-  } catch (err) {
-    el.dev.log.textContent = "Kayıt okunamadı: " + (err && err.message ? err.message : String(err));
+    const snapshot = await call("debug_log");
+    renderDevLog(snapshot);
+    el.dev.status.textContent = "Tanılama belleği yenilendi.";
+    return true;
+  } catch {
+    el.dev.status.textContent = "Kayıt okunamadı. Ayarı kapatıp yeniden açtıktan sonra tekrar deneyin.";
+    return false;
+  }
+}
+
+async function copyDebugLog() {
+  if (!(await refreshDevLog())) return;
+  const text = serializeDebugLogSnapshot(currentDevLog);
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      throw new Error("clipboard_unavailable");
+    }
+  } catch {
+    try {
+      if (!copyTextFallback(text)) throw new Error("clipboard_unavailable");
+    } catch {
+      el.dev.status.textContent = "Panoya kopyalanamadı. JSON indirme düğmesini kullanabilirsiniz.";
+      return;
+    }
+  }
+  el.dev.status.textContent = "Güncel güvenli tanılama kaydı panoya kopyalandı.";
+}
+
+async function downloadDebugLog() {
+  if (!(await refreshDevLog())) return;
+  let objectUrl = null;
+  let link = null;
+  let downloadStarted = false;
+  try {
+    const blob = new Blob([serializeDebugLogSnapshot(currentDevLog)], {
+      type: "application/json;charset=utf-8",
+    });
+    objectUrl = URL.createObjectURL(blob);
+    link = document.createElement("a");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    link.href = objectUrl;
+    link.download = `animehub-diagnostics-${stamp}.json`;
+    document.body.append(link);
+    link.click();
+    downloadStarted = true;
+    el.dev.status.textContent = "Güvenli JSON indirme başlatıldı.";
+  } catch {
+    el.dev.status.textContent = "JSON indirme başlatılamadı. Panoya kopyalamayı deneyin.";
+  } finally {
+    try {
+      link?.remove();
+    } catch {
+      // The status message should not be masked by DOM cleanup.
+    }
+    if (objectUrl) {
+      const revoke = () => {
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch {
+          // Best effort: diagnostics are already serialized in memory.
+        }
+      };
+      if (downloadStarted) {
+        try {
+          window.setTimeout(revoke, 0);
+        } catch {
+          revoke();
+        }
+      } else {
+        revoke();
+      }
+    }
+  }
+}
+
+async function resetDevLog() {
+  if (!currentSettings?.developerOptions) return;
+  try {
+    await call("debug_log_reset");
+    renderDevLog(await call("debug_log"));
+    el.dev.status.textContent = "Tanılama belleği sıfırlandı; yeni olaylar yeniden kaydediliyor.";
+  } catch {
+    el.dev.status.textContent = "Tanılama belleği sıfırlanamadı. Daha sonra tekrar deneyin.";
   }
 }
 
@@ -813,7 +925,7 @@ function syncSettingSwitches() {
   el.settings.fullscreen.checked = s.fullscreen;
   el.settings.developer.checked = s.developer;
   el.settings.blocklistEnabled.checked = s.blocklistEnabled;
-  el.dev.panel.hidden = !s.developer;
+  setDeveloperPanel(s.developer);
 }
 
 // Save logic and the PiP switch rules live in logic/settings_flow.js.
@@ -827,9 +939,7 @@ const settingsFlow = createSettingsFlow({
   setCurrent: (value) => {
     currentSettings = value;
   },
-  setDevPanel: (open) => {
-    el.dev.panel.hidden = !open;
-  },
+  setDevPanel: (open) => setDeveloperPanel(open),
   refreshDevLog: () => refreshDevLog(),
 });
 
@@ -852,6 +962,9 @@ function wireSettings() {
     settingsFlow.changeDeveloperOptions(checked),
   );
   el.dev.refresh.addEventListener("click", () => refreshDevLog());
+  el.dev.copy.addEventListener("click", () => copyDebugLog());
+  el.dev.download.addEventListener("click", () => downloadDebugLog());
+  el.dev.reset.addEventListener("click", () => resetDevLog());
   bindSwitch(el.settings.blocklistEnabled, (checked) =>
     settingsFlow.changeBlocklistEnabled(checked),
   );

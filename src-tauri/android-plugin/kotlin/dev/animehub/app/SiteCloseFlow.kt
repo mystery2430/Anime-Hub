@@ -86,57 +86,109 @@ object SiteCloseFlow {
    */
   const val FLUSH_TIMEOUT_MS: Long = 15_000
 
-  fun run(port: SiteClosePort, flush: Boolean, onDone: (String?) -> Unit) {
+  fun run(
+    port: SiteClosePort,
+    flush: Boolean,
+    operationId: String = AnimeHubDebugLog.newOperationId(),
+    onDone: (String?) -> Unit,
+  ) {
+    val safeOperationId = AnimeHubDebugLog.safeOperationId(operationId) ?: AnimeHubDebugLog.newOperationId()
+    val flowStartedAt = System.nanoTime()
     val once = AtomicBoolean(false)
-    fun done(error: String?) {
-      if (once.compareAndSet(false, true)) onDone(error)
+    fun done(error: String?, errorClass: String? = null) {
+      if (once.compareAndSet(false, true)) {
+        AnimeHubDebugLog.record(
+          "close", "complete", if (error == null) "ok" else "failed", safeOperationId,
+          durationMs = ((System.nanoTime() - flowStartedAt) / 1_000_000).coerceAtLeast(0),
+          errorClass = if (error == null) null else errorClass ?: "provider",
+        )
+        onDone(error)
+      }
     }
+    AnimeHubDebugLog.record("close", "start", "started", safeOperationId)
     if (!port.hasActiveView()) {
+      AnimeHubDebugLog.record("close", "profile_check", "absent", safeOperationId)
+      AnimeHubDebugLog.record("close", "destroy", "not_needed", safeOperationId)
       done(null)
       return
     }
+    AnimeHubDebugLog.record("close", "profile_check", "present", safeOperationId)
     if (!flush) {
+      AnimeHubDebugLog.record("close", "destroy", "started", safeOperationId)
       port.destroyActiveView()
+      AnimeHubDebugLog.record("close", "destroy", "closed", safeOperationId)
       done(null)
       return
     }
+    AnimeHubDebugLog.record("close", "resolve", "started", safeOperationId)
     val profileName =
-      port.resolveProfileName().getOrElse { e ->
+      port.resolveProfileName().getOrElse {
         // Keep the view: durability is unverified, so the session stays claimed.
-        done("profil çözümlenemedi: ${e.message}")
+        AnimeHubDebugLog.record("close", "resolve", "failed", safeOperationId, errorClass = "provider")
+        done("profil çözümlenemedi: provider", "provider")
         return
       }
+    AnimeHubDebugLog.record("close", "resolve", "ok", safeOperationId)
+
     // Watchdog + callback race, settled exactly once. Timeout = failure with
     // the view AND the session ownership untouched (retryable); a late flush
-    // callback loses the race and is ignored — it must not destroy a view
-    // whose ownership was never released.
+    // callback cannot destroy a view whose ownership was never released.
     val settled = AtomicBoolean(false)
+    val stepStartedAt = System.nanoTime()
+    val stepId = StepGuards.create().operationId
+    AnimeHubDebugLog.record("close", "flush", "started", safeOperationId, stepId = stepId)
     val watchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
       if (settled.compareAndSet(false, true)) {
-        done("çerez kalıcılığı zaman aşımına uğradı: görünüm açık kaldı")
+        AnimeHubDebugLog.record(
+          "close", "flush", "timeout", safeOperationId,
+          durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+          watchdog = "fired", errorClass = "timeout", stepId = stepId,
+        )
+        done("çerez kalıcılığı zaman aşımına uğradı: görünüm açık kaldı", "timeout")
       }
     }
     if (watchdog is Watchdog.Refused) {
-      // No watchdog ⇒ no bound on the blocking flush, so the flush is never
-      // started. Reported like a timeout (failure, retryable) and with the same
-      // conservative state: the view AND the session ownership stay, because
-      // durability was never verified.
+      // No watchdog ⇒ no bound on the blocking flush, so never start it.
       if (settled.compareAndSet(false, true)) {
-        done("çerez kalıcılığı ${SiteProfileErrors.WATCHDOG_REFUSED}: görünüm açık kaldı")
+        AnimeHubDebugLog.record(
+          "close", "flush", "failed", safeOperationId,
+          durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+          watchdog = "refused", errorClass = "watchdog_refused", stepId = stepId,
+        )
+        done("çerez kalıcılığı ${SiteProfileErrors.WATCHDOG_REFUSED}: görünüm açık kaldı", "watchdog_refused")
       }
       return
     }
+    AnimeHubDebugLog.record("close", "watchdog_arm", "armed", safeOperationId, stepId = stepId)
     val cancelWatchdog = (watchdog as Watchdog.Armed).cancel
     port.flushCookies(profileName) { error ->
-      if (!settled.compareAndSet(false, true)) return@flushCookies
+      if (!settled.compareAndSet(false, true)) {
+        AnimeHubDebugLog.record(
+          "close", "late_callback", "late", safeOperationId,
+          watchdog = "late", errorClass = "timeout", stepId = stepId,
+        )
+        return@flushCookies
+      }
       // The flush answered: drop the queued watchdog so it cannot keep this
       // port (and the view/Activity behind it) reachable for another 15 s.
       cancelWatchdog()
       if (error != null) {
-        done("çerez kalıcılığı başarısız: ${error.message}")
+        AnimeHubDebugLog.record(
+          "close", "flush", "failed", safeOperationId,
+          durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+          errorClass = "provider", stepId = stepId,
+        )
+        done("çerez kalıcılığı başarısız: provider", "provider")
         return@flushCookies
       }
+      AnimeHubDebugLog.record(
+        "close", "flush", "ok", safeOperationId,
+        durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+        stepId = stepId,
+      )
+      AnimeHubDebugLog.record("close", "destroy", "started", safeOperationId)
       port.destroyActiveView()
+      AnimeHubDebugLog.record("close", "destroy", "closed", safeOperationId)
       done(null)
     }
   }

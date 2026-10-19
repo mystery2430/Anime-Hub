@@ -61,6 +61,17 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri::{LogicalPosition, PhysicalPosition, Position, Size, WebviewUrl};
 use url::Url;
 
+fn diagnostic_error_class(error: &AppError) -> &'static str {
+    match error {
+        AppError::Other(message)
+            if message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) =>
+        {
+            "migration_partial"
+        }
+        _ => crate::diagnostics::error_class(error),
+    }
+}
+
 /// Label of the launcher window (and of the launcher webview inside it).
 pub const LAUNCHER_LABEL: &str = "main";
 
@@ -225,7 +236,7 @@ fn open_in_main_window_inner(
     // Already showing this exact site: nothing to stack, just focus.
     if app.get_webview(&label).is_some() {
         window.set_focus().map_err(|e| {
-            log::error!("pencere öne alınamadı: {e}");
+            log::error!("pencere öne alınamadı");
             AppError::Other("pencere öne alınamadı".into())
         })?;
         return Ok(label);
@@ -240,7 +251,7 @@ fn open_in_main_window_inner(
     // Windows the WebView2 user-data folder. This is what makes cookies,
     // localStorage, IndexedDB and cache independent per site.
     let base = app.path().app_data_dir().map_err(|e| {
-        log::error!("uygulama veri dizini alınamadı: {e}");
+        log::error!("uygulama veri dizini alınamadı");
         AppError::Storage("uygulama veri dizini alınamadı".into())
     })?;
     let data_dir = crate::web::session::ensure_profile_dir(&base, &site.id)?;
@@ -253,7 +264,7 @@ fn open_in_main_window_inner(
     let nav_app = app.clone();
 
     let size = window.inner_size().map_err(|e| {
-        log::error!("pencere boyutu okunamadı: {e}");
+        log::error!("pencere boyutu okunamadı");
         AppError::Other("pencere boyutu okunamadı".into())
     })?;
 
@@ -275,7 +286,7 @@ fn open_in_main_window_inner(
                     let label = nav_label.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = close_site_window(&app, &label) {
-                            log::error!("site oturumu kapatılamadı: {e}");
+                            log::error!("site oturumu kapatılamadı");
                         }
                     });
                 }
@@ -305,12 +316,10 @@ fn open_in_main_window_inner(
             match decision {
                 NavDecision::Allow => true,
                 NavDecision::Block(msg) => {
-                    log::warn!("blocked navigation to {target}: {msg}");
                     let _ = app.emit("animehub://navigation-blocked", msg.to_string());
                     false
                 }
                 NavDecision::BlockedHost => {
-                    log::debug!("blocklisted navigation to {target}");
                     false
                 }
             }
@@ -328,9 +337,7 @@ fn open_in_main_window_inner(
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 return;
             }
-            if let Err(e) = webview.eval(crate::web::session::OVERLAY_SNIPPET) {
-                log::warn!("geri dönüş katmanı kurulamadı: {e}");
-            }
+            let _ = webview.eval(crate::web::session::OVERLAY_SNIPPET);
         });
 
     // `add_child` lives on the bare `Window`, not on `WebviewWindow`; same
@@ -345,7 +352,7 @@ fn open_in_main_window_inner(
             Size::Physical(size),
         )
         .map_err(|e| {
-            log::error!("WebView pencereye eklenemedi: {e}");
+            log::error!("WebView pencereye eklenemedi");
             AppError::Other("WebView pencereye eklenemedi".into())
         })?;
 
@@ -356,11 +363,11 @@ fn open_in_main_window_inner(
     let entered_fullscreen = fullscreen && !already_fs;
     if entered_fullscreen {
         if let Err(e) = window.set_fullscreen(true) {
-            log::warn!("tam ekrana geçilemedi: {e}");
+            log::warn!("tam ekrana geçilemedi");
         }
     }
     if let Err(e) = window.set_title(&site.name) {
-        log::warn!("pencere başlığı ayarlanamadı: {e}");
+        log::warn!("pencere başlığı ayarlanamadı");
     }
 
     {
@@ -438,7 +445,7 @@ pub fn install_main_window_handlers(app: &AppHandle) {
                     position: Position::Physical(PhysicalPosition::new(0, 0)),
                     size: Size::Physical(*size),
                 }) {
-                    log::warn!("site görünümü yeniden boyutlandırılamadı: {e}");
+                    log::warn!("site görünümü yeniden boyutlandırılamadı");
                 }
             }
         }
@@ -479,7 +486,7 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
         loop {
             std::thread::sleep(SESSION_SYNC_INTERVAL);
             if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
-                log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
+                log::warn!("site oturum eşitleme süresi doldu");
                 return;
             }
             // Hold the desktop session lock across the ownership check and the
@@ -490,7 +497,7 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
             let _guard = match lock_desktop_session() {
                 Ok(g) => g,
                 Err(e) => {
-                    log::error!("masaüstü oturum eşitlemesi kilitlenemedi: {e}");
+                    log::error!("masaüstü oturum eşitlemesi kilitlenemedi");
                     return;
                 }
             };
@@ -504,7 +511,7 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
                 return;
             };
             if let Err(e) = export_cookies_webview(&child, &site_id) {
-                log::warn!("dönemsel çerez eşitlemesi başarısız ({site_id}): {e}");
+                log::warn!("dönemsel çerez eşitlemesi başarısız");
             }
         }
     });
@@ -526,13 +533,13 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
         loop {
             std::thread::sleep(SESSION_SYNC_INTERVAL);
             if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
-                log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
+                log::warn!("site oturum eşitleme süresi doldu");
                 return;
             }
             let _guard = match lock_android_session() {
                 Ok(guard) => guard,
                 Err(e) => {
-                    log::error!("Android oturum eşitlemesi kilitlenemedi: {e}");
+                    log::error!("Android oturum eşitlemesi kilitlenemedi");
                     return;
                 }
             };
@@ -543,7 +550,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
                 }
             }
             if let Err(e) = crate::android_bridge::site_flush() {
-                log::warn!("dönemsel profil çerez eşitlemesi başarısız ({site_id}): {e}");
+                log::warn!("dönemsel profil çerez eşitlemesi başarısız");
             }
         }
     });
@@ -564,7 +571,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
         loop {
             std::thread::sleep(SESSION_SYNC_INTERVAL);
             if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
-                log::warn!("oturum eşitlemesi ömrünü doldurdu: {site_id}");
+                log::warn!("site oturum eşitleme süresi doldu");
                 return;
             }
             {
@@ -581,7 +588,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: Str
                 continue;
             }
             if let Err(e) = export_cookies(&window, &site_id, &host) {
-                log::warn!("dönemsel çerez eşitlemesi başarısız ({site_id}): {e}");
+                log::warn!("dönemsel çerez eşitlemesi başarısız");
             }
         }
     });
@@ -853,7 +860,7 @@ pub fn recover_pending_profile_delete_entries(raw: &[u8]) -> (Vec<PendingProfile
             .collect();
         let dropped = total - kept.len();
         if dropped > 0 {
-            log::warn!("bekleyen profil silme listesinden {dropped} geçersiz ad çıkarıldı");
+            log::warn!("bekleyen profil silme listesi onarıldı");
         }
         return (kept, dropped > 0);
     }
@@ -867,18 +874,13 @@ pub fn recover_pending_profile_delete_entries(raw: &[u8]) -> (Vec<PendingProfile
                 .collect();
             let dropped = total - kept.len();
             if dropped > 0 {
-                log::warn!(
-                    "eski biçimli bekleyen silme listesinden {dropped} geçersiz ad çıkarıldı"
-                );
+                log::warn!("eski biçimli bekleyen silme listesi onarıldı");
             }
             (kept, dropped > 0)
         }
-        Err(e) => {
+        Err(_) => {
             let salvaged = scan_valid_profile_names(raw);
-            log::warn!(
-                "bekleyen profil silme listesi bozuk ({e}); {} ad ham kopyadan kurtarıldı",
-                salvaged.len()
-            );
+            log::warn!("bekleyen profil silme listesi bozuk; ham kopyadan güvenli kayıtlar kurtarıldı");
             let entries = salvaged
                 .iter()
                 .map(|name| PendingProfileDelete::unknown(name))
@@ -948,12 +950,20 @@ pub fn profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
     {
         Some(Ok(generation)) => Ok(generation),
         _ => {
-            log::warn!("profil nesli bozuk, kuyruktan geri yükleniyor ({site_id})");
+            log::warn!("profil nesli bozuk; tombstone kuyruğundan geri yükleniyor");
+            crate::diagnostics::record_current(
+                "profile", "generation", "fallback", None, None,
+                Some("storage"), None, None,
+            );
             let queued = read_pending_profile_deletes(state)?;
             let recovered = recover_generation_for(site_id, &queued)?;
             state
                 .provider
                 .put_secret(&key, recovered.to_string().as_bytes())?;
+            crate::diagnostics::record_current(
+                "profile", "generation", "ok", None, None,
+                None, Some(recovered as u64), None,
+            );
             Ok(recovered)
         }
     }
@@ -1080,7 +1090,7 @@ pub fn match_queued_name_to_site(name: &str, site_ids: &[String]) -> Option<Stri
     });
     let first = hits.next()?.clone();
     if hits.next().is_some() {
-        log::warn!("tombstone birden fazla kayıtlı siteyle eşleşti, sahibi belirsiz: {name}");
+        log::warn!("tombstone sahibi belirsiz; kayıt korunuyor");
         return None;
     }
     Some(first)
@@ -1105,7 +1115,7 @@ pub fn read_pending_profile_delete_entries(
         // Best effort both ways: a failed backup or repair only means the
         // salvage repeats on the next read; never block open behind it.
         if let Err(e) = state.provider.put_secret(CORRUPT_QUEUE_BACKUP_KEY, &bytes) {
-            log::warn!("bozuk silme kuyruğu yedeği yazılamadı: {e}");
+            log::warn!("bozuk silme kuyruğu yedeği yazılamadı");
         }
         match serde_json::to_vec(&entries) {
             Ok(repaired) => {
@@ -1113,10 +1123,10 @@ pub fn read_pending_profile_delete_entries(
                     .provider
                     .put_secret(PENDING_PROFILE_DELETES_KEY, &repaired)
                 {
-                    log::warn!("bozuk silme kuyruğu onarılamadı: {e}");
+                    log::warn!("bozuk silme kuyruğu onarılamadı");
                 }
             }
-            Err(e) => log::warn!("bozuk silme kuyruğu yeniden yazılamadı: {e}"),
+            Err(_) => log::warn!("bozuk silme kuyruğu yeniden yazılamadı"),
         }
     }
     Ok(entries)
@@ -1298,6 +1308,30 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
     init_script: &str,
     ops: &mut O,
 ) -> AppResult<String> {
+    let _scope = crate::diagnostics::scope_if_missing("open");
+    let started = std::time::Instant::now();
+    crate::diagnostics::record_current("open", "profile_check", "started", None, None, None, None, None);
+    let result = run_mobile_open_protocol_inner(state, site_id, url, init_script, ops);
+    crate::diagnostics::record_current(
+        "open",
+        "complete",
+        if result.is_ok() { "ok" } else { "failed" },
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        None,
+        result.as_ref().err().map(crate::diagnostics::error_class),
+        None,
+        None,
+    );
+    result
+}
+
+fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
+    state: &AppState,
+    site_id: &str,
+    url: &str,
+    init_script: &str,
+    ops: &mut O,
+) -> AppResult<String> {
     // 1. The profile for this site at its current generation — advanced past
     //    a queued deletion of that exact stored name (a stale/corrupt
     //    generation would otherwise hand out a profile whose deletion is
@@ -1305,14 +1339,34 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
     //    (clear, delete, orphan sweep) derives the same name.
     let stored_generation = profile_generation(state, site_id)?;
     let queued = read_pending_profile_deletes(state)?;
-    let (generation, advanced) =
-        resolve_queued_free_generation(site_id, stored_generation, &queued)?;
+    crate::diagnostics::record_current(
+        "open", "resolve", "started", None, None, None, Some(queued.len() as u64), None,
+    );
+    let (generation, advanced) = match resolve_queued_free_generation(site_id, stored_generation, &queued) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            crate::diagnostics::record_current(
+                "open", "resolve", "failed", None, None,
+                Some(diagnostic_error_class(&error)), None, None,
+            );
+            return Err(error);
+        }
+    };
+    crate::diagnostics::record_current(
+        "open", "resolve", if advanced { "fallback" } else { "skipped" },
+        None, None, None, Some(generation as u64), None,
+    );
     if advanced {
+        crate::diagnostics::record_current("open", "generation", "started", None, None, None, Some(generation as u64), None);
         state.provider.put_secret(
             &format!("{PROFILE_GENERATION_PREFIX}{site_id}"),
             generation.to_string().as_bytes(),
         )?;
+        crate::diagnostics::record_current("open", "generation", "ok", None, None, None, Some(generation as u64), None);
     }
+    crate::diagnostics::record_current(
+        "open", "profile_check", "ok", None, None, None, Some(generation as u64), None,
+    );
     let mut profile = android_profile_name(site_id, generation);
 
     // 2. One-time migration of the pre-profile cookie jar (0.3.4 installs).
@@ -1338,6 +1392,16 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
             }
         }
     }
+    crate::diagnostics::record_current(
+        "migration",
+        "migration",
+        if pending_migration { "started" } else { "skipped" },
+        None,
+        None,
+        None,
+        Some(cookie_headers.len() as u64),
+        None,
+    );
 
     // 3. Phase 1 (migrate, no view) → durable flag → phase 2 (the view).
     //
@@ -1352,29 +1416,99 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
     //    the NEXT open starts the whole migration over from a virgin name.
     if pending_migration {
         let mut migrate_result = ops.migrate(url, &profile, &cookie_headers);
+        crate::diagnostics::record_current(
+            "migration",
+            "migration",
+            if migrate_result.is_ok() { "ok" } else { "failed" },
+            None,
+            None,
+            migrate_result.as_ref().err().map(diagnostic_error_class),
+            Some(cookie_headers.len() as u64),
+            None,
+        );
         if let Err(AppError::Other(message)) = &migrate_result {
             if !cookie_headers.is_empty()
                 && message.contains(animehub_android::MIGRATION_RETRY_SENTINEL)
             {
-                log::warn!(
-                    "profil göçü tamamlanamadı ({site_id})={message}; profil emekliye ayrılıyor"
+                log::warn!("cookie migration incomplete; retiring the partial profile");
+                crate::diagnostics::record_current(
+                    "migration", "tombstone", "started", None, None, None, None, None,
                 );
-                queue_site_profile_delete(state, site_id, &profile)?;
-                let (retry_generation, _) = secure_generation_past_name(state, site_id, &profile)?;
+                if let Err(error) = queue_site_profile_delete(state, site_id, &profile) {
+                    crate::diagnostics::record_current(
+                        "migration", "tombstone", "failed", None, None,
+                        Some("storage"), None, None,
+                    );
+                    return Err(error);
+                }
+                crate::diagnostics::record_current(
+                    "migration", "tombstone", "queued", None, None, None, None, None,
+                );
+                crate::diagnostics::record_current(
+                    "migration", "generation", "started", None, None, None, None, None,
+                );
+                let (retry_generation, advanced) = match secure_generation_past_name(state, site_id, &profile) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        crate::diagnostics::record_current(
+                            "migration", "generation", "failed", None, None,
+                            Some(diagnostic_error_class(&error)), None, None,
+                        );
+                        return Err(error);
+                    }
+                };
+                crate::diagnostics::record_current(
+                    "migration", "generation", if advanced { "ok" } else { "skipped" },
+                    None, None, None, Some(retry_generation as u64), None,
+                );
                 profile = android_profile_name(site_id, retry_generation);
+                crate::diagnostics::record_current(
+                    "migration", "migration", "fallback", None, None,
+                    Some("migration_partial"), Some(cookie_headers.len() as u64), None,
+                );
                 migrate_result = ops.migrate(url, &profile, &cookie_headers);
+                crate::diagnostics::record_current(
+                    "migration",
+                    "migration",
+                    if migrate_result.is_ok() { "ok" } else { "failed" },
+                    None,
+                    None,
+                    migrate_result.as_ref().err().map(diagnostic_error_class),
+                    Some(cookie_headers.len() as u64),
+                    None,
+                );
                 if let Err(AppError::Other(retry_message)) = &migrate_result {
                     if retry_message.contains(animehub_android::MIGRATION_RETRY_SENTINEL) {
                         // Retire this attempt too and surface a retryable error.
-                        if let Err(e) = queue_site_profile_delete(state, site_id, &profile) {
-                            log::warn!("ikinci göç profili kuyruğa alınamadı: {e}");
+                        crate::diagnostics::record_current(
+                            "migration", "tombstone", "started", None, None, None, None, None,
+                        );
+                        if queue_site_profile_delete(state, site_id, &profile).is_err() {
+                            crate::diagnostics::record_current(
+                                "migration", "tombstone", "failed", None, None,
+                                Some("storage"), None, None,
+                            );
+                        } else {
+                            crate::diagnostics::record_current(
+                                "migration", "tombstone", "queued", None, None, None, None, None,
+                            );
                         }
-                        if let Err(e) = secure_generation_past_name(state, site_id, &profile) {
-                            log::warn!("göç sonrası nesil güvenceye alınamadı: {e}");
+                        crate::diagnostics::record_current(
+                            "migration", "generation", "started", None, None, None, None, None,
+                        );
+                        match secure_generation_past_name(state, site_id, &profile) {
+                            Ok((generation, advanced)) => crate::diagnostics::record_current(
+                                "migration", "generation", if advanced { "ok" } else { "skipped" },
+                                None, None, None, Some(generation as u64), None,
+                            ),
+                            Err(error) => crate::diagnostics::record_current(
+                                "migration", "generation", "failed", None, None,
+                                Some(diagnostic_error_class(&error)), None, None,
+                            ),
                         }
-                        return Err(AppError::Other(format!(
-                            "site çerezleri profiline taşınamadı: {retry_message}. Çerezler saklandı; sonraki açılışta yeniden denenecek."
-                        )));
+                        return Err(AppError::Other(
+                            "site çerezleri profiline taşınamadı. Çerezler saklandı; sonraki açılışta yeniden denenecek.".into(),
+                        ));
                     }
                 }
             }
@@ -1383,19 +1517,31 @@ pub fn run_mobile_open_protocol<O: MobileOpenOps>(
 
         // Durable BEFORE the view exists. A failed write aborts the open on
         // purpose: continuing would show the user a profile whose migration
-        // state is unrecorded, and the next open would treat that in-use
+        // state is unrecorded, and the next open would treat this in-use
         // profile as pending and retire it — the data-loss path this
         // ordering removes. Nothing was built yet, so the abort leaves no
         // orphan view and no ownership to unwind; the jar and the (missing)
         // flag stay exactly as they were and the next open re-imports.
-        mark_migration_done(state, site_id).map_err(|e| {
-            AppError::Other(format!(
-                "site göç durumu kalıcılaştırılamadı ({site_id}): {e}. Site açılmadı; çerezler korundu, sonraki açılışta yeniden denenecek."
-            ))
+        crate::diagnostics::record_current(
+            "migration", "flag_write", "started", None, None, None, None, None,
+        );
+        mark_migration_done(state, site_id).map_err(|_| {
+            crate::diagnostics::record_current(
+                "migration", "flag_write", "failed", None, None,
+                Some("storage"), None, None,
+            );
+            AppError::Other(
+                "site migration state could not be stored; site was not opened".into(),
+            )
         })?;
+        crate::diagnostics::record_current(
+            "migration", "flag_write", "ok", None, None, None, None, None,
+        );
     }
 
+    crate::diagnostics::record_current("open", "open", "started", None, None, None, None, None);
     ops.open(url, &profile, init_script)?;
+    crate::diagnostics::record_current("open", "open", "ok", None, None, None, None, None);
     Ok(profile)
 }
 
@@ -1433,10 +1579,54 @@ pub fn run_mobile_clear_protocol<C>(
 where
     C: FnOnce(&str) -> AppResult<()>,
 {
+    let _scope = crate::diagnostics::scope_if_missing("clear");
+    let started = std::time::Instant::now();
+    let result = run_mobile_clear_protocol_inner(state, site_id, clear_profile);
+    crate::diagnostics::record_current(
+        "clear",
+        "complete",
+        if result.is_ok() { "ok" } else { "failed" },
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        None,
+        result.as_ref().err().map(diagnostic_error_class),
+        None,
+        None,
+    );
+    result
+}
+
+fn run_mobile_clear_protocol_inner<C>(
+    state: &AppState,
+    site_id: &str,
+    clear_profile: C,
+) -> AppResult<()>
+where
+    C: FnOnce(&str) -> AppResult<()>,
+{
+    crate::diagnostics::record_current("clear", "profile_check", "started", None, None, None, None, None);
     let generation = profile_generation(state, site_id)?;
     let profile = android_profile_name(site_id, generation);
-    clear_profile(&profile)?;
-    state.provider.delete_site_session(site_id)?;
+    crate::diagnostics::record_current("clear", "profile_check", "ok", None, None, None, Some(generation as u64), None);
+
+    crate::diagnostics::record_current("clear", "cookie_wipe", "started", None, None, None, None, None);
+    if let Err(error) = clear_profile(&profile) {
+        crate::diagnostics::record_current(
+            "clear", "cookie_wipe", "failed", None, None,
+            Some(diagnostic_error_class(&error)), None, None,
+        );
+        return Err(error);
+    }
+    crate::diagnostics::record_current("clear", "cookie_wipe", "ok", None, None, None, None, None);
+
+    crate::diagnostics::record_current("clear", "cookie_write", "started", None, None, None, None, None);
+    if let Err(error) = state.provider.delete_site_session(site_id) {
+        crate::diagnostics::record_current(
+            "clear", "cookie_write", "failed", None, None,
+            Some(diagnostic_error_class(&error)), None, None,
+        );
+        return Err(error);
+    }
+    crate::diagnostics::record_current("clear", "cookie_write", "ok", None, None, None, None, None);
     Ok(())
 }
 
@@ -1499,10 +1689,38 @@ where
     D: FnOnce(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
     R: FnOnce(&str) -> AppResult<u32>,
 {
+    let _scope = crate::diagnostics::scope_if_missing("delete");
+    let started = std::time::Instant::now();
+    let result = run_mobile_delete_protocol_inner(state, site_id, delete_profile, retire_profile);
+    crate::diagnostics::record_current(
+        "delete",
+        "complete",
+        if result.is_ok() { "ok" } else { "failed" },
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        None,
+        result.as_ref().err().map(diagnostic_error_class),
+        None,
+        None,
+    );
+    result
+}
+
+fn run_mobile_delete_protocol_inner<D, R>(
+    state: &AppState,
+    site_id: &str,
+    delete_profile: D,
+    retire_profile: R,
+) -> AppResult<crate::android_bridge::SiteProfileAction>
+where
+    D: FnOnce(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
+    R: FnOnce(&str) -> AppResult<u32>,
+{
     use crate::android_bridge::SiteProfileAction;
 
+    crate::diagnostics::record_current("delete", "profile_check", "started", None, None, None, None, None);
     let generation = profile_generation(state, site_id)?;
     let profile = android_profile_name(site_id, generation);
+    crate::diagnostics::record_current("delete", "profile_check", "ok", None, None, None, Some(generation as u64), None);
 
     // 1. DURABLE INTENT, before the provider is touched, WITH THE OWNER: a
     //    name cannot be reversed into the site id that derives it, so a
@@ -1510,27 +1728,50 @@ where
     //    start. If this write fails nothing has happened yet: no deletion was
     //    requested, the name is still derivable and still clean, and the
     //    caller gets a retryable error.
-    queue_site_profile_delete(state, site_id, &profile)?;
+    crate::diagnostics::record_current("delete", "tombstone", "started", None, None, None, None, None);
+    if let Err(error) = queue_site_profile_delete(state, site_id, &profile) {
+        crate::diagnostics::record_current("delete", "tombstone", "failed", None, None, Some("storage"), None, None);
+        return Err(error);
+    }
+    crate::diagnostics::record_current("delete", "tombstone", "queued", None, None, None, None, None);
 
     // 2. The provider call. Its outcome no longer decides whether the name is
     //    remembered — only when the tombstone may be lifted.
+    crate::diagnostics::record_current("delete", "provider_delete", "started", None, None, None, None, None);
     let action = match delete_profile(&profile) {
         Ok(action) => action,
-        Err(e) => {
-            // Keep the tombstone: the deletion is finished by the startup drain
-            // instead of being forgotten with the data still on disk, and the
+        Err(error) => {
+            crate::diagnostics::record_current(
+                "delete", "provider_delete", "failed", None, None,
+                Some(diagnostic_error_class(&error)), None, None,
+            );
+            // Keep the tombstone: startup drain finishes deletion; the profile
             // name cannot be handed to an open in the meantime.
-            log::warn!("profil silinemedi, bekleyenler kuyruğunda bırakıldı: {profile}");
-            return Err(e);
+            log::warn!("profile delete did not complete; durable tombstone retained");
+            return Err(error);
         }
     };
+    let provider_result = match action {
+        SiteProfileAction::Deleted => "deleted",
+        SiteProfileAction::Absent => "absent",
+        SiteProfileAction::Pending => "deferred",
+    };
+    crate::diagnostics::record_current("delete", "provider_delete", provider_result, None, None, None, None, None);
 
     // 3. Durable: after this write no future open can derive `profile` again
     //    (and the queue already guaranteed it before this line). Monotone and
     //    idempotent — it moves the counter past THIS name, so a repeated run
     //    never burns a second generation, and a failed write propagates with
     //    the tombstone still in place.
-    secure_generation_past_name(state, site_id, &profile)?;
+    crate::diagnostics::record_current("delete", "generation", "started", None, None, None, None, None);
+    let next_generation = match secure_generation_past_name(state, site_id, &profile) {
+        Ok((next_generation, _)) => next_generation,
+        Err(error) => {
+            crate::diagnostics::record_current("delete", "generation", "failed", None, None, Some("storage"), None, None);
+            return Err(error);
+        }
+    };
+    crate::diagnostics::record_current("delete", "generation", "ok", None, None, None, Some(next_generation as u64), None);
 
     if matches!(action, SiteProfileAction::Pending) {
         // Deferred: the profile still exists and is still loaded in this
@@ -1542,12 +1783,29 @@ where
     //    then drop the ledger. A failure here is reported, not swallowed:
     //    keeping both is the conservative direction (the name is already
     //    unreachable), and the retry re-runs the protocol cleanly.
-    forget_pending_profile_delete(state, &profile)?;
-    let dropped = retire_profile(&profile)?;
+    crate::diagnostics::record_current("delete", "queue_remove", "started", None, None, None, None, None);
+    if let Err(error) = forget_pending_profile_delete(state, &profile) {
+        crate::diagnostics::record_current("delete", "queue_remove", "failed", None, None, Some("storage"), None, None);
+        return Err(error);
+    }
+    crate::diagnostics::record_current("delete", "queue_remove", "ok", None, None, None, None, None);
+
+    crate::diagnostics::record_current("delete", "quarantine_retire", "started", None, None, None, None, None);
+    let dropped = match retire_profile(&profile) {
+        Ok(dropped) => dropped,
+        Err(error) => {
+            crate::diagnostics::record_current(
+                "delete", "quarantine_retire", "failed", None, None,
+                Some(diagnostic_error_class(&error)), None, None,
+            );
+            return Err(error);
+        }
+    };
+    crate::diagnostics::record_current(
+        "delete", "quarantine_retire", "retired", None, None, None, Some(dropped as u64), None,
+    );
     if dropped > 0 {
-        log::info!(
-            "profil karantinası emekliye ayrıldı ({dropped} bekleyen işlem düştü): {profile}"
-        );
+        log::info!("quarantine ledger retired after profile delete");
     }
     Ok(action)
 }
@@ -1590,18 +1848,21 @@ fn secure_tombstone_generation(
 ) -> bool {
     match secure_generation_past_name(state, site_id, &entry.name) {
         Ok((generation, advanced)) => {
+            crate::diagnostics::record_current(
+                "delete", "generation", if advanced { "ok" } else { "skipped" },
+                None, None, None, Some(generation as u64), None,
+            );
             if advanced {
-                log::info!(
-                    "ertelenen silme sonrası nesil güvenceye alındı ({site_id} → g{generation})"
-                );
+                log::info!("deferred profile generation advanced");
             }
             true
         }
-        Err(e) => {
-            log::warn!(
-                "ertelenen silme: nesil güvenceye alınamadı, tombstone korunuyor ({}): {e}",
-                entry.name
+        Err(error) => {
+            crate::diagnostics::record_current(
+                "delete", "generation", "failed", None, None,
+                Some(diagnostic_error_class(&error)), None, None,
             );
+            log::warn!("deferred profile generation could not be secured; tombstone retained");
             report.kept_unmatched.push(entry.name.clone());
             false
         }
@@ -1626,22 +1887,26 @@ fn secure_tombstone_generation(
 /// one-way digest so there is no generation to advance without that id.
 fn hold_as_block(state: &AppState, entry: &PendingProfileDelete, report: &mut DrainReport) -> bool {
     if entry.is_blocked() {
+        crate::diagnostics::record_current(
+            "queue", "tombstone", "blocked", None, None, None, None, None,
+        );
         report.blocked += 1;
         return false;
     }
     match block_pending_profile_delete(state, &entry.name) {
         Ok(()) => {
-            log::info!(
-                "ertelenen profil silmesi kalıcı ad engeline dönüştü (sahibi yok, güvenceye alınacak nesil yok): {}",
-                entry.name
+            crate::diagnostics::record_current(
+                "queue", "tombstone", "blocked", None, None, None, None, None,
             );
+            log::info!("orphan tombstone became a permanent name block");
             report.blocked += 1;
         }
-        Err(e) => {
-            log::warn!(
-                "ertelenen profil silmesi kalıcı engele çevrilemedi, borçlu olarak korunuyor ({}): {e}",
-                entry.name
+        Err(_) => {
+            crate::diagnostics::record_current(
+                "queue", "tombstone", "owed", None, None,
+                Some("storage"), None, None,
             );
+            log::warn!("orphan tombstone block could not be stored; deletion remains owed");
             report.kept_unmatched.push(entry.name.clone());
         }
     }
@@ -1677,6 +1942,68 @@ fn hold_as_block(state: &AppState, entry: &PendingProfileDelete, report: &mut Dr
 pub fn run_pending_delete_drain<D, R, M>(
     state: &AppState,
     entries: &[PendingProfileDelete],
+    delete_profile: D,
+    retire_profile: R,
+    match_owner: M,
+) -> AppResult<DrainReport>
+where
+    D: FnMut(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
+    R: FnMut(&str) -> AppResult<u32>,
+    M: Fn(&str) -> Option<String>,
+{
+    let _scope = crate::diagnostics::scope_if_missing("startup");
+    let started = std::time::Instant::now();
+    crate::diagnostics::record_current(
+        "startup", "drain", "started", None, None, None, Some(entries.len() as u64), None,
+    );
+    let result = run_pending_delete_drain_inner(state, entries, delete_profile, retire_profile, match_owner);
+    if let Ok(report) = &result {
+        crate::diagnostics::record_current(
+            "queue", "resolve", "lifted", None, None, None,
+            Some(report.lifted as u64), None,
+        );
+        crate::diagnostics::record_current(
+            "queue", "resolve", "owed", None, None, None,
+            Some(report.deferred as u64), None,
+        );
+        crate::diagnostics::record_current(
+            "queue", "resolve", "blocked", None, None, None,
+            Some(report.blocked as u64), None,
+        );
+        crate::diagnostics::record_current(
+            "queue", "resolve", "unsupported", None, None, Some("unsupported"),
+            Some(report.unsupported as u64), None,
+        );
+        crate::diagnostics::record_current(
+            "queue", "resolve", "unknown", None, None, None,
+            Some(report.kept_unmatched.len() as u64), None,
+        );
+    }
+    crate::diagnostics::record_current(
+        "startup",
+        "drain",
+        match &result {
+            Ok(report) if report.bridge_not_ready => "unavailable",
+            Ok(_) => "ok",
+            Err(_) => "failed",
+        },
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        None,
+        result.as_ref().err().map(diagnostic_error_class),
+        result.as_ref().ok().map(|report| {
+            report.lifted.saturating_add(report.deferred)
+                .saturating_add(report.unsupported)
+                .saturating_add(report.blocked)
+                .saturating_add(report.kept_unmatched.len()) as u64
+        }),
+        None,
+    );
+    result
+}
+
+fn run_pending_delete_drain_inner<D, R, M>(
+    state: &AppState,
+    entries: &[PendingProfileDelete],
     mut delete_profile: D,
     mut retire_profile: R,
     match_owner: M,
@@ -1689,7 +2016,11 @@ where
     use crate::android_bridge::SiteProfileAction;
     let mut report = DrainReport::default();
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
+        let step_id = Some(index as u64);
+        crate::diagnostics::record_current(
+            "delete", "profile_delete", "started", None, None, None, None, step_id,
+        );
         // A permanent block is not a deletion still owed: the provider already
         // confirmed it, so it is not asked again (no provider call and no
         // warning per start, forever). The entry IS still re-matched against
@@ -1697,24 +2028,49 @@ where
         // restores its site id, and only a durably secured generation may lift
         // it after that.
         let action = if entry.is_blocked() {
+            crate::diagnostics::record_current(
+                "delete", "provider_delete", "blocked", None, None, None, None, step_id,
+            );
             SiteProfileAction::Absent
         } else {
+            crate::diagnostics::record_current(
+                "delete", "provider_delete", "started", None, None, None, None, step_id,
+            );
             match delete_profile(&entry.name) {
-                Ok(action) => action,
+                Ok(action) => {
+                    let result = match action {
+                        SiteProfileAction::Deleted => "deleted",
+                        SiteProfileAction::Absent => "absent",
+                        SiteProfileAction::Pending => "deferred",
+                    };
+                    crate::diagnostics::record_current(
+                        "delete", "provider_delete", result, None, None, None, None, step_id,
+                    );
+                    action
+                }
                 Err(AppError::Unsupported(_)) => {
+                    crate::diagnostics::record_current(
+                        "delete", "provider_delete", "unsupported", None, None,
+                        Some("unsupported"), None, step_id,
+                    );
                     // No profile API on this device: nothing deletes here until
                     // there is one. Keep it queued so a later provider update can
                     // drain it, and keep going — a feature gap must not abort the
                     // remaining names or be reported as a success.
-                    log::warn!(
-                        "ertelenen profil silme atlandı: sağlayıcı profilleri desteklemiyor ({})",
-                        entry.name
+                    log::warn!("deferred profile delete skipped: provider unsupported; tombstone retained");
+                    crate::diagnostics::record_current(
+                        "delete", "profile_delete", "unsupported", None, None,
+                        Some("unsupported"), None, step_id,
                     );
                     report.unsupported += 1;
                     continue;
                 }
-                Err(e) => {
-                    log::warn!("ertelenen profil silme denenemedi (köprü hazır değil): {e}");
+                Err(error) => {
+                    crate::diagnostics::record_current(
+                        "delete", "provider_delete", "failed", None, None,
+                        Some(diagnostic_error_class(&error)), None, step_id,
+                    );
+                    log::warn!("deferred profile delete did not complete; tombstone retained");
                     report.bridge_not_ready = true;
                     return Ok(report);
                 }
@@ -1723,9 +2079,9 @@ where
         if matches!(action, SiteProfileAction::Pending) {
             // Still in use or still unsupported: keep it queued for a later
             // start. Never reported to the user as deleted.
-            log::warn!(
-                "ertelenen profil silme bir kez daha ertelendi ({})",
-                entry.name
+            log::warn!("deferred profile delete remains owed");
+            crate::diagnostics::record_current(
+                "delete", "profile_delete", "deferred", None, None, None, None, step_id,
             );
             report.deferred += 1;
             continue;
@@ -1734,13 +2090,13 @@ where
         // Deleted (or already absent): the bytes are gone. Now make the NAME
         // unreachable durably, BEFORE the record of the deletion is dropped.
         let matched = match_owner(&entry.name);
+        crate::diagnostics::record_current(
+            "delete", "generation", "started", None, None, None, None, step_id,
+        );
         let secured = match &entry.owner {
             PendingOwner::Site(site_id) => match &matched {
                 Some(other) if other != site_id => {
-                    log::warn!(
-                        "ertelenen silme: tombstone sahibi çelişiyor (kayıt {site_id}, eşleşen {other}), korunuyor: {}",
-                        entry.name
-                    );
+                    log::warn!("deferred delete owner mismatch; tombstone retained");
                     report.kept_unmatched.push(entry.name.clone());
                     false
                 }
@@ -1758,16 +2114,20 @@ where
             PendingOwner::Unknown => match &matched {
                 Some(site_id) => secure_tombstone_generation(state, site_id, entry, &mut report),
                 None => {
-                    log::warn!(
-                        "ertelenen silme: tombstone sahibi belirlenemedi, kuyrukta korunuyor ve hiçbir açılışa verilmiyor: {}",
-                        entry.name
-                    );
+                    log::warn!("deferred delete owner cannot be identified; tombstone retained");
                     report.kept_unmatched.push(entry.name.clone());
                     false
                 }
             },
         };
+        crate::diagnostics::record_current(
+            "delete", "generation", if secured { "ok" } else { "blocked" },
+            None, None, None, None, step_id,
+        );
         if !secured {
+            crate::diagnostics::record_current(
+                "delete", "profile_delete", "blocked", None, None, None, None, step_id,
+            );
             continue;
         }
 
@@ -1776,20 +2136,42 @@ where
         // retire failure must not undo the fact that the deletion landed and
         // the name is unreachable, so it is logged: keeping the ledger only
         // blocks a name nothing can derive any more.
-        forget_pending_profile_delete(state, &entry.name)?;
-        report.lifted += 1;
-        match retire_profile(&entry.name) {
-            Ok(dropped) if dropped > 0 => log::info!(
-                "ertelenen profil karantinası emekliye ayrıldı ({dropped} bekleyen kayıt): {}",
-                entry.name
-            ),
-            Ok(_) => {}
-            Err(e) => log::warn!(
-                "ertelenen profil karantinası emekliye ayrılamadı ({}): {e}",
-                entry.name
-            ),
+        crate::diagnostics::record_current(
+            "delete", "queue_remove", "started", None, None, None, None, step_id,
+        );
+        if let Err(error) = forget_pending_profile_delete(state, &entry.name) {
+            crate::diagnostics::record_current(
+                "delete", "queue_remove", "failed", None, None,
+                Some(diagnostic_error_class(&error)), None, step_id,
+            );
+            return Err(error);
         }
-        log::info!("ertelenen profil verisi silindi ({})", entry.name);
+        crate::diagnostics::record_current(
+            "delete", "queue_remove", "ok", None, None, None, None, step_id,
+        );
+        report.lifted += 1;
+
+        crate::diagnostics::record_current(
+            "delete", "quarantine_retire", "started", None, None, None, None, step_id,
+        );
+        match retire_profile(&entry.name) {
+            Ok(dropped) => {
+                crate::diagnostics::record_current(
+                    "delete", "quarantine_retire", "retired", None, None,
+                    None, Some(dropped as u64), step_id,
+                );
+            }
+            Err(error) => {
+                crate::diagnostics::record_current(
+                    "delete", "quarantine_retire", "failed", None, None,
+                    Some(diagnostic_error_class(&error)), None, step_id,
+                );
+                log::warn!("deferred profile quarantine cleanup did not complete");
+            }
+        }
+        crate::diagnostics::record_current(
+            "delete", "profile_delete", "deleted", None, None, None, None, step_id,
+        );
     }
 
     Ok(report)
@@ -1851,6 +2233,39 @@ pub struct OrphanSweepReport {
 pub fn run_orphan_profile_sweep<D, R>(
     state: &AppState,
     names: &[String],
+    delete_profile: D,
+    retire_profile: R,
+) -> AppResult<OrphanSweepReport>
+where
+    D: FnMut(&str) -> AppResult<crate::android_bridge::SiteProfileAction>,
+    R: FnMut(&str) -> AppResult<u32>,
+{
+    let _scope = crate::diagnostics::scope_if_missing("clear");
+    let started = std::time::Instant::now();
+    crate::diagnostics::record_current(
+        "clear", "orphan_sweep", "started", None, None, None, Some(names.len() as u64), None,
+    );
+    let result = run_orphan_profile_sweep_inner(state, names, delete_profile, retire_profile);
+    crate::diagnostics::record_current(
+        "clear",
+        "orphan_sweep",
+        if result.is_ok() { "ok" } else { "failed" },
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        None,
+        result.as_ref().err().map(diagnostic_error_class),
+        result.as_ref().ok().map(|report| {
+            report.queued.saturating_add(report.blocked)
+                .saturating_add(report.deferred)
+                .saturating_add(report.unsupported) as u64
+        }),
+        None,
+    );
+    result
+}
+
+fn run_orphan_profile_sweep_inner<D, R>(
+    state: &AppState,
+    names: &[String],
     mut delete_profile: D,
     mut retire_profile: R,
 ) -> AppResult<OrphanSweepReport>
@@ -1876,62 +2291,127 @@ where
             .map(|entry| entry.name)
             .collect();
 
-    for owned_name in names {
+    for (index, owned_name) in names.iter().enumerate() {
         let name = owned_name.as_str();
+        let step_id = Some(index as u64);
+        crate::diagnostics::record_current(
+            "clear", "profile_delete", "started", None, None, None, None, step_id,
+        );
         if blocked_names.contains(name) {
-            log::debug!("yetim profil zaten kalıcı olarak engelli, yeniden silme atlandı ({name})");
+            log::debug!("orphan profile already blocked; repeated delete skipped");
+            crate::diagnostics::record_current(
+                "clear", "profile_delete", "blocked", None, None, None, None, step_id,
+            );
             continue;
         }
 
         // (1) Tombstone first. A failed write means the provider is never
         // asked: better an undeleted profile than an unrecorded deletion.
-        queue_orphan_profile_delete(state, name)?;
+        crate::diagnostics::record_current(
+            "clear", "tombstone", "started", None, None, None, None, step_id,
+        );
+        if let Err(error) = queue_orphan_profile_delete(state, name) {
+            crate::diagnostics::record_current(
+                "clear", "tombstone", "failed", None, None, Some("storage"), None, step_id,
+            );
+            return Err(error);
+        }
+        crate::diagnostics::record_current(
+            "clear", "tombstone", "queued", None, None, None, None, step_id,
+        );
         report.queued += 1;
 
-        // (2) Provider delete — only now.
+        // (2) Provider delete — only after the durable tombstone.
+        crate::diagnostics::record_current(
+            "clear", "provider_delete", "started", None, None, None, None, step_id,
+        );
         let action = match delete_profile(name) {
-            Ok(action) => action,
+            Ok(action) => {
+                let result = match action {
+                    SiteProfileAction::Deleted => "deleted",
+                    SiteProfileAction::Absent => "absent",
+                    SiteProfileAction::Pending => "deferred",
+                };
+                crate::diagnostics::record_current(
+                    "clear", "provider_delete", result, None, None, None, None, step_id,
+                );
+                action
+            }
             Err(AppError::Unsupported(_)) => {
-                log::warn!(
-                    "yetim profil silinemedi: sağlayıcı profilleri desteklemiyor, kuyrukta borçlu kalıyor ({name})"
+                crate::diagnostics::record_current(
+                    "clear", "provider_delete", "unsupported", None, None,
+                    Some("unsupported"), None, step_id,
+                );
+                log::warn!("orphan profile delete unsupported; durable tombstone retained");
+                crate::diagnostics::record_current(
+                    "clear", "profile_delete", "unsupported", None, None,
+                    Some("unsupported"), None, step_id,
                 );
                 report.unsupported += 1;
                 continue;
             }
-            Err(e) => {
-                log::warn!(
-                    "yetim profil silme köprüsü cevap vermedi, tombstone korunuyor ({name}): {e}"
+            Err(error) => {
+                crate::diagnostics::record_current(
+                    "clear", "provider_delete", "failed", None, None,
+                    Some(diagnostic_error_class(&error)), None, step_id,
                 );
-                return Err(e);
+                log::warn!("orphan profile delete did not complete; tombstone retained");
+                return Err(error);
             }
         };
         if matches!(action, SiteProfileAction::Pending) {
             // Still loaded in this process: the tombstone and its ledger stay,
             // and the startup drain finishes the deletion.
-            log::info!("yetim profil hâlâ kullanımda, silme ertelendi ({name})");
+            log::info!("orphan profile delete deferred; durable tombstone retained");
+            crate::diagnostics::record_current(
+                "clear", "profile_delete", "deferred", None, None, None, None, step_id,
+            );
             report.deferred += 1;
             continue;
         }
 
         // (3) Confirmed (`Deleted` or `Absent`): make the name permanently
         // unreachable BEFORE the ledger goes.
-        block_pending_profile_delete(state, name)?;
+        crate::diagnostics::record_current(
+            "clear", "tombstone", "started", None, None, None, None, step_id,
+        );
+        if let Err(error) = block_pending_profile_delete(state, name) {
+            crate::diagnostics::record_current(
+                "clear", "tombstone", "failed", None, None,
+                Some(diagnostic_error_class(&error)), None, step_id,
+            );
+            return Err(error);
+        }
+        crate::diagnostics::record_current(
+            "clear", "tombstone", "blocked", None, None, None, None, step_id,
+        );
         blocked_names.insert(owned_name.clone());
         report.blocked += 1;
 
         // (4) Quarantine ledger last.
+        crate::diagnostics::record_current(
+            "clear", "quarantine_retire", "started", None, None, None, None, step_id,
+        );
         match retire_profile(name) {
             Ok(dropped) => {
-                report.retired += 1;
-                log::info!(
-                    "yetim site profili temizlendi (düşen karantina kaydı: {dropped}): {name}"
+                crate::diagnostics::record_current(
+                    "clear", "quarantine_retire", "retired", None, None,
+                    None, Some(dropped as u64), step_id,
                 );
+                report.retired += 1;
             }
-            Err(e) => {
+            Err(error) => {
+                crate::diagnostics::record_current(
+                    "clear", "quarantine_retire", "failed", None, None,
+                    Some(diagnostic_error_class(&error)), None, step_id,
+                );
                 report.retire_failed += 1;
-                log::warn!("yetim profil karantinası emekliye ayrılamadı ({name}): {e}");
+                log::warn!("orphan profile quarantine retirement did not complete");
             }
         }
+        crate::diagnostics::record_current(
+            "clear", "profile_delete", "deleted", None, None, None, None, step_id,
+        );
     }
 
     Ok(report)
@@ -2000,7 +2480,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         init_script,
         &mut BridgeOpenOps,
     )?;
-    log::debug!("site profili açıldı ({}): {opened_profile}", site.id);
+    log::debug!("site profili açıldı");
 
     let label = label_for(&site.id);
     *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
@@ -2054,7 +2534,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     }
 
     window.clear_all_browsing_data().map_err(|e| {
-        log::error!("çerezler temizlenemedi: {e}");
+        log::error!("çerezler temizlenemedi");
         AppError::Other("çerezler temizlenemedi".into())
     })?;
 
@@ -2063,12 +2543,12 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     }
 
     if let Err(e) = window.eval(init_script) {
-        log::error!("script yüklenemedi: {e}");
+        log::error!("script yüklenemedi");
         return Err(AppError::Other("script yüklenemedi".into()));
     }
 
     if let Err(e) = window.navigate(url.clone()) {
-        log::error!("sayfa açılamadı: {e}");
+        log::error!("sayfa açılamadı");
         return Err(AppError::Other("sayfa açılamadı".into()));
     }
 
@@ -2101,7 +2581,7 @@ fn export_cookies(
 ) -> AppResult<()> {
     let _ = expected_host;
     let live = window.cookies().map_err(|e| {
-        log::error!("çerezler okunamadı: {e}");
+        log::error!("çerezler okunamadı");
         AppError::Other("çerezler okunamadı".into())
     })?;
     export_cookies_from(live, window.app_handle(), site_id)
@@ -2111,7 +2591,7 @@ fn export_cookies(
 #[cfg(desktop)]
 fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<()> {
     let live = webview.cookies().map_err(|e| {
-        log::error!("çerezler okunamadı: {e}");
+        log::error!("çerezler okunamadı");
         AppError::Other("çerezler okunamadı".into())
     })?;
     export_cookies_from(live, webview.app_handle(), site_id)
@@ -2158,7 +2638,7 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> Ap
     for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
         if let Some(cookie) = restore(stored) {
             if let Err(e) = window.set_cookie(cookie) {
-                log::debug!("cookie restore failed for {site_id}: {e}");
+                log::debug!("site cookie restore did not complete");
             }
         }
     }
@@ -2178,6 +2658,7 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> Ap
 /// iOS: persist the jar, then send the shared WebView back to the launcher.
 #[cfg(mobile)]
 pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
+    let _operation_scope = crate::diagnostics::scope_if_missing("close");
     #[cfg(target_os = "android")]
     let _session_guard = lock_android_session()?;
 
@@ -2220,7 +2701,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
             .clone();
         if let Some(url) = back {
             window.navigate(url).map_err(|e| {
-                log::error!("başlatıcıya dönülemedi: {e}");
+                log::error!("başlatıcıya dönülemedi");
                 AppError::Other("başlatıcıya dönülemedi".into())
             })?;
         }
@@ -2262,7 +2743,7 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     if let Some(child) = app.get_webview(&child_label) {
         // Intentionally skip `export_cookies_webview` — the caller is wiping.
         child.close().map_err(|e| {
-            log::error!("site görünümü kapatılamadı: {e}");
+            log::error!("site görünümü kapatılamadı");
             AppError::Other("site görünümü kapatılamadı".into())
         })?;
     }
@@ -2282,15 +2763,15 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
 
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         if let Err(e) = window.set_title(LAUNCHER_TITLE) {
-            log::warn!("pencere başlığı geri alınamadı: {e}");
+            log::warn!("pencere başlığı geri alınamadı");
         }
         if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
             if let Err(e) = window.set_fullscreen(false) {
-                log::warn!("tam ekrandan çıkılamadı: {e}");
+                log::warn!("tam ekrandan çıkılamadı");
             }
         }
         if let Err(e) = window.set_focus() {
-            log::debug!("pencere odaklanamadı: {e}");
+            log::debug!("pencere odaklanamadı");
         }
     }
 
@@ -2357,7 +2838,7 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
         if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
             if let Some(url) = back {
                 window.navigate(url).map_err(|e| {
-                    log::error!("başlatıcıya dönülemedi: {e}");
+                    log::error!("başlatıcıya dönülemedi");
                     AppError::Other("başlatıcıya dönülemedi".into())
                 })?;
             }
@@ -2384,6 +2865,7 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
 /// Uses `Webview::close` / `set_fullscreen`, which do not exist on mobile.
 #[cfg(desktop)]
 pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
+    let _operation_scope = crate::diagnostics::scope_if_missing("close");
     let _guard = lock_desktop_session()?;
     close_site_window_locked(app, label)
 }
@@ -2417,7 +2899,7 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
             export_cookies_webview(&child, &cur.site_id)?;
         }
         child.close().map_err(|e| {
-            log::error!("site görünümü kapatılamadı: {e}");
+            log::error!("site görünümü kapatılamadı");
             AppError::Other("site görünümü kapatılamadı".into())
         })?;
     }
@@ -2439,15 +2921,15 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
     // only when *we* were the ones who entered it.
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         if let Err(e) = window.set_title(LAUNCHER_TITLE) {
-            log::warn!("pencere başlığı geri alınamadı: {e}");
+            log::warn!("pencere başlığı geri alınamadı");
         }
         if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
             if let Err(e) = window.set_fullscreen(false) {
-                log::warn!("tam ekrandan çıkılamadı: {e}");
+                log::warn!("tam ekrandan çıkılamadı");
             }
         }
         if let Err(e) = window.set_focus() {
-            log::debug!("pencere odaklanamadı: {e}");
+            log::debug!("pencere odaklanamadı");
         }
     }
 
@@ -2473,7 +2955,7 @@ pub fn open_externally(app: &AppHandle, raw: &str) -> AppResult<()> {
         return Err(AppError::Blocked(safe.host().to_string()));
     }
     tauri_plugin_opener::open_url(safe.as_str(), None::<&str>).map_err(|e| {
-        log::error!("adres tarayıcıda açılamadı: {e}");
+        log::error!("adres tarayıcıda açılamadı");
         AppError::Other("adres tarayıcıda açılamadı".into())
     })
 }
@@ -2528,6 +3010,7 @@ mod tests {
             current_site: Mutex::new(current),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
+            diagnostics_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -3225,6 +3708,7 @@ mod tests {
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
+            diagnostics_lock: std::sync::Mutex::new(()),
         };
         (state, fail_flag, flag_writes)
     }
@@ -3695,6 +4179,7 @@ mod tests {
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
+            diagnostics_lock: std::sync::Mutex::new(()),
         };
         (state, session_deletes)
     }
@@ -3966,6 +4451,7 @@ mod tests {
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
+            diagnostics_lock: std::sync::Mutex::new(()),
         };
         (state, writes, fail_generation_writes, fail_queue_writes)
     }

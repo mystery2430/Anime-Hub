@@ -49,7 +49,7 @@ sealed class MigrationOutcome {
    * failed, callback lost): the profile is dirty and must be retired.
    * [SiteProfileErrors.MIGRATION_RETRY] prepended by the controller.
    */
-  data class Failed(val reason: String) : MigrationOutcome()
+  data class Failed(val reason: String, val errorClass: String = "provider") : MigrationOutcome()
 }
 
 /**
@@ -69,24 +69,51 @@ object SiteMigrationFlow {
   const val COOKIE_TIMEOUT_MS: Long = 10_000
   const val FLUSH_TIMEOUT_MS: Long = 15_000
 
-  fun run(cookies: List<String>, port: SiteMigrationPort, onDone: (MigrationOutcome) -> Unit) {
+  fun run(
+    cookies: List<String>,
+    port: SiteMigrationPort,
+    operationId: String = AnimeHubDebugLog.newOperationId(),
+    onDone: (MigrationOutcome) -> Unit,
+  ) {
+    val safeOperationId = AnimeHubDebugLog.safeOperationId(operationId) ?: AnimeHubDebugLog.newOperationId()
+    val flowStartedAt = System.nanoTime()
     val once = AtomicBoolean(false)
+    AnimeHubDebugLog.record("migration", "start", "started", safeOperationId, count = cookies.size.toLong())
     fun finish(outcome: MigrationOutcome) {
-      if (once.compareAndSet(false, true)) onDone(outcome)
-    }
-    val exists =
-      runCatching { port.profileExists() }.getOrElse { e ->
-        finish(MigrationOutcome.Failed("mevcut profili okunamadı: ${e.message}"))
-        return
+      if (once.compareAndSet(false, true)) {
+        val duration = ((System.nanoTime() - flowStartedAt) / 1_000_000).coerceAtLeast(0)
+        val (result, errorClass, count) = when (outcome) {
+          is MigrationOutcome.Complete -> Triple("ok", null, outcome.accepted.toLong())
+          MigrationOutcome.ProfileAlreadyExists -> Triple("duplicate", "migration_partial", cookies.size.toLong())
+          is MigrationOutcome.Failed -> Triple("failed", outcome.errorClass, null)
+        }
+        AnimeHubDebugLog.record(
+          "migration", "complete", result, safeOperationId,
+          durationMs = duration, errorClass = errorClass, count = count,
+        )
+        onDone(outcome)
       }
+    }
+
+    AnimeHubDebugLog.record("migration", "profile_check", "started", safeOperationId)
+    val exists = runCatching { port.profileExists() }.getOrElse {
+      AnimeHubDebugLog.record("migration", "profile_check", "failed", safeOperationId, errorClass = "provider")
+      finish(MigrationOutcome.Failed("provider"))
+      return
+    }
+    AnimeHubDebugLog.record("migration", "profile_check", if (exists) "present" else "absent", safeOperationId)
     if (exists) {
       finish(MigrationOutcome.ProfileAlreadyExists)
       return
     }
-    runCatching { port.createProfile() }.getOrElse { e ->
-      finish(MigrationOutcome.Failed("profil oluşturulamadı: ${e.message}"))
+
+    AnimeHubDebugLog.record("migration", "profile_create", "started", safeOperationId)
+    if (runCatching { port.createProfile() }.isFailure) {
+      AnimeHubDebugLog.record("migration", "profile_create", "failed", safeOperationId, errorClass = "provider")
+      finish(MigrationOutcome.Failed("provider"))
       return
     }
+    AnimeHubDebugLog.record("migration", "profile_create", "ok", safeOperationId)
 
     val accepted = AtomicInteger(0)
     val index = AtomicInteger(0)
@@ -95,72 +122,129 @@ object SiteMigrationFlow {
       val i = index.get()
       if (i >= cookies.size) {
         val settled = AtomicBoolean(false)
+        val stepStartedAt = System.nanoTime()
+        val stepId = cookies.size.toLong()
+        AnimeHubDebugLog.record("migration", "flush", "started", safeOperationId, stepId = stepId)
         val flushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
           if (settled.compareAndSet(false, true)) {
-            finish(MigrationOutcome.Failed("çerez aktarımı kalıcı hale getirilemedi: zaman aşımı"))
+            AnimeHubDebugLog.record(
+              "migration", "flush", "timeout", safeOperationId,
+              durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+              watchdog = "fired", errorClass = "timeout", stepId = stepId,
+            )
+            finish(MigrationOutcome.Failed("çerez aktarımı kalıcı hale getirilemedi: zaman aşımı", "timeout"))
           }
         }
         if (flushWatchdog is Watchdog.Refused) {
-          // No bound on the flush ⇒ do not start it. The strict criterion means
-          // this attempt is a retryable failure: the flag is not written, the
-          // profile is retired by the caller and the import is retried on a
-          // fresh generation — never reported as a complete migration.
+          // No bound on the flush ⇒ do not start it. Migration remains retryable.
           if (settled.compareAndSet(false, true)) {
-            finish(
-              MigrationOutcome.Failed(
-                "çerez aktarımı kalıcı hale getirilemedi: ${SiteProfileErrors.WATCHDOG_REFUSED}"
-              )
+            AnimeHubDebugLog.record(
+              "migration", "flush", "failed", safeOperationId,
+              durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+              watchdog = "refused", errorClass = "watchdog_refused", stepId = stepId,
             )
+            finish(MigrationOutcome.Failed("çerez aktarımı kalıcı hale getirilemedi: ${SiteProfileErrors.WATCHDOG_REFUSED}", "watchdog_refused"))
           }
           return
         }
+        AnimeHubDebugLog.record("migration", "watchdog_arm", "armed", safeOperationId, stepId = stepId)
         val cancelFlushWatchdog = (flushWatchdog as Watchdog.Armed).cancel
         port.flushCookies { error ->
-          if (!settled.compareAndSet(false, true)) return@flushCookies
+          if (!settled.compareAndSet(false, true)) {
+            AnimeHubDebugLog.record(
+              "migration", "late_callback", "late", safeOperationId,
+              watchdog = "late", errorClass = "timeout", stepId = stepId,
+            )
+            return@flushCookies
+          }
           cancelFlushWatchdog()
           if (error != null) {
-            finish(MigrationOutcome.Failed("çerez aktarımı kalıcı hale getirilemedi: ${error.message}"))
+            AnimeHubDebugLog.record(
+              "migration", "flush", "failed", safeOperationId,
+              durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+              errorClass = "provider", stepId = stepId,
+            )
+            finish(MigrationOutcome.Failed("provider"))
           } else {
+            AnimeHubDebugLog.record(
+              "migration", "flush", "ok", safeOperationId,
+              durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+              stepId = stepId,
+            )
             finish(MigrationOutcome.Complete(accepted.get()))
           }
         }
         return
       }
       val perCookie = AtomicBoolean(false)
+      val stepStartedAt = System.nanoTime()
+      val stepId = i.toLong()
+      AnimeHubDebugLog.record(
+        "migration", "cookie_write", "started", safeOperationId,
+        count = (i + 1).toLong(), stepId = stepId,
+      )
       val cookieWatchdog = port.scheduleTimeout(COOKIE_TIMEOUT_MS) {
         if (perCookie.compareAndSet(false, true)) {
-          finish(MigrationOutcome.Failed("çerez aktarımı zaman aşımına uğradı"))
+          AnimeHubDebugLog.record(
+            "migration", "cookie_write", "timeout", safeOperationId,
+            durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+            watchdog = "fired", errorClass = "timeout", count = (i + 1).toLong(), stepId = stepId,
+          )
+          finish(MigrationOutcome.Failed("çerez aktarımı zaman aşımına uğradı", "timeout"))
         }
       }
       if (cookieWatchdog is Watchdog.Refused) {
-        // No bound ⇒ never write the cookie: an unbounded `setCookie` could
-        // answer after this attempt was reported failed, into a profile that is
-        // about to be retired, and nothing would notice.
+        // No bound ⇒ never write this cookie; the incomplete profile is retired.
         if (perCookie.compareAndSet(false, true)) {
-          finish(MigrationOutcome.Failed("çerez aktarımı ${SiteProfileErrors.WATCHDOG_REFUSED}"))
+          AnimeHubDebugLog.record(
+            "migration", "cookie_write", "failed", safeOperationId,
+            durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+            watchdog = "refused", errorClass = "watchdog_refused", count = (i + 1).toLong(), stepId = stepId,
+          )
+          finish(MigrationOutcome.Failed("çerez aktarımı ${SiteProfileErrors.WATCHDOG_REFUSED}", "watchdog_refused"))
         }
         return
       }
+      AnimeHubDebugLog.record("migration", "watchdog_arm", "armed", safeOperationId, stepId = stepId)
       val cancelCookieWatchdog = (cookieWatchdog as Watchdog.Armed).cancel
       try {
         port.setCookie(cookies[i]) { ok ->
-          if (!perCookie.compareAndSet(false, true)) return@setCookie
+          if (!perCookie.compareAndSet(false, true)) {
+            AnimeHubDebugLog.record(
+              "migration", "late_callback", "late", safeOperationId,
+              watchdog = "late", errorClass = "timeout", count = (i + 1).toLong(), stepId = stepId,
+            )
+            return@setCookie
+          }
           cancelCookieWatchdog()
           if (!ok) {
-            // Strict criterion: a rejected cookie fails the migration and
-            // stops the chain — the doomed profile gets retired, and writing
-            // more of the jar into it would only muddy the retry.
-            finish(MigrationOutcome.Failed("çerez reddedildi (${i + 1}/${cookies.size})"))
+            // Strict criterion: any rejected cookie retires the virgin profile.
+            AnimeHubDebugLog.record(
+              "migration", "cookie_write", "rejected", safeOperationId,
+              durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+              errorClass = "migration_partial", count = (i + 1).toLong(), stepId = stepId,
+            )
+            finish(MigrationOutcome.Failed("çerez reddedildi", "migration_partial"))
             return@setCookie
           }
           accepted.incrementAndGet()
           index.incrementAndGet()
+          AnimeHubDebugLog.record(
+            "migration", "cookie_write", "ok", safeOperationId,
+            durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+            count = accepted.get().toLong(), stepId = stepId,
+          )
           setNext()
         }
-      } catch (e: Exception) {
+      } catch (_: Exception) {
         if (perCookie.compareAndSet(false, true)) {
           cancelCookieWatchdog()
-          finish(MigrationOutcome.Failed("çerez aktarımı başarısız: ${e.message}"))
+          AnimeHubDebugLog.record(
+            "migration", "cookie_write", "failed", safeOperationId,
+            durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+            errorClass = "provider", count = (i + 1).toLong(), stepId = stepId,
+          )
+          finish(MigrationOutcome.Failed("provider"))
         }
       }
     }

@@ -972,7 +972,18 @@ textarea:focus-visible {
   }
 }
 
-/* Developer panel: the PiP log is plain text, never HTML. */
+/* Developer panel: diagnostics are plain text, never HTML. */
+.dev-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-block: 10px;
+}
+
+.dev-actions button {
+  min-height: 38px;
+}
+
 .dev-log {
   white-space: pre-wrap;
   word-break: break-all;

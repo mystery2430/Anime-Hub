@@ -139,13 +139,17 @@ test("both open phases gate on MULTI_PROFILE before anything else and never fall
   for (const entry of ["fun migrate(", "fun open("]) {
     const at = controllerKt.indexOf(entry);
     assert.ok(at > 0, `${entry} missing`);
-    const signatureEnd = controllerKt.indexOf(") {", at);
-    const guard = controllerKt.slice(signatureEnd, signatureEnd + 400);
-    assert.match(
-      guard,
-      /if \(!isSupported\(\)\) \{\n\s*onResult\(ERR_UNSUPPORTED_MULTI_PROFILE\)/,
-      `${entry} must refuse an unsupported provider first`,
+    const guardEnd = controllerKt.indexOf("activity.runOnUiThread", at);
+    assert.ok(guardEnd > at, `${entry} UI dispatch missing`);
+    const guard = controllerKt.slice(at, guardEnd);
+    const supportCheck = guard.indexOf("if (!isSupported())");
+    const profileCheck = guard.indexOf("if (!profileNameIsValid(profileName))");
+    assert.ok(supportCheck > 0, `${entry} must check MULTI_PROFILE`);
+    assert.ok(
+      profileCheck > supportCheck,
+      `${entry} must refuse an unsupported provider before profile or UI work`,
     );
+    assert.match(guard, /onResult\(ERR_UNSUPPORTED_MULTI_PROFILE\)\s*return/);
   }
   // No path opens the site when the feature is missing: both phases reject,
   // and the delete refusal reports the same feature gap (clear uses the
@@ -158,7 +162,7 @@ test("both open phases gate on MULTI_PROFILE before anything else and never fall
   );
   // Rust classifies exactly that sentinel into the user-facing message.
   assert.match(pluginLibRs, /pub const MULTI_PROFILE_SENTINEL: &str = "unsupported-multi-profile"/);
-  assert.match(bridgeRs, /is_unsupported_multi_profile\(&e\)/);
+  assert.match(bridgeRs, /is_unsupported_multi_profile\(&error\)/);
   assert.match(
     bridgeRs,
     /AppError::Unsupported\(\s*MULTI_PROFILE_UNSUPPORTED_MSG\.to_string\(\),?\s*\)/,
@@ -238,8 +242,8 @@ test("site cookies never touch the static CookieManager", () => {
 
 test("migration is one-time, profile-scoped, and ordered before first navigation", () => {
   // Rust side: `run_mobile_open_protocol` owns migrate → durable flag → open.
-  const protoAt = windowsRs.indexOf("pub fn run_mobile_open_protocol");
-  assert.ok(protoAt > 0, "the two-phase protocol function is missing");
+  const protoAt = windowsRs.indexOf("fn run_mobile_open_protocol_inner");
+  assert.ok(protoAt > 0, "the host-tested two-phase protocol body is missing");
   const body = windowsRs.slice(protoAt, windowsRs.indexOf("\n}\n", protoAt));
   assert.match(body, /MIGRATION_FLAG_PREFIX/, "migration must be flag-gated");
   assert.match(body, /mark_migration_done/, "the protocol writes the flag");
@@ -257,7 +261,8 @@ test("migration is one-time, profile-scoped, and ordered before first navigation
   );
   // A failed flag write ABORTS the open — never the old log-and-continue,
   // which left a shown profile with a missing flag and got it retired.
-  assert.match(body, /kalıcılaştırılamadı/, "the abort must be user-visible");
+  assert.match(body, /site migration state could not be stored; site was not opened/,
+    "a failed flag write must abort before opening the view");
   assert.doesNotMatch(
     body,
     /log::warn!\("profil göç bayrağı yazılamadı/,
@@ -276,7 +281,7 @@ test("migration is one-time, profile-scoped, and ordered before first navigation
   // authoritative and the migration REFUSES (retryable sentinel) instead of
   // being overwritten by the stale snapshot (A.3).
   assert.match(controllerKt, /MigrationOutcome\.ProfileAlreadyExists/);
-  assert.match(controllerKt, /onResult\("\$ERR_MIGRATION_RETRY: profil zaten mevcut"\)/);
+  assert.match(controllerKt, /onResult\("\$ERR_MIGRATION_RETRY: profile already exists"\)/);
   // Flush to disk completes inside the migration flow, before buildWebView.
   assert.match(controllerKt, /m\.flush\(\)/);
   const flushAt = controllerKt.indexOf("m.flush()");
@@ -398,14 +403,14 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
   // lift → retire, all on the derived name. The tombstone is first because a
   // process kill inside the (slow) provider call must not leave a name that is
   // still derivable, still on disk and no longer remembered — see AH-04 / R-07.
-  const at = windowsRs.indexOf("pub fn run_mobile_delete_protocol");
+  const at = windowsRs.indexOf("fn run_mobile_delete_protocol_inner");
   assert.ok(at > 0, "the delete protocol is missing");
   const body = windowsRs.slice(at, windowsRs.indexOf("\n}\n", at));
-  const queue = body.indexOf("queue_site_profile_delete(state, site_id, &profile)?");
+  const queue = body.indexOf("queue_site_profile_delete(state, site_id, &profile)");
   const del = body.indexOf("delete_profile(&profile)");
-  const bump = body.indexOf("secure_generation_past_name(state, site_id, &profile)?");
-  const forget = body.indexOf("forget_pending_profile_delete(state, &profile)?");
-  const retire = body.indexOf("retire_profile(&profile)?");
+  const bump = body.indexOf("secure_generation_past_name(state, site_id, &profile)");
+  const forget = body.indexOf("forget_pending_profile_delete(state, &profile)");
+  const retire = body.indexOf("retire_profile(&profile)");
   assert.ok(queue > 0, "the durable intent is written before anything else");
   assert.ok(del > queue, "the provider is only called once the tombstone is durable");
   assert.ok(bump > del, "the durable generation follows the deletion");
@@ -430,7 +435,7 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
   assert.match(body, /return Ok\(action\);/);
   // A failed provider call propagates WITHOUT lifting the tombstone, so the
   // deletion is retried at the next start instead of being forgotten.
-  assert.match(body, /Err\(e\) => \{[\s\S]{0,400}?return Err\(e\);/);
+  assert.match(body, /Err\(error\) => \{[\s\S]{0,500}?return Err\(error\);/);
   // Host tests that execute the order itself.
   for (const name of [
     "mobile_delete_protocol_retires_only_after_the_generation_is_durable",
@@ -486,7 +491,7 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
   );
   assert.match(
     controllerKt,
-    /fun retireProfileQuarantine\(profileName: String, onResult: \(dropped: Int, error: String\?\) -> Unit\)/,
+    /fun retireProfileQuarantine\(\s*profileName: String,\s*operationId: String,\s*onResult: \(dropped: Int, error: String\?\) -> Unit/,
   );
   assert.match(controllerKt, /ProfileRetirement\.refusal\(profileName, active\.activeProfile\)/);
   assert.match(ops, /object ProfileRetirement/);
@@ -501,7 +506,7 @@ test("the quarantine ledger is retired only AFTER the generation is durable", ()
   );
   assert.match(pluginLibRs, /pub struct SiteProfileRetireResult/);
   assert.match(pluginKt, /fun site_profile_retire\(invoke: Invoke\)/);
-  assert.match(pluginKt, /AnimeHubSiteController\.retireProfileQuarantine\(profileName\)/);
+  assert.match(pluginKt, /AnimeHubSiteController\.retireProfileQuarantine\(profileName, operationId\)/);
   // The other two deletion paths keep the same rule: durable step first. The
   // orphan sweep no longer retires inline — it hands both provider calls to the
   // host-tested `run_orphan_profile_sweep`, which retires ONLY after the
@@ -540,11 +545,15 @@ test("clear_site_data clears profiles in place and sweeps orphans, never the lau
     body,
     /#\[cfg\(not\(target_os = "android"\)\)\]\s+state\.provider\.delete_site_session\(id\)\?;/,
   );
-  assert.match(
-    windowsRs,
-    /clear_profile\(&profile\)\?;\s+state\.provider\.delete_site_session\(site_id\)\?;/,
-    "wipe the profile first, then drop the encrypted blobs",
-  );
+  const clearProtoAt = windowsRs.indexOf("fn run_mobile_clear_protocol_inner");
+  assert.ok(clearProtoAt > 0, "the host-tested clear body is missing");
+  const clearProtocol = windowsRs.slice(clearProtoAt, windowsRs.indexOf("\n}\n", clearProtoAt));
+  const profileWipeAt = clearProtocol.indexOf("clear_profile(&profile)");
+  const sessionDropAt = clearProtocol.indexOf("state.provider.delete_site_session(site_id)");
+  assert.ok(profileWipeAt > 0 && sessionDropAt > profileWipeAt,
+    "wipe the profile first, then drop the encrypted blobs");
+  assert.match(clearProtocol, /if let Err\(error\) = clear_profile\(&profile\)[\s\S]*?return Err\(error\)/,
+    "a failed profile wipe keeps the encrypted session for retry");
   // Close-without-flush precedes the wipes for the active site.
   assert.ok(body.indexOf("close_site_window_for_clear_locked") < body.indexOf("site_clear_data"));
   // Orphan sweep (is_all) addresses only our namespace and never owned names.
@@ -583,12 +592,12 @@ test("the startup drain proves a name is underivable before lifting its tombston
   // P1 / R-07: a kill between the tombstone write and the generation write used
   // to leave the stored generation behind — the drain deleted the profile,
   // lifted the tombstone, and the next open derived the SAME name.
-  const at = windowsRs.indexOf("pub fn run_pending_delete_drain");
+  const at = windowsRs.indexOf("fn run_pending_delete_drain_inner");
   assert.ok(at > 0, "the drain is missing from windows.rs");
   const body = windowsRs.slice(at, windowsRs.indexOf("\n}\n", at));
   const del = body.indexOf("delete_profile(&entry.name)");
   const secure = body.indexOf("secure_tombstone_generation(");
-  const forget = body.indexOf("forget_pending_profile_delete(state, &entry.name)?");
+  const forget = body.indexOf("forget_pending_profile_delete(state, &entry.name)");
   const retire = body.indexOf("retire_profile(&entry.name)");
   assert.ok(del > 0, "the provider delete comes first");
   assert.ok(secure > del, "the generation is secured after a confirmed deletion");
@@ -623,7 +632,7 @@ test("the startup drain proves a name is underivable before lifting its tombston
   const libRs = read("src-tauri/src/lib.rs");
   const drain = libRs.slice(libRs.indexOf("fn drain_pending_profile_deletes"));
   assert.match(drain, /w::run_pending_delete_drain\(/);
-  assert.match(drain, /w::read_pending_profile_delete_entries\(state\)\?/);
+  assert.match(drain, /w::read_pending_profile_delete_entries\(state\)/);
   assert.match(drain, /w::match_queued_name_to_site\(name, &site_ids\)/);
   assert.match(drain, /report\.kept_unmatched/);
   assert.doesNotMatch(
@@ -636,19 +645,22 @@ test("the startup drain proves a name is underivable before lifting its tombston
   // order as the other two, and that order has to live where `cargo test` can
   // see it: the sweep block in commands.rs is #[cfg(target_os = "android")] and
   // is only type-checked by the aarch64 job.
+  const sweepEntryAt = windowsRs.indexOf("pub fn run_orphan_profile_sweep");
+  const sweepAt = windowsRs.indexOf("fn run_orphan_profile_sweep_inner");
+  assert.ok(sweepEntryAt > 0 && sweepAt > sweepEntryAt, "the host-tested orphan sweep is missing");
+  assert.match(
+    windowsRs.slice(sweepEntryAt, sweepAt),
+    /pub fn run_orphan_profile_sweep<D, R>\(/,
+    "the public sweep entry takes injected provider calls",
+  );
   const sweepFn = windowsRs.slice(
-    windowsRs.indexOf("pub fn run_orphan_profile_sweep"),
+    sweepAt,
     windowsRs.indexOf("/// Android: open the site in a fresh native WebView"),
   );
-  assert.ok(sweepFn.length > 500, "the host-tested orphan sweep is missing");
-  assert.match(
-    sweepFn,
-    /pub fn run_orphan_profile_sweep<D, R>\(/,
-    "the sweep takes injected provider calls so its order is host-tested",
-  );
-  const tombstoneAt = sweepFn.indexOf("queue_orphan_profile_delete(state, name)?");
+  assert.ok(sweepFn.length > 500, "the host-tested orphan sweep body is missing");
+  const tombstoneAt = sweepFn.indexOf("queue_orphan_profile_delete(state, name)");
   const deleteAt = sweepFn.indexOf("delete_profile(name)");
-  const blockAt = sweepFn.indexOf("block_pending_profile_delete(state, name)?");
+  const blockAt = sweepFn.indexOf("block_pending_profile_delete(state, name)");
   const retireAt = sweepFn.indexOf("retire_profile(name)");
   assert.ok(tombstoneAt > 0, "the sweep must write the durable tombstone");
   assert.ok(deleteAt > tombstoneAt, "the provider call must start AFTER the tombstone is durable");
@@ -671,11 +683,15 @@ test("the startup drain proves a name is underivable before lifting its tombston
   assert.match(windowsRs, /pub blocked: usize,/);
   // The drain consults the block: a blocked entry is not re-deleted, and an
   // orphan without an owner is held, never lifted.
-  assert.match(
-    windowsRs,
-    /let action = if entry\.is_blocked\(\) \{\s+SiteProfileAction::Absent/,
-    "a permanent block must not be sent to the provider again",
-  );
+  const drainInnerAt = windowsRs.indexOf("fn run_pending_delete_drain_inner");
+  const drainInner = windowsRs.slice(drainInnerAt, windowsRs.indexOf("/// What one \"clear all\" orphan sweep did.", drainInnerAt));
+  const blockedAt = drainInner.indexOf("let action = if entry.is_blocked()");
+  const blockedElseAt = drainInner.indexOf("} else {", blockedAt);
+  assert.ok(blockedAt > 0 && blockedElseAt > blockedAt, "blocked-state branch is missing");
+  const blockedBranch = drainInner.slice(blockedAt, blockedElseAt);
+  assert.match(blockedBranch, /SiteProfileAction::Absent/);
+  assert.doesNotMatch(blockedBranch, /delete_profile\(/,
+    "a permanent block must not be sent to the provider again");
   assert.match(windowsRs, /None => hold_as_block\(state, entry, &mut report\),/);
   const holdFn = windowsRs.slice(
     windowsRs.indexOf("fn hold_as_block("),
@@ -767,8 +783,8 @@ test("the open is two-phased: site_migrate carries the jar, site_open carries no
   );
   // Kotlin: an @Command per phase; site_open never parses a cookie array.
   assert.match(pluginKt, /fun site_migrate\(invoke: Invoke\)/);
-  assert.match(pluginKt, /AnimeHubSiteController\.migrate\(activity, url, profileName, cookies\)/);
-  assert.match(pluginKt, /AnimeHubSiteController\.open\(activity, url, profileName, initScript\)/);
+  assert.match(pluginKt, /AnimeHubSiteController\.migrate\(activity, url, profileName, cookies, operationId\)/);
+  assert.match(pluginKt, /AnimeHubSiteController\.open\(activity, url, profileName, initScript, operationId\)/);
   const siteOpenAt = pluginKt.indexOf("fun site_open(invoke: Invoke)");
   assert.ok(siteOpenAt > 0);
   const siteOpenBody = pluginKt.slice(siteOpenAt, pluginKt.indexOf("\n  }\n", siteOpenAt));
@@ -788,8 +804,8 @@ test("every awaited flush is watchdog-bounded, in close and clear alike", () => 
   assert.match(closeFlow, /port\.scheduleTimeout\(FLUSH_TIMEOUT_MS\)/);
   assert.match(
     closeFlow,
-    /if \(!settled\.compareAndSet\(false, true\)\) return@flushCookies/,
-    "a late flush callback must lose the race",
+    /if \(!settled\.compareAndSet\(false, true\)\) \{[\s\S]*?return@flushCookies/,
+    "a late flush callback must lose the race and return without destroying the view",
   );
   // The view is destroyed only by the settled winner, after the guard.
   const flushCbAt = closeFlow.indexOf("port.flushCookies(profileName) { error ->");
@@ -806,7 +822,7 @@ test("every awaited flush is watchdog-bounded, in close and clear alike", () => 
   assert.match(clearFlow, /port\.scheduleTimeout\(FLUSH_TIMEOUT_MS\)/);
   assert.match(
     clearFlow,
-    /if \(!flushSettled\.compareAndSet\(false, true\)\) return@flushCookies/,
+    /if \(!flushSettled\.compareAndSet\(false, true\)\) \{[\s\S]*?return@flushCookies/,
   );
   // Migration keeps its own bounds.
   assert.match(ops, /const val COOKIE_TIMEOUT_MS: Long = 10_000/);
@@ -861,7 +877,7 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
   assert.doesNotMatch(controllerKt, /for \(origin in origins\) geo\.clear\(origin\)/);
   assert.match(
     controllerKt,
-    /SiteClearFlow\.run\(isSupported\(\), profileName, port\)/,
+    /SiteClearFlow\.run\(supported, profileName, port, operationId\)/,
     "the flow needs the name to quarantine the right profile",
   );
 
@@ -948,7 +964,7 @@ test("a timed-out wipe cannot mutate the profile behind a new session", () => {
     /AppError::Quarantined\(PROFILE_QUARANTINED_MSG\.to_string\(\)\)/,
   );
   assert.equal(
-    (bridgeRs.match(/\.map_err\(classify_site_open_error\)/g) || []).length,
+    (bridgeRs.match(/classify_site_open_error\(error\)/g) || []).length,
     2,
     "both open phases classify their refusals the same way",
   );
@@ -1060,8 +1076,8 @@ test("every awaited step cancels its watchdog, and an unarmable one fails fast",
   assert.match(flushWorkerKt, /Watchdog\.Armed\(\{ mainHandler\.removeCallbacks\(task\) \}\)/);
   assert.match(
     pureKotlin,
-    /watchdog could not be armed \(postDelayed returned false\)/,
-    "the pure decision must name the false-return contract",
+    /if \(thrown != null \|\| !queued\) "watchdog_refused" else null/,
+    "the pure decision must use a safe refusal code for both false and thrown posts",
   );
   // On refusal the worker must NOT settle the step itself: the flow owns that,
   // and firing onTimeout here would report a timeout for a provider call that
@@ -1139,9 +1155,10 @@ test("a refused watchdog stops the flow before any provider work starts", () => 
   );
   assert.match(
     refusedBranch,
-    /no operation\s*\n?\s*\/\/ is left outstanding|nothing is quarantined|is deliberately not/,
-    "the branch must say why nothing is quarantined",
+    /no provider call is issued and there is no\s*\/\/ destructive operation to quarantine/,
+    "the branch must explain that a refused watchdog leaves no provider operation outstanding",
   );
+  assert.match(refusedBranch, /next\(false\)/, "the clear reports failure without starting provider work");
   // And the timeout path still quarantines (unchanged contract).
   assert.match(clear, /ProfileQuarantine\.quarantine\(profileName, guard\.operationId, COOKIE_UNVERIFIED_REASON\)/);
 });
@@ -1169,17 +1186,17 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
   // the worker's back.
   assert.doesNotMatch(code(controllerKt), /FLUSH_EXECUTOR/);
   assert.equal(
-    (controllerKt.match(/SiteFlushWorker\.execute\("destroy"\)/g) || []).length,
+    (controllerKt.match(/SiteFlushWorker\.execute\("destroy", operationId\)/g) || []).length,
     1,
     "the destroy-time flush uses the same worker",
   );
-  const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity)");
+  const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity, operationId: String");
   assert.ok(destroyAt > 0);
   const destroyBody = controllerKt.slice(
     destroyAt,
     controllerKt.indexOf("private fun ensureBackCallback", destroyAt),
   );
-  assert.match(destroyBody, /SiteFlushWorker\.execute\("destroy"\)/);
+  assert.match(destroyBody, /SiteFlushWorker\.execute\("destroy", operationId\)/);
   assert.match(
     destroyBody,
     /ShutdownFlow\.run\(/,
@@ -1198,7 +1215,7 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
   // A watchdog answers the caller; it cannot cancel the blocking provider
   // call, so a stuck worker must be observable instead of hidden.
   assert.match(flushWorkerKt, /FLUSH_STUCK_WARN_MS/);
-  assert.match(flushWorkerKt, /flush worker stuck/);
+  assert.match(flushWorkerKt, /flush worker remains busy/);
   assert.equal(
     (flushWorkerKt.match(/Executors\.newSingleThreadExecutor/g) || []).length,
     1,
@@ -1216,7 +1233,7 @@ test("back navigation: fullscreen first, then site history, then the launcher ho
   assert.match(controllerKt, /if \(customView != null\) \{\s*exitCustomViewIfNeeded\(\)/);
   assert.match(controllerKt, /webView\.canGoBack\(\)/);
   assert.match(controllerKt, /webView\.goBack\(\)/);
-  assert.match(controllerKt, /closeViaLauncher\(activity\)/);
+  assert.match(controllerKt, /closeViaLauncher\(activity, operationId\)/);
   // The callback is disabled when no site is open, so the launcher's own
   // default back behaviour (Tauri: no wry callback) stays as before.
   assert.match(controllerKt, /private var backCallback: OnBackPressedCallback\?/);
@@ -1226,7 +1243,7 @@ test("back navigation: fullscreen first, then site history, then the launcher ho
   // for the real outcome (pending | closed | failed:<reason> | idle).
   assert.match(
     mainJs,
-    /window\.__animehubBackToLauncher = \(\) => backSession\.requestClose\(\)\.accepted;/,
+    /window\.__animehubBackToLauncher = \(operationId\) => backSession\.requestClose\(operationId\)\.accepted;/,
   );
   assert.match(mainJs, /window\.__animehubBackStatus = \(\) => backSession\.statusString\(\);/);
   // A.5: the label must not be dropped in a finally after invoking close.
@@ -1236,14 +1253,16 @@ test("back navigation: fullscreen first, then site history, then the launcher ho
 });
 
 test("PiP re-binds between the site WebView and the launcher", () => {
-  // Open: bind to the site view. Close/failure/destroy: back to launcher.
-  assert.match(controllerKt, /AnimeHubPipController\.attach\(activity, webView\)/);
-  const launcherRebinds =
-    controllerKt.match(/AnimeHubPipController\.attach\(activity, (it|launcher)\)/g) || [];
+  // Open: bind to the site view. Close/failure/destroy: use the shared,
+  // behavior-tested launcher-transfer flow rather than duplicating attach logic.
+  assert.match(controllerKt, /AnimeHubPipController\.attach\(activity, webView, operationId\)/);
+  const launcherTransfers =
+    controllerKt.match(/transferPipToLauncher\(activity, operationId\)/g) || [];
   assert.ok(
-    launcherRebinds.length >= 2,
+    launcherTransfers.length >= 2,
     "close and failure paths must re-bind to the launcher",
   );
+  assert.match(controllerKt, /PipTransferFlow\.transferToLauncher\(/);
   // The plugin remembers the launcher at load time for both purposes.
   assert.match(pluginKt, /AnimeHubSiteController\.bindLauncher\(webView\)/);
   // Activity teardown orders site-destroy before PiP detach.
@@ -1323,7 +1342,7 @@ test("the site WebView settings come from a tested plan, not inline defaults", (
   // Neither denial logs the origin.
   const chromeAt = controllerKt.indexOf("private class SiteChromeClient(");
   const chromeBody = controllerKt.slice(chromeAt, controllerKt.indexOf("private class WebSettingsSink"));
-  assert.doesNotMatch(chromeBody, /AnimeHubDebugLog\.add\([^)]*origin/, "no origin in the denial log");
+  assert.doesNotMatch(chromeBody, /AnimeHubDebugLog\.record\([^)]*origin/, "no origin in the denial log");
 });
 
 test("the developer log is gated and carries no host, url or token values", () => {
@@ -1335,7 +1354,7 @@ test("the developer log is gated and carries no host, url or token values", () =
   assert.ok(at > 0, "debug_log is missing");
   const body = commands.slice(at, commands.indexOf("\n}\n", at));
   assert.match(body, /developer_options/, "must consult the setting");
-  assert.match(body, /return Ok\(Vec::new\(\)\)/, "an empty list, not an error");
+  assert.match(body, /return Ok\(crate::diagnostics::empty_snapshot\(\)\)/, "a structured empty snapshot, not an error");
   const gate = body.indexOf("if !enabled");
   const bridge = body.indexOf("crate::android_bridge::debug_log()");
   assert.ok(gate > 0 && bridge > gate, "the bridge is only reached when enabled");
@@ -1343,15 +1362,24 @@ test("the developer log is gated and carries no host, url or token values", () =
 
   // Every Kotlin log line is an event, never a value from the page or the URL.
   for (const file of [
+    "AnimeHubDebugLog.kt",
+    "AnimeHubPlugin.kt",
+    "AnimeHubPipController.kt",
+    "AnimeHubSiteController.kt",
+    "SiteBackStatus.kt",
+    "SiteClearFlow.kt",
+    "SiteCloseFlow.kt",
+    "SiteFlushWorker.kt",
+    "SiteMigrationFlow.kt",
     "SiteNavigationGuard.kt",
     "SiteNavigationPolicy.kt",
+    "SiteProfileOps.kt",
+    "SiteShutdownFlow.kt",
     "SiteWebViewSettings.kt",
-    "AnimeHubSiteController.kt",
-    "AnimeHubPipController.kt",
   ]) {
     const src = code(read(`${KOTLIN}/${file}`));
     for (const raw of src.split("\n")) {
-      if (!/AnimeHubDebugLog\.add\(|\bnote\(|Log\.[dweiv]\(/.test(raw)) continue;
+      if (!/AnimeHubDebugLog\.record\(|\bnote\(|Log\.[dweiv]\(/.test(raw)) continue;
       assert.doesNotMatch(
         raw,
         /\$\{?\s*(uri|url|request\.url|host|token|cookie|secret|origin)/i,
@@ -1361,19 +1389,17 @@ test("the developer log is gated and carries no host, url or token values", () =
   }
 });
 
-test("the navigation guard logs the reason, never the host or path", () => {
-  // AH-12 / AH-G8 / AH-13: logcat is readable over adb and by apps holding
-  // READ_LOGS on older releases, and the host alone identifies the site.
+test("the navigation guard preserves blocking without per-request diagnostics", () => {
+  // Per-request/page logs can reveal site identity and create unbounded noise.
+  // Keep the policy decisions and fail-closed responses, but do not log them.
   const guardKt = read(`${KOTLIN}/SiteNavigationGuard.kt`);
-  const policyKt = read(`${KOTLIN}/SiteNavigationPolicy.kt`);
   const guardBody = code(guardKt);
-  assert.doesNotMatch(guardBody, /\$\{uri\.host\}/, "host must not be logged");
-  assert.doesNotMatch(guardBody, /uri\.path|uri\.query|uri\.toString\(\)/, "no path/query/url");
-  assert.match(guardBody, /SiteNavigationPolicy\.blockedMessage\(uri\.scheme, blocked, request\.isForMainFrame\)/);
-  // The redaction rule itself lives in pure code (the guard cannot even be
-  // class-loaded in a JVM test) and is asserted there behaviourally.
-  assert.match(policyKt, /fun blockedMessage\(scheme: String\?, reason: String, forMainFrame: Boolean\): String/);
-  assert.match(policyKt, /navigation blocked reason=\$reason scheme=\$\{scheme \?: "none"\} frame=\$frame/);
+  assert.match(guardBody, /SiteNavigationPolicy\.rejection\(uri\)/);
+  assert.match(guardBody, /if \(blocked != null\) \{\s*return true/);
+  assert.match(guardBody, /SiteNavigationPolicy\.subresourceRejection\(uri\)/);
+  assert.match(guardBody, /if \(blocked != null\) \{\s*return blockedResponse\(\)/);
+  assert.doesNotMatch(guardBody, /AnimeHubDebugLog\.record|Log\.[a-z]+\(/,
+    "navigation must not emit per-request logs");
 });
 
 test("top-level data: is refused on both platforms while blob: playback is kept", () => {
@@ -1542,11 +1568,11 @@ test("the destroy-time site flush is awaited within a bounded budget", () => {
     flow.indexOf("port.teardownView()") < flow.indexOf("port.awaitFlush(budgetMillis)"),
     "the bounded wait follows teardown, so the two overlap",
   );
-  assert.match(flow, /if \(!port\.awaitFlush\(budgetMillis\)\) return ShutdownFlush\.TimedOut/);
+  assert.match(flow, /if \(!port\.awaitFlush\(budgetMillis\)\) \{\s*ShutdownFlush\.TimedOut\s*\} else \{/);
 
   // The controller side: worker-submitted I/O, per-call completion state,
   // bounded await, teardown for every outcome, honest reporting.
-  const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity)");
+  const destroyAt = controllerKt.indexOf("fun destroy(activity: Activity, operationId: String");
   assert.ok(destroyAt > 0);
   const destroy = controllerKt.slice(
     destroyAt,
@@ -1555,7 +1581,7 @@ test("the destroy-time site flush is awaited within a bounded budget", () => {
   assert.match(destroy, /ShutdownFlow\.run\(/);
   assert.match(destroy, /val finished = CountDownLatch\(1\)/);
   assert.match(destroy, /val failure = AtomicReference<String\?>\(null\)/);
-  assert.match(destroy, /SiteFlushWorker\.execute\("destroy"\) \{/);
+  assert.match(destroy, /SiteFlushWorker\.execute\("destroy", operationId\) \{/);
   assert.match(destroy, /finished\.await\(budgetMillis, TimeUnit\.MILLISECONDS\)/);
   assert.match(destroy, /finished\.countDown\(\)/);
   assert.doesNotMatch(
@@ -1573,8 +1599,8 @@ test("the destroy-time site flush is awaited within a bounded budget", () => {
   );
   assert.match(destroy, /override fun teardownView\(\)/);
   assert.match(destroy, /webView\.destroy\(\)/);
-  assert.match(destroy, /ShutdownFlush\.TimedOut ->/);
-  assert.match(destroy, /durability not guaranteed/);
+  assert.match(destroy, /outcome == ShutdownFlush\.TimedOut/);
+  assert.match(destroy, /durability NOT guaranteed/);
 
   // The generated Activity awaits destroy() before killing the process, and no
   // longer presents the default-profile flush as site-profile evidence.

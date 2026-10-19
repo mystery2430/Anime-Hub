@@ -176,13 +176,9 @@ sealed interface Watchdog {
  * [Watchdog.Refused].
  */
 object WatchdogArming {
-  /** Why arming failed, or `null` when the runnable was queued. */
+  /** Safe refusal code, or `null` when the runnable was queued. */
   fun refusal(queued: Boolean, thrown: Throwable?): String? =
-    when {
-      thrown != null -> "watchdog could not be armed (${thrown.javaClass.simpleName})"
-      !queued -> "watchdog could not be armed (postDelayed returned false)"
-      else -> null
-    }
+    if (thrown != null || !queued) "watchdog_refused" else null
 
   /** [cancel] is handed out only when the runnable really was queued. */
   fun decide(queued: Boolean, thrown: Throwable?, cancel: () -> Unit): Watchdog =

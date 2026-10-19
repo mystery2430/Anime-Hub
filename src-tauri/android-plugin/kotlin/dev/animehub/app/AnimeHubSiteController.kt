@@ -143,8 +143,10 @@ object AnimeHubSiteController {
   private var customViewCallback: WebChromeClient.CustomViewCallback? = null
 
   // Back-close handshake with the launcher JS (window.__animehubBack*).
-  private const val BACK_HOOK_SCRIPT =
-    "!!(window.__animehubBackToLauncher && (window.__animehubBackToLauncher(), true))"
+  // The generated operation id is quoted as a JS string so correlation cannot
+  // turn into script injection if its format ever changes.
+  private fun backHookScript(operationId: String): String =
+    "!!(window.__animehubBackToLauncher && (window.__animehubBackToLauncher(${JSONObject.quote(operationId)}), true))"
   private const val BACK_STATUS_SCRIPT =
     "window.__animehubBackStatus ? window.__animehubBackStatus() : null"
   private const val BACK_POLL_MS = 200L
@@ -179,11 +181,17 @@ object AnimeHubSiteController {
    * the decision itself is pure Kotlin, executed by the CI unit tests. This
    * refusal is identical in both phases: [migrate] and [open] call this.
    */
-  private fun quarantineRefusal(profileName: String, phase: String): String? =
-    SiteOpenGate.check(profileName)?.also { refusal ->
-      Log.w(LOG_TAG, "site $phase refused: $refusal")
-      AnimeHubDebugLog.add("site", "$phase refused (quarantined profile)")
-    }
+  private fun quarantineRefusal(
+    profileName: String,
+    operationId: String,
+  ): String? = SiteOpenGate.check(profileName)?.also {
+    val pending = ProfileQuarantine.pendingOperations(profileName).size
+    Log.w(LOG_TAG, "site open refused by quarantine gate")
+    AnimeHubDebugLog.record(
+      "profile", "quarantine", "quarantined", operationId,
+      errorClass = "quarantined", count = pending.toLong(),
+    )
+  }
 
   private fun liveActivity(activity: Activity): Boolean = !activity.isFinishing && !activity.isDestroyed
 
@@ -217,32 +225,39 @@ object AnimeHubSiteController {
     url: String,
     profileName: String,
     cookies: List<String>,
+    operationId: String,
     onResult: (error: String?) -> Unit,
   ) {
     if (!isSupported()) {
+      AnimeHubDebugLog.record("profile", "capability", "unsupported_provider", operationId, errorClass = "unsupported")
       onResult(ERR_UNSUPPORTED_MULTI_PROFILE)
       return
     }
+    AnimeHubDebugLog.record("profile", "capability", "supported", operationId)
     if (!profileNameIsValid(profileName)) {
+      AnimeHubDebugLog.record("profile", "profile_check", "invalid", operationId, errorClass = "invalid_profile")
       onResult("geçersiz profil adı")
       return
     }
+    AnimeHubDebugLog.record("profile", "profile_check", "ok", operationId)
     // Quarantine gate, BEFORE the provider is touched: writing the legacy jar
     // into a profile whose previous wipe may still be in flight would hand
     // those cookies to a late `removeAllCookies`. Rust writes its migration
     // flag only after a success, so refusing here leaves the jar and the flag
     // exactly as they were.
-    val quarantined = quarantineRefusal(profileName, "migration")
+    val quarantined = quarantineRefusal(profileName, operationId)
     if (quarantined != null) {
       onResult(quarantined)
       return
     }
     activity.runOnUiThread {
       if (!liveActivity(activity)) {
+        AnimeHubDebugLog.record("migration", "complete", "failed", operationId, errorClass = "activity_gone")
         onResult("Android Activity artık kullanılamıyor")
         return@runOnUiThread
       }
       if (active.hasActive()) {
+        AnimeHubDebugLog.record("migration", "complete", "failed", operationId, errorClass = "active_site")
         onResult(ERR_ACTIVE_SITE)
         return@runOnUiThread
       }
@@ -251,15 +266,17 @@ object AnimeHubSiteController {
         // and no profile to create here — [open] binds the view to the name
         // and the provider materialises it. The flag still becomes durable
         // before any view exists, exactly like the imported case.
+        AnimeHubDebugLog.record("migration", "start", "started", operationId, count = 0)
+        AnimeHubDebugLog.record("migration", "complete", "empty", operationId, count = 0)
         onResult(null)
         return@runOnUiThread
       }
       try {
-        migrateCookies(activity, url, profileName, cookies, onResult)
-      } catch (e: Exception) {
-        Log.e(LOG_TAG, "cookie migration failed (${e.javaClass.simpleName})")
-        AnimeHubDebugLog.add("cookie", "migration failed (${e.javaClass.simpleName})")
-        onResult("site çerezleri taşınamadı: ${e.message}")
+        migrateCookies(activity, url, profileName, cookies, operationId, onResult)
+      } catch (_: Exception) {
+        Log.e(LOG_TAG, "cookie migration failed")
+        AnimeHubDebugLog.record("migration", "complete", "failed", operationId, errorClass = "provider")
+        onResult("$ERR_MIGRATION_RETRY: migration failed")
       }
     }
   }
@@ -282,13 +299,18 @@ object AnimeHubSiteController {
     url: String,
     profileName: String,
     initScript: String,
+    operationId: String,
     onResult: (error: String?) -> Unit,
   ) {
+    AnimeHubDebugLog.record("open", "start", "started", operationId)
     if (!isSupported()) {
+      AnimeHubDebugLog.record("profile", "capability", "unsupported_provider", operationId, errorClass = "unsupported")
       onResult(ERR_UNSUPPORTED_MULTI_PROFILE)
       return
     }
+    AnimeHubDebugLog.record("profile", "capability", "supported", operationId)
     if (!profileNameIsValid(profileName)) {
+      AnimeHubDebugLog.record("profile", "profile_check", "invalid", operationId, errorClass = "invalid_profile")
       onResult("geçersiz profil adı")
       return
     }
@@ -297,26 +319,28 @@ object AnimeHubSiteController {
     // provider call that timed out. Nothing is claimed and nothing is built
     // on this path, so Rust's `current_site` stays empty and the refusal is
     // simply retryable once the wipe is verified.
-    val quarantined = quarantineRefusal(profileName, "open")
+    val quarantined = quarantineRefusal(profileName, operationId)
     if (quarantined != null) {
       onResult(quarantined)
       return
     }
     activity.runOnUiThread {
       if (!liveActivity(activity)) {
+        AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "activity_gone")
         onResult("Android Activity artık kullanılamıyor")
         return@runOnUiThread
       }
       if (active.hasActive()) {
+        AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "active_site")
         onResult(ERR_ACTIVE_SITE)
         return@runOnUiThread
       }
       try {
-        buildWebView(activity, url, profileName, initScript, onResult)
-      } catch (e: Exception) {
-        Log.e(LOG_TAG, "site open failed (${e.javaClass.simpleName})")
-        AnimeHubDebugLog.add("site", "open failed (${e.javaClass.simpleName})")
-        onResult("site açılamadı: ${e.message}")
+        buildWebView(activity, url, profileName, initScript, operationId, onResult)
+      } catch (_: Exception) {
+        Log.e(LOG_TAG, "site open failed")
+        AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "provider")
+        onResult("site açılamadı")
       }
     }
   }
@@ -333,30 +357,24 @@ object AnimeHubSiteController {
     url: String,
     profileName: String,
     cookies: List<String>,
+    operationId: String,
     onResult: (error: String?) -> Unit,
   ) {
-    val port = migrationPort(activity, url, profileName)
-    SiteMigrationFlow.run(cookies, port) { outcome ->
+    val port = migrationPort(activity, url, profileName, operationId)
+    SiteMigrationFlow.run(cookies, port, operationId) { outcome ->
       when (outcome) {
-        is MigrationOutcome.Complete -> {
-          AnimeHubDebugLog.add("cookie", "migrated into profile (${outcome.accepted} accepted)")
-          onResult(null)
-        }
-        MigrationOutcome.ProfileAlreadyExists -> {
-          AnimeHubDebugLog.add("cookie", "migration refused: profile already exists")
-          onResult("$ERR_MIGRATION_RETRY: profil zaten mevcut")
-        }
+        is MigrationOutcome.Complete -> onResult(null)
+        MigrationOutcome.ProfileAlreadyExists -> onResult("$ERR_MIGRATION_RETRY: profile already exists")
         is MigrationOutcome.Failed -> {
-          Log.w(LOG_TAG, "cookie migration failed: ${outcome.reason}")
-          AnimeHubDebugLog.add("cookie", "migration failed (${outcome.reason})")
-          onResult("$ERR_MIGRATION_RETRY: ${outcome.reason}")
+          Log.w(LOG_TAG, "cookie migration failed")
+          onResult("$ERR_MIGRATION_RETRY: migration incomplete")
         }
       }
     }
   }
 
   /** Android wiring for [SiteMigrationFlow]; callbacks land on the UI thread. */
-  private fun migrationPort(activity: Activity, url: String, profileName: String): SiteMigrationPort =
+  private fun migrationPort(activity: Activity, url: String, profileName: String, operationId: String): SiteMigrationPort =
     object : SiteMigrationPort {
       private var manager: CookieManager? = null
 
@@ -379,7 +397,7 @@ object AnimeHubSiteController {
           activity.runOnUiThread { onDone(IllegalStateException("profil cookie yöneticisi yok")) }
           return
         }
-        SiteFlushWorker.submit(activity, "migration", { m.flush() }, onDone)
+        SiteFlushWorker.submit(activity, "migration", { m.flush() }, operationId, onDone)
       }
 
       override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
@@ -392,14 +410,20 @@ object AnimeHubSiteController {
     url: String,
     profileName: String,
     initScript: String,
+    operationId: String,
     onResult: (error: String?) -> Unit,
   ) {
     var webView: WebView? = null
     var attached = false
+    val buildStarted = System.nanoTime()
     try {
       // (1) Constructor, (2) profile — before ANY other WebView API.
+      AnimeHubDebugLog.record("open", "view_create", "started", operationId)
       webView = WebView(activity)
+      AnimeHubDebugLog.record("open", "view_create", "ok", operationId)
+      AnimeHubDebugLog.record("open", "profile_bind", "started", operationId)
       WebViewCompat.setProfile(webView, profileName)
+      AnimeHubDebugLog.record("open", "profile_bind", "ok", operationId)
 
       // (3) Settings: the decided plan from `SiteWebViewSettings`, applied
       // through the only adapter that touches the platform object. JavaScript,
@@ -469,12 +493,13 @@ object AnimeHubSiteController {
         ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
       )
       attached = true
+      AnimeHubDebugLog.record("open", "view_attach", "ok", operationId)
       webView.isFocusable = true
       webView.isFocusableInTouchMode = true
       webView.requestFocus()
 
       // (7) PiP follows the visible page: bind the controller to this view.
-      AnimeHubPipController.attach(activity, webView)
+      AnimeHubPipController.attach(activity, webView, operationId)
 
       // (8) Back button: history first, launcher second, never the task.
       ensureBackCallback(activity).isEnabled = true
@@ -486,13 +511,22 @@ object AnimeHubSiteController {
       }
       // The migration (if any) completed and its flag is durable before this
       // view exists — phase 2 only builds and navigates.
-      AnimeHubDebugLog.add("site", "opened")
+      AnimeHubDebugLog.record("open", "slot_claim", "ok", operationId)
 
+      AnimeHubDebugLog.record("open", "navigation_start", "started", operationId)
       webView.loadUrl(url)
+      AnimeHubDebugLog.record(
+        "open", "complete", "ok", operationId,
+        durationMs = (System.nanoTime() - buildStarted) / 1_000_000,
+      )
       onResult(null)
-    } catch (e: Exception) {
-      Log.e(LOG_TAG, "site WebView setup failed (${e.javaClass.simpleName})")
-      AnimeHubDebugLog.add("site", "setup failed (${e.javaClass.simpleName})")
+    } catch (_: Exception) {
+      Log.e(LOG_TAG, "site WebView setup failed")
+      AnimeHubDebugLog.record(
+        "open", "complete", "failed", operationId,
+        durationMs = (System.nanoTime() - buildStarted) / 1_000_000,
+        errorClass = "provider",
+      )
       // Roll the partial view back so a failed open never leaves a hidden
       // half-configured WebView above the launcher.
       try {
@@ -510,9 +544,9 @@ object AnimeHubSiteController {
       if (!active.hasActive()) {
         if (backCallback?.isEnabled == true) backCallback?.isEnabled = false
         exitCustomViewIfNeeded()
-        launcherWebView?.get()?.let { launcher -> AnimeHubPipController.attach(activity, launcher) }
+        transferPipToLauncher(activity, operationId)
       }
-      onResult("site açılamadı: ${e.message}")
+      onResult("site açılamadı")
     }
   }
 
@@ -529,7 +563,7 @@ object AnimeHubSiteController {
    * Idempotent: closing with no active site is a success, which is what
    * keeps a stale Rust session harmless.
    */
-  fun close(activity: Activity, flush: Boolean, onResult: (error: String?) -> Unit) {
+  fun close(activity: Activity, flush: Boolean, operationId: String, onResult: (error: String?) -> Unit) {
     activity.runOnUiThread {
       val port =
         object : SiteClosePort {
@@ -552,20 +586,19 @@ object AnimeHubSiteController {
               onDone(IllegalStateException("profil çözümlenemedi"))
               return
             }
-            SiteFlushWorker.submit(activity, "close", { profile.cookieManager.flush() }, onDone)
+            SiteFlushWorker.submit(activity, "close", { profile.cookieManager.flush() }, operationId, onDone)
           }
 
           override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
             SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
 
           override fun destroyActiveView() {
-            finishClose(activity)
+            finishClose(activity, operationId)
           }
         }
-      SiteCloseFlow.run(port, flush) { error ->
+      SiteCloseFlow.run(port, flush, operationId) { error ->
         if (error != null) {
-          Log.w(LOG_TAG, "site close refused: $error")
-          AnimeHubDebugLog.add("site", "close refused (${error.take(60)})")
+          Log.w(LOG_TAG, "site close did not complete")
         }
         onResult(error)
       }
@@ -573,7 +606,7 @@ object AnimeHubSiteController {
   }
 
   /** UI thread. Remove, destroy, re-bind PiP/focus to the launcher. */
-  private fun finishClose(activity: Activity) {
+  private fun finishClose(activity: Activity, operationId: String) {
     val webView = active.activeToken
     active.clear()
     if (webView != null) {
@@ -590,10 +623,20 @@ object AnimeHubSiteController {
     }
     exitCustomViewIfNeeded()
     backCallback?.isEnabled = false
-    // PiP belongs to whatever the user sees now: the launcher.
-    launcherWebView?.get()?.let { AnimeHubPipController.attach(activity, it) }
-    launcherWebView?.get()?.requestFocus()
-    AnimeHubDebugLog.add("site", "closed")
+    // PiP belongs to whatever the user sees now: the launcher. A missing
+    // launcher or a failed native attach is diagnostic, not a close failure.
+    transferPipToLauncher(activity, operationId)
+    AnimeHubDebugLog.record("close", "destroy", "ok", operationId)
+  }
+
+  private fun transferPipToLauncher(activity: Activity, operationId: String) {
+    val launcher = launcherWebView?.get()
+    PipTransferFlow.transferToLauncher(
+      operationId = operationId,
+      launcherAvailable = launcher != null,
+      attach = { launcher?.let { AnimeHubPipController.attach(activity, it, operationId) } ?: false },
+      focus = { launcher?.requestFocus() == true },
+    )
   }
 
   // ------------------------------------------------------- lifecycle / back
@@ -624,31 +667,37 @@ object AnimeHubSiteController {
    * regardless of the flush outcome; a second call finds the session slot
    * already cleared and flushes nothing.
    */
-    fun destroy(activity: Activity) {
+  fun destroy(activity: Activity, operationId: String = AnimeHubDebugLog.newOperationId()) {
     val webView = active.activeToken
     val profileName = active.clear()
     exitCustomViewIfNeeded()
     backCallback?.isEnabled = false
-    if (webView == null) return
+    if (webView == null) {
+      AnimeHubDebugLog.record("shutdown", "destroy", "started", operationId)
+      AnimeHubDebugLog.record("shutdown", "destroy_flush", "not_needed", operationId)
+      AnimeHubDebugLog.record("shutdown", "complete", "ok", operationId)
+      return
+    }
     // Resolved BEFORE the view is destroyed, and the ONLY thing the worker task
     // captures: a `Profile` comes from the store and outlives its WebView,
     // while capturing the Activity (or the view) here would leak it past
     // teardown. The completion state below is local to THIS call, so a double
     // destroy — or a flush belonging to an older session — cannot be counted
     // here.
+    val finished = CountDownLatch(1)
+    val failure = AtomicReference<String?>(null)
     val profile =
       if (profileName != null) {
         try {
           WebViewCompat.getProfile(webView)
-        } catch (e: Exception) {
-          Log.w(LOG_TAG, "profile flush on destroy skipped (${e.javaClass.simpleName})")
+        } catch (_: Exception) {
+          failure.set("provider")
+          Log.w(LOG_TAG, "profile flush on destroy skipped")
           null
         }
       } else {
         null
       }
-    val finished = CountDownLatch(1)
-    val failure = AtomicReference<String?>(null)
     val outcome =
       ShutdownFlow.run(
         object : ShutdownPort {
@@ -657,14 +706,13 @@ object AnimeHubSiteController {
             // Disk I/O on the single flush worker, never on this (UI) thread —
             // and through the worker, so a stuck provider flush is observable
             // here too instead of only on the awaited paths.
-            SiteFlushWorker.execute("destroy") {
+            SiteFlushWorker.execute("destroy", operationId) {
               try {
                 target.cookieManager.flush()
-                AnimeHubDebugLog.add("site", "destroy-time flush completed")
-              } catch (e: Exception) {
-                failure.set("${e.javaClass.simpleName}: ${e.message}")
-                Log.w(LOG_TAG, "profile flush on destroy failed (${e.javaClass.simpleName})")
-                AnimeHubDebugLog.add("site", "destroy-time flush failed (${e.javaClass.simpleName})")
+              } catch (error: Exception) {
+                failure.set("provider")
+                Log.w(LOG_TAG, "profile flush on destroy failed")
+                throw error
               } finally {
                 finished.countDown()
               }
@@ -696,28 +744,16 @@ object AnimeHubSiteController {
 
           override fun flushFailure(): String? = failure.get()
         },
+        operationId = operationId,
       )
-    when (outcome) {
-      ShutdownFlush.Completed ->
-        AnimeHubDebugLog.add("site", "destroyed with activity (site profile flush completed)")
-      ShutdownFlush.NotNeeded ->
-        AnimeHubDebugLog.add("site", "destroyed with activity (no site profile to flush)")
-      ShutdownFlush.TimedOut -> {
-        // The generated Activity kills the process right after this when it is
-        // finishing, so a timeout means the write may never land: say so.
-        Log.w(
-          LOG_TAG,
-          "destroy-time flush unfinished in ${ShutdownFlow.DESTROY_FLUSH_BUDGET_MS}ms; " +
-            "cookie durability NOT guaranteed",
-        )
-        AnimeHubDebugLog.add(
-          "site",
-          "destroyed with activity (flush unfinished in " +
-            "${ShutdownFlow.DESTROY_FLUSH_BUDGET_MS}ms - durability not guaranteed)",
-        )
-      }
-      is ShutdownFlush.Failed ->
-        AnimeHubDebugLog.add("site", "destroyed with activity (flush failed: ${outcome.reason})")
+    if (outcome == ShutdownFlush.TimedOut) {
+      // The generated Activity kills the process right after this when it is
+      // finishing, so a timeout means the write may never land: say so.
+      Log.w(
+        LOG_TAG,
+        "destroy-time flush unfinished in ${ShutdownFlow.DESTROY_FLUSH_BUDGET_MS}ms; " +
+          "cookie durability NOT guaranteed",
+      )
     }
   }
 
@@ -730,16 +766,30 @@ object AnimeHubSiteController {
     backCallback?.let { return it }
     val callback = object : OnBackPressedCallback(false) {
       override fun handleOnBackPressed() {
+        val operationId = AnimeHubDebugLog.newOperationId()
+        AnimeHubDebugLog.record("back", "back_pressed", "started", operationId)
+        AnimeHubDebugLog.record("back", "back_step", "started", operationId, stepId = 0)
         if (customView != null) {
           exitCustomViewIfNeeded()
+          AnimeHubDebugLog.record("back", "fullscreen", "handled", operationId, stepId = 0)
+          AnimeHubDebugLog.record("back", "back_step", "handled", operationId, stepId = 0)
           return
         }
+        AnimeHubDebugLog.record("back", "fullscreen", "skipped", operationId, stepId = 0)
+        AnimeHubDebugLog.record("back", "back_step", "passed", operationId, stepId = 0)
+        AnimeHubDebugLog.record("back", "back_step", "started", operationId, stepId = 1)
         val webView = active.activeToken
         if (webView != null && webView.canGoBack()) {
           webView.goBack()
+          AnimeHubDebugLog.record("back", "web_history", "handled", operationId, stepId = 1)
+          AnimeHubDebugLog.record("back", "back_step", "handled", operationId, stepId = 1)
           return
         }
-        closeViaLauncher(activity)
+        AnimeHubDebugLog.record("back", "web_history", "skipped", operationId, stepId = 1)
+        AnimeHubDebugLog.record("back", "back_step", "passed", operationId, stepId = 1)
+        AnimeHubDebugLog.record("back", "back_step", "started", operationId, stepId = 2)
+        AnimeHubDebugLog.record("back", "launcher_close", "started", operationId)
+        closeViaLauncher(activity, operationId)
       }
     }
     // `onBackPressedDispatcher` lives on ComponentActivity (MainActivity is
@@ -770,31 +820,40 @@ object AnimeHubSiteController {
    * Every step re-checks that the captured view is still the active one, so
    * a stale callback can never close a newer site.
    */
-  private fun closeViaLauncher(activity: Activity) {
+  private fun closeViaLauncher(activity: Activity, operationId: String) {
     val captured = active.activeToken ?: return
     val launcher = launcherWebView?.get()
     if (launcher == null || launcher === captured) {
-      nativeFallbackClose(activity, captured)
+      AnimeHubDebugLog.record("back", "launcher_close", "fallback", operationId, errorClass = "unavailable")
+      nativeFallbackClose(activity, captured, operationId)
       return
     }
     try {
-      launcher.evaluateJavascript(BACK_HOOK_SCRIPT) { result ->
+      launcher.evaluateJavascript(backHookScript(operationId)) { result ->
         if (result == "true") {
-          pollBackStatus(activity, launcher, captured, 0)
+          AnimeHubDebugLog.record("back", "launcher_close", "started", operationId)
+          pollBackStatus(activity, launcher, captured, 0, operationId)
         } else {
-          AnimeHubDebugLog.add("site", "launcher back hook unavailable; closing natively")
-          nativeFallbackClose(activity, captured)
+          AnimeHubDebugLog.record("back", "launcher_close", "fallback", operationId, errorClass = "unavailable")
+          nativeFallbackClose(activity, captured, operationId)
         }
       }
     } catch (_: Exception) {
-      AnimeHubDebugLog.add("site", "launcher back hook failed; closing natively")
-      nativeFallbackClose(activity, captured)
+      AnimeHubDebugLog.record("back", "launcher_close", "fallback", operationId, errorClass = "provider")
+      nativeFallbackClose(activity, captured, operationId)
     }
   }
 
   /** UI thread. One poll of the launcher close status; see [closeViaLauncher]. */
-  private fun pollBackStatus(activity: Activity, launcher: WebView, captured: WebView, attempt: Int) {
+  private fun pollBackStatus(
+    activity: Activity,
+    launcher: WebView,
+    captured: WebView,
+    attempt: Int,
+    operationId: String,
+  ) {
     if (active.activeToken !== captured) return
+    AnimeHubDebugLog.record("back", "poll", "started", operationId, count = attempt.toLong())
     try {
       launcher.evaluateJavascript(BACK_STATUS_SCRIPT) { raw ->
         if (active.activeToken !== captured) return@evaluateJavascript
@@ -805,22 +864,46 @@ object AnimeHubSiteController {
             null
           }
         when (SiteBackStatus.decide(status, attempt, BACK_MAX_POLLS)) {
-          BackCloseDecision.POLL ->
-            mainHandler.postDelayed({ pollBackStatus(activity, launcher, captured, attempt + 1) }, BACK_POLL_MS)
-          BackCloseDecision.CLOSED ->
-            AnimeHubDebugLog.add("site", "closed via launcher close_site flow")
-          BackCloseDecision.FAILED -> {
-            val message = SiteBackStatus.failureMessage(status)
-            AnimeHubDebugLog.add("site", "launcher close failed")
-            toast(activity, "Site kapatılamadı: $message — tekrar deneyebilirsiniz")
+          BackCloseDecision.POLL -> {
+            AnimeHubDebugLog.record("back", "poll", "pending", operationId, count = attempt.toLong())
+            mainHandler.postDelayed(
+              { pollBackStatus(activity, launcher, captured, attempt + 1, operationId) },
+              BACK_POLL_MS,
+            )
           }
-          BackCloseDecision.FALLBACK -> nativeFallbackClose(activity, captured)
-          BackCloseDecision.GIVE_UP ->
-            AnimeHubDebugLog.add("site", "close still pending after poll budget")
+          BackCloseDecision.CLOSED -> {
+            AnimeHubDebugLog.record("back", "poll", "closed", operationId, count = attempt.toLong())
+            AnimeHubDebugLog.record("back", "launcher_close", "closed", operationId)
+            AnimeHubDebugLog.record("back", "back_step", "closed", operationId, stepId = 2)
+          }
+          BackCloseDecision.FAILED -> {
+            AnimeHubDebugLog.record("back", "poll", "failed", operationId, count = attempt.toLong(), errorClass = "provider")
+            AnimeHubDebugLog.record("back", "launcher_close", "failed", operationId, errorClass = "provider")
+            AnimeHubDebugLog.record("back", "back_step", "failed", operationId, stepId = 2)
+            toast(activity, "Site kapatılamadı; tekrar deneyebilirsiniz")
+          }
+          BackCloseDecision.FALLBACK -> {
+            AnimeHubDebugLog.record("back", "poll", "fallback", operationId, count = attempt.toLong())
+            AnimeHubDebugLog.record("back", "back_step", "fallback", operationId, stepId = 2)
+            nativeFallbackClose(activity, captured, operationId)
+          }
+          BackCloseDecision.GIVE_UP -> {
+            AnimeHubDebugLog.record(
+              "back", "poll", "timeout", operationId,
+              durationMs = (attempt * BACK_POLL_MS), watchdog = "fired", errorClass = "timeout",
+              count = attempt.toLong(),
+            )
+            AnimeHubDebugLog.record(
+              "back", "launcher_close", "pending", operationId,
+              durationMs = (attempt * BACK_POLL_MS), watchdog = "fired", errorClass = "timeout",
+            )
+            AnimeHubDebugLog.record("back", "back_step", "pending", operationId, stepId = 2)
+          }
         }
       }
     } catch (_: Exception) {
-      nativeFallbackClose(activity, captured)
+      AnimeHubDebugLog.record("back", "launcher_close", "fallback", operationId, errorClass = "provider")
+      nativeFallbackClose(activity, captured, operationId)
     }
   }
 
@@ -830,12 +913,13 @@ object AnimeHubSiteController {
    * the view stays open, the Rust session stays claimed and the user can
    * retry from the back button.
    */
-  private fun nativeFallbackClose(activity: Activity, captured: WebView) {
+  private fun nativeFallbackClose(activity: Activity, captured: WebView, operationId: String) {
     if (active.activeToken !== captured) return
-    close(activity, flush = true) { error ->
+    AnimeHubDebugLog.record("back", "native_close", "started", operationId)
+    close(activity, flush = true, operationId = operationId) { error ->
       if (error != null) {
-        AnimeHubDebugLog.add("site", "native close failed")
-        toast(activity, "Site kapatılamadı: $error — tekrar deneyebilirsiniz")
+        AnimeHubDebugLog.record("back", "native_close", "failed", operationId, errorClass = "provider")
+        toast(activity, "Site kapatılamadı; tekrar deneyebilirsiniz")
       }
     }
   }
@@ -881,17 +965,25 @@ object AnimeHubSiteController {
    * Unsupported providers report [SiteProfileErrors.UNSUPPORTED] — never a
    * success over data this build cannot address.
    */
-  fun clearProfileData(activity: Activity, profileName: String, onResult: (error: String?) -> Unit) {
+  fun clearProfileData(
+    activity: Activity,
+    profileName: String,
+    operationId: String,
+    onResult: (error: String?) -> Unit,
+  ) {
     if (!profileNameIsValid(profileName)) {
+      AnimeHubDebugLog.record("clear", "profile_check", "invalid", operationId, errorClass = "invalid_profile")
       onResult("geçersiz profil adı")
       return
     }
     if (active.activeProfile == profileName) {
+      AnimeHubDebugLog.record("clear", "profile_check", "failed", operationId, errorClass = "active_site")
       onResult("aktif site verisi önce kapatılmalı")
       return
     }
     activity.runOnUiThread {
       if (!liveActivity(activity)) {
+        AnimeHubDebugLog.record("clear", "complete", "failed", operationId, errorClass = "activity_gone")
         onResult("Android Activity artık kullanılamıyor")
         return@runOnUiThread
       }
@@ -973,7 +1065,17 @@ object AnimeHubSiteController {
               guard,
               object : GeolocationApi {
                 override fun getOrigins(onResult: (Set<String>?) -> Unit) {
-                  geo.getOrigins { origins -> activity.runOnUiThread { onResult(origins) } }
+                  geo.getOrigins { origins ->
+                    activity.runOnUiThread {
+                      AnimeHubDebugLog.record(
+                        "clear", "geolocation_origins", if (origins == null) "failed" else "ok",
+                        operationId,
+                        count = origins?.size?.toLong(),
+                        errorClass = if (origins == null) "provider" else null,
+                      )
+                      onResult(origins)
+                    }
+                  }
                 }
 
                 override fun clear(origin: String) {
@@ -981,10 +1083,7 @@ object AnimeHubSiteController {
                 }
               },
             ) { ok ->
-              if (!ok) {
-                Log.w(LOG_TAG, "geolocation wipe incomplete (op ${guard.operationId})")
-                AnimeHubDebugLog.add("site", "geo wipe incomplete (op ${guard.operationId})")
-              }
+              if (!ok) Log.w(LOG_TAG, "geolocation wipe incomplete")
               onDone(ok)
             }
           }
@@ -995,30 +1094,36 @@ object AnimeHubSiteController {
               onDone(IllegalStateException("profil yok"))
               return
             }
-            SiteFlushWorker.submit(activity, "clear", { profile.cookieManager.flush() }, onDone)
+            SiteFlushWorker.submit(activity, "clear", { profile.cookieManager.flush() }, operationId, onDone)
           }
 
           override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
             SiteFlushWorker.scheduleWatchdog(millis, onTimeout)
         }
-      SiteClearFlow.run(isSupported(), profileName, port) { error ->
+      val supported = isSupported()
+      AnimeHubDebugLog.record(
+        "profile", "capability", if (supported) "supported" else "unsupported_provider",
+        operationId, errorClass = if (supported) null else "unsupported",
+      )
+      SiteClearFlow.run(supported, profileName, port, operationId) { error ->
         when (error) {
-          null -> AnimeHubDebugLog.add("site", "profile data cleared")
+          null -> Unit
           SiteProfileErrors.UNSUPPORTED -> {
-            AnimeHubDebugLog.add("site", "clear refused: profile feature unavailable")
             Log.w(LOG_TAG, "profile clear refused: MULTI_PROFILE unsupported")
           }
           else -> {
-            Log.w(LOG_TAG, "profile clear failed: $error")
-            AnimeHubDebugLog.add("site", "clear failed (${error.take(60)})")
+            Log.w(LOG_TAG, "profile clear failed")
             if (ProfileQuarantine.isBlocked(profileName)) {
               // A destructive provider call is still outstanding (or the last
               // verification predates it): the site is refused until that is
               // resolved (see SiteOpenGate), so say so here instead of leaving
               // the user with a bare failure.
               val pending = ProfileQuarantine.pendingOperations(profileName).size
-              Log.w(LOG_TAG, "profile blocked until its wipe is verified: $profileName ($pending pending)")
-              AnimeHubDebugLog.add("site", "profile blocked (unverified wipe, $pending pending)")
+              Log.w(LOG_TAG, "profile blocked until its wipe is verified")
+              AnimeHubDebugLog.record(
+                "profile", "quarantine", "blocked", operationId,
+                errorClass = "cookie_unverified", count = pending.toLong(),
+              )
             }
           }
         }
@@ -1053,21 +1158,30 @@ object AnimeHubSiteController {
    * underivable. A *deferred* deletion keeps every record too — the profile
    * still exists on disk.
    */
-  fun deleteProfileData(profileName: String, onResult: (deleted: Boolean, pending: Boolean, error: String?) -> Unit) {
+  fun deleteProfileData(
+    profileName: String,
+    operationId: String,
+    onResult: (deleted: Boolean, pending: Boolean, error: String?) -> Unit,
+  ) {
+    AnimeHubDebugLog.record("delete", "provider_delete", "started", operationId)
     if (!profileNameIsValid(profileName)) {
+      AnimeHubDebugLog.record("delete", "profile_check", "invalid", operationId, errorClass = "invalid_profile")
       onResult(false, false, "geçersiz profil adı")
       return
     }
     if (active.activeProfile == profileName) {
+      AnimeHubDebugLog.record("delete", "profile_check", "failed", operationId, errorClass = "active_site")
       onResult(false, false, "aktif site profili önce kapatılmalı")
       return
     }
     if (!isSupported()) {
       // No profile can be addressed through this API — report the feature
       // gap honestly instead of pretending a deletion was deferred.
+      AnimeHubDebugLog.record("profile", "capability", "unsupported_provider", operationId, errorClass = "unsupported")
       onResult(false, false, ERR_UNSUPPORTED_MULTI_PROFILE)
       return
     }
+    AnimeHubDebugLog.record("profile", "capability", "supported", operationId)
     // NOTE: no getProfile/getOrCreateProfile here on purpose — merely loading
     // a profile makes the provider refuse deletion for the rest of the
     // process (AwBrowserContextStore::Delete returns in-use).
@@ -1082,23 +1196,20 @@ object AnimeHubSiteController {
       // still in flight on it. Rust calls [retireProfileQuarantine] once the
       // bump succeeded; the deferred branch below keeps every record as well,
       // because a pending profile still exists on disk.
-      AnimeHubDebugLog.add("site", if (deleted) "profile deleted" else "profile absent")
+      AnimeHubDebugLog.record(
+        "delete", "provider_delete", if (deleted) "deleted" else "absent", operationId,
+      )
       onResult(deleted, false, null)
-    } catch (e: IllegalStateException) {
-      // Living/loaded context: defer to the next process start. "In use" is the
-      // DOCUMENTED reason for this exception, but a provider could throw it for
-      // another one — and a deferral that can never succeed would then be
-      // re-queued at every start while the user is told "deferred". The reason
-      // is therefore kept measurable instead of discarded; the classification
-      // itself stays (a deferred deletion is recoverable, an error is not, and
-      // which one a given provider means can only be settled on a device — see
-      // docs/android-storage-isolation.md).
-      AnimeHubDebugLog.add("site", "profile delete deferred (in use: ${e.message})")
-      Log.w(LOG_TAG, "profile delete deferred (${e.javaClass.simpleName}: ${e.message})")
+    } catch (_: IllegalStateException) {
+      // Preserve the existing retry-at-next-start decision. Provider wording
+      // is not copied into logs or returned through the bridge.
+      AnimeHubDebugLog.record("delete", "provider_delete", "deferred", operationId, errorClass = "in_use")
+      Log.w(LOG_TAG, "profile delete deferred")
       onResult(false, true, null)
-    } catch (e: Exception) {
-      Log.e(LOG_TAG, "profile delete failed (${e.javaClass.simpleName})")
-      onResult(false, false, "profil verisi silinemedi: ${e.message}")
+    } catch (_: Exception) {
+      AnimeHubDebugLog.record("delete", "provider_delete", "failed", operationId, errorClass = "provider")
+      Log.e(LOG_TAG, "profile delete failed")
+      onResult(false, false, "profil verisi silinemedi")
     }
   }
 
@@ -1116,17 +1227,22 @@ object AnimeHubSiteController {
    * flight. The refusal cases are decided by the pure [ProfileRetirement]
    * (an invalid name, or a profile a live session is using), never here.
    */
-  fun retireProfileQuarantine(profileName: String, onResult: (dropped: Int, error: String?) -> Unit) {
+  fun retireProfileQuarantine(
+    profileName: String,
+    operationId: String,
+    onResult: (dropped: Int, error: String?) -> Unit,
+  ) {
     val refusal = ProfileRetirement.refusal(profileName, active.activeProfile)
     if (refusal != null) {
-      AnimeHubDebugLog.add("site", "profile retirement refused ($refusal)")
+      AnimeHubDebugLog.record(
+        "delete", "quarantine_retire", "refused", operationId,
+        errorClass = if (active.activeProfile == profileName) "active_site" else "invalid_profile",
+      )
       onResult(0, refusal)
       return
     }
     val dropped = ProfileQuarantine.retire(profileName)
-    if (dropped > 0) {
-      AnimeHubDebugLog.add("site", "profile retired ($dropped pending wipe op(s) dropped)")
-    }
+    AnimeHubDebugLog.record("delete", "quarantine_retire", "retired", operationId, count = dropped.toLong())
     onResult(dropped, null)
   }
 
@@ -1143,7 +1259,7 @@ object AnimeHubSiteController {
   }
 
   /** Durability hook for the periodic Rust session sync. */
-  fun flush(activity: Activity, onResult: (error: String?) -> Unit) {
+  fun flush(activity: Activity, operationId: String, onResult: (error: String?) -> Unit) {
     val view = active.activeToken
     if (view == null) {
       onResult(null)
@@ -1152,14 +1268,13 @@ object AnimeHubSiteController {
     val profile: Profile =
       try {
         WebViewCompat.getProfile(view)
-      } catch (e: Exception) {
-        onResult("profil çözümlenemedi: ${e.message}")
+      } catch (_: Exception) {
+        AnimeHubDebugLog.record("flush", "flush", "failed", operationId, errorClass = "provider")
+        onResult("profile could not be resolved")
         return
       }
-    SiteFlushWorker.submit(activity, "sync", { profile.cookieManager.flush() }) { error ->
-      onResult(
-        if (error == null) null else "çerez kalıcılığı başarısız: ${error.message}",
-      )
+    SiteFlushWorker.submit(activity, "sync", { profile.cookieManager.flush() }, operationId) { error ->
+      onResult(if (error == null) null else "profile flush failed")
     }
   }
 
@@ -1193,7 +1308,6 @@ object AnimeHubSiteController {
      */
     override fun onPermissionRequest(request: PermissionRequest) {
       request.deny()
-      AnimeHubDebugLog.add("web", "permission request denied")
     }
 
     /**
@@ -1207,7 +1321,6 @@ object AnimeHubSiteController {
       callback: GeolocationPermissions.Callback,
     ) {
       callback.invoke(origin, false, false)
-      AnimeHubDebugLog.add("web", "geolocation denied")
     }
   }
 
@@ -1336,7 +1449,7 @@ object AnimeHubSiteController {
         try {
           view.evaluateJavascript(initScript, null)
         } catch (_: Exception) {
-          Log.w(LOG_TAG, "page-start init script failed")
+          // Page-start callbacks are high-volume; do not emit per-navigation logs.
         }
       }
       super.onPageStarted(view, url, favicon)

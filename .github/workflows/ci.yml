@@ -234,6 +234,8 @@ jobs:
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteNavigationPolicyTest.kt could not be copied into the test source set"; exit 1; }
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteProfileOpsTest.kt could not be copied into the test source set"; exit 1; }
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteWebViewSettingsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteWebViewSettingsTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubDebugLogTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::AnimeHubDebugLogTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/PipTransferFlowTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::PipTransferFlowTest.kt could not be copied into the test source set"; exit 1; }
           # The shared navigation-policy vectors: the Kotlin suite loads this
           # file from the test classpath and the Rust suite includes the very
           # same path with include_str!. A missing copy fails here (and the test
@@ -272,7 +274,7 @@ jobs:
           # AnimeHubDebugLog.kt / SiteNavigationGuard.kt, the pure Kotlin flow
           # files (SiteProfileOps.kt, ProfileQuarantine.kt, SiteCloseFlow.kt,
           # SiteShutdownFlow.kt, SiteClearFlow.kt, SiteMigrationFlow.kt,
-          # SiteBackStatus.kt),
+          # SiteBackStatus.kt, PipTransferFlow.kt),
           # SiteNavigationPolicy.kt and IpPolicy.kt STAY — so
           # `:app:test*UnitTest` type-checks the production controller every
           # run instead of trusting the (unreadable) APK-step logs. Nothing
@@ -438,7 +440,7 @@ jobs:
             echo "::error::Kotlin test has FAILED in log"
             exit 1
           fi
-          echo "Kotlin tests passed via Gradle (SiteNavigationPolicyTest + SiteProfileOpsTest + SiteWebViewSettingsTest; production AnimeHubSiteController.kt type-checked in the same source set)"
+          echo "Kotlin tests passed via Gradle (SiteNavigationPolicyTest + SiteProfileOpsTest + SiteWebViewSettingsTest + AnimeHubDebugLogTest + PipTransferFlowTest; production AnimeHubSiteController.kt type-checked in the same source set)"
 
       - name: Upload Kotlin test log
         if: always()
@@ -470,7 +472,7 @@ jobs:
             exit 1
           }
           tail -n 20 /tmp/prepare-apk.log
-          for required in AnimeHubPlugin AnimeHubSiteController AnimeHubPipController SiteNavigationGuard SiteNavigationPolicy SiteWebViewSettings IpPolicy MainActivity; do
+          for required in AnimeHubPlugin AnimeHubSiteController AnimeHubPipController PipTransferFlow SiteNavigationGuard SiteNavigationPolicy SiteWebViewSettings IpPolicy MainActivity; do
             test -f "src-tauri/gen/android/app/src/main/java/dev/animehub/app/$required.kt" || {
               echo "::error::$required.kt is missing from the generated source set; the APK would build without it"
               exit 1

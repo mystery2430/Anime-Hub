@@ -102,25 +102,27 @@ impl AppError {
 }
 
 impl From<url::ParseError> for AppError {
-    fn from(e: url::ParseError) -> Self {
-        AppError::InvalidUrl(e.to_string())
+    fn from(_e: url::ParseError) -> Self {
+        // Parsing errors may quote user-controlled URL data. Keep only a safe
+        // class; diagnostics and command errors do not need parser internals.
+        AppError::InvalidUrl("adres biçimi geçersiz".into())
     }
 }
 
 impl From<std::io::Error> for AppError {
-    fn from(e: std::io::Error) -> Self {
-        // `Display` for io errors can include a filesystem path. The UI
-        // renders this string; the detail stays in the log.
-        log::error!("dosya işlemi başarısız: {e}");
+    fn from(_e: std::io::Error) -> Self {
+        // `Display` for io errors can include a filesystem path. Keep both
+        // the user-facing message and the system log to a static class.
+        log::error!("dosya işlemi başarısız");
         AppError::Storage("dosya işlemi başarısız".into())
     }
 }
 
 impl From<serde_json::Error> for AppError {
-    fn from(e: serde_json::Error) -> Self {
-        // Serde errors quote a fragment of the input. That fragment can be
-        // a site list or, on a settings file, a client secret.
-        log::error!("veri çözümlenemedi: {e}");
+    fn from(_e: serde_json::Error) -> Self {
+        // Serde errors can quote a fragment of a site list or settings file.
+        // Keep the log static; never emit parser input or exception text.
+        log::error!("veri çözümlenemedi");
         AppError::Storage("veri çözümlenemedi".into())
     }
 }
@@ -139,8 +141,8 @@ impl From<reqwest::Error> for AppError {
 }
 
 impl From<aes_gcm::Error> for AppError {
-    fn from(e: aes_gcm::Error) -> Self {
-        AppError::Crypto(e.to_string())
+    fn from(_e: aes_gcm::Error) -> Self {
+        AppError::Crypto("şifreleme işlemi başarısız".into())
     }
 }
 

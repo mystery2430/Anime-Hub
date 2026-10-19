@@ -8,7 +8,6 @@
 package dev.animehub.app
 
 import android.graphics.Bitmap
-import android.util.Log
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -49,13 +48,8 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
     val uri = request.url
     val blocked = SiteNavigationPolicy.rejection(uri)
     if (blocked != null) {
-      // NO host, NO path, NO query: logcat is readable by other apps on older
-      // Android releases and by anyone with adb, and the host alone identifies
-      // which site the user is watching. Scheme + reason code + frame kind is
-      // everything a developer needs to understand the decision.
-      val message = SiteNavigationPolicy.blockedMessage(uri.scheme, blocked, request.isForMainFrame)
-      Log.w(LOG_TAG, message)
-      AnimeHubDebugLog.add("nav", message)
+      // The navigation remains blocked as before. Do not emit per-request or
+      // per-page diagnostics; the target could expose a URL or site identity.
       return true
     }
     return inner.shouldOverrideUrlLoading(view, request)
@@ -82,11 +76,7 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
     val uri = request.url
     val blocked = SiteNavigationPolicy.subresourceRejection(uri)
     if (blocked != null) {
-      // Same redaction as the navigation log: scheme, reason and frame only.
-      AnimeHubDebugLog.add(
-        "net",
-        SiteNavigationPolicy.blockedMessage(uri.scheme, blocked, request.isForMainFrame),
-      )
+      // Keep the existing fail-closed response, without per-request logging.
       return blockedResponse()
     }
     return inner.shouldInterceptRequest(view, request)
@@ -113,15 +103,7 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
     inner.onPageFinished(view, url)
 
   override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-    // Error code and frame only: the description and URL are left out.
-    if (request.isForMainFrame) {
-      AnimeHubDebugLog.add("web", "main frame error code=${error.errorCode}")
-    }
+    // Forward the original callback unchanged; page errors are not diagnostics.
     inner.onReceivedError(view, request, error)
-  }
-
-  companion object {
-    private const val LOG_TAG = "AnimeHubNavGuard"
-
   }
 }

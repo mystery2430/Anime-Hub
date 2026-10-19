@@ -12,6 +12,7 @@
 pub mod android_bridge;
 pub mod anilist;
 pub mod commands;
+pub mod diagnostics;
 pub mod error;
 pub mod secure;
 pub mod sites;
@@ -67,6 +68,7 @@ pub fn run() {
             commands::enter_pip,
             commands::set_pip_auto_enter,
             commands::debug_log,
+            commands::debug_log_reset,
             commands::set_window_theme,
             commands::app_info,
         ])
@@ -91,6 +93,11 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .flatten()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
+
+    crate::diagnostics::set_enabled(settings.developer_options);
+    crate::diagnostics::record(
+        "startup", "start", "started", None, None, None, None, None,
+    );
 
     let blocklist = Blocklist::from_rules(&settings.blocklist.rules, settings.blocklist.enabled);
     // Captured before `settings` moves into the managed state; applied to
@@ -148,7 +155,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 return;
                             }
                             Err(e) if attempt == 3 => {
-                                log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                                log::warn!("PiP auto-enter ayarı uygulanamadı");
                                 return;
                             }
                             Err(_) => {
@@ -169,7 +176,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                         Err(e) if attempt == 3 => {
-                            log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                            log::warn!("PiP auto-enter ayarı uygulanamadı");
                             return;
                         }
                         Err(_) => {}
@@ -183,10 +190,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(w) = &warning {
-        log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü: {w}");
+        log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü");
     }
-    // The raw error stays in the log. The notice is a fixed sentence so a
-    // parse fragment never reaches the launcher.
+    // The user-facing notice is fixed text; parser details stay out of logs.
     let startup_warning = warning
         .as_ref()
         .map(|_| "Kayıtlı site listesi okunamadı, varsayılanlara dönüldü.".to_string());
@@ -211,7 +217,57 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         current_site: Mutex::new(None),
         pip_lock: Mutex::new(()),
         pip_generation: AtomicU64::new(0),
+        diagnostics_lock: Mutex::new(()),
     });
+
+    // Mirror the persisted gate into Kotlin before the developer panel can
+    // request events. The setting is re-read under diagnostics_lock on each
+    // retry so a stale startup value cannot re-enable collection after a user
+    // toggle wins the race.
+    #[cfg(target_os = "android")]
+    {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+            for attempt in 0..8 {
+                let mut retry = true;
+                if let Some(state) = handle.try_state::<AppState>() {
+                    if let Ok(_gate) = state.diagnostics_lock.lock() {
+                        let enabled = state
+                            .settings
+                            .lock()
+                            .map(|settings| settings.developer_options)
+                            .unwrap_or(false);
+                        crate::diagnostics::set_enabled(enabled);
+                        match crate::android_bridge::set_debug_logging(enabled) {
+                            Ok(()) => {
+                                if enabled {
+                                    crate::diagnostics::record(
+                                        "startup", "capability", "enabled", None, None,
+                                        None, None, None,
+                                    );
+                                }
+                                retry = false;
+                            }
+                            Err(_) if attempt == 7 => {
+                                crate::diagnostics::record(
+                                    "startup", "capability", "failed", None, None,
+                                    Some("provider"), None, None,
+                                );
+                                retry = false;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                if !retry {
+                    return;
+                }
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+        });
+    }
 
     // Android: finish deferred profile deletions before the frontend can
     // open anything (see `drain_pending_profile_deletes`). A throwaway
@@ -223,25 +279,30 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     {
         let handle = app.handle().clone();
         std::thread::spawn(move || {
+            let _startup_scope = crate::diagnostics::scope_if_missing("startup");
             for attempt in 0..8 {
-                let stop = match handle.try_state::<AppState>() {
+                let (stop, round_result, error_class) = match handle.try_state::<AppState>() {
                     Some(state) => match crate::web::windows::lock_android_session() {
                         Ok(_guard) => match drain_pending_profile_deletes(&state) {
-                            Ok(done) => done,
-                            Err(e) => {
+                            Ok(done) => (done, if done { "ok" } else { "pending" }, None),
+                            Err(_) => {
                                 // Storage failure: retrying now would fail the
                                 // same way; the queue stays for the next start.
-                                log::error!("ertelenen profil silmeleri okunamadı: {e}");
-                                true
+                                log::error!("ertelenen profil silmeleri okunamadı");
+                                (true, "failed", Some("storage"))
                             }
                         },
-                        Err(e) => {
-                            log::error!("ertelenen profil silmeleri kilitlenemedi: {e}");
-                            false
+                        Err(_) => {
+                            log::error!("ertelenen profil silmeleri kilitlenemedi");
+                            (false, "unavailable", Some("storage"))
                         }
                     },
-                    None => false,
+                    None => (false, "unavailable", Some("unavailable")),
                 };
+                crate::diagnostics::record_current(
+                    "startup", "worker_wait", round_result, None, None,
+                    error_class, Some(attempt as u64), None,
+                );
                 if stop {
                     return;
                 }
@@ -251,6 +312,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             log::warn!(
                 "ertelenen profil silmeleri bu açılışta işlenemedi; sonraki açılışta yeniden denenecek"
+            );
+            crate::diagnostics::record_current(
+                "startup", "drain", "timeout", None, Some("fired"),
+                Some("timeout"), Some(8), None,
             );
         });
     }
@@ -262,7 +327,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // intent-filter in AndroidManifest.xml handles it instead.
     #[cfg(desktop)]
     if let Err(e) = app.deep_link().register_all() {
-        log::warn!("deep-link şeması kaydedilemedi: {e}");
+        log::warn!("deep-link şeması kaydedilemedi");
     }
 
     // Desktop hosts site webviews inside the launcher window: keep them
@@ -279,7 +344,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             commands::ThemePref::Light => Some(tauri::Theme::Light),
         };
         if let Err(e) = w.set_theme(target) {
-            log::warn!("kayıtlı tema uygulanamadı: {e}");
+            log::warn!("kayıtlı tema uygulanamadı");
         }
     }
 
@@ -333,8 +398,35 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
     use crate::error::AppError;
     use crate::web::windows as w;
 
-    let entries = w::read_pending_profile_delete_entries(state)?;
+    let _operation_scope = crate::diagnostics::scope_if_missing("startup");
+    let entries = match w::read_pending_profile_delete_entries(state) {
+        Ok(entries) => entries,
+        Err(error) => {
+            crate::diagnostics::record_current(
+                "startup", "drain", "failed", None, None,
+                Some("storage"), None, None,
+            );
+            return Err(error);
+        }
+    };
+    let blocked = entries.iter().filter(|entry| entry.is_blocked()).count();
+    let owed = entries.len().saturating_sub(blocked);
+    crate::diagnostics::record_current(
+        "queue", "profile_list", "ok", None, None, None,
+        Some(entries.len() as u64), None,
+    );
+    crate::diagnostics::record_current(
+        "queue", "resolve", if blocked == 0 { "skipped" } else { "blocked" },
+        None, None, None, Some(blocked as u64), None,
+    );
+    crate::diagnostics::record_current(
+        "queue", "resolve", if owed == 0 { "skipped" } else { "owed" },
+        None, None, None, Some(owed as u64), None,
+    );
     if entries.is_empty() {
+        crate::diagnostics::record_current(
+            "startup", "drain", "empty", None, None, None, Some(0), None,
+        );
         return Ok(true);
     }
     log::info!("ertelenen profil silmeleri deneniyor: {}", entries.len());
@@ -345,10 +437,16 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
     // so re-matching against the registry is the only way to find out whose
     // generation has to be secured before the tombstone may be lifted.
     let site_ids: Vec<String> = {
-        let reg = state
-            .registry
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+        let reg = match state.registry.lock() {
+            Ok(registry) => registry,
+            Err(_) => {
+                crate::diagnostics::record_current(
+                    "startup", "drain", "failed", None, None,
+                    Some("storage"), None, None,
+                );
+                return Err(AppError::Storage("kilit alınamadı".into()));
+            }
+        };
         reg.sites.iter().map(|site| site.id.clone()).collect()
     };
 
@@ -364,9 +462,7 @@ fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult
     )?;
 
     for name in &report.kept_unmatched {
-        log::warn!(
-            "ertelenen profil silmesi kuyrukta korundu (sahibi belirsiz veya nesil güvenceye alınamadı): {name}"
-        );
+        log::warn!("deferred profile tombstone retained; owner or generation is unresolved");
     }
     if report.lifted > 0 || report.deferred > 0 || report.unsupported > 0 || report.blocked > 0 {
         log::info!(

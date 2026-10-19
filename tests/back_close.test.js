@@ -79,6 +79,16 @@ test("first requestClose starts exactly one close and reports pending", async ()
   assert.equal(h.session.statusString(), "pending");
 });
 
+test("native back operation id is forwarded through the launcher close bridge", () => {
+  const h = harness();
+  h.session.opened("site-a", "id-a");
+  assert.deepEqual(h.session.requestClose("k-42"), { accepted: true });
+  assert.deepEqual(h.calls[0], {
+    cmd: "close_site",
+    args: { label: "site-a", operationId: "k-42" },
+  });
+});
+
 test("successful close settles to closed and keeps the label until the event", async () => {
   const h = harness();
   h.session.opened("site-a", "id-a");

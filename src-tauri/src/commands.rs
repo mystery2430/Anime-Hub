@@ -50,6 +50,9 @@ pub struct AppState {
     /// live one while holding `pip_lock`, so even a value-preserving toggle
     /// (false→true→false) is not mistaken for \"no change\".
     pub pip_generation: std::sync::atomic::AtomicU64,
+    /// Serialize developer-options changes with the Kotlin collection gate and
+    /// panel reads; a stale startup toggle must never re-enable diagnostics.
+    pub diagnostics_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +305,7 @@ pub fn remove_site(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<RemoveSiteOutcome> {
+    let _operation_scope = crate::diagnostics::scope_if_missing("delete");
     // Preserve the registry until the destructive cleanup succeeds, so a
     // failed close/delete does not orphan the tile. The whole sequence is
     // serialized by the desktop/android lifecycle lock (`DESKTOP` →
@@ -349,7 +353,7 @@ pub fn remove_site(
         }
         state.provider.delete_site_session(&id)?;
         let base = app.path().app_data_dir().map_err(|e| {
-            log::error!("profil dizini bulunamadı: {e}");
+            log::error!("profil dizini bulunamadı");
             AppError::Storage("profil dizini bulunamadı".into())
         })?;
         let dir = crate::web::session::profile_dir_path(&base, &id);
@@ -357,7 +361,7 @@ pub fn remove_site(
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                log::error!("profil dizini silinemedi: {e}");
+                log::error!("profil dizini silinemedi");
                 return Err(AppError::Storage("site verisi silinemedi".into()));
             }
         }
@@ -529,15 +533,30 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     // string policy already passed, and failing closed would make every site
     // unopenable during a DNS outage.
     let host = safe.host().to_string();
-    let dns = tauri::async_runtime::spawn_blocking(move || crate::web::dns::classify_host(&host))
-        .await
-        .map_err(|e| AppError::Other(format!("adres çözümlenemedi: {e}")))?;
+    let dns_result = tauri::async_runtime::spawn_blocking(move || {
+        crate::web::dns::classify_host(&host)
+    })
+    .await;
+
+    // Async command continuations may resume on a different thread; establish
+    // synchronous bridge correlation immediately after the DNS await, before
+    // any subsequent synchronous validation or window-open work.
+    let _operation_scope = crate::diagnostics::scope_if_missing("open");
+    let dns = dns_result.map_err(|_| {
+        crate::diagnostics::record_current(
+            "open", "resolve", "failed", None, None, Some("unknown"), None, None,
+        );
+        AppError::Other("adres çözümlenemedi".into())
+    })?;
     if matches!(dns, crate::web::dns::DnsClass::Answered { private: true }) {
+        crate::diagnostics::record_current(
+            "open", "resolve", "rejected", None, None,
+            Some("invalid_profile"), None, None,
+        );
         return Err(AppError::InvalidUrl(
             "alan adı yerel/ağ içi bir adrese çözümlendi".into(),
         ));
     }
-
     let injected = InjectedConfig {
         block_popups: settings.block_popups,
         hide_selectors: if settings.inject_cosmetic_rules {
@@ -584,7 +603,15 @@ pub struct OpenedSite {
 /// flushes/destroys the site's profiled WebView (Android); desktop removes
 /// the child WebView.
 #[tauri::command]
-pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
+pub async fn close_site(
+    app: AppHandle,
+    label: String,
+    operation_id: Option<String>,
+) -> AppResult<()> {
+    let _operation_scope = operation_id
+        .as_deref()
+        .map(|id| crate::diagnostics::begin_operation_with_id("close", id))
+        .or_else(|| crate::diagnostics::scope_if_missing("close"));
     windows::close_site_window(&app, &label)
 }
 
@@ -601,6 +628,7 @@ pub async fn close_site(app: AppHandle, label: String) -> AppResult<()> {
 /// default profile and its data are never touched.
 #[tauri::command]
 pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u32> {
+    let _operation_scope = crate::diagnostics::scope_if_missing("clear");
     // `is_all` captures whether the caller asked for "all sites" before `id`
     // is moved. Used for orphan profile cleanup and for Android live-jar
     // handling.
@@ -763,7 +791,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     #[cfg(desktop)]
     {
         let base = app.path().app_data_dir().map_err(|e| {
-            log::error!("profil dizini bulunamadı: {e}");
+            log::error!("profil dizini bulunamadı");
             AppError::Storage("profil dizini bulunamadı".into())
         })?;
         for id in &ids {
@@ -772,7 +800,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    log::error!("profil dizini silinemedi: {e}");
+                    log::error!("profil dizini silinemedi");
                     return Err(AppError::Storage("site verisi silinemedi".into()));
                 }
             }
@@ -802,11 +830,11 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                         let orphan_dir = profiles_dir.join(&name);
                         match std::fs::remove_dir_all(&orphan_dir) {
                             Ok(()) => {
-                                log::info!("yetim profil dizini temizlendi: {name}");
+                                log::info!("yetim profil dizini temizlendi");
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                             Err(e) => {
-                                log::error!("yetim profil dizini silinemedi ({name}): {e}");
+                                log::error!("yetim profil dizini silinemedi");
                                 return Err(AppError::Storage("site verisi silinemedi".into()));
                             }
                         }
@@ -814,7 +842,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    log::error!("profil dizini listelenemedi: {e}");
+                    log::error!("profil dizini listelenemedi");
                     return Err(AppError::Storage("site verisi silinemedi".into()));
                 }
             }
@@ -870,6 +898,32 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsView> {
     })
 }
 
+/// Commit a settings patch without creating a diagnostics gate-off window in
+/// which Kotlin can still collect while the persisted setting is already false.
+/// The native disable is preflighted before persistence; on persistence failure
+/// the prior native gate is restored best-effort. The callback is injectable so
+/// the ordering/rollback contract is tested without Android or a Tauri runtime.
+fn commit_settings_with_diagnostics_preflight(
+    was_enabled: bool,
+    requested: Option<bool>,
+    mut set_native_gate: impl FnMut(bool) -> AppResult<()>,
+    persist_and_commit: impl FnOnce() -> AppResult<()>,
+) -> AppResult<()> {
+    if requested != Some(false) {
+        return persist_and_commit();
+    }
+
+    if let Err(error) = set_native_gate(false) {
+        let _ = set_native_gate(was_enabled);
+        return Err(error);
+    }
+    if let Err(error) = persist_and_commit() {
+        let _ = set_native_gate(was_enabled);
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn update_settings(
     state: State<'_, AppState>,
@@ -889,46 +943,105 @@ pub fn update_settings(
     } else {
         None
     };
+    let diagnostics_update = patch.developer_options;
+    let _diagnostics_guard = if diagnostics_update.is_some() {
+        Some(
+            state
+                .diagnostics_lock
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?,
+        )
+    } else {
+        None
+    };
 
-    {
-        use std::sync::atomic::Ordering;
-        let mut live = state
+    let diagnostics_was_enabled = if diagnostics_update.is_some() {
+        state
             .settings
             .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        let mut next = live.clone();
-        if let Some(b) = patch.blocklist {
-            next.blocklist = b;
-        }
-        if let Some(v) = patch.block_popups {
-            next.block_popups = v;
-        }
-        if let Some(v) = patch.inject_cosmetic_rules {
-            next.inject_cosmetic_rules = v;
-        }
-        if let Some(v) = patch.fullscreen_sites {
-            next.fullscreen_sites = v;
-        }
-        if let Some(v) = patch.theme {
-            next.theme = v;
-        }
-        let pip_changed =
-            patch.pip_auto_enter.is_some() && patch.pip_auto_enter != Some(live.pip_auto_enter);
-        if let Some(v) = patch.pip_auto_enter {
-            next.pip_auto_enter = v;
-        }
-        if let Some(v) = patch.developer_options {
-            next.developer_options = v;
-        }
-        if let Some(a) = patch.anilist {
-            next.anilist = a;
-        }
-        write_settings_doc(&state, &next)?;
-        *live = next;
-        if pip_changed {
-            state.pip_generation.fetch_add(1, Ordering::SeqCst);
+            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?
+            .developer_options
+    } else {
+        false
+    };
+    let mut native_disable_failed = false;
+    let mut native_restore_failed = false;
+    let commit_result = commit_settings_with_diagnostics_preflight(
+        diagnostics_was_enabled,
+        diagnostics_update,
+        |enabled| {
+            let result = crate::android_bridge::set_debug_logging(enabled);
+            if !enabled && result.is_err() {
+                native_disable_failed = true;
+            } else if enabled && result.is_err() {
+                native_restore_failed = true;
+            }
+            result
+        },
+        || {
+            use std::sync::atomic::Ordering;
+            let mut live = state
+                .settings
+                .lock()
+                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+            let mut next = live.clone();
+            if let Some(b) = patch.blocklist {
+                next.blocklist = b;
+            }
+            if let Some(v) = patch.block_popups {
+                next.block_popups = v;
+            }
+            if let Some(v) = patch.inject_cosmetic_rules {
+                next.inject_cosmetic_rules = v;
+            }
+            if let Some(v) = patch.fullscreen_sites {
+                next.fullscreen_sites = v;
+            }
+            if let Some(v) = patch.theme {
+                next.theme = v;
+            }
+            let pip_changed =
+                patch.pip_auto_enter.is_some() && patch.pip_auto_enter != Some(live.pip_auto_enter);
+            if let Some(v) = patch.pip_auto_enter {
+                next.pip_auto_enter = v;
+            }
+            if let Some(v) = patch.developer_options {
+                next.developer_options = v;
+            }
+            if let Some(a) = patch.anilist {
+                next.anilist = a;
+            }
+            write_settings_doc(&state, &next)?;
+            *live = next;
+            if pip_changed {
+                state.pip_generation.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        },
+    );
+    if native_disable_failed || native_restore_failed {
+        crate::diagnostics::record(
+            "devlog", "gate", "failed", None, None, Some("provider"), None, None,
+        );
+    }
+    commit_result?;
+
+    if let Some(enabled) = diagnostics_update {
+        if enabled {
+            crate::diagnostics::set_enabled(true);
+            #[cfg(target_os = "android")]
+            if crate::android_bridge::set_debug_logging(true).is_err() {
+                crate::diagnostics::record(
+                    "devlog", "gate", "failed", None, None,
+                    Some("provider"), None, None,
+                );
+            }
+        } else {
+            // Kotlin was disabled before the persisted setting changed above.
+            crate::diagnostics::set_enabled(false);
         }
     }
+    drop(_diagnostics_guard);
     drop(_pip_guard);
     rebuild_blocklist(&state);
     get_settings(state)
@@ -1146,14 +1259,14 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
                 // Refresh rejected => the session is over.
                 Err(_) => {
                     if let Err(e) = state.provider.delete_secret("anilist-token") {
-                        log::error!("süresi dolmuş AniList oturumu silinemedi: {e}");
+                        log::error!("süresi dolmuş AniList oturumu silinemedi");
                     }
                     return Ok(None);
                 }
             },
             None => {
                 if let Err(e) = state.provider.delete_secret("anilist-token") {
-                    log::error!("yenilenemeyen AniList oturumu silinemedi: {e}");
+                    log::error!("yenilenemeyen AniList oturumu silinemedi");
                 }
                 return Ok(None);
             }
@@ -1168,7 +1281,7 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
 /// Clears a token the server rejected outright.
 fn drop_rejected_token(state: &AppState) {
     if let Err(e) = state.provider.delete_secret("anilist-token") {
-        log::error!("geçersiz AniList oturumu silinemedi: {e}");
+        log::error!("geçersiz AniList oturumu silinemedi");
     }
 }
 
@@ -1301,7 +1414,7 @@ pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppRe
         ThemePref::Light => Some(tauri::Theme::Light),
     };
     window.set_theme(target).map_err(|e| {
-        log::error!("tema uygulanamadı: {e}");
+        log::error!("tema uygulanamadı");
         AppError::Other("tema uygulanamadı".into())
     })
 }
@@ -1370,6 +1483,7 @@ pub fn set_pip_auto_enter(
         return get_settings(state);
     }
 
+    let _operation_scope = crate::diagnostics::begin_operation("pip");
     // Platform check: unknown platform is refused without a save.
     // On desktop we store only; on Android we must drive the native controller.
     let is_android = cfg!(target_os = "android");
@@ -1467,33 +1581,55 @@ pub fn pip_startup_should_apply(
     captured_val == live_val
 }
 
-/// Developer panel: the last PiP diagnostic lines (empty off Android).
-///
-/// GATED on the `developerOptions` setting (AH-P9). The launcher UI already
-/// hides the panel when the setting is off, but the command itself was callable
-/// by anything running in the launcher WebView. Site WebViews have no Tauri IPC
-/// at all (no `@JavascriptInterface`, no `addWebMessageListener` — pinned by
-/// tests), so this is defence in depth on the trusted surface, not a hole in the
-/// site boundary. With the setting off the answer is an EMPTY LIST rather than
-/// an error, so a stale or hand-built UI learns nothing — not even whether the
-/// log has content.
-///
-/// The lock is released before the bridge call: the Kotlin side answers through
-/// the plugin, and a settings lock must not be held across it.
-// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
-// thread. These commands wait for a Kotlin reply through the plugin bridge.
+/// Read the bounded, mixed Rust+Kotlin diagnostics timeline. Collection and
+/// reads are both gated by the persisted `developer_options` setting.
 #[tauri::command(async)]
-pub fn debug_log(app: AppHandle) -> AppResult<Vec<String>> {
+pub fn debug_log(app: AppHandle) -> AppResult<animehub_android::DebugLogSnapshot> {
     let state = app.state::<AppState>();
+    let _gate = state
+        .diagnostics_lock
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
     let enabled = state
         .settings
         .lock()
         .map_err(|_| AppError::Storage("kilit alınamadı".into()))?
         .developer_options;
     if !enabled {
-        return Ok(Vec::new());
+        crate::diagnostics::set_enabled(false);
+        #[cfg(target_os = "android")]
+        let _ = crate::android_bridge::set_debug_logging(false);
+        return Ok(crate::diagnostics::empty_snapshot());
     }
+    crate::diagnostics::set_enabled(true);
+    #[cfg(target_os = "android")]
+    crate::android_bridge::set_debug_logging(true)
+        .map_err(|_| AppError::Other("diagnostic setting could not be applied".into()))?;
     crate::android_bridge::debug_log()
+}
+
+/// User-triggered reset of both process-local rings. No file is written.
+#[tauri::command(async)]
+pub fn debug_log_reset(app: AppHandle) -> AppResult<()> {
+    let state = app.state::<AppState>();
+    let _gate = state
+        .diagnostics_lock
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+    let enabled = state
+        .settings
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?
+        .developer_options;
+    if !enabled {
+        crate::diagnostics::set_enabled(false);
+        #[cfg(target_os = "android")]
+        let _ = crate::android_bridge::set_debug_logging(false);
+        return Ok(());
+    }
+    crate::android_bridge::debug_log_reset()?;
+    crate::diagnostics::reset();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1582,7 +1718,59 @@ mod tests {
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
+            diagnostics_lock: Mutex::new(()),
         }
+    }
+
+    #[test]
+    fn diagnostics_disable_bridge_failure_does_not_commit_settings() {
+        use std::cell::{Cell, RefCell};
+
+        let native_calls = RefCell::new(Vec::new());
+        let committed = Cell::new(false);
+        let result = commit_settings_with_diagnostics_preflight(
+            true,
+            Some(false),
+            |enabled| {
+                native_calls.borrow_mut().push(enabled);
+                if enabled {
+                    Ok(())
+                } else {
+                    Err(AppError::Other("safe bridge failure".into()))
+                }
+            },
+            || {
+                committed.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            *native_calls.borrow(),
+            vec![false, true],
+            "a failed disable is restored best-effort before returning",
+        );
+        assert!(!committed.get(), "the persisted setting must not change");
+    }
+
+    #[test]
+    fn diagnostics_disable_persistence_failure_restores_previous_native_gate() {
+        use std::cell::RefCell;
+
+        let native_calls = RefCell::new(Vec::new());
+        let result = commit_settings_with_diagnostics_preflight(
+            true,
+            Some(false),
+            |enabled| {
+                native_calls.borrow_mut().push(enabled);
+                Ok(())
+            },
+            || Err(AppError::Storage("settings write failed".into())),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*native_calls.borrow(), vec![false, true]);
     }
 
     #[test]

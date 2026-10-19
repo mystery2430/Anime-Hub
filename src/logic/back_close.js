@@ -53,10 +53,12 @@ export function createBackSession({ call, notify, errorText }) {
     state = message ? `${next}:${message}` : next;
   }
 
-  async function runClose(target) {
+  async function runClose(target, operationId) {
     settle("pending");
     try {
-      await call("close_site", { label: target });
+      const args = { label: target };
+      if (typeof operationId === "string") args.operationId = operationId;
+      await call("close_site", args);
       // The session may already have been re-opened for another site while
       // this call was in flight — never clobber the newer owner.
       if (label === target) settle("closed");
@@ -94,7 +96,7 @@ export function createBackSession({ call, notify, errorText }) {
      *              concurrent `close_site` calls), or a previous failure is
      *              being retried.
      */
-    requestClose() {
+    requestClose(operationId) {
       if (!label) return { accepted: false };
       if (state === "pending") return { accepted: true };
       if (state === "closed") {
@@ -102,7 +104,7 @@ export function createBackSession({ call, notify, errorText }) {
         // poller observes `closed` instead of falling back.
         return { accepted: true };
       }
-      void runClose(label);
+      void runClose(label, operationId);
       return { accepted: true };
     },
 

@@ -31,6 +31,7 @@ class SiteProfileOpsTest {
   @Before
   fun resetQuarantine() {
     ProfileQuarantine.reset()
+    AnimeHubDebugLog.resetForTests()
   }
 
   // ---------------------------------------------------------------- close
@@ -408,11 +409,16 @@ class SiteProfileOpsTest {
 
   @Test
   fun `clear on an unsupported provider refuses instead of faking success`() {
+    AnimeHubDebugLog.setEnabled(true)
     val port = FakeClearPort()
     var result = "unset"
     SiteClearFlow.run(supported = false, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertEquals(SiteProfileErrors.UNSUPPORTED, result)
     Assert.assertTrue("no port operation may run", port.log.isEmpty())
+    Assert.assertTrue(AnimeHubDebugLog.snapshot().events.any {
+      it.area == "clear" && it.phase == "complete" &&
+        it.result == "unsupported" && it.errorClass == "unsupported"
+    })
   }
 
   @Test
@@ -431,6 +437,87 @@ class SiteProfileOpsTest {
     SiteClearFlow.run(supported = true, profileName = profile, port = port) { result = it ?: "ok" }
     Assert.assertEquals("ok", result)
     Assert.assertEquals(listOf("exists", "cookies", "geo", "storage", "flush"), port.log)
+  }
+
+  @Test
+  fun `diagnostics are observational and redact a clear failure without changing its safety outcome`() {
+    AnimeHubDebugLog.setEnabled(true)
+    val privateError = "https://private.example/path?token=TOP-SECRET; Cookie: value"
+    val port = FakeClearPort(cookiesFailWith = privateError)
+    var results = 0
+    var result: String? = null
+    SiteClearFlow.run(
+      supported = true,
+      profileName = profile,
+      port = port,
+      operationId = "k-77",
+    ) { error ->
+      results++
+      result = error
+    }
+
+    Assert.assertEquals(1, results)
+    Assert.assertEquals(
+      "${SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX}: ${SiteClearFlow.PROVIDER_FAILURE}",
+      result,
+    )
+    Assert.assertEquals(
+      "exists, wipe, geolocation, storage, then flush still run",
+      listOf("exists", "cookies", "geo", "storage", "flush"),
+      port.log,
+    )
+    Assert.assertFalse("a settled failure does not quarantine the profile", ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull("retry remains possible", SiteOpenGate.check(profile))
+
+    val snapshot = AnimeHubDebugLog.snapshot()
+    val flowEvents = snapshot.events.filter { it.operationId == "k-77" }
+    Assert.assertTrue(flowEvents.any { it.phase == "cookie_wipe" && it.result == "failed" && it.errorClass == "provider" })
+    Assert.assertTrue(flowEvents.any { it.phase == "complete" && it.result == "failed" })
+    Assert.assertTrue(flowEvents.all { it.source == "kotlin" })
+    val exported = snapshot.toString()
+    Assert.assertFalse(exported.contains("private.example"))
+    Assert.assertFalse(exported.contains("TOP-SECRET"))
+    Assert.assertFalse(exported.contains("Cookie"))
+  }
+
+  @Test
+  fun `diagnostics record a timed-out cookie wipe and late settlement without reopening the profile`() {
+    AnimeHubDebugLog.setEnabled(true)
+    val port = FakeClearPort(cookiesNeverAnswer = true)
+    var results = 0
+    var result: String? = null
+    SiteClearFlow.run(
+      supported = true,
+      profileName = profile,
+      port = port,
+      operationId = "k-78",
+    ) { error ->
+      results++
+      result = error
+    }
+
+    Assert.assertNull("the cookie call is still pending", result)
+    Assert.assertEquals(1, ProfileQuarantine.pendingOperations(profile).size)
+    port.timeouts[0].invoke()
+    Assert.assertEquals(1, results)
+    Assert.assertNotNull("timeout is not reported as a successful clear", result)
+    Assert.assertTrue("the profile remains blocked", ProfileQuarantine.isBlocked(profile))
+    Assert.assertNotNull(SiteOpenGate.check(profile))
+
+    port.pendingCookies!!.invoke(CookieWipe.Answered(true))
+    Assert.assertEquals("late callback cannot re-report the operation", 1, results)
+    Assert.assertTrue("settling is not verification", ProfileQuarantine.isBlocked(profile))
+    val flowEvents = AnimeHubDebugLog.snapshot().events.filter { it.operationId == "k-78" }
+    Assert.assertTrue(flowEvents.any {
+      it.phase == "cookie_wipe" && it.result == "timeout" && it.watchdog == "fired"
+    })
+    Assert.assertTrue(flowEvents.any { it.phase == "quarantine" && it.result == "quarantined" })
+    Assert.assertTrue(flowEvents.any {
+      it.phase == "late_callback" && it.result == "late" && it.watchdog == "late"
+    })
+    val exported = AnimeHubDebugLog.snapshot().toString()
+    Assert.assertFalse(exported.contains(profile))
+    Assert.assertFalse(exported.contains("Cookie"))
   }
 
   @Test
@@ -1024,10 +1111,16 @@ class SiteProfileOpsTest {
     // and SiteFlushWorker turns that into Watchdog.Refused. The flow must answer
     // its caller instead of waiting for a watchdog that will never fire — and it
     // must NOT issue the provider call nobody could bound.
+    AnimeHubDebugLog.setEnabled(true)
     val port = FakeClearPort(armFails = true)
     var results = 0
     var last: String? = "unset"
-    SiteClearFlow.run(supported = true, profileName = profile, port = port) {
+    SiteClearFlow.run(
+      supported = true,
+      profileName = profile,
+      port = port,
+      operationId = "k-79",
+    ) {
       results++
       last = it
     }
@@ -1046,6 +1139,12 @@ class SiteProfileOpsTest {
     // ledger tracks provider operations that may still land, not refusals.
     Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
     Assert.assertNull(SiteOpenGate.check(profile))
+    val flowEvents = AnimeHubDebugLog.snapshot().events.filter { it.operationId == "k-79" }
+    Assert.assertTrue(flowEvents.any {
+      it.phase == "cookie_wipe" && it.result == "failed" &&
+        it.watchdog == "refused" && it.errorClass == "watchdog_refused"
+    })
+    Assert.assertFalse(AnimeHubDebugLog.snapshot().toString().contains(profile))
   }
 
   @Test
@@ -1075,15 +1174,15 @@ class SiteProfileOpsTest {
     val refusedByReturnValue = WatchdogArming.decide(queued = false, thrown = null, cancel = cancel)
     Assert.assertEquals(Watchdog.Refused, refusedByReturnValue)
     Assert.assertEquals(
-      "watchdog could not be armed (postDelayed returned false)",
+      "watchdog_refused",
       WatchdogArming.refusal(queued = false, thrown = null),
     )
 
     val refusedByThrow = WatchdogArming.decide(queued = false, thrown = IllegalStateException("looper gone"), cancel = cancel)
     Assert.assertEquals(Watchdog.Refused, refusedByThrow)
     Assert.assertEquals(
-      "watchdog could not be armed (IllegalStateException)",
-      WatchdogArming.refusal(queued = false, thrown = IllegalStateException("looper gone")),
+      "watchdog_refused",
+      WatchdogArming.refusal(queued = false, thrown = IllegalStateException("private exception text")),
     )
     // A throw wins even if something claims it queued: never hand out a canceller
     // for a runnable that is not in the queue.
@@ -1225,12 +1324,19 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `a failed flush reports its reason and is not a success`() {
-    val port = FakeShutdownPort(failure = "IOException: disk full")
+  fun `a failed flush reports a safe class and never an exception detail`() {
+    AnimeHubDebugLog.setEnabled(true)
+    val privateError = "IOException: disk full at https://private.example/?token=TOP-SECRET"
+    val port = FakeShutdownPort(failure = privateError)
     val outcome = ShutdownFlow.run(port, 50)
     Assert.assertTrue("a throw is a Failed, not Completed", outcome is ShutdownFlush.Failed)
-    Assert.assertEquals("IOException: disk full", (outcome as ShutdownFlush.Failed).reason)
+    Assert.assertEquals("unknown", (outcome as ShutdownFlush.Failed).reason)
     Assert.assertEquals(1, port.teardowns)
+    val exported = AnimeHubDebugLog.snapshot().toString()
+    Assert.assertFalse(exported.contains("disk full"))
+    Assert.assertFalse(exported.contains("private.example"))
+    Assert.assertFalse(exported.contains("TOP-SECRET"))
+    Assert.assertTrue(AnimeHubDebugLog.snapshot().events.any { it.errorClass == "unknown" })
   }
 
   @Test
@@ -1362,11 +1468,11 @@ class SiteProfileOpsTest {
   fun `a thrown provider call and a vanished profile stay typed failures`() {
     val thrown = CookieWipes.failed(IllegalStateException("store gone"))
     Assert.assertTrue("a throw is a Failed, never an Answered", thrown is CookieWipe.Failed)
-    Assert.assertEquals("IllegalStateException: store gone", (thrown as CookieWipe.Failed).reason)
-    // An exception without a message must not crash the mapping either.
-    val messageless = CookieWipes.failed(IllegalStateException())
+    Assert.assertEquals("provider", (thrown as CookieWipe.Failed).reason)
+    // Neither the exception type nor its text enters the safe reason code.
+    val messageless = CookieWipes.failed(IllegalStateException("private detail"))
     Assert.assertTrue(messageless is CookieWipe.Failed)
-    Assert.assertEquals("IllegalStateException: null", (messageless as CookieWipe.Failed).reason)
+    Assert.assertEquals("provider", (messageless as CookieWipe.Failed).reason)
 
     val noProfile = CookieWipes.noProfile()
     Assert.assertTrue(noProfile is CookieWipe.Failed)
@@ -1668,8 +1774,9 @@ class SiteProfileOpsTest {
       result = it ?: "ok"
     }
     Assert.assertEquals(1, results)
-    Assert.assertTrue("the access failure is reported verbatim: $result", result.startsWith(SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX))
-    Assert.assertTrue(result.contains("profil bu adımda erişilebilir değil"))
+    Assert.assertTrue("the failure has a safe class code: $result", result.startsWith(SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX))
+    Assert.assertTrue(result.endsWith(SiteClearFlow.PROVIDER_FAILURE))
+    Assert.assertFalse("provider detail must not be reflected", result.contains("profil bu adımda erişilebilir değil"))
     Assert.assertEquals("no probe: the failure type already decided it", 0, port.emptinessChecks)
     Assert.assertTrue("later steps are still attempted", port.log.contains("storage"))
     // Nothing was issued, so nothing is in flight: no block, and the profile
@@ -1718,12 +1825,17 @@ class SiteProfileOpsTest {
     Assert.assertEquals("only the indeterminate answers probe", 3, probes)
 
     val failed =
-      SiteClearFlow.interpretCookieWipe(CookieWipe.Failed("IllegalStateException: null"), probe(true))
+      SiteClearFlow.interpretCookieWipe(
+        CookieWipe.Failed("Exception: https://private.example/?token=TOP-SECRET"),
+        probe(true),
+      )
     Assert.assertFalse(failed.ok)
     Assert.assertEquals(
-      "${SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX}: IllegalStateException: null",
+      "${SiteClearFlow.COOKIE_ACCESS_FAILED_PREFIX}: ${SiteClearFlow.PROVIDER_FAILURE}",
       failed.error,
     )
+    Assert.assertFalse(failed.error!!.contains("private.example"))
+    Assert.assertFalse(failed.error!!.contains("TOP-SECRET"))
     Assert.assertEquals("a typed failure never probes", 3, probes)
   }
 

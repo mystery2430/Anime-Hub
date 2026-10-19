@@ -83,9 +83,6 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.security.KeyStore
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -102,7 +99,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     installNavigationGuard(webView)
     restrictIpcToLauncher(webView)
     AnimeHubSiteController.bindLauncher(webView)
-    AnimeHubDebugLog.add("app", "WebView ready, api ${Build.VERSION.SDK_INT}")
+    AnimeHubDebugLog.record("app", "start", "ok", count = Build.VERSION.SDK_INT.toLong())
   }
 
   /**
@@ -123,13 +120,13 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val id = (webView as? RustWebView)?.id
     if (id == null) {
       Log.e(LOG_TAG, "launcher IPC is off: WebView is not a RustWebView")
-      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebView is not a RustWebView")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "unavailable", errorClass = "ipc")
       showIpcOffNotice()
       return
     }
     if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
       Log.e(LOG_TAG, "launcher IPC is off: WebMessageListener unsupported")
-      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebMessageListener unsupported")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "unsupported", errorClass = "unsupported")
       showIpcOffNotice()
       return
     }
@@ -140,11 +137,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         LauncherIpc.ORIGINS,
         LauncherIpc(id),
       )
-      AnimeHubDebugLog.add("ipc", "launcher listener installed")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "ok")
     } catch (e: Exception) {
-      AnimeHubDebugLog.add("ipc", "listener failed (${e.javaClass.simpleName}); launcher IPC is off")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "failed_closed", errorClass = "ipc")
       // Fail closed: the wry object is already gone, so no site page gets an `ipc` object.
-      Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off", e)
+      Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off")
       showIpcOffNotice()
     }
   }
@@ -164,7 +161,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         ).show()
       } catch (e: Exception) {
         // Showing a notice must never break the plugin load.
-        Log.e(LOG_TAG, "could not show the IPC notice", e)
+        Log.e(LOG_TAG, "could not show the IPC notice")
       }
     }
   }
@@ -199,6 +196,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     return false
   }
 
+  /** Only generated opaque ids are accepted from Rust; raw arguments are never logged. */
+  private fun operationId(args: JSObject): String =
+    AnimeHubDebugLog.safeOperationId(args.getString("operationId"))
+      ?: AnimeHubDebugLog.newOperationId()
+
   /** Run Activity-bound Android APIs on the UI thread and reject a destroyed host. */
   private fun withLiveActivity(invoke: Invoke, action: () -> Unit) {
     try {
@@ -207,11 +209,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         try {
           action()
         } catch (e: Exception) {
-          invoke.reject("Android işlemi başarısız", e)
+          invoke.reject("Android işlemi başarısız")
         }
       }
     } catch (e: Exception) {
-      invoke.reject("Android Activity artık kullanılamıyor", e)
+      invoke.reject("Android Activity artık kullanılamıyor")
     }
   }
 
@@ -234,7 +236,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       val combined = cipher.iv + ct
       invoke.resolve(JSObject().put("value", Base64.encodeToString(combined, Base64.NO_WRAP)))
     } catch (e: Exception) {
-      invoke.reject("Keystore şifrelemesi başarısız: ${e.message}", e)
+      invoke.reject("Keystore şifrelemesi başarısız")
     }
   }
 
@@ -262,7 +264,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     } catch (e: Exception) {
       // Never leak the plaintext or the key; a decrypt failure is reported
       // as a generic error.
-      invoke.reject("Keystore çözülemedi", e)
+      invoke.reject("Keystore çözülemedi")
     }
   }
 
@@ -308,11 +310,12 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         }
       }
     } catch (e: Exception) {
-      invoke.reject("çerez listesi çözümlenemedi", e)
+      invoke.reject("çerez listesi çözümlenemedi")
       return
     }
     withLiveActivity(invoke) {
-      AnimeHubSiteController.migrate(activity, url, profileName, cookies) { error ->
+      val operationId = operationId(args)
+      AnimeHubSiteController.migrate(activity, url, profileName, cookies, operationId) { error ->
         if (error != null) {
           invoke.reject(error)
         } else {
@@ -337,8 +340,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.reject("profile gerekli"); return
     }
     val initScript = args.getString("initScript") ?: ""
+    val operationId = operationId(args)
     withLiveActivity(invoke) {
-      AnimeHubSiteController.open(activity, url, profileName, initScript) { error ->
+      AnimeHubSiteController.open(activity, url, profileName, initScript, operationId) { error ->
         if (error != null) {
           invoke.reject(error)
         } else {
@@ -355,9 +359,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    */
   @Command
   fun site_close(invoke: Invoke) {
-    val flush = invoke.getArgs().optBoolean("flush", true)
+    val args = invoke.getArgs()
+    val flush = args.optBoolean("flush", true)
+    val operationId = operationId(args)
     withLiveActivity(invoke) {
-      AnimeHubSiteController.close(activity, flush) { error ->
+      AnimeHubSiteController.close(activity, flush, operationId) { error ->
         if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
       }
     }
@@ -371,11 +377,13 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    */
   @Command
   fun site_profile_delete(invoke: Invoke) {
-    val profileName = invoke.getArgs().getString("profile") ?: run {
+    val args = invoke.getArgs()
+    val profileName = args.getString("profile") ?: run {
       invoke.reject("profile gerekli"); return
     }
+    val operationId = operationId(args)
     withLiveActivity(invoke) {
-      AnimeHubSiteController.deleteProfileData(profileName) { deleted, pending, error ->
+      AnimeHubSiteController.deleteProfileData(profileName, operationId) { deleted, pending, error ->
         if (error != null) {
           invoke.reject(error)
         } else {
@@ -400,11 +408,13 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    */
   @Command
   fun site_profile_retire(invoke: Invoke) {
-    val profileName = invoke.getArgs().getString("profile") ?: run {
+    val args = invoke.getArgs()
+    val profileName = args.getString("profile") ?: run {
       invoke.reject("profile gerekli"); return
     }
+    val operationId = operationId(args)
     withLiveActivity(invoke) {
-      AnimeHubSiteController.retireProfileQuarantine(profileName) { dropped, error ->
+      AnimeHubSiteController.retireProfileQuarantine(profileName, operationId) { dropped, error ->
         if (error != null) {
           invoke.reject(error)
         } else {
@@ -417,11 +427,13 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   /** Clear one site profile in place (cookies, web storage, permissions). */
   @Command
   fun site_clear_data(invoke: Invoke) {
-    val profileName = invoke.getArgs().getString("profile") ?: run {
+    val args = invoke.getArgs()
+    val profileName = args.getString("profile") ?: run {
       invoke.reject("profile gerekli"); return
     }
+    val operationId = operationId(args)
     withLiveActivity(invoke) {
-      AnimeHubSiteController.clearProfileData(activity, profileName) { error ->
+      AnimeHubSiteController.clearProfileData(activity, profileName, operationId) { error ->
         if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
       }
     }
@@ -430,8 +442,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   /** Periodic durability hook: flush the active site profile's cookies. */
   @Command
   fun site_flush(invoke: Invoke) {
+    val operationId = operationId(invoke.getArgs())
     withLiveActivity(invoke) {
-      AnimeHubSiteController.flush(activity) { error ->
+      AnimeHubSiteController.flush(activity, operationId) { error ->
         if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
       }
     }
@@ -444,14 +457,21 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    */
   @Command
   fun site_profile_names(invoke: Invoke) {
+    val operationId = operationId(invoke.getArgs())
     withLiveActivity(invoke) {
       val names = AnimeHubSiteController.allProfileNames()
       val payload = JSObject()
       val array = org.json.JSONArray()
       if (names == null) {
+        AnimeHubDebugLog.record(
+          "profile", "capability", "unsupported_provider", operationId, errorClass = "unsupported",
+        )
         payload.put("unsupported", true)
       } else {
         names.forEach { array.put(it) }
+        AnimeHubDebugLog.record(
+          "profile", "profile_list", "ok", operationId, count = names.size.toLong(),
+        )
       }
       payload.put("names", array)
       invoke.resolve(payload)
@@ -479,6 +499,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val args = invoke.getArgs()
     val num = args.getInteger("num", 16)
     val den = args.getInteger("den", 9)
+    val operationId = operationId(args)
     try {
       var answered = false
       fun answer(ok: Boolean) {
@@ -494,6 +515,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       val claimed = AnimeHubPipController.requestEnter(
         activity,
         "command",
+        operationId = operationId,
         onResult = { entered -> answer(entered) },
         fallbackNum = num,
         fallbackDen = den,
@@ -501,7 +523,8 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       // Unsupported device: no callback will ever fire.
       if (!claimed) answer(false)
     } catch (e: Exception) {
-      invoke.reject("PiP başlatılamadı: ${e.message}", e)
+      AnimeHubDebugLog.record("pip", "pip_enter", "failed", operationId, errorClass = "provider")
+      invoke.reject("PiP başlatılamadı")
     }
   }
 
@@ -516,21 +539,61 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    */
   @Command
   fun set_pip_auto_enter(invoke: Invoke) {
-    val enabled = invoke.getArgs().getBoolean("enabled", false)
+    val args = invoke.getArgs()
+    val enabled = args.getBoolean("enabled", false)
+    val operationId = operationId(args)
     try {
-      val applied = AnimeHubPipController.applyAutoEnter(activity, enabled)
+      val applied = AnimeHubPipController.applyAutoEnter(activity, enabled, operationId)
       invoke.resolve(JSObject().put("ok", applied))
     } catch (e: Exception) {
-      invoke.reject("PiP ayarlanamadı: ${e.message}", e)
+      AnimeHubDebugLog.record("pip", "capability", "failed", operationId, errorClass = "provider")
+      invoke.reject("PiP ayarlanamadı")
     }
   }
 
-  /** Developer panel: the last Android lines, so no logcat is needed on a device. */
+  /** Developer panel: the merged Rust caller reads this bounded Kotlin ring. */
   @Command
   fun debug_log(invoke: Invoke) {
-    val lines = org.json.JSONArray()
-    AnimeHubDebugLog.snapshot().forEach { lines.put(it) }
-    invoke.resolve(JSObject().put("lines", lines))
+    // Rust checks the persisted developer_options setting and drives
+    // set_debug_logging before it reads the snapshot.
+    val snapshot = AnimeHubDebugLog.snapshot()
+    val events = org.json.JSONArray()
+    snapshot.events.forEach { event ->
+      val row = JSObject()
+      row.put("sequence", event.sequence)
+      row.put("timestampMs", event.timestampMs)
+      row.put("source", event.source)
+      row.put("area", event.area)
+      row.put("phase", event.phase)
+      row.put("result", event.result)
+      event.operationId?.let { row.put("operationId", it) }
+      event.durationMs?.let { row.put("durationMs", it) }
+      event.watchdog?.let { row.put("watchdog", it) }
+      event.errorClass?.let { row.put("errorClass", it) }
+      event.count?.let { row.put("count", it) }
+      event.stepId?.let { row.put("stepId", it) }
+      events.put(row)
+    }
+    val payload = JSObject()
+    payload.put("events", events)
+    payload.put("droppedEvents", snapshot.droppedEvents)
+    payload.put("capacity", snapshot.capacity)
+    invoke.resolve(payload)
+  }
+
+  /** User-triggered, in-memory reset; the Rust command enforces the setting gate. */
+  @Command
+  fun debug_log_reset(invoke: Invoke) {
+    AnimeHubDebugLog.reset()
+    invoke.resolve(JSObject().put("ok", true))
+  }
+
+  /** Rust mirrors developer_options here so collection itself is opt-in. */
+  @Command
+  fun set_debug_logging(invoke: Invoke) {
+    val enabled = invoke.getArgs().getBoolean("enabled", false)
+    AnimeHubDebugLog.setEnabled(enabled)
+    invoke.resolve(JSObject().put("ok", true))
   }
 
   companion object {
@@ -589,11 +652,7 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     replyProxy: JavaScriptReplyProxy,
   ) {
     if (!isMainFrame) return
-    if (!isAllowedOrigin(sourceOrigin)) {
-      Log.w(LOG_TAG, "IPC blocked: unexpected origin ${sourceOrigin.scheme}")
-      AnimeHubDebugLog.add("ipc", "blocked origin scheme=${sourceOrigin.scheme}")
-      return
-    }
+    if (!isAllowedOrigin(sourceOrigin)) return
     val body = message.data ?: return
     val url = view.url ?: "about:blank"
     // onPostMessage runs on the UI thread. Rust runs blocking commands inline, and
@@ -604,12 +663,12 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
       IPC_EXECUTOR.execute {
         try {
           Rust.ipc(webViewId, url, body)
-        } catch (e: Exception) {
-          AnimeHubDebugLog.add("ipc", "dispatch failed (${e.javaClass.simpleName})")
+        } catch (_: Exception) {
+          // Per-message failures are intentionally not recorded in the flow log.
         }
       }
-    } catch (e: Exception) {
-      AnimeHubDebugLog.add("ipc", "dispatch could not be queued (${e.javaClass.simpleName})")
+    } catch (_: Exception) {
+      // Dispatch is per-message; omit it from high-volume diagnostics.
     }
   }
 

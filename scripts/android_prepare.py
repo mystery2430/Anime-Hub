@@ -467,6 +467,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
     # a dropped file from silently shrinking the CI unit-test compile.
     for aux in (
         "AnimeHubDebugLog",
+        "PipTransferFlow",
         "SiteFlushWorker",
         "SiteNavigationGuard",
         "SiteWebViewSettings",

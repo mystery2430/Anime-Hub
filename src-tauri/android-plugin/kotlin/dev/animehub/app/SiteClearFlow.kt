@@ -41,7 +41,7 @@ sealed interface CookieWipe {
   /** The provider answered; [deleted] is its raw "were any cookies removed". */
   data class Answered(val deleted: Boolean) : CookieWipe
 
-  /** The call itself failed; [reason] is aggregated into the reported error. */
+  /** The call itself failed; [reason] is a safe class code, never provider text. */
   data class Failed(val reason: String) : CookieWipe
 }
 
@@ -69,14 +69,14 @@ data class CookieStep(val ok: Boolean, val error: String?)
  */
 object CookieWipes {
   /** Reason used when the profile is gone by the time the cookie step runs. */
-  const val NO_PROFILE_REASON: String = "profil bu adımda erişilebilir değil"
+  const val NO_PROFILE_REASON: String = "profile_unavailable"
 
   /** The provider's raw `ValueCallback<Boolean>` delivery, mapped null-safely. */
   fun answered(deleted: Boolean?): CookieWipe = CookieWipe.Answered(deleted == true)
 
-  /** A call that threw never reached the cookie store: a typed failure. */
-  fun failed(error: Throwable): CookieWipe =
-    CookieWipe.Failed("${error.javaClass.simpleName}: ${error.message}")
+  /** A call that threw never reached the cookie store: a typed safe failure. */
+  fun failed(@Suppress("UNUSED_PARAMETER") error: Throwable): CookieWipe =
+    CookieWipe.Failed("provider")
 
   /** No profile access at this step — an error, never "nothing to delete". */
   fun noProfile(): CookieWipe = CookieWipe.Failed(NO_PROFILE_REASON)
@@ -208,8 +208,9 @@ object SiteClearFlow {
   const val COOKIE_STATE_UNKNOWN_REASON: String =
     "sağlayıcı hiçbir çerez silmediğini bildirdi, çerez deposunun boş olduğu doğrulanamadı"
 
-  /** Prefix for a cookie call that never reached the store. */
+  /** Safe user-facing reason for a cookie call that never reached the store. */
   const val COOKIE_ACCESS_FAILED_PREFIX: String = "çerez deposuna erişilemedi"
+  const val PROVIDER_FAILURE: String = "provider"
 
   /**
    * Decide one cookie step from its TYPED delivery — pure, CI-tested, and the
@@ -225,9 +226,9 @@ object SiteClearFlow {
    *    failure, and so is a store whose emptiness cannot be read: the
    *    dangerous direction is claiming a wipe we cannot see, never reporting
    *    one more failure the user can retry;
-   *  * [CookieWipe.Failed] → failure carrying the provider's reason. Never a
-   *    success: an unreachable store deleted nothing, and this is the case the
-   *    old boolean shape silently confused with an empty jar.
+   *  * [CookieWipe.Failed] → a retryable failure with a safe provider code.
+   *    Never a success: an unreachable store deleted nothing, and this is the
+   *    case the old boolean shape silently confused with an empty jar.
    *
    * The emptiness probe runs ONLY in the `deleted == false` branch, so it
    * never races the deletion it would otherwise be checking: nothing was just
@@ -245,45 +246,73 @@ object SiteClearFlow {
             null -> CookieStep(false, COOKIE_STATE_UNKNOWN_REASON)
           }
         }
-      is CookieWipe.Failed -> CookieStep(false, "$COOKIE_ACCESS_FAILED_PREFIX: ${wipe.reason}")
+      is CookieWipe.Failed -> CookieStep(false, "$COOKIE_ACCESS_FAILED_PREFIX: $PROVIDER_FAILURE")
     }
 
   fun run(
     supported: Boolean,
     profileName: String,
     port: SiteClearPort,
+    operationId: String = AnimeHubDebugLog.newOperationId(),
     onDone: (String?) -> Unit,
   ) {
+    val safeOperationId = AnimeHubDebugLog.safeOperationId(operationId) ?: AnimeHubDebugLog.newOperationId()
+    val flowStartedAt = System.nanoTime()
     val once = AtomicBoolean(false)
+    var firstError: String? = null
+    var firstErrorClass: String? = null
+    AnimeHubDebugLog.record(
+      "clear", "start", "started", safeOperationId,
+    )
     fun done(error: String?) {
       if (once.compareAndSet(false, true)) {
+        val duration = ((System.nanoTime() - flowStartedAt) / 1_000_000).coerceAtLeast(0)
         if (error == null) {
           // Fully verified wipe: every step of THIS attempt answered. That is
           // recorded as a verification, not as a release — an earlier attempt's
           // timed-out `removeAllCookies` may still be outstanding, and its
           // record belongs to that operation alone (see ProfileQuarantine).
           ProfileQuarantine.verified(profileName)
+          AnimeHubDebugLog.record("clear", "verified", "verified", safeOperationId)
         }
+        val completion = when {
+          error == null -> "ok"
+          firstErrorClass == "unsupported" -> "unsupported"
+          else -> "failed"
+        }
+        AnimeHubDebugLog.record(
+          "clear", "complete", completion, safeOperationId,
+          durationMs = duration,
+          errorClass = if (error == null) null else firstErrorClass ?: "provider",
+        )
         onDone(error)
       }
     }
     if (!supported) {
+      AnimeHubDebugLog.record("clear", "capability", "unsupported_provider", safeOperationId, errorClass = "unsupported")
+      firstErrorClass = "unsupported"
       done(SiteProfileErrors.UNSUPPORTED)
       return
     }
+    AnimeHubDebugLog.record("clear", "profile_check", "started", safeOperationId)
     val exists =
-      runCatching { port.profileExists() }.getOrElse { e ->
-        done("site verisi temizlenemedi: ${e.message}")
+      runCatching { port.profileExists() }.getOrElse {
+        AnimeHubDebugLog.record("clear", "profile_check", "failed", safeOperationId, errorClass = "provider")
+        firstErrorClass = "provider"
+        done("site verisi temizlenemedi: provider")
         return
       }
+    AnimeHubDebugLog.record("clear", "profile_check", if (exists) "present" else "absent", safeOperationId)
     if (!exists) {
       done(null)
       return
     }
 
-    var firstError: String? = null
-    fun record(message: String) {
-      if (firstError == null) firstError = message
+    fun record(message: String, errorClass: String = "provider") {
+      if (firstError == null) {
+        firstError = message
+        firstErrorClass = errorClass
+      }
     }
 
     /**
@@ -311,6 +340,7 @@ object SiteClearFlow {
      * a retry over an already-applied mutation is harmless.
      */
     fun awaited(
+      phase: String,
       stepName: String,
       timeoutMessage: String,
       onTimeout: (StepGuard) -> Unit = {},
@@ -320,13 +350,22 @@ object SiteClearFlow {
     ) {
       val settled = AtomicBoolean(false)
       val guard = StepGuards.create()
+      val stepStartedAt = System.nanoTime()
+      AnimeHubDebugLog.record(
+        "clear", phase, "started", safeOperationId, stepId = guard.operationId,
+      )
       val watchdog = port.scheduleTimeout(STEP_TIMEOUT_MS) {
         // Close the mutation window before deciding the result: a callback
         // racing this watchdog on another thread must see the guard shut even
         // if it arrives between the two atomic steps.
         guard.claim()
         if (settled.compareAndSet(false, true)) {
-          record("$stepName: $timeoutMessage")
+          record("$stepName: $timeoutMessage", "timeout")
+          AnimeHubDebugLog.record(
+            "clear", phase, "timeout", safeOperationId,
+            durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+            watchdog = "fired", errorClass = "timeout", stepId = guard.operationId,
+          )
           // The hook receives THIS step's guard, so anything it registers is
           // owned by this operation id and nothing else's.
           onTimeout(guard)
@@ -334,18 +373,22 @@ object SiteClearFlow {
         }
       }
       if (watchdog is Watchdog.Refused) {
-        // The scheduler refused, so there is nothing to bound this step's
-        // provider call: the call is NOT issued. That also means no operation
-        // is left outstanding, and [ProfileQuarantine] tracks only provider
-        // calls that may still land — so the timeout hook is deliberately not
-        // run here and nothing is quarantined. Failing the step (and continuing
-        // with the rest) is the same conservative direction a timeout takes.
+        // The scheduler refused, so no provider call is issued and there is no
+        // destructive operation to quarantine.
         if (settled.compareAndSet(false, true)) {
-          record("$stepName: ${SiteProfileErrors.WATCHDOG_REFUSED}")
+          record("$stepName: ${SiteProfileErrors.WATCHDOG_REFUSED}", "watchdog_refused")
+          AnimeHubDebugLog.record(
+            "clear", phase, "failed", safeOperationId,
+            durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+            watchdog = "refused", errorClass = "watchdog_refused", stepId = guard.operationId,
+          )
           next(false)
         }
         return
       }
+      AnimeHubDebugLog.record(
+        "clear", "watchdog_arm", "armed", safeOperationId, stepId = guard.operationId,
+      )
       val cancelWatchdog = (watchdog as Watchdog.Armed).cancel
       arm(guard) { ok ->
         if (settled.compareAndSet(false, true)) {
@@ -353,8 +396,17 @@ object SiteClearFlow {
           // delayed runnable queued — it would keep this port, and through it
           // the WebView and the Activity, reachable for the rest of the window.
           cancelWatchdog()
+          AnimeHubDebugLog.record(
+            "clear", phase, if (ok) "ok" else "failed", safeOperationId,
+            durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
+            errorClass = if (ok) null else "provider", stepId = guard.operationId,
+          )
           next(ok)
         } else {
+          AnimeHubDebugLog.record(
+            "clear", "late_callback", "late", safeOperationId,
+            watchdog = "late", errorClass = "timeout", stepId = guard.operationId,
+          )
           onLateAnswer(guard)
         }
       }
@@ -363,17 +415,20 @@ object SiteClearFlow {
     // Reason from the typed cookie delivery, for the aggregate error below.
     var cookieError: String? = null
     awaited(
+      "cookie_wipe",
       "çerez temizliği",
       "zaman aşımı",
       onTimeout = { guard ->
         // Ungated AND unverified: `removeAllCookies` was issued before the
         // await, offers no cancellation, and may still delete cookies after
-        // this flow reported failure — including cookies a reopened session
-        // just created. Ignoring the late callback result would not stop
-        // that, so THIS operation is registered as outstanding under its own
-        // id: another attempt's success cannot clear it, and only its own
-        // callback can.
+        // this flow reported failure. Keep THIS operation quarantined until
+        // its own provider callback settles.
         ProfileQuarantine.quarantine(profileName, guard.operationId, COOKIE_UNVERIFIED_REASON)
+        AnimeHubDebugLog.record(
+          "profile", "quarantine", "quarantined", safeOperationId,
+          errorClass = "cookie_unverified", count = ProfileQuarantine.pendingOperations(profileName).size.toLong(),
+          stepId = guard.operationId,
+        )
       },
       onLateAnswer = { guard ->
         // The provider answered after losing the race, so this operation is no
@@ -381,7 +436,13 @@ object SiteClearFlow {
         // closes its OWN record; whether the profile is usable again is the
         // registry's condition (nothing outstanding AND a verification that
         // postdates the last settle). A duplicate answer closes nothing.
-        ProfileQuarantine.settle(profileName, guard.operationId)
+        if (ProfileQuarantine.settle(profileName, guard.operationId)) {
+          AnimeHubDebugLog.record(
+            "profile", "quarantine", "settled", safeOperationId,
+            count = ProfileQuarantine.pendingOperations(profileName).size.toLong(),
+            stepId = guard.operationId,
+          )
+        }
       },
       arm = { _, cb ->
         port.removeAllCookies { wipe ->
@@ -401,14 +462,20 @@ object SiteClearFlow {
       // [StepGuard] the watchdog closes, so a late callback provably clears
       // nothing (GeolocationWipe) and `getOrigins` is read-only.
       awaited(
+        "geolocation_wipe",
         "geolocation izin temizliği",
         "zaman aşımı",
         arm = { guard, cb -> port.clearGeolocationPermissions(guard, cb) },
       ) { geoOk ->
         if (!geoOk) record("geolocation izinleri temizlenemedi")
-        runCatching { port.deleteAllStorage() }.getOrElse { e ->
-          record("site deposu temizlenemedi: ${e.message}")
-        }
+        AnimeHubDebugLog.record("clear", "storage", "started", safeOperationId)
+        runCatching { port.deleteAllStorage() }.fold(
+          onSuccess = { AnimeHubDebugLog.record("clear", "storage", "ok", safeOperationId) },
+          onFailure = {
+            record("site deposu temizlenemedi: provider")
+            AnimeHubDebugLog.record("clear", "storage", "failed", safeOperationId, errorClass = "provider")
+          },
+        )
         // Durability last: a failed flush must never be reported as success —
         // and a flush whose callback never arrives must never hang the wipe
         // either. Watchdog and callback race, settled exactly once; a timeout
@@ -420,29 +487,59 @@ object SiteClearFlow {
         // already exists, so a late one cannot delete or grant anything a new
         // session created (see [ProfileQuarantine] for the full argument).
         val flushSettled = AtomicBoolean(false)
+        val flushStartedAt = System.nanoTime()
+        val flushStepId = StepGuards.create().operationId
+        AnimeHubDebugLog.record(
+          "clear", "flush", "started", safeOperationId, stepId = flushStepId,
+        )
         val flushWatchdog = port.scheduleTimeout(FLUSH_TIMEOUT_MS) {
           if (flushSettled.compareAndSet(false, true)) {
-            record("çerez kalıcılığı: zaman aşımı")
+            record("çerez kalıcılığı: zaman aşımı", "timeout")
+            AnimeHubDebugLog.record(
+              "clear", "flush", "timeout", safeOperationId,
+              durationMs = ((System.nanoTime() - flushStartedAt) / 1_000_000).coerceAtLeast(0),
+              watchdog = "fired", errorClass = "timeout", stepId = flushStepId,
+            )
             done(firstError)
           }
         }
         if (flushWatchdog is Watchdog.Refused) {
           // Unbounded ⇒ the flush is never started, and the wipe is reported as
-          // the failure it is: Rust keeps the encrypted session blobs and the
-          // retry starts over instead of a half-finished clear passing as done.
+          // the failure it is: Rust keeps the encrypted session blobs for a retry.
           if (flushSettled.compareAndSet(false, true)) {
-            record("çerez kalıcılığı: ${SiteProfileErrors.WATCHDOG_REFUSED}")
+            record("çerez kalıcılığı: ${SiteProfileErrors.WATCHDOG_REFUSED}", "watchdog_refused")
+            AnimeHubDebugLog.record(
+              "clear", "flush", "failed", safeOperationId,
+              durationMs = ((System.nanoTime() - flushStartedAt) / 1_000_000).coerceAtLeast(0),
+              watchdog = "refused", errorClass = "watchdog_refused", stepId = flushStepId,
+            )
             done(firstError)
           }
         } else {
-        val cancelFlushWatchdog = (flushWatchdog as Watchdog.Armed).cancel
-        port.flushCookies { flushError ->
-          if (!flushSettled.compareAndSet(false, true)) return@flushCookies
-          // Settled: drop the queued watchdog (see [SiteClearPort.scheduleTimeout]).
-          cancelFlushWatchdog()
-          if (flushError != null) record("çerez kalıcılığı başarısız: ${flushError.message}")
-          done(firstError)
-        }
+          AnimeHubDebugLog.record(
+            "clear", "watchdog_arm", "armed", safeOperationId, stepId = flushStepId,
+          )
+          val cancelFlushWatchdog = (flushWatchdog as Watchdog.Armed).cancel
+          port.flushCookies { flushError ->
+            if (!flushSettled.compareAndSet(false, true)) {
+              AnimeHubDebugLog.record(
+                "clear", "late_callback", "late", safeOperationId,
+                watchdog = "late", errorClass = "timeout", stepId = flushStepId,
+              )
+              return@flushCookies
+            }
+            // Settled: drop the queued watchdog (see [SiteClearPort.scheduleTimeout]).
+            cancelFlushWatchdog()
+            if (flushError != null) {
+              record("çerez kalıcılığı başarısız: provider", "provider")
+            }
+            AnimeHubDebugLog.record(
+              "clear", "flush", if (flushError == null) "ok" else "failed", safeOperationId,
+              durationMs = ((System.nanoTime() - flushStartedAt) / 1_000_000).coerceAtLeast(0),
+              errorClass = if (flushError == null) null else "provider", stepId = flushStepId,
+            )
+            done(firstError)
+          }
         }
       }
     }

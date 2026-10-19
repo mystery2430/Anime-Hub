@@ -50,6 +50,45 @@ pub struct OkResult {
     pub ok: bool,
 }
 
+/// One bounded, redacted event returned by the in-memory Kotlin diagnostic ring.
+/// Text fields are closed-vocabulary codes, never user/provider data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugEvent {
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<u64>,
+    pub timestamp_ms: u64,
+    pub source: String,
+    pub area: String,
+    pub phase: String,
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<u64>,
+}
+
+/// Kotlin's process-local diagnostic ring snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugLogSnapshot {
+    pub events: Vec<DebugEvent>,
+    pub dropped_events: u64,
+    pub capacity: u32,
+}
+
+/// Bounded capacity of each language-side ring.
+pub const DEBUG_LOG_CAPACITY: u32 = 2_000;
+
 // ---------------------------------------------------------------------------
 // Mobile command names — must match the `@Command` methods in the Kotlin file.
 // ---------------------------------------------------------------------------
@@ -59,6 +98,8 @@ pub const CMD_KEYSTORE_OPEN: &str = "keystore_open";
 pub const CMD_ENTER_PIP: &str = "enter_pip";
 pub const CMD_SET_PIP_AUTO_ENTER: &str = "set_pip_auto_enter";
 pub const CMD_DEBUG_LOG: &str = "debug_log";
+pub const CMD_DEBUG_LOG_RESET: &str = "debug_log_reset";
+pub const CMD_SET_DEBUG_LOGGING: &str = "set_debug_logging";
 pub const CMD_SITE_MIGRATE: &str = "site_migrate";
 pub const CMD_SITE_OPEN: &str = "site_open";
 pub const CMD_SITE_CLOSE: &str = "site_close";
@@ -153,6 +194,7 @@ pub fn keystore_open(purpose: String, sealed: String) -> Result<KeystoreResult> 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SiteMigratePayload {
+    operation_id: String,
     url: String,
     profile: String,
     cookies: Vec<String>,
@@ -167,6 +209,7 @@ struct SiteMigratePayload {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SiteOpenPayload {
+    operation_id: String,
     url: String,
     profile: String,
     init_script: String,
@@ -175,15 +218,33 @@ struct SiteOpenPayload {
 /// Wire format for `site_close`.
 #[cfg(target_os = "android")]
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SiteClosePayload {
+    operation_id: String,
     flush: bool,
 }
 
 /// Wire format for `site_profile_delete` / `site_clear_data`.
 #[cfg(target_os = "android")]
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SiteProfilePayload {
+    operation_id: String,
     profile: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationPayload {
+    operation_id: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugLoggingPayload {
+    enabled: bool,
 }
 
 /// Kotlin's `{deleted, pending}` reply from `site_profile_delete`.
@@ -260,12 +321,18 @@ pub fn is_profile_quarantined(error: &Error) -> bool {
 /// The caller persists its migration flag only after this resolves, and only
 /// then calls [`site_open`]: a view the user has seen can never exist while
 /// the flag is missing.
-pub fn site_migrate(url: String, profile: String, cookies: Vec<String>) -> Result<OkResult> {
+pub fn site_migrate(
+    operation_id: String,
+    url: String,
+    profile: String,
+    cookies: Vec<String>,
+) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
         call_plugin(
             CMD_SITE_MIGRATE,
             SiteMigratePayload {
+                operation_id,
                 url,
                 profile,
                 cookies,
@@ -274,7 +341,7 @@ pub fn site_migrate(url: String, profile: String, cookies: Vec<String>) -> Resul
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (url, profile, cookies);
+        let _ = (operation_id, url, profile, cookies);
         Err(Error::Unsupported)
     }
 }
@@ -286,12 +353,18 @@ pub fn site_migrate(url: String, profile: String, cookies: Vec<String>) -> Resul
 /// [`QUARANTINE_SENTINEL`]: Kotlin refuses to bind a WebView to a profile
 /// whose last in-place wipe is still unverified, because the provider call
 /// that timed out cannot be cancelled and may still mutate it.
-pub fn site_open(url: String, profile: String, init_script: String) -> Result<OkResult> {
+pub fn site_open(
+    operation_id: String,
+    url: String,
+    profile: String,
+    init_script: String,
+) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
         call_plugin(
             CMD_SITE_OPEN,
             SiteOpenPayload {
+                operation_id,
                 url,
                 profile,
                 init_script,
@@ -300,35 +373,41 @@ pub fn site_open(url: String, profile: String, init_script: String) -> Result<Ok
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (url, profile, init_script);
+        let _ = (operation_id, url, profile, init_script);
         Err(Error::Unsupported)
     }
 }
 
 /// Close (and flush unless `flush=false`) the active site WebView.
 /// Idempotent: no active site resolves normally.
-pub fn site_close(flush: bool) -> Result<OkResult> {
+pub fn site_close(operation_id: String, flush: bool) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SITE_CLOSE, SiteClosePayload { flush })
+        call_plugin(CMD_SITE_CLOSE, SiteClosePayload { operation_id, flush })
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = flush;
+        let _ = (operation_id, flush);
         Err(Error::Unsupported)
     }
 }
 
 /// Delete a site profile's data (never the default profile — Kotlin validates
 /// the name against `android_profile_name`'s shape).
-pub fn site_profile_delete(profile: String) -> Result<SiteProfileDeleteResult> {
+pub fn site_profile_delete(
+    operation_id: String,
+    profile: String,
+) -> Result<SiteProfileDeleteResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SITE_PROFILE_DELETE, SiteProfilePayload { profile })
+        call_plugin(
+            CMD_SITE_PROFILE_DELETE,
+            SiteProfilePayload { operation_id, profile },
+        )
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = profile;
+        let _ = (operation_id, profile);
         Err(Error::Unsupported)
     }
 }
@@ -344,51 +423,62 @@ pub fn site_profile_delete(profile: String) -> Result<SiteProfileDeleteResult> {
 /// storage write aborted `remove_site` with the registry intact, the next open
 /// derived the SAME name, and the gate no longer knew about a
 /// `removeAllCookies` deletion that could still be in flight on it.
-pub fn site_profile_retire(profile: String) -> Result<SiteProfileRetireResult> {
+pub fn site_profile_retire(
+    operation_id: String,
+    profile: String,
+) -> Result<SiteProfileRetireResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SITE_PROFILE_RETIRE, SiteProfilePayload { profile })
+        call_plugin(
+            CMD_SITE_PROFILE_RETIRE,
+            SiteProfilePayload { operation_id, profile },
+        )
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = profile;
+        let _ = (operation_id, profile);
         Err(Error::Unsupported)
     }
 }
 
 /// Clear one site profile in place (cookies, web storage, permissions).
-pub fn site_clear_data(profile: String) -> Result<OkResult> {
+pub fn site_clear_data(operation_id: String, profile: String) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SITE_CLEAR_DATA, SiteProfilePayload { profile })
+        call_plugin(
+            CMD_SITE_CLEAR_DATA,
+            SiteProfilePayload { operation_id, profile },
+        )
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = profile;
+        let _ = (operation_id, profile);
         Err(Error::Unsupported)
     }
 }
 
 /// Flush the active site profile's cookie jar (periodic durability sync).
-pub fn site_flush() -> Result<OkResult> {
+pub fn site_flush(operation_id: String) -> Result<OkResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SITE_FLUSH, NoArgs {})
+        call_plugin(CMD_SITE_FLUSH, OperationPayload { operation_id })
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _ = operation_id;
         Err(Error::Unsupported)
     }
 }
 
 /// Every profile name the provider store knows, or `unsupported=true`.
-pub fn site_profile_names() -> Result<SiteProfileNamesResult> {
+pub fn site_profile_names(operation_id: String) -> Result<SiteProfileNamesResult> {
     #[cfg(target_os = "android")]
     {
-        call_plugin(CMD_SITE_PROFILE_NAMES, NoArgs {})
+        call_plugin(CMD_SITE_PROFILE_NAMES, OperationPayload { operation_id })
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _ = operation_id;
         Err(Error::Unsupported)
     }
 }
@@ -399,12 +489,17 @@ pub fn site_profile_names() -> Result<SiteProfileNamesResult> {
 /// calls the site's `window.__animehubPreparePip()` and waits for its answer),
 /// so the PiP window shows the active player instead of the whole site. The
 /// ratio here is only used when the page could not report the player's own.
-pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
+pub fn enter_pip(
+    operation_id: String,
+    aspect_num: u32,
+    aspect_den: u32,
+) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
         call_plugin::<_, OkResult>(
             CMD_ENTER_PIP,
             PipPayload {
+                operation_id,
                 num: aspect_num,
                 den: aspect_den,
             },
@@ -413,7 +508,7 @@ pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> Result<bool> {
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (aspect_num, aspect_den);
+        let _ = (operation_id, aspect_num, aspect_den);
         Err(Error::Unsupported)
     }
 }
@@ -425,20 +520,57 @@ struct NoArgs {}
 
 #[cfg(target_os = "android")]
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DebugLogResponse {
-    lines: Vec<String>,
+    events: Vec<DebugEvent>,
+    #[serde(default)]
+    dropped_events: u64,
+    #[serde(default)]
+    capacity: u32,
 }
 
-/// The last PiP diagnostic lines kept by the Kotlin side (in-app log; no
-/// logcat needed). Read-only: it never changes PiP state.
-pub fn debug_log() -> Result<Vec<String>> {
+/// The bounded Kotlin-side diagnostic ring (in-memory only).
+pub fn debug_log() -> Result<DebugLogSnapshot> {
     #[cfg(target_os = "android")]
     {
-        call_plugin::<_, DebugLogResponse>(CMD_DEBUG_LOG, NoArgs {}).map(|r| r.lines)
+        call_plugin::<_, DebugLogResponse>(CMD_DEBUG_LOG, NoArgs {}).map(|r| DebugLogSnapshot {
+            events: r.events,
+            dropped_events: r.dropped_events,
+            capacity: r.capacity,
+        })
     }
     #[cfg(not(target_os = "android"))]
     {
         Err(Error::Unsupported)
+    }
+}
+
+/// Clear the Kotlin ring and retain one safe reset marker while collection is enabled.
+pub fn debug_log_reset() -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin::<_, OkResult>(CMD_DEBUG_LOG_RESET, NoArgs {}).map(|_| ())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(())
+    }
+}
+
+/// Gate Kotlin-side collection from the persisted Rust developer-options setting.
+pub fn set_debug_logging(enabled: bool) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin::<_, OkResult>(
+            CMD_SET_DEBUG_LOGGING,
+            DebugLoggingPayload { enabled },
+        )
+        .map(|_| ())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = enabled;
+        Ok(())
     }
 }
 
@@ -447,15 +579,18 @@ pub fn debug_log() -> Result<Vec<String>> {
 /// See `AnimeHubPipController.applyAutoEnter`: `setAutoEnterEnabled(true)`
 /// would let the system skip the WebView preparation entirely, so the setting
 /// only gates `onPictureInPictureRequested()` / `onUserLeaveHint()`.
-pub fn set_pip_auto_enter(enabled: bool) -> Result<bool> {
+pub fn set_pip_auto_enter(operation_id: String, enabled: bool) -> Result<bool> {
     #[cfg(target_os = "android")]
     {
-        call_plugin::<_, OkResult>(CMD_SET_PIP_AUTO_ENTER, AutoEnterPayload { enabled })
-            .map(|r| r.ok)
+        call_plugin::<_, OkResult>(
+            CMD_SET_PIP_AUTO_ENTER,
+            AutoEnterPayload { operation_id, enabled },
+        )
+        .map(|r| r.ok)
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = enabled;
+        let _ = (operation_id, enabled);
         Err(Error::Unsupported)
     }
 }
@@ -490,7 +625,9 @@ struct PurposeValuePayload {
 /// Wire format for `enter_pip`.
 #[cfg(target_os = "android")]
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PipPayload {
+    operation_id: String,
     num: u32,
     den: u32,
 }
@@ -499,6 +636,7 @@ struct PipPayload {
 #[cfg(target_os = "android")]
 #[derive(Debug, Serialize)]
 struct AutoEnterPayload {
+    operation_id: String,
     enabled: bool,
 }
 
@@ -580,11 +718,18 @@ mod tests {
                 keystore_open("p".into(), "eA==".into()),
                 Err(Error::Unsupported)
             ));
-            assert!(matches!(enter_pip(16, 9), Err(Error::Unsupported)));
-            assert!(matches!(set_pip_auto_enter(true), Err(Error::Unsupported)));
+            assert!(matches!(
+                enter_pip("r-1".into(), 16, 9),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(
+                set_pip_auto_enter("r-1".into(), true),
+                Err(Error::Unsupported)
+            ));
             // Both phases of the two-phase open fail honestly off Android.
             assert!(matches!(
                 site_migrate(
+                    "r-1".into(),
                     "https://example.com/".into(),
                     "site-00000000000000000000000000000000-g0".into(),
                     Vec::new(),
@@ -593,17 +738,40 @@ mod tests {
             ));
             assert!(matches!(
                 site_open(
+                    "r-1".into(),
                     "https://example.com/".into(),
                     "site-00000000000000000000000000000000-g0".into(),
                     String::new(),
                 ),
                 Err(Error::Unsupported)
             ));
-            assert!(matches!(site_close(true), Err(Error::Unsupported)));
             assert!(matches!(
-                site_profile_delete("site-00000000000000000000000000000000-g0".into()),
+                site_close("r-1".into(), true),
                 Err(Error::Unsupported)
             ));
+            assert!(matches!(
+                site_profile_delete(
+                    "r-1".into(),
+                    "site-00000000000000000000000000000000-g0".into(),
+                ),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(
+                site_profile_retire(
+                    "r-1".into(),
+                    "site-00000000000000000000000000000000-g0".into(),
+                ),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(
+                site_clear_data(
+                    "r-1".into(),
+                    "site-00000000000000000000000000000000-g0".into(),
+                ),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(site_flush("r-1".into()), Err(Error::Unsupported)));
+            assert!(matches!(site_profile_names("r-1".into()), Err(Error::Unsupported)));
         }
     }
 
@@ -618,6 +786,19 @@ mod tests {
     fn ok_result_deserialises_from_kotlin() {
         let r: OkResult = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert!(r.ok);
+    }
+
+    #[test]
+    fn structured_debug_snapshot_deserialises_camelcase_and_optional_fields() {
+        let snapshot: DebugLogSnapshot = serde_json::from_str(
+            r#"{"events":[{"sequence":4,"timestampMs":1234,"source":"kotlin","area":"clear","phase":"cookie_wipe","result":"timeout","operationId":"r-9","durationMs":10000,"watchdog":"fired","errorClass":"timeout","count":1,"stepId":7}],"droppedEvents":3,"capacity":2000}"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].operation_id.as_deref(), Some("r-9"));
+        assert_eq!(snapshot.events[0].step_id, Some(7));
+        assert_eq!(snapshot.dropped_events, 3);
+        assert_eq!(snapshot.capacity, DEBUG_LOG_CAPACITY);
     }
 
     #[test]
@@ -639,6 +820,8 @@ mod tests {
         assert_eq!(CMD_ENTER_PIP, "enter_pip");
         assert_eq!(CMD_SET_PIP_AUTO_ENTER, "set_pip_auto_enter");
         assert_eq!(CMD_DEBUG_LOG, "debug_log");
+        assert_eq!(CMD_DEBUG_LOG_RESET, "debug_log_reset");
+        assert_eq!(CMD_SET_DEBUG_LOGGING, "set_debug_logging");
         // Two-phase open: phase 1 (jar import, no view) runs BEFORE Rust
         // persists the migration flag; phase 2 builds the view.
         assert_eq!(CMD_SITE_MIGRATE, "site_migrate");

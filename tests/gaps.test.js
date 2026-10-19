@@ -587,29 +587,31 @@ test("Android IPC is limited to the launcher origins and main frame, never a sit
   assert.ok(guard > 0 && restrict > guard, "restrictIpcToLauncher must run after installNavigationGuard");
 });
 
-test("Android in-app log: one shared buffer, no site URLs or hosts in any line", () => {
-  const kt = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
+test("Android diagnostics: bounded structured events are packaged and exposed through the plugin", () => {
+  const plugin = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt"));
   const pip = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPipController.kt"));
   const debugLog = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubDebugLog.kt"));
   const controller = read(join(ROOT, "src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubSiteController.kt"));
   const prepare = read(join(ROOT, "scripts/android_prepare.py"));
-  // The buffer moved to its own file so the CI unit test compiles it — and
-  // android_prepare.py must copy that file or the APK would not build.
-  assert.match(debugLog, /^object AnimeHubDebugLog \{/m);
-  assert.equal(/^object AnimeHubDebugLog \{/m.test(kt), false, "buffer no longer in the plugin file");
-  assert.match(prepare, /"AnimeHubDebugLog"/, "the split buffer file must be copied");
-  assert.doesNotMatch(pip, /object AnimeHubPipLog/);
-  // The @Command entry point stays on the plugin class (Tauri dispatches
-  // commands through the registered instance's methods only).
-  assert.match(kt, /@Command\s+fun debug_log\(/);
   const rs = read(join(ROOT, "src-tauri/android-plugin/src/lib.rs"));
+
+  assert.match(debugLog, /^object AnimeHubDebugLog \{/m);
+  assert.match(debugLog, /const val MAX_EVENTS: Int = 2_000/);
+  assert.match(debugLog, /private val events = ArrayDeque<DebugEvent>\(\)/);
+  assert.match(debugLog, /private val areas = setOf\(/);
+  assert.match(debugLog, /private val phases = setOf\(/);
+  assert.match(debugLog, /fun safeOperationId\(/);
+  assert.match(prepare, /"AnimeHubDebugLog"/, "the ring must be packaged into the APK");
+  assert.match(plugin, /@Command\s+fun debug_log\(/);
+  assert.match(plugin, /payload\.put\("droppedEvents", snapshot\.droppedEvents\)/);
+  assert.match(plugin, /payload\.put\("capacity", snapshot\.capacity\)/);
   assert.match(rs, /CMD_DEBUG_LOG: &str = "debug_log"/);
-  // Every add() call: no URL, host, path or uri object in the message.
-  const calls = [...(kt + pip + controller + debugLog).matchAll(/AnimeHubDebugLog\.add\(([^\n]*)\)/g)].map((m) => m[1]);
-  assert.ok(calls.length >= 8, `expected the log calls, found ${calls.length}`);
-  for (const args of calls) {
-    assert.doesNotMatch(args, /\.host\b|\burl\b|\.path\b|\bhost\b|\buri\b(?!\.scheme\b)|\bbody\b/i, args);
-  }
+  assert.match(rs, /CMD_DEBUG_LOG_RESET: &str = "debug_log_reset"/);
+
+  const sources = [plugin, pip, controller, debugLog].join("\n");
+  assert.ok((sources.match(/AnimeHubDebugLog\.record\(/g) || []).length >= 40);
+  assert.doesNotMatch(sources, /AnimeHubDebugLog\.add\(/, "the old free-form text logger is gone");
+  assert.doesNotMatch(debugLog, /FileOutputStream|FileWriter|HttpURLConnection|fetch\(/);
 });
 
 test("PiP play/pause button: shown only for a <video> candidate, never for an iframe", () => {
@@ -706,7 +708,8 @@ test("the PiP diagnostic report goes to the in-app log only, never a Toast over 
   assert.ok(start > 0, "showDebugReport found");
   const body = kt.slice(start, kt.indexOf("\n  }\n", start));
   assert.doesNotMatch(body, /Toast/);
-  assert.match(body, /note\("report: /);
+  assert.match(body, /"pip_playback"/);
+  assert.match(body, /event\(/);
   const prepare = read(join(ROOT, "scripts/android_prepare.py"));
   assert.match(prepare, /AnimeHubPipController\.showDebugReport\(AnimeHubPipController\.webView\(\)\)/);
 });

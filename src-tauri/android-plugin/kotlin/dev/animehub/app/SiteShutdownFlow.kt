@@ -23,7 +23,7 @@ sealed interface ShutdownFlush {
   /** The background worker finished the flush inside the budget. */
   object Completed : ShutdownFlush
 
-  /** The worker ran the flush and it threw: [reason]. */
+  /** The worker failed; [reason] is a safe class code, never exception text. */
   data class Failed(val reason: String) : ShutdownFlush
 
   /**
@@ -54,7 +54,7 @@ interface ShutdownPort {
   /** Wait at most [budgetMillis] for the submitted flush; `true` if it finished. */
   fun awaitFlush(budgetMillis: Long): Boolean
 
-  /** Why the flush failed, or `null` when it did not. Read after [awaitFlush]. */
+  /** Safe failure code (`provider`), or `null`; provider text is never returned. */
   fun flushFailure(): String?
 }
 
@@ -95,14 +95,85 @@ object ShutdownFlow {
    */
   const val DESTROY_FLUSH_BUDGET_MS: Long = 1_000
 
-  fun run(port: ShutdownPort, budgetMillis: Long = DESTROY_FLUSH_BUDGET_MS): ShutdownFlush {
+  private fun safeFailureClass(value: String?): String? =
+    when (value) {
+      null -> null
+      "provider" -> "provider"
+      else -> "unknown"
+    }
+
+  fun run(
+    port: ShutdownPort,
+    budgetMillis: Long = DESTROY_FLUSH_BUDGET_MS,
+    operationId: String = AnimeHubDebugLog.newOperationId(),
+  ): ShutdownFlush {
     require(budgetMillis > 0) { "the destroy-time flush budget must be positive" }
+    val safeOperationId = AnimeHubDebugLog.safeOperationId(operationId) ?: AnimeHubDebugLog.newOperationId()
+    val startedAt = System.nanoTime()
+    AnimeHubDebugLog.record("shutdown", "destroy", "started", safeOperationId)
+    AnimeHubDebugLog.record("shutdown", "worker_start", "started", safeOperationId)
     val submitted = port.submitFlush()
+    AnimeHubDebugLog.record(
+      "shutdown", "worker_start", if (submitted) "accepted" else "skipped", safeOperationId,
+    )
     // Teardown runs whatever happened: a site view must never survive destroy
     // because a flush was skipped, slow or failed.
+    AnimeHubDebugLog.record("shutdown", "destroy", "started", safeOperationId)
     port.teardownView()
-    if (!submitted) return ShutdownFlush.NotNeeded
-    if (!port.awaitFlush(budgetMillis)) return ShutdownFlush.TimedOut
-    return port.flushFailure()?.let { ShutdownFlush.Failed(it) } ?: ShutdownFlush.Completed
+    AnimeHubDebugLog.record("shutdown", "destroy", "closed", safeOperationId)
+    if (!submitted) {
+      val failure = safeFailureClass(port.flushFailure())
+      val outcome = failure?.let { ShutdownFlush.Failed(it) } ?: ShutdownFlush.NotNeeded
+      val result = if (outcome == ShutdownFlush.NotNeeded) "not_needed" else "failed"
+      AnimeHubDebugLog.record(
+        "shutdown", "destroy_flush", result, safeOperationId,
+        durationMs = ((System.nanoTime() - startedAt) / 1_000_000).coerceAtLeast(0),
+        errorClass = failure,
+      )
+      AnimeHubDebugLog.record(
+        "shutdown", "complete", if (failure == null) "ok" else "failed", safeOperationId,
+        durationMs = ((System.nanoTime() - startedAt) / 1_000_000).coerceAtLeast(0),
+        errorClass = failure,
+      )
+      return outcome
+    }
+    AnimeHubDebugLog.record("shutdown", "destroy_flush", "started", safeOperationId)
+    val outcome =
+      if (!port.awaitFlush(budgetMillis)) {
+        ShutdownFlush.TimedOut
+      } else {
+        safeFailureClass(port.flushFailure())?.let { ShutdownFlush.Failed(it) }
+          ?: ShutdownFlush.Completed
+      }
+    val duration = ((System.nanoTime() - startedAt) / 1_000_000).coerceAtLeast(0)
+    when (outcome) {
+      ShutdownFlush.Completed ->
+        AnimeHubDebugLog.record(
+          "shutdown", "destroy_flush", "ok", safeOperationId, durationMs = duration,
+        )
+      ShutdownFlush.NotNeeded ->
+        AnimeHubDebugLog.record("shutdown", "destroy_flush", "not_needed", safeOperationId, durationMs = duration)
+      ShutdownFlush.TimedOut ->
+        AnimeHubDebugLog.record(
+          "shutdown", "destroy_flush", "timeout", safeOperationId,
+          durationMs = duration, watchdog = "fired", errorClass = "timeout",
+        )
+      is ShutdownFlush.Failed ->
+        AnimeHubDebugLog.record(
+          "shutdown", "destroy_flush", "failed", safeOperationId,
+          durationMs = duration,
+          errorClass = if (outcome.reason == "provider") "provider" else "unknown",
+        )
+    }
+    AnimeHubDebugLog.record(
+      "shutdown", "complete", if (outcome is ShutdownFlush.Completed) "ok" else "failed",
+      safeOperationId, durationMs = duration,
+      errorClass = when (outcome) {
+        ShutdownFlush.TimedOut -> "timeout"
+        is ShutdownFlush.Failed -> if (outcome.reason == "provider") "provider" else "unknown"
+        else -> null
+      },
+    )
+    return outcome
   }
 }
