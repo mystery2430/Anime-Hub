@@ -4465,8 +4465,9 @@ mod tests {
         // A visible, retryable error — never the old log-and-continue.
         assert!(matches!(err, AppError::Other(_)), "{err:?}");
         assert!(
-            err.to_string().contains("kalıcılaştırılamadı"),
-            "error must say the migration state could not be persisted: {err}"
+            err.to_string()
+                .contains("site migration state could not be stored; site was not opened"),
+            "error must report the safe migration-state persistence failure: {err}"
         );
         // The view was NEVER built: phase 1 ran, phase 2 did not. In
         // production that means no Kotlin WebView exists, so Rust claiming
