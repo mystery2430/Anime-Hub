@@ -359,10 +359,8 @@ fn open_in_main_window_inner(
     // without stealing a fullscreen the user chose by hand.
     let already_fs = window.is_fullscreen().unwrap_or(false);
     let entered_fullscreen = fullscreen && !already_fs;
-    if entered_fullscreen {
-        if window.set_fullscreen(true).is_err() {
-            log::warn!("tam ekrana geçilemedi");
-        }
+    if entered_fullscreen && window.set_fullscreen(true).is_err() {
+        log::warn!("tam ekrana geçilemedi");
     }
     if window.set_title(&site.name).is_err() {
         log::warn!("pencere başlığı ayarlanamadı");
@@ -3469,10 +3467,10 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
         if window.set_title(LAUNCHER_TITLE).is_err() {
             log::warn!("pencere başlığı geri alınamadı");
         }
-        if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
-            if window.set_fullscreen(false).is_err() {
-                log::warn!("tam ekrandan çıkılamadı");
-            }
+        if current.as_ref().is_some_and(|c| c.entered_fullscreen)
+            && window.set_fullscreen(false).is_err()
+        {
+            log::warn!("tam ekrandan çıkılamadı");
         }
         if window.set_focus().is_err() {
             log::debug!("pencere odaklanamadı");
@@ -3627,10 +3625,10 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
         if window.set_title(LAUNCHER_TITLE).is_err() {
             log::warn!("pencere başlığı geri alınamadı");
         }
-        if current.as_ref().is_some_and(|c| c.entered_fullscreen) {
-            if window.set_fullscreen(false).is_err() {
-                log::warn!("tam ekrandan çıkılamadı");
-            }
+        if current.as_ref().is_some_and(|c| c.entered_fullscreen)
+            && window.set_fullscreen(false).is_err()
+        {
+            log::warn!("tam ekrandan çıkılamadı");
         }
         if window.set_focus().is_err() {
             log::debug!("pencere odaklanamadı");
