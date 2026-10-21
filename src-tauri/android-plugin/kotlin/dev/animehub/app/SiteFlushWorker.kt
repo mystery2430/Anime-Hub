@@ -9,6 +9,12 @@
 // the next submission swaps in a fresh single-thread executor. The stuck
 // daemon thread is abandoned and its queue discarded; callers all have a
 // watchdog or a bounded await, so a discarded task settles as a failure.
+//
+// BOUND: `shutdownNow()` cannot stop a native call blocked in the provider, so
+// an abandoned worker keeps its thread. After
+// `FlushRecovery.MAX_ABANDONED_WORKERS` replacements the worker refuses new
+// submissions (`execute` returns false, `submit` settles the caller with an
+// error) instead of producing an unbounded number of threads.
 
 package dev.animehub.app
 
@@ -37,6 +43,14 @@ object SiteFlushWorker {
   private var busySince = 0L
   private var busyGeneration = -1L
 
+  /**
+   * Workers abandoned after a stall. `shutdownNow()` cannot stop a native call
+   * blocked inside the platform, so every replacement leaks one daemon thread.
+   * The count is capped by [FlushRecovery.MAX_ABANDONED_WORKERS]; past that
+   * limit new work is REFUSED instead of creating yet another thread.
+   */
+  private var abandonedWorkers = 0
+
   /** The ONLY place a flush thread is created (startup or stall recovery). */
   private fun newFlushExecutor(): ExecutorService =
     Executors.newSingleThreadExecutor { runnable ->
@@ -64,22 +78,29 @@ object SiteFlushWorker {
     return Watchdog.Armed({ mainHandler.removeCallbacks(task) })
   }
 
-  /** Queue work on the single blocking worker; no provider text is logged. */
+  /**
+   * Queue work on the single blocking worker; no provider text is logged.
+   *
+   * Returns `false` when nothing was queued: the worker is stalled and has
+   * spent its replacement budget, or the submission was rejected concurrently.
+   * Callers own a watchdog or a bounded await, so a refusal settles as a
+   * failure instead of an unbounded thread leak.
+   */
   fun execute(
     tag: String,
     operationId: String,
     recordWorkerStart: Boolean = true,
     recordSuccess: Boolean = true,
     work: () -> Unit,
-  ) {
-    warnOrRecover(operationId)
+  ): Boolean {
+    if (!warnOrRecover(operationId)) return false
     val target: ExecutorService
     val generation: Long
     synchronized(stateLock) {
       target = flushExecutor
       generation = executorGeneration
     }
-    try {
+    return try {
       target.execute {
         val startedAt = System.nanoTime()
         synchronized(stateLock) {
@@ -114,10 +135,12 @@ object SiteFlushWorker {
           }
         }
       }
+      true
     } catch (_: Exception) {
       // Rejected after a concurrent replacement. The caller still owns a
       // watchdog/bounded await, so report a failure instead of hanging.
       AnimeHubDebugLog.record("flush", tag, "failed", operationId, errorClass = "provider")
+      false
     }
   }
 
@@ -132,12 +155,13 @@ object SiteFlushWorker {
     val startedAt = System.nanoTime()
     val routineSync = tag == "sync"
     try {
-      execute(
-        tag,
-        operationId,
-        recordWorkerStart = !routineSync,
-        recordSuccess = false,
-      ) {
+      val accepted =
+        execute(
+          tag,
+          operationId,
+          recordWorkerStart = !routineSync,
+          recordSuccess = false,
+        ) {
         val error =
           try {
             work()
@@ -152,7 +176,15 @@ object SiteFlushWorker {
             errorClass = if (error == null) null else "provider",
           )
         }
-        activity.runOnUiThread { onDone(error) }
+          activity.runOnUiThread { onDone(error) }
+        }
+      if (!accepted) {
+        // Nothing was queued: settle now instead of leaving the caller to its
+        // watchdog. The provider operation never started.
+        AnimeHubDebugLog.record(
+          "flush", "flush", "refused", operationId, errorClass = "timeout",
+        )
+        activity.runOnUiThread { onDone(IllegalStateException("flush worker exhausted")) }
       }
     } catch (_: Exception) {
       AnimeHubDebugLog.record("flush", "flush", "failed", operationId, errorClass = "provider")
@@ -165,19 +197,25 @@ object SiteFlushWorker {
    * threshold. Replacement is lazy (next submission), so an idle app never
    * pays for a thread it does not need.
    */
-  private fun warnOrRecover(operationId: String) {
+  private fun warnOrRecover(operationId: String): Boolean {
     var replacement: ExecutorService? = null
     var stuckFor = 0L
+    var budgetExhausted = false
     synchronized(stateLock) {
       val now = System.currentTimeMillis()
       val since = busySince
       stuckFor = FlushRecovery.stuckFor(since, now)
       if (FlushRecovery.shouldReplace(since, now)) {
-        replacement = flushExecutor
-        executorGeneration += 1
-        flushExecutor = newFlushExecutor()
-        busySince = 0L
-        busyGeneration = -1L
+        if (FlushRecovery.replacementAllowed(abandonedWorkers)) {
+          replacement = flushExecutor
+          abandonedWorkers = FlushRecovery.workerBudgetAfter(abandonedWorkers, true)
+          executorGeneration += 1
+          flushExecutor = newFlushExecutor()
+          busySince = 0L
+          busyGeneration = -1L
+        } else {
+          budgetExhausted = true
+        }
       }
     }
     val old = replacement
@@ -188,7 +226,16 @@ object SiteFlushWorker {
         "flush", "worker_wait", "recovered", operationId,
         durationMs = stuckFor, watchdog = "fired", errorClass = "timeout",
       )
-      return
+      return true
+    }
+    if (budgetExhausted) {
+      // Fail-closed: refuse the submission rather than leak thread N+1.
+      Log.w(LOG_TAG, "flush worker budget exhausted; refusing new work")
+      AnimeHubDebugLog.record(
+        "flush", "worker_wait", "refused", operationId,
+        durationMs = stuckFor, watchdog = "refused", errorClass = "timeout",
+      )
+      return false
     }
     if (stuckFor >= FLUSH_STUCK_WARN_MS) {
       Log.w(LOG_TAG, "flush worker remains busy")
@@ -197,5 +244,6 @@ object SiteFlushWorker {
         durationMs = stuckFor, watchdog = "fired", errorClass = "timeout",
       )
     }
+    return true
   }
 }

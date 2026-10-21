@@ -77,3 +77,75 @@ test("the Android prepare step treats every referenced Kotlin unit as required",
     "IpPolicy/SiteNavigationPolicy must fail loudly, not warn",
   );
 });
+
+// Round 6 (security follow-up) source-level guards. Behaviour that needs a
+// device (WebView callbacks, native flush) is covered by the Kotlin unit tests
+// for the pure policy code; these pins catch the wiring being undone.
+test("blocklist sync is fail-closed and both call sites propagate the failure", () => {
+  assert.match(
+    commandsRs,
+    /fn sync_android_blocklist\(state: &AppState\) -> AppResult<\(\)>/,
+    "sync must return a result",
+  );
+  assert.match(commandsRs, /sync_android_blocklist\(&state\)\?;/);
+  const callSites = commandsRs.match(/sync_android_blocklist\(&state\)\??;/g) ?? [];
+  assert.equal(
+    callSites.some((line) => line.endsWith(");")),
+    false,
+    "no call site may ignore the transfer result",
+  );
+  // A poisoned lock must not become an empty (re-enabled-looking) snapshot.
+  assert.equal(/blocklist\.lock\(\)[\s\S]{0,80}unwrap_or_default/.test(commandsRs), false);
+});
+
+test("OAuth login validates the redirect before writing pending state", () => {
+  const loginStart = commandsRs.slice(commandsRs.indexOf("pub async fn anilist_login_start"));
+  const validatorAt = loginStart.indexOf("validate_redirect_uri");
+  const stateAt = loginStart.indexOf("*s = Some(state_value)");
+  assert.ok(validatorAt > 0, "login start must validate the redirect URI");
+  assert.ok(stateAt > 0, "login start still writes pending state");
+  assert.ok(validatorAt < stateAt, "validation must happen before pending state");
+  // The listener is only started for the port the URI actually names.
+  assert.match(loginStart, /LoginRedirect::Loopback\(port\)/);
+  assert.equal(/loopback_port\(&cfg\.redirect_uri\)/.test(loginStart), false);
+});
+
+test("top-level navigation consults the DNS gate and the gate is shipped", () => {
+  const guard = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt");
+  const gate = read("src-tauri/android-plugin/kotlin/dev/animehub/app/NavigationDnsGate.kt");
+  assert.match(guard, /shouldOverrideUrlLoading[\s\S]{0,900}dnsGate\.decide/);
+  assert.match(guard, /dnsGate\.cachedVerdict/);
+  assert.match(gate, /class NavigationDnsGate/);
+  assert.match(gate, /Decision\.BLOCK/);
+  assert.match(read("scripts/android_prepare.py"), /"NavigationDnsGate"/);
+});
+
+test("flush worker replacement is bounded and can refuse work", () => {
+  const ops = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOps.kt");
+  const worker = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteFlushWorker.kt");
+  assert.match(ops, /MAX_ABANDONED_WORKERS: Int = 2/);
+  assert.match(ops, /fun replacementAllowed\(abandoned: Int\): Boolean/);
+  assert.match(worker, /replacementAllowed\(abandonedWorkers\)/);
+  assert.match(worker, /fun execute\([\s\S]{0,200}\): Boolean/);
+  assert.match(worker, /flush worker exhausted/);
+});
+
+test("Actions pinning is reported as a blocker, not claimed as fixed", () => {
+  // R-09 / item 5: the hardened, SHA-pinned workflows live in ci-fixes/ and
+  // the ACTIVE workflows still use mutable tags, because this branch's token
+  // is refused ("without `workflow` scope"). Bypassing that was explicitly out
+  // of scope, so the honest state is: proposals pinned, active files not, and
+  // the limit written down. This test fails if the docs start claiming
+  // otherwise.
+  const docs = read("docs/security-residual-risks.md");
+  assert.match(docs, /workflow` scope/);
+  assert.match(docs, /Actions pinning/);
+  const active = read(".github/workflows/ci.yml");
+  assert.equal(
+    /uses:\s*actions\/checkout@[0-9a-f]{40}/.test(active),
+    false,
+    "if the active workflow ever gets pinned, update the blocker docs and this test",
+  );
+  const proposal = read("ci-fixes/ci.yml");
+  assert.match(proposal, /uses:\s*actions\/checkout@[0-9a-f]{40} # v7/);
+});

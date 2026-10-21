@@ -203,9 +203,39 @@ object FlushRecovery {
   /** After this stall the next submission replaces the worker. */
   const val REPLACE_AFTER_MS: Long = 30_000
 
+  /**
+   * Hard cap on workers abandoned after a stall.
+   *
+   * `shutdownNow()` cannot cancel a native provider call that is blocked
+   * inside the platform: the thread stays alive (a daemon) until the call
+   * returns, and Java offers no way to reclaim it. Replacing the worker
+   * therefore leaks one thread per stall, so repeated stalls must NOT keep
+   * producing workers: after [MAX_ABANDONED_WORKERS] the worker refuses new
+   * work (fail-closed, bounded) instead of accumulating threads.
+   */
+  const val MAX_ABANDONED_WORKERS: Int = 2
+
   /** `true` only for a real, measured stall at/after the hard threshold. */
   fun shouldReplace(busySince: Long, now: Long): Boolean =
     busySince > 0L && now >= busySince && now - busySince >= REPLACE_AFTER_MS
+
+  /**
+   * May another worker be created after [abandoned] previous ones?
+   *
+   * A negative count is treated as zero so a caller bug cannot unlock an
+   * unbounded number of threads.
+   */
+  fun replacementAllowed(abandoned: Int): Boolean =
+    abandoned.coerceAtLeast(0) < MAX_ABANDONED_WORKERS
+
+  /**
+   * Worker budget after one submission: `exhausted` means the caller must
+   * refuse the work instead of queueing it on a wedged executor.
+   */
+  fun workerBudgetAfter(abandonedBefore: Int, replaced: Boolean): Int {
+    val kept = abandonedBefore.coerceAtLeast(0)
+    return if (replaced) kept + 1 else kept
+  }
 
   /** Milliseconds the worker has been busy, clamped to zero. */
   fun stuckFor(busySince: Long, now: Long): Long =

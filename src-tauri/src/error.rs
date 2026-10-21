@@ -66,6 +66,13 @@ pub enum AppError {
     /// A tile photo the user attached. The message is already safe to show.
     #[error("{0}")]
     Icon(String),
+
+    /// The user's ad/tracker rules could not be handed to the Android site
+    /// WebView. Deliberately its own variant: continuing would mean the site
+    /// silently runs with stale or no rules (desktop-only enforcement), so
+    /// `open_site` refuses and `update_settings` reports it.
+    #[error("Engelleme listesi site görünümüne uygulanamadı; site açılmadı.")]
+    BlocklistUnavailable,
 }
 
 /// Serializable payload for the `invoke` boundary.
@@ -97,6 +104,7 @@ impl AppError {
             AppError::Unsupported(_) => "unsupported",
             AppError::Quarantined(_) => "quarantined",
             AppError::Icon(_) => "icon",
+            AppError::BlocklistUnavailable => "blocklist_unavailable",
         }
     }
 }

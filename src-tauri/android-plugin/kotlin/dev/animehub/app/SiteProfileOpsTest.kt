@@ -2140,6 +2140,33 @@ class SiteProfileOpsTest {
   }
 
   @Test
+  fun `flush worker replacement budget is bounded and refusals are explicit`() {
+    // shutdownNow() cannot stop a blocked native call, so each replacement
+    // leaks a thread; the budget stops the count from growing without bound.
+    Assert.assertEquals(2, FlushRecovery.MAX_ABANDONED_WORKERS)
+    Assert.assertTrue(FlushRecovery.replacementAllowed(0))
+    Assert.assertTrue(FlushRecovery.replacementAllowed(1))
+    Assert.assertFalse(FlushRecovery.replacementAllowed(2))
+    Assert.assertFalse(FlushRecovery.replacementAllowed(3))
+    // A negative count (caller bug) must not unlock extra threads.
+    Assert.assertTrue(FlushRecovery.replacementAllowed(-5))
+    Assert.assertEquals(0, FlushRecovery.workerBudgetAfter(0, false))
+    Assert.assertEquals(1, FlushRecovery.workerBudgetAfter(0, true))
+    Assert.assertEquals(2, FlushRecovery.workerBudgetAfter(1, true))
+    // Consecutive stalls stop producing workers at the cap.
+    var abandoned = 0
+    var replacements = 0
+    repeat(10) {
+      if (FlushRecovery.replacementAllowed(abandoned)) {
+        abandoned = FlushRecovery.workerBudgetAfter(abandoned, true)
+        replacements += 1
+      }
+    }
+    Assert.assertEquals(FlushRecovery.MAX_ABANDONED_WORKERS, replacements)
+    Assert.assertEquals(FlushRecovery.MAX_ABANDONED_WORKERS, abandoned)
+  }
+
+  @Test
   fun `dns pre-check refuses private and changed public answers`() {
     val policy = SiteNavigationPolicy.ResolvedHostPolicy
     Assert.assertEquals(

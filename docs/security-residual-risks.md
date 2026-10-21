@@ -76,6 +76,61 @@ scope). A test rejects mutable tags in those files.
 `android_prepare.py` fails unless each Gradle pin appears exactly once, and CI
 inspects the resolved dependency graph.
 
+## Round 6 — what is fixed and what is still blocked
+
+### Android blocklist is fail-closed
+
+`commands::sync_android_blocklist` returns `AppResult<()>`
+(`AppError::BlocklistUnavailable`). `open_site` refuses to open the site and
+`update_settings` reports the failure when the snapshot cannot be applied;
+a failed transfer can no longer leave a site running with stale or no rules.
+A disabled list still arrives as an **empty** snapshot (Kotlin has no enabled
+flag), which is the only representation that matches `Blocklist::is_blocked`.
+
+### Redirect DNS verdicts (partial)
+
+`NavigationDnsGate` is shared by `shouldOverrideUrlLoading` and
+`shouldInterceptRequest`. The top-level checkpoint cancels a target whose
+**cached** answer is private or changed and probes off the UI thread otherwise
+(it must answer synchronously and must not resolve on the UI thread). This
+blocks redirect chains that previously reached a private address without any
+check. It is **not** connection pinning: the engine resolves again when it
+connects, so a rebinding host can still answer public to the check and private
+to the socket. **R-01 (b) stays open.**
+
+### OAuth loopback redirect must be exactly the served endpoint
+
+`loopback_port()` now accepts only `http://127.0.0.1:<explicit port>/callback`
+— no `/cb`, no omitted port (80), no query/fragment/userinfo, no `localhost`
+or `[::1]` (the listener binds `127.0.0.1`). `validate_redirect_uri()` runs
+**before** pending state is written and the listener is started only for
+`LoginRedirect::Loopback(port)`, so an unusable URI can no longer burn a state
+value and hang the login.
+
+### Flush worker replacement is bounded
+
+`shutdownNow()` cannot stop a native provider call blocked in the platform, so
+each abandoned worker keeps a thread. `FlushRecovery.MAX_ABANDONED_WORKERS = 2`
+bounds replacements; after that the worker **refuses** new submissions
+(`execute` returns `false`, `submit` settles the caller with an error) instead
+of creating more threads. Real provider latency and kill paths remain device
+work (R-04).
+
+### Actions pinning — explicit blocker
+
+The hardened, **SHA-pinned** workflows live only in `ci-fixes/*.yml`; the
+**active** `.github/workflows/*.yml` still reference mutable tags. The push of
+this round's active-workflow pinning was rejected with:
+
+```
+refusing to allow a Personal Access Token to create or update workflow
+`.github/workflows/ci.yml` without `workflow` scope
+```
+
+The permission was not worked around, nothing was pushed to `main`, and no tag
+or release was created. The item stays **open** until a token with `workflow`
+scope (or a maintainer running `ci-fixes/apply.sh`) lands the pinned files.
+
 ## Partially mitigated / residual
 
 ### DNS rebinding on Android

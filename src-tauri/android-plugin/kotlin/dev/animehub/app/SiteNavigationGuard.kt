@@ -15,7 +15,7 @@ import android.os.SystemClock
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import java.net.InetAddress
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 /**
  * Top-level navigation guard for the shared site WebView (Android only).
@@ -37,12 +37,16 @@ import java.util.concurrent.ConcurrentHashMap
  *    does and does not catch).
  *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
  *    `open_on_mobile` already validates the first URL).
- *  - Partially covered: DNS rebinding. `shouldInterceptRequest` resolves the
- *    host (short, bounded cache) and refuses a non-empty answer containing a
- *    private/loopback/link-local address, or a public answer that differs from
- *    the pinned first answer. This is defence in depth, not a complete fix:
- *    the engine resolves again when it connects (TOCTOU). See
- *    `docs/security-residual-risks.md`.
+ *  - Partially covered: DNS rebinding. BOTH checkpoints consult
+ *    [NavigationDnsGate]: `shouldInterceptRequest` resolves the host (short,
+ *    bounded cache) and refuses a private/loopback/link-local answer or a
+ *    changed public answer, and `shouldOverrideUrlLoading` cancels a
+ *    redirect/main-frame target whose *cached* answer is private or changed.
+ *    On a cache miss the top-level check cannot block (it must answer
+ *    synchronously and never resolve on the UI thread), so it allows the
+ *    navigation and probes in the background. This is defence in depth, not
+ *    connection pinning: the engine resolves again when it connects (TOCTOU).
+ *    See `docs/security-residual-risks.md` — R-01 stays partial.
  *  - Blocklist: the user's Rust rules are pushed into [SiteBlocklist] before
  *    every open; both the top-level and sub-resource checkpoints consult it.
  *
@@ -51,8 +55,18 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
 
-  /** Hostname → (blocked?, monotonic check time, pinned public set). */
-  private val resolutions = ConcurrentHashMap<String, Resolution>()
+  /** Shared verdict cache for both checkpoints. */
+  private val dnsGate = NavigationDnsGate()
+
+  /**
+   * One daemon thread for top-level probes. The UI thread must never resolve:
+   * `shouldOverrideUrlLoading` has to answer synchronously, which is why an
+   * unknown host is allowed AND probed instead of blocking the navigation.
+   */
+  private val probeExecutor =
+    Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "AnimeHubDnsProbe").apply { isDaemon = true }
+    }
 
   override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
     val uri = request.url
@@ -61,6 +75,14 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
       // The navigation remains blocked as before. Do not emit per-request or
       // per-page diagnostics; the target could expose a URL or site identity.
       return true
+    }
+    when (dnsGate.decide(uri.host, SystemClock.elapsedRealtime())) {
+      // A redirect target whose answer was already seen to be private (or to
+      // have changed) is cancelled HERE as well: redirect chains are not
+      // guaranteed to reach `shouldInterceptRequest`.
+      NavigationDnsGate.Decision.BLOCK -> return true
+      NavigationDnsGate.Decision.ALLOW_AND_PROBE -> probeInBackground(uri.host)
+      NavigationDnsGate.Decision.ALLOW -> {}
     }
     return inner.shouldOverrideUrlLoading(view, request)
   }
@@ -97,6 +119,29 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
   }
 
   /**
+   * Resolve a top-level target off the UI thread purely to feed the cache.
+   * The navigation that triggered it proceeds: blocking on a lookup here
+   * would mean either a UI-thread resolver call or an ANR.
+   */
+  private fun probeInBackground(rawHost: String?) {
+    // IP literals and empty hosts: the pure policy already decides those.
+    val host = NavigationDnsGate.normalize(rawHost) ?: return
+    try {
+      probeExecutor.execute {
+        try {
+          val answer = InetAddress.getAllByName(host).mapNotNull { it.hostAddress }
+          dnsGate.record(host, answer, SystemClock.elapsedRealtime())
+        } catch (_: Exception) {
+          // Resolver outage: fail-open, and never leave the host "probing".
+          dnsGate.recordLookupFailure(host)
+        }
+      }
+    } catch (_: Exception) {
+      dnsGate.recordLookupFailure(host)
+    }
+  }
+
+  /**
    * Best-effort DNS pre-check. `shouldInterceptRequest` runs on a WebView
    * background thread, so the resolver call cannot block the UI.
    */
@@ -109,42 +154,24 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
     val bare = host.removePrefix("[").removeSuffix("]")
     if (bare.contains(':') || bare.all { it.isDigit() || it == '.' }) return false
     val now = SystemClock.elapsedRealtime()
-    cachedResolution(host)?.let { cached ->
-      if (now - cached.checkedAt < DNS_CACHE_MS) return cached.privateAddress
+    when (dnsGate.cachedVerdict(host, now)) {
+      NavigationDnsGate.Verdict.PUBLIC -> return false
+      NavigationDnsGate.Verdict.PRIVATE, NavigationDnsGate.Verdict.CHANGED -> return true
+      null -> Unit
     }
-    val previous = cachedResolution(host)?.pinnedPublic
     val answer =
       try {
         InetAddress.getAllByName(host).mapNotNull { it.hostAddress }
       } catch (_: Exception) {
         // Resolver unavailable: do not turn a network outage into a local block.
+        dnsGate.recordLookupFailure(host)
         return false
       }
-    if (answer.isEmpty()) return false
-    val verdict = SiteNavigationPolicy.ResolvedHostPolicy.classify(previous, answer)
-    val blocked = verdict != SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW
-    val pinned =
-      if (verdict == SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW) {
-        previous ?: answer.map { it.substringBefore('%').trim() }.toSet()
-      } else {
-        previous
-      }
-    if (resolutions.size > MAX_CACHED_HOSTS) resolutions.clear()
-    resolutions[host] = Resolution(blocked, now, pinned)
-    return blocked
-  }
-
-  private fun cachedResolution(host: String): Resolution? = resolutions[host]
-
-  private data class Resolution(
-    val privateAddress: Boolean,
-    val checkedAt: Long,
-    val pinnedPublic: Set<String>? = null,
-  )
-
-  private companion object {
-    const val DNS_CACHE_MS = 60_000L
-    const val MAX_CACHED_HOSTS = 256
+    if (answer.isEmpty()) {
+      dnsGate.recordLookupFailure(host)
+      return false
+    }
+    return dnsGate.record(host, answer, now) == NavigationDnsGate.Decision.BLOCK
   }
 
   /**

@@ -519,6 +519,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
         "SiteWebViewSettings",
         "SiteProfileOps",
         "SiteBlocklist",
+        "NavigationDnsGate",
         "ProfileQuarantine",
         "SiteCloseFlow",
         "SiteShutdownFlow",

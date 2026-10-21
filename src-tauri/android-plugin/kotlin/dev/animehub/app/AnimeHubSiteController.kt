@@ -707,6 +707,8 @@ object AnimeHubSiteController {
             // Disk I/O on the single flush worker, never on this (UI) thread —
             // and through the worker, so a stuck provider flush is observable
             // here too instead of only on the awaited paths.
+            // Destroy-time flush is best effort: a refusal (worker budget
+            // exhausted) is already recorded by the worker itself.
             SiteFlushWorker.execute("destroy", operationId) {
               try {
                 target.cookieManager.flush()

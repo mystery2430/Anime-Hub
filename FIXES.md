@@ -47,6 +47,27 @@ built-in'i geri getirmiyor), `remove_site`'ın iki platformdaki built-in kolu
 Doğrulanamayan: Rust/Kotlin araç zinciri bu ortamda yok; `cargo test`,
 `clippy` ve Gradle birim testleri koşmadı. `node --test` (256 test) geçti.
 
+## Review round 6 — security follow-up items
+
+| # | Finding (as reported) | Fix | Evidence |
+| --- | --- | --- | --- |
+| 1 | Android blocklist transfer failure was only logged; the site opened anyway. | `sync_android_blocklist` returns `AppResult<()>` with `AppError::BlocklistUnavailable`; `open_site` aborts, `update_settings` reports failure. Lock stays recovered, never an empty rule set (empty means "list disabled"). | `commands.rs`, `error.rs` |
+| 2 | Redirect URLs skip `shouldInterceptRequest`; `shouldOverrideUrlLoading` ignored DNS entirely. | Pure `NavigationDnsGate` shared by both checkpoints: cached private/changed verdict cancels the top-level navigation; a miss allows + probes off the UI thread; the request path feeds its synchronous answer into the same cache. | `NavigationDnsGate.kt`, `SiteNavigationGuard.kt`, `SiteNavigationPolicyTest.kt` |
+| 3 | `loopback_port()` accepted `/cb`, a missing port, `localhost`, queries/fragments/userinfo, while the listener serves only `http://127.0.0.1:<port>/callback`. | Exact-endpoint parsing + `validate_redirect_uri()` **before** pending state; listener starts only for `LoginRedirect::Loopback(port)`; desktop custom scheme validated and refused on Android. | `anilist.rs`, `commands.rs` |
+| 4 | `shutdownNow()` cannot stop a blocked native call; consecutive stalls accumulated workers. | `FlushRecovery.MAX_ABANDONED_WORKERS = 2` + `replacementAllowed`/`workerBudgetAfter`; `execute` returns `Boolean`, refuses when exhausted, `submit` settles the caller. | `SiteProfileOps.kt`, `SiteFlushWorker.kt`, `SiteProfileOpsTest.kt` |
+| 5 | Proposals in `ci-fixes/` were treated as if the active workflows were pinned. | **Blocked, reported, not bypassed:** push rejected (`without `workflow` scope`). Active workflows remain mutable; pinned proposals stay separate and are not claimed as active. Nothing pushed to `main`, no tag/release. | `docs/security-residual-risks.md`, `docs/audit-item-status.md` (R-09), tests |
+| 6 | Audit docs did not match the code (R-01/R-05) and did not state the Android 8/9 drop. | R-01 split into blocklist (fixed) / DNS (partial) / host rules (fixed); R-05 split into custom-scheme removal (fixed) / loopback hardening (new); `minSdkVersion=29` removing Android 8/9 support stated in README and the audit doc. | `docs/audit-item-status.md`, `docs/security-residual-risks.md`, `README.md` |
+
+### Verification state for round 6
+
+| Check | Result |
+| --- | --- |
+| `npm test` (node) | run locally in this environment — see the PR comment / step output |
+| Rust `cargo test` + `cargo clippy -- -D warnings` | **not run** here: no Rust toolchain in the reviewing container. Not counted as a pass. |
+| Kotlin unit tests (`./gradlew test`, `--tests dev.animehub.app.*Test`) | **not run** here: no Android SDK/Gradle. Not counted as a pass. |
+| Device / emulator | **not performed**. MULTI_PROFILE, real `flush()` latency, blocklist push observed in a live WebView and the guard callbacks are still R-04 device work. |
+| GitHub Actions for the new commit | workflow files could not be changed (no `workflow` scope); CI runs on push — its result is reported separately / check the commit checks. |
+
 ## Remaining release gates
 
 - **DNS rebinding TOCTOU** still needs a connection-pinning network layer.

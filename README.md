@@ -360,6 +360,14 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 
 ### 📱&nbsp; Android &nbsp;·&nbsp; `Android 10+ (API 29)`
 
+> **Android 8.x ve 9 artık desteklenmiyor.** Bu dal `minSdkVersion` değerini
+> **29 (Android 10)** yapar; site başına yalıtım `androidx.webkit`
+> MULTI_PROFILE çok süreçli WebView tabanına dayanır. Android 8/9 cihazlara APK
+> kurulmaz; `MULTI_PROFILE` sunmayan bir sağlayıcıda site **açılmaz** ve nedeni
+> gösterilir — ortak profile sessiz dönüş yoktur. Bu, depolama yalıtımı için
+> bilinçli bir kapsam kararıdır.
+
+
 | Yöntem | Boyut | Açıklama |
 |---|---|---|
 | **İmzalı APK** | ~7–11 MB | Releases sayfasından ABI'nize uygun `.apk` (`animehub-aarch64-release.apk` çoğu modern telefon; `animehub-armv7-release.apk` eski 32-bit; `animehub-x86_64-release.apk` emülatör) |

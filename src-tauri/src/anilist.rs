@@ -1064,22 +1064,96 @@ pub struct LoopbackListener {
     redirect_uri: String,
 }
 
-/// Port of a loopback redirect URI (`http://127.0.0.1:17395/callback`),
-/// or `None` for any other form (custom scheme, remote host).
+/// The only path [`LoopbackListener`] answers.
+pub const LOOPBACK_CALLBACK_PATH: &str = "/callback";
+
+/// Port of a redirect URI the local listener can actually serve.
 ///
-/// The login command consults this to decide whether a local HTTP listener
-/// must catch the OAuth redirect; it only makes sense to bind a port the
-/// registered redirect actually points at.
+/// This used to accept ANY `http` URI on `127.0.0.1`/`localhost` and answer
+/// `port_or_known_default()`, so `http://127.0.0.1/cb`, `…:17395/anything`,
+/// `http://localhost:17395/callback` and even a URI with a query, a fragment
+/// or userinfo all "looked like" a loopback redirect. The listener binds
+/// `127.0.0.1:<port>` and answers only `/callback`, so every one of those
+/// forms produced a login that was started (pending state written, browser
+/// opened) and could never be completed: the redirect landed on a path or
+/// host the listener refused, or on port 80 where nothing listens.
+///
+/// The rule here is therefore EXACTLY "what `bind_port` serves":
+/// `http://127.0.0.1:<explicit port>/callback`, nothing else.
 pub fn loopback_port(redirect_uri: &str) -> Option<u16> {
     let url = url::Url::parse(redirect_uri).ok()?;
     if url.scheme() != "http" {
         return None;
     }
-    let host = url.host_str()?;
-    if host != "127.0.0.1" && host != "localhost" {
+    // `bind_port` listens on 127.0.0.1 only: `localhost` may resolve to ::1,
+    // and `[::1]` is not the bound address either.
+    if url.host_str() != Some("127.0.0.1") {
         return None;
     }
-    url.port_or_known_default()
+    // An omitted port means 80. We never bind 80 (privileged) and the
+    // registered redirect always carries a non-default port, so require one.
+    let port = url.port()?;
+    if port == 0 {
+        return None;
+    }
+    if url.path() != LOOPBACK_CALLBACK_PATH {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    Some(port)
+}
+
+/// How an authorised login will be completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginRedirect {
+    /// A local listener on this port receives the redirect.
+    Loopback(u16),
+    /// The OS delivers `animehub://anilist/callback` to the deep-link handler.
+    CustomScheme,
+}
+
+/// Validate the configured redirect URI BEFORE a pending OAuth state exists.
+///
+/// Both this and the callback parser ([`parse_callback`]) must agree exactly:
+/// accepting a redirect here that the callback parser (or the listener) then
+/// rejects produces a login that burns a state value and can never finish.
+/// * loopback form → [`LoginRedirect::Loopback`], served by
+///   [`LoopbackListener::bind_port`];
+/// * `animehub://anilist/callback` → [`LoginRedirect::CustomScheme`], allowed
+///   on desktop only (another app could register the scheme on Android, which
+///   is why `allow_custom_scheme` is false there);
+/// * anything else (`https://`, a remote host, a missing port, another path,
+///   a query, a fragment, userinfo) → error, and the caller must not write
+///   `pending state` or build an authorization URL.
+pub fn validate_redirect_uri(redirect_uri: &str, allow_custom_scheme: bool) -> AppResult<LoginRedirect> {
+    if let Some(port) = loopback_port(redirect_uri) {
+        return Ok(LoginRedirect::Loopback(port));
+    }
+    let url = url::Url::parse(redirect_uri)?;
+    let is_expected_custom_scheme = url.scheme() == "animehub"
+        && url.host_str() == Some("anilist")
+        && url.path() == "/callback"
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    if is_expected_custom_scheme && allow_custom_scheme {
+        return Ok(LoginRedirect::CustomScheme);
+    }
+    if is_expected_custom_scheme {
+        return Err(AppError::AniList(ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.into()));
+    }
+    Err(AppError::AniList(
+        "dönüş adresi desteklenmiyor: yalnızca http://127.0.0.1:<port>/callback \
+         veya animehub://anilist/callback kullanılabilir"
+            .into(),
+    ))
 }
 
 impl LoopbackListener {
@@ -1619,6 +1693,67 @@ mod tests {
             ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.contains("loopback")
                 || ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.contains("127.0.0.1")
         );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Redirect URI validation (must match what the listener serves)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn loopback_port_accepts_only_the_listener_endpoint() {
+        assert_eq!(loopback_port("http://127.0.0.1:17395/callback"), Some(17395));
+        // Every form below used to pass the old prefix-only check and then
+        // fail at the listener: the login burned its state and never finished.
+        for bad in [
+            "http://127.0.0.1:17395/cb",            // listener answers /callback
+            "http://127.0.0.1:17395/callback/x",
+            "http://127.0.0.1/callback",            // port 80, nothing bound
+            "http://127.0.0.1:17395/callback?a=1",  // query on the registered URI
+            "http://127.0.0.1:17395/callback#f",    // fragment
+            "http://user@127.0.0.1:17395/callback", // userinfo
+            "http://user:pw@127.0.0.1:17395/callback",
+            "http://localhost:17395/callback", // listener binds 127.0.0.1
+            "http://[::1]:17395/callback",
+            "http://127.0.0.1:0/callback",
+            "https://127.0.0.1:17395/callback", // listener is plain http
+            "animehub://anilist/callback",
+            "not a url",
+        ] {
+            assert_eq!(loopback_port(bad), None, "{bad} must not be a loopback redirect");
+        }
+    }
+
+    #[test]
+    fn validate_redirect_uri_rejects_before_state_is_written() {
+        // Accepted forms.
+        assert_eq!(
+            validate_redirect_uri("http://127.0.0.1:17395/callback", false).unwrap(),
+            LoginRedirect::Loopback(17395)
+        );
+        assert_eq!(
+            validate_redirect_uri("animehub://anilist/callback", true).unwrap(),
+            LoginRedirect::CustomScheme
+        );
+        // Custom scheme on Android (allow=false) is refused, not downgraded.
+        let refused = validate_redirect_uri("animehub://anilist/callback", false).unwrap_err();
+        assert_eq!(refused.code(), "anilist");
+        assert!(refused.to_string().contains("loopback"));
+        // Unsupported/insecure forms are refused for both platforms.
+        for bad in [
+            "https://anilist.co/callback",
+            "http://evil.example:17395/callback",
+            "http://127.0.0.1:17395/cb",
+            "http://127.0.0.1/callback",
+            "animehub://evil/callback",
+            "animehub://anilist:1234/callback",
+            "ftp://127.0.0.1:17395/callback",
+        ] {
+            assert!(
+                validate_redirect_uri(bad, true).is_err(),
+                "{bad} must be refused before a pending state is written"
+            );
+        }
     }
 
     #[test]

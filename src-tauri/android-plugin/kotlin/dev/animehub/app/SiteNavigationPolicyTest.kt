@@ -275,6 +275,89 @@ class SiteNavigationPolicyTest {
      * (`Uri.getScheme/getHost/getSchemeSpecificPart`) is three property reads in
      * `SiteNavigationPolicy.rejection(Uri)` and needs a device to verify.
      */
+    // ---------------------------------------------------------------------
+    // Top-level DNS verdicts (redirect targets)
+    // ---------------------------------------------------------------------
+
+    @Test
+    fun `top-level redirect to a resolved private address is blocked`() {
+        val gate = NavigationDnsGate()
+        // First sight of the host: the UI thread must not resolve, so the
+        // navigation is allowed AND a probe is requested.
+        assertEquals(
+            NavigationDnsGate.Decision.ALLOW_AND_PROBE,
+            gate.decide("redirector.example", 1_000L),
+        )
+        // The probe answers with loopback: the next navigation is cancelled.
+        assertEquals(
+            NavigationDnsGate.Decision.BLOCK,
+            gate.record("redirector.example", listOf("127.0.0.1"), 1_100L),
+        )
+        assertEquals(
+            NavigationDnsGate.Decision.BLOCK,
+            gate.decide("redirector.example", 1_200L),
+        )
+        // Same for a private range and a link-local metadata endpoint.
+        gate.record("lan.example", listOf("192.168.1.10"), 1_100L)
+        assertEquals(NavigationDnsGate.Decision.BLOCK, gate.decide("LAN.example.", 1_200L))
+        gate.record("meta.example", listOf("169.254.169.254"), 1_100L)
+        assertEquals(NavigationDnsGate.Decision.BLOCK, gate.decide("meta.example", 1_200L))
+    }
+
+    @Test
+    fun `public answers allow and a changed answer is blocked`() {
+        val gate = NavigationDnsGate()
+        gate.decide("site.example", 0L)
+        assertEquals(
+            NavigationDnsGate.Decision.ALLOW,
+            gate.record("site.example", listOf("93.184.216.34"), 10L),
+        )
+        assertEquals(NavigationDnsGate.Decision.ALLOW, gate.decide("site.example", 20L))
+        // Rebinding: a different public set after the first answer is refused.
+        assertEquals(
+            NavigationDnsGate.Decision.BLOCK,
+            gate.record("site.example", listOf("93.184.216.35"), 30L),
+        )
+        assertEquals(NavigationDnsGate.Decision.BLOCK, gate.decide("site.example", 40L))
+    }
+
+    @Test
+    fun `unknown hosts fail open once and are probed once`() {
+        val gate = NavigationDnsGate()
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("a.example", 0L))
+        // A second navigation while the probe is in flight must not stampede.
+        assertEquals(NavigationDnsGate.Decision.ALLOW, gate.decide("a.example", 1L))
+        // A resolver outage clears the in-flight mark and caches nothing, so a
+        // DNS problem never bricks the app.
+        gate.recordLookupFailure("a.example")
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("a.example", 2L))
+    }
+
+    @Test
+    fun `missing, ip literal and malformed hosts are blocked at the top level`() {
+        val gate = NavigationDnsGate()
+        assertEquals(NavigationDnsGate.Decision.BLOCK, gate.decide(null, 0L))
+        assertEquals(NavigationDnsGate.Decision.BLOCK, gate.decide("", 0L))
+        // IP literals are decided by SiteNavigationPolicy, not resolved here.
+        assertNull(NavigationDnsGate.normalize("127.0.0.1"))
+        assertNull(NavigationDnsGate.normalize("0x7f000001"))
+        assertNull(NavigationDnsGate.normalize("[::1]"))
+        assertEquals("site.example", NavigationDnsGate.normalize("SITE.example."))
+    }
+
+    @Test
+    fun `cached verdicts expire and honour the entry cap`() {
+        val gate = NavigationDnsGate(cacheMs = 1_000L, maxHosts = 3)
+        gate.decide("x.example", 0L)
+        gate.record("x.example", listOf("127.0.0.1"), 0L)
+        assertNull(gate.cachedVerdict("x.example", 1_000L))
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("x.example", 1_000L))
+        for (i in 0 until 10) {
+            gate.record("h$i.example", listOf("93.184.216.34"), 2_000L)
+        }
+        assertTrue(gate.size() <= 3)
+    }
+
     private fun parseVector(raw: String): SiteNavigationPolicy.NavTarget {
         val colon = raw.indexOf(':')
         if (colon <= 0) return SiteNavigationPolicy.NavTarget(null, null, null)

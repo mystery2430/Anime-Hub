@@ -518,8 +518,10 @@ pub fn set_site_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> 
 #[tauri::command]
 pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     let state = app.state::<AppState>();
-    // The WebView policy needs the current user rules BEFORE any navigation.
-    sync_android_blocklist(&state);
+    // The WebView policy needs the current user rules BEFORE any navigation,
+    // and a failed push must abort the open (fail-closed). Logging it and
+    // continuing used to leave the site running with stale or no rules.
+    sync_android_blocklist(&state)?;
     let (site, settings) = {
         let state = app.state::<AppState>();
         let reg = state
@@ -1085,7 +1087,10 @@ pub fn update_settings(
     drop(_diagnostics_guard);
     drop(_pip_guard);
     rebuild_blocklist(&state);
-    sync_android_blocklist(&state);
+    // The new rules are persisted above; if the Android WebView did not accept
+    // them, the caller must see a failure, not a refreshed settings view that
+    // implies the change took effect everywhere.
+    sync_android_blocklist(&state)?;
     get_settings(state)
 }
 
@@ -1189,6 +1194,12 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
         ));
     }
 
+    // Validate the redirect BEFORE any pending state exists. Writing state
+    // first meant an unusable URI (a path or port the listener never serves)
+    // still armed the flow, so the browser round-trip could only fail after
+    // the user had already granted access.
+    let redirect = anilist::validate_redirect_uri(&cfg.redirect_uri, cfg!(desktop))?;
+
     // A fresh, unpredictable state value; the callback must echo it.
     let state_value = uuid::Uuid::new_v4().to_string();
     let url = anilist::authorize_url(&cfg, &state_value)?;
@@ -1207,7 +1218,7 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
     // in the background and finish the login through the same events the
     // deep-link handler already uses. A custom-scheme redirect skips this:
     // the OS delivers it to the deep-link handler in lib.rs instead.
-    if let Some(port) = anilist::loopback_port(&cfg.redirect_uri) {
+    if let anilist::LoginRedirect::Loopback(port) = redirect {
         let handle = app.clone();
         let redirect_uri = cfg.redirect_uri.clone();
         tauri::async_runtime::spawn(async move {
@@ -1667,20 +1678,29 @@ fn android_blocklist_entries(list: &Blocklist) -> Vec<String> {
 ///
 /// Called before every site open and after a settings change, because the
 /// WebView evaluates the rules itself (Kotlin has no access to Rust state).
-fn sync_android_blocklist(state: &AppState) {
+///
+/// FAIL-CLOSED: this returns the transfer error instead of logging it. A site
+/// WebView must not start navigating with the previous (or no) rule set: that
+/// is silent desktop-only enforcement, which is exactly the regression R-01
+/// was supposed to close. Both call sites propagate the error — `open_site`
+/// refuses the open, `update_settings` reports the failure instead of a
+/// success.
+///
+/// The lock is recovered, never mapped to an empty rule set: an empty snapshot
+/// means "the user disabled the list" to Kotlin, so turning a poisoned lock
+/// into `vec![]` would quietly switch enforcement off.
+pub(crate) fn sync_android_blocklist(state: &AppState) -> AppResult<()> {
     #[cfg(target_os = "android")]
     {
-        // Recover a poisoned lock instead of sending an empty rule set: the old
-        // `unwrap_or_default()` silently disabled enforcement after one panic.
         let entries = android_blocklist_entries(&lock_recover(&state.blocklist));
-        if let Err(error) = crate::android_bridge::site_blocklist_update(&entries) {
-            // Enforcement must not silently regress to desktop-only.
-            log::warn!("Android blocklist could not be synchronised: {error}");
-        }
+        crate::android_bridge::site_blocklist_update(&entries)
+            .map_err(|_| AppError::BlocklistUnavailable)?;
+        Ok(())
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = state;
+        Ok(())
     }
 }
 
