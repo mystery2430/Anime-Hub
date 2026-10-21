@@ -45,6 +45,7 @@ pub fn run() {
         .setup(setup)
         .invoke_handler(tauri::generate_handler![
             commands::list_sites,
+            commands::list_hidden_sites,
             commands::add_site,
             commands::update_site,
             commands::remove_site,

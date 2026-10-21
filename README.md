@@ -393,6 +393,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | Android geri tuşu | `Esc` ile aynı davranış |
 | Site menüsü → **Düzenle** | Ad, adres, harf ve rengi değiştirir. Varsayılan olmayan sitelere fotoğraf eklenebilir |
 | Site menüsü → **Başlatıcıdan gizle** | Siteyi listeden kaldırır, verisini silmez |
+| Ayarlar → **Gizlenen siteler** → *Geri göster*          | Gizlenen siteyi başlatıcıya döndürür; gizleme veriyi silmez            |
 | Site menüsü → **Çerezleri ve site verilerini temizle** | O sitenin tüm oturum verisini yok eder |
 
 ---

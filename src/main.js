@@ -38,6 +38,7 @@ import {
 import { createBackSession } from "./logic/back_close.js";
 import { copyTextFallback } from "./logic/copy_text.js";
 import { clearResultMessage, takeMigrationNotice } from "./logic/storage_scope.js";
+import { hasNoHiddenSites, hiddenSiteRows } from "./logic/hidden_sites.js";
 import {
   sanitizeDebugLogSnapshot,
   serializeDebugLogSnapshot,
@@ -86,6 +87,8 @@ const el = {
     anilistRedirect: document.getElementById("set-anilist-redirect"),
     anilistStatus: document.getElementById("anilist-status"),
     keyHint: document.getElementById("key-backend-hint"),
+    hiddenSites: document.getElementById("hidden-sites"),
+    hiddenSitesEmpty: document.getElementById("hidden-sites-empty"),
   },
   btnSaveBlocklist: document.getElementById("btn-save-blocklist"),
   btnResetBlocklist: document.getElementById("btn-reset-blocklist"),
@@ -770,6 +773,56 @@ async function applyPlatformVisibility() {
   });
 }
 
+/**
+ * Render the hidden-site restore list.
+ *
+ * «Başlatıcıdan gizle» keeps the entry, so hiding must be reversible from the
+ * UI: `list_sites` only returns the visible grid, and `list_hidden_sites` is
+ * the read that makes `set_site_hidden(id, false)` reachable at all. Every
+ * value goes through textContent — the repo rule is no innerHTML anywhere.
+ */
+async function refreshHiddenSites() {
+  const list = el.settings.hiddenSites;
+  if (!list) return;
+  let sites = [];
+  try {
+    sites = await call("list_hidden_sites");
+  } catch {
+    // Browser mode without the command, or an older backend: show nothing
+    // rather than a broken section.
+    sites = [];
+  }
+  const rows = hiddenSiteRows(sites);
+  list.replaceChildren();
+  if (el.settings.hiddenSitesEmpty) {
+    el.settings.hiddenSitesEmpty.hidden = !hasNoHiddenSites(sites);
+  }
+  for (const row of rows) {
+    const item = document.createElement("li");
+    item.className = "hidden-site";
+    const name = document.createElement("span");
+    name.textContent = row.name;
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "btn ghost";
+    restore.textContent = "Geri göster";
+    restore.addEventListener("click", async () => {
+      restore.disabled = true;
+      try {
+        await call("set_site_hidden", { id: row.id, hidden: false });
+        await refreshLauncher();
+        await refreshHiddenSites();
+        showNotice(`${row.name} başlatıcıya geri eklendi.`, "info");
+      } catch (e) {
+        showNotice(errMessage(e));
+        restore.disabled = false;
+      }
+    });
+    item.append(name, restore);
+    list.append(item);
+  }
+}
+
 async function openSettings() {
   try {
     await applyPlatformVisibility();
@@ -798,6 +851,7 @@ async function openSettings() {
     el.settings.anilistStatus.dataset.state = s.anilist.configured ? "ok" : "";
     el.btnAnilistLogin.disabled = !s.anilist.configured;
     openModal(el.modalSettings);
+    await refreshHiddenSites();
     await refreshAniListStatus();
     if (s.developerOptions) await refreshDevLog();
   } catch (e) {

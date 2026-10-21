@@ -452,13 +452,21 @@ def prepare(root: Path, gen: Path) -> list[str]:
     notes.append(f"copied {class_name}.kt -> {target}")
 
     # Saf IP policy – Android bagimliligi yok, APK ve unit test ortak kullanir
+    # REQUIRED: SiteNavigationPolicy delegates every numeric-host decision to
+    # IpPolicy, so a missing file is an unresolvable reference, not a soft
+    # degradation. Package-checked like the controller.
     ip_policy_src = kotlin_source(root, package, "IpPolicy")
-    if ip_policy_src.is_file():
-        ip_target = dest / "IpPolicy.kt"
-        ip_target.write_text(ip_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
-        notes.append(f"copied IpPolicy.kt -> {ip_target}")
-    else:
-        notes.append(f"warning: IpPolicy.kt not found at {ip_policy_src}")
+    if not ip_policy_src.is_file():
+        raise SystemExit(f"IpPolicy.kt not found at {ip_policy_src}")
+    ip_policy_pkg = package_of(ip_policy_src)
+    if ip_policy_pkg != package:
+        raise SystemExit(
+            f"Kotlin package {ip_policy_pkg!r} != register_android_plugin package {package!r} "
+            f"({ip_policy_src})"
+        )
+    ip_target = dest / "IpPolicy.kt"
+    ip_target.write_text(ip_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
+    notes.append(f"copied IpPolicy.kt -> {ip_target}")
 
     # The per-site WebView/profile controller: required, the plugin's site
     # commands have no other implementation.
@@ -477,13 +485,23 @@ def prepare(root: Path, gen: Path) -> list[str]:
     )
     notes.append(f"copied {SITE_CONTROLLER_CLASS}.kt -> {site_controller_target}")
 
+    # REQUIRED, like every other unit: SiteNavigationPolicy.kt is the class the
+    # guard and the controller call on every navigation, and the blocklist is
+    # resolved from it. A "warning" here used to let the copy silently shrink,
+    # and the next Gradle run failed with an unresolved reference instead of
+    # this script's clear message.
     site_policy_src = kotlin_source(root, package, "SiteNavigationPolicy")
-    if site_policy_src.is_file():
-        site_target = dest / "SiteNavigationPolicy.kt"
-        site_target.write_text(site_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
-        notes.append(f"copied SiteNavigationPolicy.kt -> {site_target}")
-    else:
-        notes.append(f"warning: SiteNavigationPolicy.kt not found at {site_policy_src}")
+    if not site_policy_src.is_file():
+        raise SystemExit(f"SiteNavigationPolicy.kt not found at {site_policy_src}")
+    site_policy_pkg = package_of(site_policy_src)
+    if site_policy_pkg != package:
+        raise SystemExit(
+            f"Kotlin package {site_policy_pkg!r} != register_android_plugin package {package!r} "
+            f"({site_policy_src})"
+        )
+    site_target = dest / "SiteNavigationPolicy.kt"
+    site_target.write_text(site_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
+    notes.append(f"copied SiteNavigationPolicy.kt -> {site_target}")
 
     # Auxiliary units the bridge/controller depend on. They used to live
     # INSIDE AnimeHubPlugin.kt; after the split each is its own file and is

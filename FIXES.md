@@ -29,6 +29,24 @@ Not re-verified in this round: the reviewing environment had no Rust or Kotlin
 toolchain, so `cargo test`, `cargo clippy -D warnings` and the Gradle unit tests
 were not run here. `npm test` (250 tests) passes.
 
+## Review round 5 — reachability and build-input audit
+
+| Review id | Finding | Fix | Evidence |
+| --- | --- | --- | --- |
+| BUG-05 | «Başlatıcıdan gizle»yi tersine çevirmenin hiçbir yolu yoktu. `remove_site` bir built-in'i `Reg.is_hidden = true` yapıyor (veri silinmiyor), ama `list_sites` yalnızca `visible()` döndürüyor ve `set_site_hidden` komutunun frontend'de **tek bir çağıranı yoktu**. Yani gizlenen built-in UI'dan bir daha adlandırılamıyordu; geri getirmenin tek yolu şifreli yapılandırmayı silmekti (AniList token'ları ve tüm ayarlarla birlikte). | `Registry::hidden()` + `list_hidden_sites` komutu (kayıtlı), Ayarlar → «Gizlenen siteler» bölümü ve `set_site_hidden(id, false)` çağıran «Geri göster» düğmesi. Tarayıcı modu stub'ı da artık built-in'i **silmek yerine gizliyor**. | `sites/registry.rs`, `commands.rs`, `lib.rs`, `src/main.js`, `index.html`, `src/styles.css`, `src/logic/bridge.js`, `src/logic/hidden_sites.js` |
+| BUG-06 | `android_prepare.py` iki Kotlin dosyasını (`IpPolicy.kt`, `SiteNavigationPolicy.kt`) «bulunamadı» **uyarısıyla** atlıyordu. Bu dosyalar `SiteNavigationPolicy`/guard tarafından her gezinmede kullanılıyor; eksik kopya, anlaşılır betik hatası yerine Gradle'da çözülemeyen referans olarak patlıyordu. | İkisi de diğer zorunlu birimler gibi sert hata + paket doğrulaması. | `scripts/android_prepare.py` |
+| VER-03 | Reachability regresyonunu kilitleyen testler: kayıtlı her komutun `commands.rs`'te tanımlı olması, frontend'in çağırdığı her komutun kayıtlı olması, `list_hidden_sites`/`set_site_hidden` çiftinin korunması ve prepare betiğinin zorunlu Kotlin birimleri. | 4 test + 6 gizli-site görünüm modeli testi (`hidden_sites.js`). | `tests/command_wiring.test.js`, `tests/hidden_sites.test.js` |
+
+Round 5'te yeniden bakılıp **temiz** bulunanlar: `embed_json` (JSON içindeki
+`</script`, U+2028/U+2029 kaçışları), `profile_dir_name` id temizliği (yol
+geçişi yok), Android `LauncherIpc` origin denetimi (şema+host+port+yol+query+
+fragment+userInfo, yalnız ana çerçeve), `Registry::ensure_builtins` (gizli
+built-in'i geri getirmiyor), `remove_site`'ın iki platformdaki built-in kolu
+(profil silmeden gizleme).
+
+Doğrulanamayan: Rust/Kotlin araç zinciri bu ortamda yok; `cargo test`,
+`clippy` ve Gradle birim testleri koşmadı. `node --test` (256 test) geçti.
+
 ## Remaining release gates
 
 - **DNS rebinding TOCTOU** still needs a connection-pinning network layer.

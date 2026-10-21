@@ -46,6 +46,13 @@ The rule text stays in Rust; the WebView receives a parsed snapshot. A
 `is_blocked` honours. Previously the rules were pushed while disabled, so
 Android kept blocking after the user turned the list off.
 
+### Hidden sites are reversible again
+
+`list_sites` returns the visible grid only, so the restore path needs its own
+read: `list_hidden_sites` plus `set_site_hidden(id, false)` from
+Ayarlar → Gizlenen siteler. Hiding still keeps the entry, its icon and its
+profile; nothing is deleted either way.
+
 ### Poisoned locks
 
 `commands::lock_recover` takes the guard out of a poisoned mutex instead of

@@ -229,6 +229,20 @@ pub fn list_sites(state: State<'_, AppState>) -> AppResult<Vec<SiteView>> {
     Ok(reg.visible().iter().map(|s| to_view(s, native)).collect())
 }
 
+/// Hidden entries, so «Başlatıcıdan gizle» is not a one-way door.
+///
+/// `list_sites` deliberately returns only the visible grid; without this
+/// companion the hidden list was write-only. Nothing about a hidden site's
+/// data is touched here — it is a read of the encrypted registry.
+#[tauri::command]
+pub fn list_hidden_sites(state: State<'_, AppState>) -> AppResult<Vec<SiteView>> {
+    let reg = state
+        .registry
+        .lock()
+        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+    Ok(reg.hidden().iter().map(|s| to_view(s, false)).collect())
+}
+
 #[tauri::command]
 pub fn add_site(state: State<'_, AppState>, draft: SiteDraft) -> AppResult<SiteView> {
     let site = {
