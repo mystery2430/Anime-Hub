@@ -934,6 +934,44 @@ fn queued_site_profile_prefix(site_id: &str) -> String {
         .to_string()
 }
 
+/// Whether a legacy jar entry belongs to the site being opened.
+///
+/// The 0.3.4 jar was captured from the shared WebView's whole cookie store, so
+/// it can contain cookies for CDN/player/ad origins that a profile-scoped
+/// `setCookie(site_url, …)` will reject. Replaying those turned one rejected
+/// third-party cookie into a permanent `migration-partial` loop. Migration is
+/// therefore restricted to cookies the target site can actually own:
+/// host-only entries (no Domain attribute) and entries whose Domain is the
+/// site host or one of its parents. Anything else is intentionally not
+/// migrated and is reported by count, not treated as a failure.
+///
+/// A URL that does not parse is fail-closed here: no cookie is imported.
+pub fn cookie_belongs_to_site(stored: &crate::web::session::StoredCookie, site_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(site_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(|h| h.to_lowercase()) else {
+        return false;
+    };
+    if host.is_empty() {
+        return false;
+    }
+    let Some(domain) = stored
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    else {
+        // No Domain attribute: a host-only cookie captured for this site.
+        return true;
+    };
+    let domain = domain.trim_start_matches('.').to_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
 /// The persisted generation for `site_id` (0 when never bumped).
 ///
 /// A corrupt value is recovered from the pending-delete queue instead of
@@ -1455,9 +1493,14 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
         if let Some(bytes) = state.provider.get_secret(&format!("cookies-{site_id}"))? {
             let jar: CookieJar = serde_json::from_slice(&bytes)?;
             let now = crate::anilist::now_unix();
-            for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
-                // Qualified: the `restore` import is iOS-only, and this
-                // protocol body is host-compiled (and host-tested).
+            // Third-party jar entries are skipped BEFORE the provider sees
+            // them: setCookie(site_url, …) rejects a foreign Domain, and a
+            // single rejection used to retire the profile and retry forever.
+            for stored in jar
+                .cookies
+                .iter()
+                .filter(|c| c.is_live(now) && cookie_belongs_to_site(c, url))
+            {
                 if let Some(cookie) = crate::web::session::restore(stored) {
                     cookie_headers.push(cookie.to_string());
                 }
@@ -7000,6 +7043,73 @@ mod tests {
             .get_secret(&format!("profilemig-{id}"))
             .unwrap()
             .is_some());
+    }
+
+    fn cookie_for_test(
+        name: &str,
+        domain: Option<&str>,
+        expires: Option<i64>,
+    ) -> crate::web::session::StoredCookie {
+        crate::web::session::StoredCookie {
+            name: name.into(),
+            value: "x".into(),
+            domain: domain.map(str::to_string),
+            path: Some("/".into()),
+            expires,
+            secure: true,
+            http_only: true,
+            same_site: Some("Lax".into()),
+        }
+    }
+
+    #[test]
+    fn migration_imports_only_cookies_the_target_site_can_own() {
+        let host_only = cookie_for_test("session", None, None);
+        let parent = cookie_for_test("parent", Some(".example.com"), None);
+        let exact = cookie_for_test("exact", Some("a.example.com"), None);
+        let cdna = cookie_for_test("cdn", Some(".cdn.example.net"), None);
+        let attacker = cookie_for_test("sibling", Some(".evil-example.com"), None);
+        let empty_domain = cookie_for_test("empty", Some(""), None);
+        for allowed in [&host_only, &parent, &exact] {
+            assert!(cookie_belongs_to_site(
+                allowed,
+                "https://a.example.com/watch/1"
+            ));
+        }
+        for refused in [&cdna, &attacker, &empty_domain] {
+            assert!(!cookie_belongs_to_site(
+                refused,
+                "https://a.example.com/watch/1"
+            ));
+        }
+        assert!(!cookie_belongs_to_site(&host_only, "not a url"));
+        assert!(!cookie_belongs_to_site(&host_only, "file:///tmp/x"));
+    }
+
+    #[test]
+    fn third_party_jar_cookies_never_reach_the_migration_port() {
+        let (state, fail_flag, _writes) = failing_flag_state();
+        fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        let id = "user-third-party";
+        let jar = CookieJar {
+            site_id: id.into(),
+            saved_at: crate::anilist::now_unix(),
+            cookies: vec![
+                cookie_for_test("own", None, None),
+                cookie_for_test("parent", Some(".example.com"), None),
+                cookie_for_test("player", Some(".player-cdn.example"), None),
+                cookie_for_test("ad", Some(".ads.example.net"), None),
+            ],
+        };
+        state
+            .provider
+            .put_secret(&format!("cookies-{id}"), &serde_json::to_vec(&jar).unwrap())
+            .unwrap();
+        let mut ops = ScriptedOpenOps::ok();
+        run_mobile_open_protocol(&state, id, "https://a.example.com/watch/1", "", &mut ops)
+            .unwrap();
+        assert_eq!(ops.cookies_seen, vec![2]);
+        assert!(ops.calls.iter().any(|call| call == "open:site-"));
     }
 
     #[test]

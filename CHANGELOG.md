@@ -1,3 +1,28 @@
+## [Unreleased] — PR #27 review follow-ups
+
+### Security
+
+- Android native AniList login is loopback-only; the mobile `animehub://`
+  intent filter is removed so no OAuth code/state intent exists to intercept.
+- The user blocklist is pushed into the Android WebView and enforced for both
+  top-level navigations and sub-resources.
+- DNS pre-check refuses private answers and changed public answers (rebinding
+  detection). The residual TOCTOU window is documented.
+- Capability description corrected to the native per-site WebView model.
+
+### Fixed
+
+- 0.3.4 cookie migration keeps only host-ownable cookies and skips provider
+  rejections instead of locking the site out.
+- Stuck flush worker is replaced after a measured stall.
+- `minSdkVersion` raised to 29 (Android 10).
+
+### Supply chain / build
+
+- All external GitHub Actions pinned to commit SHAs with a test guard.
+- `android_prepare.py` validates unique Gradle pins; CI verifies the resolved
+  dependency graph.
+
 # Changelog
 
 Notable user-facing changes are recorded here. Production assets are built and checked before the matching tag and public release are created.

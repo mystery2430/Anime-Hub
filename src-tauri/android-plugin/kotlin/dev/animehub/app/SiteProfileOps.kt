@@ -186,6 +186,33 @@ object WatchdogArming {
 }
 
 /**
+ * Circuit-breaker policy for the single blocking-flush worker.
+ *
+ * Provider `flush()` offers no cancellation: once it blocks, the worker thread
+ * can stay busy forever. Logging a warning made the pile-up observable but left
+ * every later close/clear/migration queued behind a call that may never return.
+ * After [REPLACE_AFTER_MS] the worker is replaced — the old daemon thread is
+ * abandoned, its queue discarded, and a fresh single-thread executor serves the
+ * next work. This is the one deliberate exception to "never spawn more
+ * threads": only after a bounded, measured stall, and still ONE thread.
+ */
+object FlushRecovery {
+  /** First diagnostic warning; operations still queue normally. */
+  const val WARN_AFTER_MS: Long = 10_000
+
+  /** After this stall the next submission replaces the worker. */
+  const val REPLACE_AFTER_MS: Long = 30_000
+
+  /** `true` only for a real, measured stall at/after the hard threshold. */
+  fun shouldReplace(busySince: Long, now: Long): Boolean =
+    busySince > 0L && now >= busySince && now - busySince >= REPLACE_AFTER_MS
+
+  /** Milliseconds the worker has been busy, clamped to zero. */
+  fun stuckFor(busySince: Long, now: Long): Long =
+    if (busySince <= 0L || now < busySince) 0L else now - busySince
+}
+
+/**
  * Validity token for ONE awaited step: the cancellation flag a port must
  * consult before it mutates profile data.
  *

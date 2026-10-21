@@ -45,7 +45,7 @@ pub fn keystore_open(purpose: &str, sealed: &str) -> AppResult<Vec<u8>> {
 /// support. Deliberately explicit: the site is refused rather than opened on
 /// the shared default profile, because "open but not isolated" would silently
 /// reintroduce the cross-site data mixing this feature removes.
-pub const MULTI_PROFILE_UNSUPPORTED_MSG: &str = "Bu cihazın WebView sağlayıcısı çoklu profil (MULTI_PROFILE) desteği sunmuyor; site verileri izole edilemediği için site açılamadı. Android System WebView veya Google Chrome'u güncelleyin; güncelleme sonrası da devam ederse bu cihaz bu özelliği desteklemiyor olabilir.";
+pub const MULTI_PROFILE_UNSUPPORTED_MSG: &str = "Bu cihazın WebView sağlayıcısı çoklu profil (MULTI_PROFILE) desteği sunmuyor; site verileri izole edilemediği için site açılamadı. AnimeHub Android 10 (API 29) ve üzeri ile güncel bir Android System WebView gerektirir. WebView veya Google Chrome'u güncelleyin; güncelleme sonrası da devam ederse bu cihaz bu özelliği desteklemiyor olabilir.";
 
 /// User-facing explanation when Kotlin refuses a *quarantined* profile: an
 /// in-place wipe timed out on `removeAllCookies`, a destructive provider call
@@ -443,6 +443,25 @@ pub fn site_flush() -> AppResult<()> {
             );
             Err(AppError::Other("site profile flush failed".into()))
         }
+    }
+}
+
+/// Replace the blocklist snapshot evaluated by the Android site WebView.
+///
+/// Best-effort but logged: a failed push means the built-in host/IP rules still
+/// apply, while the user blocklist would silently regress to desktop-only.
+/// Callers must never open a site before this returns.
+pub fn site_blocklist_update(entries: &[String]) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        let operation_id = crate::diagnostics::current_or_new_operation_id();
+        animehub_android::site_blocklist_update(operation_id.as_str().to_owned(), entries.to_vec())
+            .map_err(|_| AppError::Other("Android blocklist could not be updated".into()))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = entries;
+        Ok(())
     }
 }
 

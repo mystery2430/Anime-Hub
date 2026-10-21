@@ -11,8 +11,11 @@ import android.graphics.Bitmap
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.os.SystemClock
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Top-level navigation guard for the shared site WebView (Android only).
@@ -34,15 +37,22 @@ import android.webkit.WebViewClient
  *    does and does not catch).
  *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
  *    `open_on_mobile` already validates the first URL).
- *  - Not covered: DNS rebinding and the user blocklist. No DNS runs here — a
- *    pre-check would be TOCTOU against the engine's own resolution — and the
- *    Rust blocklist is not plumbed to the WebView yet. Both are documented open
- *    limitations, not protection.
+ *  - Partially covered: DNS rebinding. `shouldInterceptRequest` resolves the
+ *    host (short, bounded cache) and refuses a non-empty answer containing a
+ *    private/loopback/link-local address, or a public answer that differs from
+ *    the pinned first answer. This is defence in depth, not a complete fix:
+ *    the engine resolves again when it connects (TOCTOU). See
+ *    `docs/security-residual-risks.md`.
+ *  - Blocklist: the user's Rust rules are pushed into [SiteBlocklist] before
+ *    every open; both the top-level and sub-resource checkpoints consult it.
  *
  * Every other callback is forwarded unchanged, so wry's custom-protocol
  * handling, the IPC page-started tracking and the error recovery keep working.
  */
 class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
+
+  /** Hostname → (blocked?, monotonic check time, pinned public set). */
+  private val resolutions = ConcurrentHashMap<String, Resolution>()
 
   override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
     val uri = request.url
@@ -59,13 +69,14 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
    * Sub-resource checkpoint: refuse cleartext and private/loopback/reserved
    * hosts for every request the WebView makes, not just top-level navigations.
    *
-   * Deliberately NO DNS lookup here. Returning null hands the request back to
-   * the engine, which resolves and connects by itself, so a lookup would be a
-   * TOCTOU check a rebinding hostname defeats — plus latency on every request.
-   * What is caught: IP literals and the host rules in [SiteNavigationPolicy].
-   * What is not: a hostname that resolves to a private address, and the user
-   * blocklist (not plumbed to the WebView yet). Both are documented as open
-   * limitations instead of being claimed as protection.
+   * A hostname is resolved before the request is handed to the engine, and
+   * requests whose answer contains ANY private/loopback/link-local address —
+   * or a different public set after the first check — are refused. The
+   * engine's own later resolution keeps a TOCTOU window, documented in
+   * `docs/security-residual-risks.md` and NOT claimed as fixed.
+   *
+   * The cache is per-process, keyed by hostname, and bounded. A resolver
+   * failure is fail-open: a DNS outage must not brick every site.
    *
    * Runs on the WebView's background thread, never the UI thread.
    */
@@ -79,7 +90,61 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
       // Keep the existing fail-closed response, without per-request logging.
       return blockedResponse()
     }
+    if (resolvesToPrivateAddress(uri)) {
+      return blockedResponse()
+    }
     return inner.shouldInterceptRequest(view, request)
+  }
+
+  /**
+   * Best-effort DNS pre-check. `shouldInterceptRequest` runs on a WebView
+   * background thread, so the resolver call cannot block the UI.
+   */
+  private fun resolvesToPrivateAddress(uri: android.net.Uri): Boolean {
+    val scheme = uri.scheme?.lowercase() ?: return false
+    if (scheme != "https" && scheme != "wss") return false
+    val host = uri.host?.lowercase()?.trimEnd('.') ?: return false
+    if (host.isEmpty()) return false
+    // IP literals are already covered by the pure policy; skip the resolver.
+    val bare = host.removePrefix("[").removeSuffix("]")
+    if (bare.contains(':') || bare.all { it.isDigit() || it == '.' }) return false
+    val now = SystemClock.elapsedRealtime()
+    cachedResolution(host)?.let { cached ->
+      if (now - cached.checkedAt < DNS_CACHE_MS) return cached.privateAddress
+    }
+    val previous = cachedResolution(host)?.pinnedPublic
+    val answer =
+      try {
+        InetAddress.getAllByName(host).mapNotNull { it.hostAddress }
+      } catch (_: Exception) {
+        // Resolver unavailable: do not turn a network outage into a local block.
+        return false
+      }
+    if (answer.isEmpty()) return false
+    val verdict = SiteNavigationPolicy.ResolvedHostPolicy.classify(previous, answer)
+    val blocked = verdict != SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW
+    val pinned =
+      if (verdict == SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW) {
+        previous ?: answer.map { it.substringBefore('%').trim() }.toSet()
+      } else {
+        previous
+      }
+    if (resolutions.size > MAX_CACHED_HOSTS) resolutions.clear()
+    resolutions[host] = Resolution(blocked, now, pinned)
+    return blocked
+  }
+
+  private fun cachedResolution(host: String): Resolution? = resolutions[host]
+
+  private data class Resolution(
+    val privateAddress: Boolean,
+    val checkedAt: Long,
+    val pinnedPublic: Set<String>? = null,
+  )
+
+  private companion object {
+    const val DNS_CACHE_MS = 60_000L
+    const val MAX_CACHED_HOSTS = 256
   }
 
   /**

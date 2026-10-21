@@ -40,7 +40,8 @@ the WebView is created and is keyed by WebView id (`URL_LOADING_OVERRIDE` in wry
 Tauri calls `load()` from `on_webview_created`, which runs after wry calls
 `setWebViewClient(RustWebViewClient)` (wry `src/android/main_pipe.rs`). So the
 guard wraps wry's client, not a default one. `WebView.getWebViewClient()` is
-public from API 26, which matches `minSdkVersion` 26.
+public from API 26; the app requires `minSdkVersion` 29 because
+MULTI_PROFILE needs the multi-process WebView available from Android 10.
 
 The *first* `loadUrl` for the launcher URL runs before `addJavascriptInterface` and
 before `on_webview_created` (see wry `main_pipe.rs` order below). That initial

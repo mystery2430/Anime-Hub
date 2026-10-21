@@ -53,7 +53,7 @@ PIP_CONTROLLER_CLASS = "AnimeHubPipController"
 # template ships its own version of this dependency; this script *replaces*
 # it (or adds it once) so the build does not depend on which CLI version
 # generated the project. 1.16.0 is the researched current stable, minSdk 24
-# against the app's pinned minSdk 26. No RC/alpha.
+# against the app's pinned minSdk 29 (Android 10+). No RC/alpha.
 #
 # VERSION ALIGNMENT (do not "fix" one side alone): 1.16.0 declares
 # org.jetbrains.kotlin:kotlin-stdlib:2.1.20. Gradle's highest-wins resolution
@@ -75,6 +75,34 @@ WEBKIT_DEP_RE = re.compile(r'implementation\(\s*"androidx\.webkit:webkit:[^"]+"\
 # wrapper) and AGP 8.11.0 both support Kotlin 2.1.
 KGP_PIN = 'classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.20")'
 KGP_DEP_RE = re.compile(r'classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]+"\)')
+def verify_pin_state(root_gradle: Path, app_gradle: Path) -> None:
+    """Fail if a pin is duplicated, missing or stale.
+
+    The old string/regex replacement could silently no-op when the generated
+    template changed shape, or add a second classpath. A pin that is not exactly
+    one occurrence is a broken build, not a note.
+    """
+    app_text = app_gradle.read_text(encoding="utf-8")
+    if app_text.count(WEBKIT_PIN) != 1:
+        raise SystemExit(
+            "androidx.webkit pin is not exactly one occurrence in "
+            f"{app_gradle}; expected {WEBKIT_PIN!r}"
+        )
+    if app_text.count("androidx.webkit:webkit:") != 1:
+        raise SystemExit(f"expected exactly one androidx.webkit dependency in {app_gradle}")
+    if root_gradle.is_file():
+        root_text = root_gradle.read_text(encoding="utf-8")
+        if root_text.count(KGP_PIN) != 1:
+            raise SystemExit(
+                "kotlin-gradle-plugin pin is not exactly one occurrence in "
+                f"{root_gradle}; expected {KGP_PIN!r}"
+            )
+        if root_text.count("kotlin-gradle-plugin:") != 1:
+            raise SystemExit(
+                f"expected exactly one kotlin-gradle-plugin classpath in {root_gradle}"
+            )
+
+
 PIP_CONTROLLER_JS_REL = ("src-tauri", "src", "web", "pip_controller.js")
 PIP_CONTROLLER_KT_REL = ("src-tauri", "android-plugin", "kotlin")
 PIP_JS_PLACEHOLDER = "__ANIMEHUB_PIP_CONTROLLER_JS__"
@@ -472,6 +500,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
         "SiteNavigationGuard",
         "SiteWebViewSettings",
         "SiteProfileOps",
+        "SiteBlocklist",
         "ProfileQuarantine",
         "SiteCloseFlow",
         "SiteShutdownFlow",
@@ -595,6 +624,9 @@ def prepare(root: Path, gen: Path) -> list[str]:
         notes.append(f"injected release signing config into {gradle}")
     if gradle_changed:
         gradle.write_text(text, encoding="utf-8")
+
+    verify_pin_state(root_gradle, gradle)
+    notes.append("verified: exactly one webkit pin and one Kotlin plugin pin")
     return notes
 
 

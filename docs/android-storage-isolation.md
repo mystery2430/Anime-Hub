@@ -144,7 +144,8 @@ contract in the generated project, idempotently:
 
 1. `androidx.webkit:webkit:1.16.0` in `app/build.gradle.kts` — the researched
    current stable (May 2026), multi-profile APIs stable since androidx.webkit
-   1.9.0, minSdk 24 against the app's pinned `minSdkVersion: 26`; no RC/alpha.
+   1.9.0, minSdk 24 against the app's pinned `minSdkVersion: 29`; no RC/alpha.
+   API 29 is the MULTI_PROFILE baseline (multi-process WebView).
    The template's own version (1.14.0 on Tauri CLI 2.11) is *replaced*, never
    stacked.
 2. `kotlin-gradle-plugin:2.1.20` in the root `build.gradle.kts`, raised from
@@ -200,7 +201,7 @@ cookies are untouched.
 
 | 0.3.4 data | Migrated? | How / why |
 | --- | --- | --- |
-| Encrypted cookie jar (`cookies-<site_id>`) | **Yes, once, strictly** | On the first open of a site under the new version, while the profile does not exist yet: Rust reads the jar (expired cookies pruned) and passes the `Set-Cookie` headers to **`site_migrate`** (phase 1 — no WebView is created); Kotlin writes them through the **profile's** `Profile.getCookieManager()` (never the static default-profile manager) and waits for every `setCookie` callback **and** the background `flush()`, with per-cookie and flush timeouts. Only after that full success does Rust write the `profilemig-<site_id>` flag — **durably, before phase 2 (`site_open`) constructs the WebView and navigates**. A failed flag write therefore aborts the open with a visible, retryable error while nothing has been shown: no orphan view, no split Rust/Kotlin ownership, jar and (missing) flag untouched for the next attempt. Any rejection, exception, lost callback, flush failure — or an already-existing profile, whose live cookies are authoritative and must not be overwritten — fails phase 1 with the `migration-partial` sentinel: Rust queues that virgin name for deletion, bumps the generation and retries **once** on a fresh name; a second failure surfaces a visible, retryable error ("site çerezleri profiline taşınamadı …") with the flag and the jar **both kept**, so the next open starts the migration over. Because the flag is durable before any view exists, a `migration-partial` on reopen can only ever retire a profile the user has **not** seen — a shown profile is never queued or rebuilt from the stale jar. A partially imported profile can therefore never pass as complete, and the legacy jar survives until a real success (or until the user's own clear/remove drops it). |
+| Encrypted cookie jar (`cookies-<site_id>`) | **Yes, once, filtered** | On the first open of a site under the new version: Rust prunes expired entries and keeps only cookies the target host can own (host-only, or Domain equal to / a parent of the site host). Third-party ad/CDN entries are dropped before the provider call because `setCookie(site_url, …)` rejects a foreign Domain. Kotlin writes the rest through the **profile's** cookie manager, skips individual provider rejections, and the durable `flush()` is the success criterion; only then is `profilemig-<site_id>` written, before phase 2 (`site_open`). | A failed flag write therefore aborts the open with a visible, retryable error while nothing has been shown: no orphan view, no split Rust/Kotlin ownership, jar and (missing) flag untouched for the next attempt. Any rejection, exception, lost callback, flush failure — or an already-existing profile, whose live cookies are authoritative and must not be overwritten — fails phase 1 with the `migration-partial` sentinel: Rust queues that virgin name for deletion, bumps the generation and retries **once** on a fresh name; a second failure surfaces a visible, retryable error ("site çerezleri profiline taşınamadı …") with the flag and the jar **both kept**, so the next open starts the migration over. Because the flag is durable before any view exists, a `migration-partial` on reopen can only ever retire a profile the user has **not** seen — a shown profile is never queued or rebuilt from the stale jar. A partially imported profile can therefore never pass as complete, and the legacy jar survives until a real success (or until the user's own clear/remove drops it). |
 | `localStorage` snapshot (`localstorage-<site_id>`) | **No** | Only imported when origin verification, completion confirmation and data safety can all be guaranteed — they cannot be, without reviving the origin TOCTOU of the old import path (write lands in whichever document is loaded) and without keeping the JS-eval bridge this change deletes. The blobs are **kept on disk** (not deleted early) until the user clears or removes that site; they are simply never re-injected. |
 | IndexedDB snapshot (`indexeddb-<site_id>`) | **No, deliberately** | The dump was lossy (indexes, key paths, structured-clone/Blob values do not round-trip) and is never silently re-imported. Kept on disk like the localStorage snapshot, removed only by the user's own clear/delete. |
 
@@ -745,8 +746,8 @@ verified to fail these tests. **No physical device or emulator was used.**
   failures even when the probe would say "empty", the `hasCookies()` inversion,
   a throwing probe staying `null`, and all three provider store states driven
   through the real flow end to end),
-  the strict migration criterion (virgin-only, every cookie + flush,
-  rejection/exception/flush/watchdog failures, exactly-once),
+  the migration criterion (virgin-only, host-domain filtering, rejected
+  entries skipped, flush/watchdog failures fatal, exactly-once),
   session-slot rollback after a failed open (stale failure cannot clear a
   newer session), and the back-status decision matrix. These catch the
   real error paths A.1–A.5 were about; the controller only *wires* them.

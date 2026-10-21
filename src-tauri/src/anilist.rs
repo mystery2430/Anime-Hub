@@ -61,6 +61,26 @@ impl AniListConfig {
     }
 }
 
+/// The only redirect an Android build may use for native OAuth.
+///
+/// A custom-scheme redirect (`animehub://anilist/callback`) can be claimed by
+/// another installed app: the OS delivers the intent — including both `code`
+/// and `state` — to that app, so single-use state validation cannot help. Until
+/// AniList offers a verified App Link/PKCE flow, Android therefore uses the
+/// same loopback listener as desktop. A custom-scheme redirect is refused
+/// BEFORE a login is started, and the mobile deep-link registration is gone, so
+/// a hostile app has no intent to intercept.
+pub fn mobile_native_login_allowed(redirect_uri: &str) -> bool {
+    loopback_port(redirect_uri).is_some()
+}
+
+/// User-facing refusal for an unsafe Android redirect. Never contains the
+/// redirect value itself (it may carry a hostile host or credentials).
+pub const ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED: &str =
+    "Android'de güvenli AniList girişi yalnızca yerel geri dönüş adresiyle \
+     (http://127.0.0.1:PORT/callback) desteklenir. Özel şema (animehub://) \
+     başka uygulamalar tarafından ele geçirilebildiği için kapatıldı.";
+
 /// Build the authorization URL the user is sent to.
 ///
 /// `state` must be a fresh, unpredictable value; the callback handler rejects
@@ -1575,6 +1595,30 @@ mod tests {
         // A nonsensical ANILIST_REDIRECT_URI must fail closed rather than
         // silently widening the check.
         assert!(parse_callback(LOOPBACK, "not a uri").is_err());
+    }
+
+    #[test]
+    fn mobile_native_login_requires_a_loopback_redirect() {
+        // A registered custom scheme is claimable by another app; the OS hands
+        // it the code and the state, so this must never be a login redirect.
+        assert!(!mobile_native_login_allowed("animehub://anilist/callback"));
+        assert!(!mobile_native_login_allowed("animehub://attacker/callback"));
+        assert!(!mobile_native_login_allowed(
+            "https://127.0.0.1:17395/callback"
+        ));
+        assert!(!mobile_native_login_allowed("http://example.com/callback"));
+        assert!(!mobile_native_login_allowed("not a url"));
+        assert!(mobile_native_login_allowed(
+            "http://127.0.0.1:17395/callback"
+        ));
+        assert!(mobile_native_login_allowed(
+            "http://localhost:17395/callback"
+        ));
+        // The refusal is fixed text: it must never echo the hostile redirect.
+        assert!(
+            ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.contains("loopback")
+                || ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.contains("127.0.0.1")
+        );
     }
 
     #[test]

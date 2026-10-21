@@ -111,6 +111,11 @@ pub const CMD_SITE_CLEAR_DATA: &str = "site_clear_data";
 pub const CMD_SITE_FLUSH: &str = "site_flush";
 pub const CMD_SITE_PROFILE_NAMES: &str = "site_profile_names";
 
+/// Push a blocklist snapshot into the Android site WebView. The WebView has no
+/// access to the Rust blocklist, so without this command the user's rules were
+/// enforced on desktop only (review finding R-01).
+pub const CMD_SITE_BLOCKLIST_UPDATE: &str = "site_blocklist_update";
+
 /// Kotlin's `AnimeHubSiteController.ERR_UNSUPPORTED_MULTI_PROFILE`. A bridge
 /// error containing this string means the WebView provider cannot isolate
 /// sites; callers must surface user-facing guidance, never retry on the
@@ -481,6 +486,35 @@ pub fn site_flush(operation_id: String) -> Result<OkResult> {
     #[cfg(not(target_os = "android"))]
     {
         let _ = operation_id;
+        Err(Error::Unsupported)
+    }
+}
+
+/// Payload for [`site_blocklist_update`].
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SiteBlocklistPayload {
+    operation_id: String,
+    rules: Vec<String>,
+}
+
+/// Replace the blocklist snapshot evaluated by the site WebView.
+pub fn site_blocklist_update(operation_id: String, rules: Vec<String>) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        call_plugin::<_, OkResult>(
+            CMD_SITE_BLOCKLIST_UPDATE,
+            SiteBlocklistPayload {
+                operation_id,
+                rules,
+            },
+        )
+        .map(|_| ())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (operation_id, rules);
         Err(Error::Unsupported)
     }
 }

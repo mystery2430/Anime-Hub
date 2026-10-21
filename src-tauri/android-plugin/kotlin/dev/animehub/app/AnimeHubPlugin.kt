@@ -455,6 +455,34 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    * sweep). An unsupported provider resolves an empty list with
    * `unsupported=true`: Rust skips the sweep and logs instead of guessing.
    */
+  /**
+   * Replace the user blocklist snapshot used by the site WebView.
+   *
+   * Rust calls this before every site open and after a settings change. The
+   * WebView never reads the Rust state directly, so this is the only path that
+   * makes the user's ad/redirect rules effective on Android.
+   */
+  @Command
+  fun site_blocklist_update(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val operationId = operationId(args)
+    val array = args.optJSONArray("rules")
+    val rules =
+      buildList {
+        if (array != null) {
+          for (i in 0 until array.length()) {
+            val value = array.optString(i, "")
+            if (value.isNotBlank()) add(value)
+          }
+        }
+      }
+    SiteBlocklist.update(rules)
+    AnimeHubDebugLog.record("site", "gate", "ok", operationId, count = rules.size.toLong())
+    val payload = JSObject()
+    payload.put("ok", true)
+    invoke.resolve(payload)
+  }
+
   @Command
   fun site_profile_names(invoke: Invoke) {
     val operationId = operationId(invoke.getArgs())

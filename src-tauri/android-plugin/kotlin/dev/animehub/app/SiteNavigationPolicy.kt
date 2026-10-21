@@ -150,6 +150,10 @@ internal object SiteNavigationPolicy {
   private fun hostAllowed(rawHost: String?): Boolean {
     val host = rawHost?.lowercase()?.trimEnd('.')
     if (host.isNullOrEmpty()) return false
+    // User blocklist (pushed from Rust before the open). Must be evaluated
+    // before any built-in allow rule so a listed tracker is refused in the
+    // main frame AND in sub-resources.
+    if (SiteBlocklist.isBlocked(host)) return false
     val bare = host.removePrefix("[").removeSuffix("]")
     if (bare.contains(':')) return isPublicIpv6(bare)
     // Every numeric host form — a canonical dotted quad included — goes through
@@ -170,4 +174,43 @@ internal object SiteNavigationPolicy {
   private fun isPublicIpv6(ip: String): Boolean = IpPolicy.isPublicIpv6(ip)
 
   fun isPublicIpForTest(ip: String): Boolean = isPublicIp(ip)
+
+  /**
+   * Decision for the DNS PRE-CHECK in [SiteNavigationGuard].
+   *
+   * A hostname that resolves to a private/loopback/link-local address is
+   * refused before the request is handed back to the engine. Once a host has
+   * answered with public addresses, a later DIFFERENT public set is refused
+   * too (rebinding detection). This is deliberately NOT a complete fix: the
+   * engine resolves again when it connects (TOCTOU), and the user blocklist is
+   * pushed separately. The only complete answer is a network layer that pins
+   * the resolved address; see docs/security-residual-risks.md.
+   */
+  object ResolvedHostPolicy {
+    /** How one DNS answer relates to the previous pinned answer. */
+    enum class DnsVerdict { ALLOW, PRIVATE_ADDRESS, CHANGED_ADDRESS }
+
+    fun anyPrivate(answer: List<String>): Boolean =
+      answer.any { raw ->
+        val ip = raw.substringBefore('%').trim()
+        if (ip.isEmpty()) return@any true
+        !IpPolicy.isPublicIp(ip)
+      }
+
+    /**
+     * [anyPrivate] plus flip detection. An empty answer is fail-open at the
+     * caller (a resolver outage must not brick the app); a malformed entry
+     * fails closed. This cannot make the engine's connection use the checked
+     * address; that residual TOCTOU window stays documented.
+     */
+    fun classify(previousPublic: Set<String>?, answer: List<String>): DnsVerdict {
+      if (answer.isEmpty()) return DnsVerdict.ALLOW
+      if (anyPrivate(answer)) return DnsVerdict.PRIVATE_ADDRESS
+      val normalized = answer.map { it.substringBefore('%').trim() }.toSet()
+      if (previousPublic != null && normalized != previousPublic) {
+        return DnsVerdict.CHANGED_ADDRESS
+      }
+      return DnsVerdict.ALLOW
+    }
+  }
 }

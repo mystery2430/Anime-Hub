@@ -2125,6 +2125,95 @@ class SiteProfileOpsTest {
   }
 
   @Test
+  fun `flush recovery warns early and replaces only after the hard threshold`() {
+    Assert.assertFalse(FlushRecovery.shouldReplace(0L, 99_999L))
+    Assert.assertFalse(FlushRecovery.shouldReplace(1_000L, 1_000L + FlushRecovery.WARN_AFTER_MS))
+    Assert.assertFalse(
+      FlushRecovery.shouldReplace(1_000L, 1_000L + FlushRecovery.REPLACE_AFTER_MS - 1),
+    )
+    Assert.assertTrue(
+      FlushRecovery.shouldReplace(1_000L, 1_000L + FlushRecovery.REPLACE_AFTER_MS),
+    )
+    Assert.assertFalse(FlushRecovery.shouldReplace(5_000L, 1_000L))
+    Assert.assertEquals(0L, FlushRecovery.stuckFor(0L, 50_000L))
+    Assert.assertEquals(2_500L, FlushRecovery.stuckFor(10_000L, 12_500L))
+  }
+
+  @Test
+  fun `dns pre-check refuses private and changed public answers`() {
+    val policy = SiteNavigationPolicy.ResolvedHostPolicy
+    Assert.assertEquals(
+      SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW,
+      policy.classify(null, listOf("8.8.8.8", "1.1.1.1")),
+    )
+    Assert.assertEquals(
+      SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.PRIVATE_ADDRESS,
+      policy.classify(null, listOf("8.8.8.8", "192.168.1.10")),
+    )
+    Assert.assertEquals(
+      SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.PRIVATE_ADDRESS,
+      policy.classify(null, listOf("::1")),
+    )
+    // A public set that changes after the first check is a rebinding signal.
+    Assert.assertEquals(
+      SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.CHANGED_ADDRESS,
+      policy.classify(setOf("8.8.8.8"), listOf("1.1.1.1")),
+    )
+    // Same answer (order/duplicates irrelevant) stays allowed.
+    Assert.assertEquals(
+      SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW,
+      policy.classify(setOf("8.8.8.8", "1.1.1.1"), listOf("1.1.1.1", "8.8.8.8")),
+    )
+    // Empty answer is fail-open at the caller; malformed entries fail closed.
+    Assert.assertEquals(SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW, policy.classify(null, emptyList()))
+    Assert.assertEquals(
+      SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.PRIVATE_ADDRESS,
+      policy.classify(null, listOf("")),
+    )
+  }
+
+  @Test
+  fun `android blocklist mirrors the rust suffix wildcard and exact rules`() {
+    val rules =
+      BlocklistRules.parse(
+        listOf(
+          "# comment",
+          "",
+          "doubleclick.net",
+          "*.wild.example",
+          "=exact.example",
+          "  MIXED.Example.  ",
+        ),
+      )
+    Assert.assertTrue(rules.isBlocked("doubleclick.net"))
+    Assert.assertTrue(rules.isBlocked("a.b.doubleclick.net"))
+    Assert.assertFalse(rules.isBlocked("notdoubleclick.net"))
+    Assert.assertFalse(rules.isBlocked("doubleclick.net.evil.example"))
+    Assert.assertFalse(rules.isBlocked("wild.example"))
+    Assert.assertTrue(rules.isBlocked("a.wild.example"))
+    Assert.assertTrue(rules.isBlocked("exact.example"))
+    Assert.assertFalse(rules.isBlocked("a.exact.example"))
+    Assert.assertTrue(rules.isBlocked("mixed.example"))
+    Assert.assertTrue(rules.isBlocked("MIXED.EXAMPLE."))
+    Assert.assertEquals("::1", BlocklistRules.normalizeHost("[::1]"))
+    Assert.assertFalse(rules.isBlocked(null))
+    Assert.assertFalse(rules.isBlocked(""))
+  }
+
+  @Test
+  fun `android blocklist snapshot can be replaced and cleared`() {
+    SiteBlocklist.resetForTests()
+    Assert.assertEquals(0, SiteBlocklist.size())
+    Assert.assertFalse(SiteBlocklist.isBlocked("ads.example"))
+    SiteBlocklist.update(listOf("ads.example"))
+    Assert.assertEquals(1, SiteBlocklist.size())
+    Assert.assertTrue(SiteBlocklist.isBlocked("x.ads.example"))
+    SiteBlocklist.update(emptyList())
+    Assert.assertFalse(SiteBlocklist.isBlocked("x.ads.example"))
+    SiteBlocklist.resetForTests()
+  }
+
+  @Test
   fun `migration requires a virgin profile and never touches an existing one`() {
     val port = FakeMigrationPort(exists = true)
     var outcome: MigrationOutcome? = null
@@ -2134,26 +2223,50 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `migration completes only when every cookie was accepted and flushed`() {
+  fun `migration completes when all cookies were accepted and flushed`() {
     val port = FakeMigrationPort(cookieCount = 3)
     var outcome: MigrationOutcome? = null
     SiteMigrationFlow.run(listOf("a=1", "b=2", "c=3"), port) { outcome = it }
     val complete = outcome as? MigrationOutcome.Complete
     Assert.assertNotNull("expected Complete, got $outcome", complete)
     Assert.assertEquals(3, complete!!.accepted)
+    Assert.assertEquals(0, complete.skipped)
     Assert.assertEquals(listOf("exists", "create", "cookie0", "cookie1", "cookie2", "flush"), port.log)
   }
 
   @Test
-  fun `a rejected cookie fails the migration and stops the chain`() {
-    val port = FakeMigrationPort(acceptAll = false)
+  fun `a rejected third-party cookie is skipped and the migration still completes`() {
+    val port = FakeMigrationPort(acceptAll = false, cookieCount = 2)
     var outcome: MigrationOutcome? = null
     SiteMigrationFlow.run(listOf("a=1", "b=2"), port) { outcome = it }
-    val failed = outcome as? MigrationOutcome.Failed
-    Assert.assertNotNull("rejection must not be a success, got $outcome", failed)
-    Assert.assertTrue(failed!!.reason.contains("reddedildi"))
-    Assert.assertEquals("chain must stop after the first rejection", 1, port.log.count { it.startsWith("cookie") })
-    Assert.assertFalse("doomed profile must not be flushed", port.log.contains("flush"))
+    val complete = outcome as? MigrationOutcome.Complete
+    Assert.assertNotNull("a rejection must not fail the upgrade: $outcome", complete)
+    Assert.assertEquals(0, complete!!.accepted)
+    Assert.assertEquals(2, complete.skipped)
+    Assert.assertEquals(2, port.log.count { it.startsWith("cookie") })
+    Assert.assertTrue("the profile is still flushed", port.log.contains("flush"))
+  }
+
+  @Test
+  fun `a partially rejected migration keeps the accepted cookies and reports the skipped count`() {
+    val port =
+      object : SiteMigrationPort {
+        var index = 0
+        override fun profileExists(): Boolean = false
+        override fun createProfile() {}
+        override fun setCookie(cookie: String, onAccepted: (Boolean) -> Unit) {
+          onAccepted(index++ == 0)
+        }
+        override fun flushCookies(onDone: (Throwable?) -> Unit) { onDone(null) }
+        override fun scheduleTimeout(millis: Long, onTimeout: () -> Unit): Watchdog =
+          Watchdog.Armed({})
+      }
+    var outcome: MigrationOutcome? = null
+    SiteMigrationFlow.run(listOf("own", "foreign"), port) { outcome = it }
+    val complete = outcome as? MigrationOutcome.Complete
+    Assert.assertNotNull("expected Complete, got $outcome", complete)
+    Assert.assertEquals(1, complete!!.accepted)
+    Assert.assertEquals(1, complete.skipped)
   }
 
   @Test
@@ -2165,13 +2278,15 @@ class SiteProfileOpsTest {
   }
 
   @Test
-  fun `setCookie exception fails the migration`() {
+  fun `setCookie exception skips one entry and still flushes the rest`() {
     val port = FakeMigrationPort(setCookieThrowsAt = 1)
     var outcome: MigrationOutcome? = null
     SiteMigrationFlow.run(listOf("a=1", "b=2", "c=3"), port) { outcome = it }
-    val failed = outcome as? MigrationOutcome.Failed
-    Assert.assertNotNull(failed)
-    Assert.assertFalse(port.log.contains("flush"))
+    val complete = outcome as? MigrationOutcome.Complete
+    Assert.assertNotNull("one malformed entry must not abort the upgrade: $outcome", complete)
+    Assert.assertEquals(1, complete!!.skipped)
+    Assert.assertEquals(2, port.log.count { it.startsWith("cookie") })
+    Assert.assertTrue("the durable flush still ran", port.log.contains("flush"))
   }
 
   @Test

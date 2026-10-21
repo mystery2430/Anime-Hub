@@ -630,47 +630,25 @@ mod tests {
     }
 
     #[test]
-    fn registered_mobile_redirect_matches_the_deep_link_config() {
-        // The runtime intent filter and `tauri.conf.json` must describe the same
-        // redirect, or the OS hands the callback to nobody.
+    fn mobile_deep_link_registration_is_empty_and_native_login_is_loopback_only() {
         let conf = include_str!("../tauri.conf.json");
         let conf: serde_json::Value = serde_json::from_str(conf).expect("tauri.conf.json");
         let mobile = &conf["plugins"]["deep-link"]["mobile"];
-        let entries = mobile.as_array().expect("mobile deep-link listesi");
-        // In tauri.conf.json both `scheme` and `pathPrefix` are LISTS
-        // (`"scheme": ["animehub"]`, `"pathPrefix": ["/callback"]`), which is
-        // what the generated Android intent filter is built from. Reading them
-        // as strings silently matched nothing.
-        let entry = entries
-            .iter()
-            .find(|e| {
-                e["scheme"].as_array().is_some_and(|list| {
-                    list.iter()
-                        .any(|scheme| scheme.as_str() == Some(OAUTH_SCHEME))
-                })
-            })
-            .expect("animehub şeması kayıtlı olmalı");
-        let uri = mobile_redirect_uri();
-        assert!(uri.starts_with(&format!("{OAUTH_SCHEME}://")), "{uri}");
-        let host = entry["host"]
-            .as_str()
-            .expect("deep-link host'u bir dize olmalı");
-        assert!(uri.contains(host), "{uri} config host'u içermeli: {host}");
-        let prefixes: Vec<&str> = entry["pathPrefix"]
-            .as_array()
-            .expect("pathPrefix bir liste olmalı")
-            .iter()
-            .filter_map(|prefix| prefix.as_str())
-            .collect();
-        assert!(!prefixes.is_empty(), "pathPrefix listesi boş");
-        assert!(
-            prefixes.iter().any(|prefix| uri.ends_with(prefix)),
-            "{uri} config pathPrefix değerlerinden biriyle bitmeli: {prefixes:?}"
+        assert_eq!(
+            mobile.as_array().map(Vec::len),
+            Some(0),
+            "mobile custom-scheme registration must stay empty: {mobile}"
         );
-        // ... and the OAuth parser agrees with the intent filter.
-        let callback = mobile_callback_url("code=a&state=b");
-        assert!(crate::anilist::parse_callback(&callback, &uri).is_ok());
-        assert!(crate::anilist::parse_callback(&callback, "animehub://evil/callback").is_err());
+        assert!(
+            !crate::anilist::mobile_native_login_allowed(&mobile_redirect_uri()),
+            "the mobile custom scheme must never be an accepted login redirect"
+        );
+        assert!(crate::anilist::mobile_native_login_allowed(
+            "http://127.0.0.1:17395/callback"
+        ));
+        assert!(conf["plugins"]["deep-link"]["desktop"]["schemes"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(OAUTH_SCHEME))));
     }
 
     #[test]

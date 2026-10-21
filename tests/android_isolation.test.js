@@ -64,6 +64,7 @@ const pureFile = (f) => read(`${KOTLIN}/${f}`);
  * it lives outside the pure set.
  */
 const flushWorkerKt = read(`${KOTLIN}/SiteFlushWorker.kt`);
+const blocklistKt = read(`${KOTLIN}/SiteBlocklist.kt`);
 
 const windowsRs = read("src-tauri/src/web/windows.rs");
 const commandsRs = read("src-tauri/src/commands.rs");
@@ -1178,13 +1179,15 @@ test("all blocking flushes share ONE worker, with stuck detection not new thread
   // worker — no extra threads — and is awaited for a bounded budget, because
   // the generated Activity kills the process right after teardown: a
   // fire-and-forget flush there could be killed mid-write.
-  // ONE executor, in ONE file: nothing in the controller may queue flush work
-  // behind the worker's back (the destroy-time teardown goes through it too, so
-  // a stuck provider flush is observable there as well).
-  assert.equal((flushWorkerKt.match(/FLUSH_EXECUTOR\.execute/g) || []).length, 1);
-  // Only documentation may still name it; no controller CODE may queue behind
-  // the worker's back.
-  assert.doesNotMatch(code(controllerKt), /FLUSH_EXECUTOR/);
+  // ONE executor factory, in ONE file: recovery creates a replacement through
+  // the same factory, and the controller may never queue work behind its back.
+  assert.match(flushWorkerKt, /private fun newFlushExecutor\(\): ExecutorService/);
+  assert.match(flushWorkerKt, /flushExecutor = newFlushExecutor\(\)/);
+  assert.match(flushWorkerKt, /FLUSH_STUCK_REPLACE_MS/);
+  assert.match(flushWorkerKt, /shutdownNow\(\)/);
+  assert.match(flushWorkerKt, /flush worker replaced after a stuck provider call/);
+  assert.match(pureKotlin, /object FlushRecovery/);
+  assert.doesNotMatch(code(controllerKt), /newFlushExecutor|flushExecutor/);
   assert.equal(
     (controllerKt.match(/SiteFlushWorker\.execute\("destroy", operationId\)/g) || []).length,
     1,
@@ -1456,8 +1459,15 @@ test("navigation policy wraps the site client too", () => {
     "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt",
   );
   assert.match(guardKt, /class SiteNavigationGuard/);
+  assert.match(guardKt, /InetAddress\.getAllByName\(host\)/);
+  assert.match(guardKt, /ResolvedHostPolicy\.classify\(previous, answer\)/);
+  assert.match(guardKt, /DnsVerdict\.ALLOW/);
+  assert.match(guardKt, /MAX_CACHED_HOSTS/);
+  assert.match(read(`${KOTLIN}/SiteNavigationPolicy.kt`), /object ResolvedHostPolicy/);
+  assert.match(read(`${KOTLIN}/SiteNavigationPolicy.kt`), /CHANGED_ADDRESS/);
   assert.match(guardKt, /SiteNavigationPolicy\.rejection\(uri\)/);
   assert.match(preparePy, /"SiteNavigationGuard"/);
+  assert.match(preparePy, /"SiteBlocklist"/);
   assert.match(preparePy, /"AnimeHubDebugLog"/);
   assert.match(preparePy, /"SiteProfileOps"/);
 });
@@ -1545,6 +1555,13 @@ test("android_prepare copies the site controller and pins androidx.webkit", () =
   );
   assert.match(preparePy, /KGP_DEP_RE = re\.compile\(/);
   assert.match(preparePy, /pinned kotlin-gradle-plugin:2\.1\.20/);
+  assert.match(preparePy, /def verify_pin_state\(root_gradle: Path, app_gradle: Path\)/);
+  assert.match(preparePy, /verify_pin_state\(root_gradle, gradle\)/);
+  assert.match(preparePy, /androidx\.webkit pin is not exactly one occurrence/);
+  const ciYml = read("ci-fixes/ci.yml");
+  assert.match(ciYml, /Verify resolved Android pins/);
+  assert.match(ciYml, /:app:dependencies --configuration debugRuntimeClasspath/);
+  assert.match(ciYml, /buildEnvironment/);
   assert.match(preparePy, /kotlin-stdlib:2\.1\.20/, "the alignment rationale stays documented");
 });
 
@@ -1653,4 +1670,33 @@ test("docs describe the profile architecture, migration and what survives", () =
   const changelog = read("CHANGELOG.md");
   assert.match(changelog, /Unreleased/i);
   assert.match(changelog, /profil/i);
+});
+
+
+test("the user blocklist is pushed from Rust into the Android WebView", () => {
+  const bridgeRs = read("src-tauri/src/android_bridge.rs");
+  const pluginLib = read("src-tauri/android-plugin/src/lib.rs");
+  const pluginKt = read(`${KOTLIN}/AnimeHubPlugin.kt`);
+  const commandsRs = read("src-tauri/src/commands.rs");
+  const policyKt = read(`${KOTLIN}/SiteNavigationPolicy.kt`);
+
+  // Transport: Rust command, Kotlin command, and a call before every open.
+  assert.match(pluginLib, /CMD_SITE_BLOCKLIST_UPDATE: &str = "site_blocklist_update"/);
+  assert.match(pluginLib, /pub fn site_blocklist_update\(/);
+  assert.match(bridgeRs, /pub fn site_blocklist_update\(entries: &\[String\]\)/);
+  assert.match(pluginKt, /fun site_blocklist_update\(invoke: Invoke\)/);
+  assert.match(pluginKt, /SiteBlocklist\.update\(rules\)/);
+  assert.match(commandsRs, /fn sync_android_blocklist\(state: &AppState\)/);
+  assert.match(commandsRs, /sync_android_blocklist\(&state\)/);
+  assert.match(commandsRs, /site_blocklist_update\(&entries\)/);
+
+  // Matching: same three rule forms + lookalike safety, and enforcement in
+  // BOTH the navigation and sub-resource checkpoints via hostAllowed.
+  assert.match(blocklistKt, /data class BlocklistRules/);
+  assert.match(blocklistKt, /fun isBlocked\(rawHost: String\?\): Boolean/);
+  assert.match(blocklistKt, /fun parse\(raw: List<String>\): BlocklistRules/);
+  assert.match(blocklistKt, /wildcardOnly/);
+  assert.match(blocklistKt, /notdoubleclick\.net|lookalike/i);
+  assert.match(policyKt, /SiteBlocklist\.isBlocked\(host\)/);
+  assert.match(read("src-tauri/src/sites/blocklist.rs"), /pub fn entries\(&self\) -> Vec<String>/);
 });

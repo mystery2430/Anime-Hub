@@ -503,6 +503,9 @@ pub fn set_site_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> 
 /// `MULTI_PROFILE`).
 #[tauri::command]
 pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
+    let state = app.state::<AppState>();
+    // The WebView policy needs the current user rules BEFORE any navigation.
+    sync_android_blocklist(&state);
     let (site, settings) = {
         let state = app.state::<AppState>();
         let reg = state
@@ -1068,6 +1071,7 @@ pub fn update_settings(
     drop(_diagnostics_guard);
     drop(_pip_guard);
     rebuild_blocklist(&state);
+    sync_android_blocklist(&state);
     get_settings(state)
 }
 
@@ -1159,6 +1163,17 @@ fn save_token(state: &AppState, token: &Token) -> AppResult<()> {
 pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
     let state = app.state::<AppState>();
     let (cli, cfg) = client(&state)?;
+
+    // SECURITY: on Android a custom-scheme redirect can be intercepted by
+    // another app (it receives BOTH code and state), so native login is
+    // restricted to the loopback listener that desktop already uses. Refuse
+    // before writing a pending state or returning an authorization URL.
+    #[cfg(target_os = "android")]
+    if !anilist::mobile_native_login_allowed(&cfg.redirect_uri) {
+        return Err(AppError::AniList(
+            anilist::ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.into(),
+        ));
+    }
 
     // A fresh, unpredictable state value; the callback must echo it.
     let state_value = uuid::Uuid::new_v4().to_string();
@@ -1603,6 +1618,29 @@ pub fn pip_startup_should_apply(
         return false;
     }
     captured_val == live_val
+}
+
+/// Push the current blocklist snapshot into the Android site WebView.
+///
+/// Called before every site open and after a settings change, because the
+/// WebView evaluates the rules itself (Kotlin has no access to Rust state).
+fn sync_android_blocklist(state: &AppState) {
+    #[cfg(target_os = "android")]
+    {
+        let entries = state
+            .blocklist
+            .lock()
+            .map(|list| list.entries())
+            .unwrap_or_default();
+        if let Err(error) = crate::android_bridge::site_blocklist_update(&entries) {
+            // Enforcement must not silently regress to desktop-only.
+            log::warn!("Android blocklist could not be synchronised: {error}");
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = state;
+    }
 }
 
 /// Read the bounded, mixed Rust+Kotlin diagnostics timeline. Collection and

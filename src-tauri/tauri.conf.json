@@ -36,14 +36,7 @@
       "desktop": {
         "schemes": ["animehub"]
       },
-      "mobile": [
-        {
-          "scheme": ["animehub"],
-          "host": "anilist",
-          "pathPrefix": ["/callback"],
-          "appLink": false
-        }
-      ]
+      "mobile": []
     }
   },
   "bundle": {
@@ -64,7 +57,7 @@
       }
     },
     "android": {
-      "minSdkVersion": 26
+      "minSdkVersion": 29
     },
     "windows": {
       "nsis": {

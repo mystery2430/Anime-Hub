@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -99,11 +99,36 @@ test("README and the packaged description describe the profile model, not the 0.
   // The config stays parseable and the deep-link registration the OAuth
   // callback check compares against is untouched by the wording fix.
   const parsed = JSON.parse(conf);
-  assert.deepEqual(parsed.plugins["deep-link"].mobile, [
-    { scheme: ["animehub"], host: "anilist", pathPrefix: ["/callback"], appLink: false },
-  ]);
+  // No Android custom-scheme intent filter: another app can claim it and
+  // receive both the OAuth code and the state. Mobile login is loopback-only.
+  assert.deepEqual(parsed.plugins["deep-link"].mobile, []);
+  assert.ok(parsed.plugins["deep-link"].desktop.schemes.includes("animehub"));
   assert.ok(parsed.bundle.longDescription.length > 200);
   assert.ok(parsed.bundle.shortDescription.length > 10);
+});
+
+test("every external GitHub Action is pinned to a commit SHA, not a mutable tag", () => {
+  // The hardened copies live in ci-fixes/ because the branch token has no
+  // workflow scope; apply.sh installs them. Validate the proposed files here.
+  const dir = join(ROOT, "ci-fixes");
+  const files = readdirSync(dir).filter((name) => name.endsWith(".yml"));
+  assert.ok(files.length > 0);
+  let external = 0;
+  for (const name of files) {
+    const src = read(join(dir, name));
+    for (const line of src.split("\n")) {
+      const match = line.match(/^\s*(?:-\s*)?uses:\s*(\S+)\s*(?:#\s*(\S+))?\s*$/);
+      if (!match) continue;
+      const ref = match[1];
+      if (ref.startsWith("./")) continue;
+      external += 1;
+      const [action, sha] = ref.split("@");
+      assert.ok(action && action.includes("/"), `${name}: malformed action ${ref}`);
+      assert.match(sha || "", /^[0-9a-f]{40}$/, `${name}: ${action} must be pinned to a commit SHA`);
+      assert.match(match[2] || "", /^(?:v?\d|stable$)/, `${name}: version comment missing for ${action}`);
+    }
+  }
+  assert.ok(external >= 20, `expected the CI/release action set, saw ${external}`);
 });
 
 test("android release workflow prepares the project before signing", () => {
@@ -139,6 +164,11 @@ test("CI android job builds and uploads an installable debug APK", () => {
   assert.match(yml, /CARGO_PROFILE_DEV_DEBUG/);
   assert.match(yml, /animehub-android-aarch64-debug/);
   assert.match(yml, /actions\/upload-artifact@v7/);
+  assert.match(
+    read(join(ROOT, "ci-fixes/ci.yml")),
+    /actions\/upload-artifact@[0-9a-f]{40} # v7/,
+    "the proposed CI pins every action",
+  );
 });
 
 test("CI Kotlin step copies its test sources and reports the real cargo status", () => {

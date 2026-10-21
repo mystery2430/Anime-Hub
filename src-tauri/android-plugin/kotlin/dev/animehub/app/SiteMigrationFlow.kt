@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// One-time 0.3.4 cookie migration into a virgin profile: strict success,
-// retryable failure.
+// One-time 0.3.4 cookie migration into a virgin profile: durable flush is the
+// success criterion; unimportable third-party entries are skipped, not fatal.
 //
 // Pure decision/sequencing code: this file must NOT import `android.*` or any
 // Tauri class, so the CI unit-test source set compiles and runs it against the
@@ -38,8 +38,13 @@ interface SiteMigrationPort {
 
 /** Result of the migration attempt, with the strict success criterion. */
 sealed class MigrationOutcome {
-  /** Every cookie accepted AND flush durable → Rust may write the flag. */
-  data class Complete(val accepted: Int) : MigrationOutcome()
+  /**
+   * The flush completed durably. [accepted] cookies were imported; [skipped]
+   * were rejected by the provider (usually a third-party Domain the profile
+   * cannot own). A rejection is NOT fatal: refusing the whole login for one
+   * ad/CDN cookie locked upgraded users out of the site forever.
+   */
+  data class Complete(val accepted: Int, val skipped: Int = 0) : MigrationOutcome()
 
   /** The profile already existed: its state is authoritative — never write. */
   object ProfileAlreadyExists : MigrationOutcome()
@@ -116,6 +121,7 @@ object SiteMigrationFlow {
     AnimeHubDebugLog.record("migration", "profile_create", "ok", safeOperationId)
 
     val accepted = AtomicInteger(0)
+    val skipped = AtomicInteger(0)
     val index = AtomicInteger(0)
 
     fun setNext() {
@@ -171,7 +177,7 @@ object SiteMigrationFlow {
               durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
               stepId = stepId,
             )
-            finish(MigrationOutcome.Complete(accepted.get()))
+            finish(MigrationOutcome.Complete(accepted.get(), skipped.get()))
           }
         }
         return
@@ -218,13 +224,16 @@ object SiteMigrationFlow {
           }
           cancelCookieWatchdog()
           if (!ok) {
-            // Strict criterion: any rejected cookie retires the virgin profile.
+            // A provider rejection can mean a foreign Domain a site profile
+            // cannot own. Skip it, keep the rest, and still flush.
+            skipped.incrementAndGet()
+            index.incrementAndGet()
             AnimeHubDebugLog.record(
-              "migration", "cookie_write", "rejected", safeOperationId,
+              "migration", "cookie_write", "skipped", safeOperationId,
               durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
-              errorClass = "migration_partial", count = (i + 1).toLong(), stepId = stepId,
+              errorClass = "provider", count = skipped.get().toLong(), stepId = stepId,
             )
-            finish(MigrationOutcome.Failed("çerez reddedildi", "migration_partial"))
+            setNext()
             return@setCookie
           }
           accepted.incrementAndGet()
@@ -239,12 +248,15 @@ object SiteMigrationFlow {
       } catch (_: Exception) {
         if (perCookie.compareAndSet(false, true)) {
           cancelCookieWatchdog()
+          // One malformed entry is not a provider outage: keep going.
+          skipped.incrementAndGet()
+          index.incrementAndGet()
           AnimeHubDebugLog.record(
-            "migration", "cookie_write", "failed", safeOperationId,
+            "migration", "cookie_write", "skipped", safeOperationId,
             durationMs = ((System.nanoTime() - stepStartedAt) / 1_000_000).coerceAtLeast(0),
-            errorClass = "provider", count = (i + 1).toLong(), stepId = stepId,
+            errorClass = "provider", count = skipped.get().toLong(), stepId = stepId,
           )
-          finish(MigrationOutcome.Failed("provider"))
+          setNext()
         }
       }
     }

@@ -140,7 +140,7 @@ ulaşamaz.
 > **Android'de yalıtım, `androidx.webkit` MULTI_PROFILE özelliğine dayanır.**
 > Her site kendi profilini alır; profil adı yalnızca `site_id`'den türetilir ve
 > bir "nesil" sayacı ile korunur. Sağlayıcı özelliği desteklemiyorsa site
-> **açılmaz** (hata mesajı WebView'ı güncellemeyi söyler) — ortak/default
+> **açılmaz** (hata mesajı Android 10+ ve güncel WebView gerektiğini söyler) — ortak/default
 > profile sessiz geri dönüş yoktur. Başlatıcının kendi profili hiçbir site
 > yolunda adreslenmez.
 >
@@ -257,8 +257,8 @@ göre değişir ve `tauri.conf.json`'daki kayıt ile birebir aynıdır:
 
 | Platform | Dönüş adresi |
 |---|---|
-| Masaüstü | `http://127.0.0.1:17395/callback` (yalnızca bu gezinti için açılan yerel dinleyici; `ANILIST_REDIRECT_URI` ile değiştirilebilir) |
-| Android | `animehub://anilist/callback` (kayıtlı deep-link şeması) |
+| Masaüstü | `http://127.0.0.1:17395/callback` (yerel dinleyici; `ANILIST_REDIRECT_URI` ile değiştirilebilir) |
+| Android | `http://127.0.0.1:17395/callback` (aynı loopback dinleyicisi; özel şema kullanılmıyor) |
 
 Gelen adres **harfi harfine** doğrulanır: şema, host, port ve yol beklenen
 dönüş adresiyle uyuşmazsa (`animehub://evil/callback`, başka bir loopback portu,
@@ -269,13 +269,13 @@ yalnızca eşleştiğinde kilit altında tüketilir — aynı `state` ile gelen 
 yakmaz. Client ID kaydedilmediyse düğme pasif görünür ve site kutucuğu siteyi
 WebView'da açmaya devam eder.
 
-> [!WARNING]
-> **Android'de özel şema kaçırılması bu doğrulamayla çözülmez.** `animehub://`
-> şemasını başka bir uygulama da kaydettirebilir ve işletim sistemi intent'ini o
-> alabilir; bu durumda yetki kodu bize hiç ulaşmaz. AniList'in belgelenmiş
-> akışında PKCE veya app-link/asset-statement desteği doğrulanmadığı için burada
-> yeni bir mekanizma uydurulmadı: risk, birleştirme öncesi açık madde olarak
-> raporlanır.
+> [!IMPORTANT]
+> **Android'de özel şema OAuth'u kapatıldı.** `animehub://` şemasını başka bir
+> uygulama da kaydettirebilir ve yetki kodu ile `state`'i alabilir. Bu yüzden
+> Android'de yerel giriş yalnızca loopback dinleyicisiyle çalışır;
+> `plugins.deep-link.mobile` boştur ve özel şemayla giriş state yazılmadan
+> reddedilir. Kalan sınırlar
+> [`docs/security-residual-risks.md`](docs/security-residual-risks.md) içinde.
 
 ### 🎨&nbsp; Tema: sistem / koyu / açık
 
@@ -301,7 +301,7 @@ kaldığı yerden, kaydırma konumu ve oynatma durumu korunarak geri gelir.
 
 - API 30+ (`Android 11`): `onPictureInPictureRequested()`; uygulama `true`
   döndüğü için sistem kendi (hazırlıksız) akışına karışmaz.
-- API 26-29 (`Android 8.0-10`): `onUserLeaveHint()` geri dönüş yolu.
+- API 29 (`Android 10`): `onUserLeaveHint()` geri dönüş yolu.
 - Sistemin kendi otomatik girişi (`setAutoEnterEnabled(true)`) **bilinçli
   olarak** kullanılmaz: Android belgelerine göre bu ayar açıkken
   `onPictureInPictureRequested()` hiç çağrılmaz, yani PiP hazırlıksız açılırdı.
@@ -358,7 +358,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 > [!NOTE]
 > **Windows paketleri henüz kod imzalı değildir (v0.3.4 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
 
-### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
+### 📱&nbsp; Android &nbsp;·&nbsp; `Android 10+ (API 29)`
 
 | Yöntem | Boyut | Açıklama |
 |---|---|---|
