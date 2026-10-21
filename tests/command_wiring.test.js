@@ -157,6 +157,43 @@ test("Actions pinning is reported as a blocker, not claimed as fixed", () => {
   );
   const proposal = read("ci-fixes/ci.yml");
   assert.match(proposal, /uses:\s*actions\/checkout@[0-9a-f]{40} # v7/);
+
+  // The verification half of R-09 IS done: every tag was resolved to a commit
+  // SHA through GET /repos/<owner>/<repo>/commits/<tag>. Those values are
+  // recorded in the blocker doc so a maintainer does not have to re-derive
+  // them, and they are asserted here so they cannot rot silently.
+  const verified = {
+    "actions/checkout": ["3d3c42e5aac5ba805825da76410c181273ba90b1", "v7"],
+    "dtolnay/rust-toolchain": ["b725eda525362e7cf34af9a7243cac1e3f01a7ec", "stable"],
+    "Swatinem/rust-cache": ["d1527c8f67ef9af357290475d4af4b0fab8f12e0", "v2"],
+    "actions/setup-node": ["949feb2413d6458794dcd2491c4babbbce0c15c1", "v7"],
+    "actions/setup-java": ["b843ebf9b913146b38da2eaa7aeddf76074ae1ad", "v6"],
+    "android-actions/setup-android": ["be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd", "v4"],
+    "actions/upload-artifact": ["cf430e030ddbb5b0abf93d22962f4752f3646cd9", "v7"],
+    "actions/download-artifact": ["9000827ccba6bdab643e8b6fd33ac0654aef8333", "v8"],
+    "tauri-apps/tauri-action": ["1deb371b0cd8bd54025b384f1cd735e725c4060f", "v1"],
+  };
+  for (const [action, [sha, tag]] of Object.entries(verified)) {
+    assert.match(sha, /^[0-9a-f]{40}$/, `${action}: not a full commit SHA`);
+    assert.match(
+      docs,
+      new RegExp(`\`${action.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\` \\| \`${sha}\` \\| ${tag} \\|`),
+      `${action}@${tag} -> ${sha} must stay documented for the maintainer`,
+    );
+    // And the documented SHA must be the one the reviewed proposal uses.
+    const found = new Set(
+      [...proposal.matchAll(new RegExp(`uses:\\s*${action.replace(/\//g, "\\/")}@([0-9a-f]{40})`, "g"))].map(
+        (m) => m[1],
+      ),
+    );
+    if (found.size > 0) {
+      assert.deepEqual([...found], [sha], `${action}: ci-fixes/ disagrees with the verified SHA`);
+    }
+  }
+  // The doc must tell the maintainer exactly what to change, and must not
+  // pretend ci-fixes/apply.sh is that minimal change.
+  assert.match(docs, /uses:` line/);
+  assert.match(docs, /Verify resolved Android pins/);
 });
 
 test("blocklist transfers are serialized and generation-guarded (PR #27 follow-up)", () => {
