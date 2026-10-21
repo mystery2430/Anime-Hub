@@ -19,6 +19,47 @@ use tauri::{AppHandle, Emitter, Manager, State};
 // State
 // ---------------------------------------------------------------------------
 
+/// Delivery bookkeeping for the Android blocklist snapshot.
+///
+/// `generation` starts at **1** while `applied` starts at **0**, so the very
+/// first transfer always pushes. That matters: `lib.rs` builds the startup
+/// `Blocklist` directly instead of going through [`rebuild_blocklist`], and
+/// Kotlin's `SiteBlocklist` starts empty. Encoding "nothing delivered yet" as
+/// generation 0 on both sides would have let the first `open_site` skip the
+/// push and run the site WebView with no user rules at all.
+#[derive(Debug)]
+pub struct BlocklistSyncGate {
+    /// Serializes the transfers themselves.
+    ///
+    /// **Lock order:** this lock → `ANDROID_SESSION_LOCK`. The fail-closed
+    /// close path (`close_active_android_site` → `windows::close_site_window`)
+    /// takes the session lock while this one is held; nothing ever takes them
+    /// the other way round and the close path never acquires this lock, so the
+    /// existing lifecycle rules and lock order are unchanged and this cannot
+    /// deadlock against them.
+    pub lock: Mutex<()>,
+    /// Bumped once per installed `Blocklist`, while the blocklist lock is held.
+    pub generation: std::sync::atomic::AtomicU64,
+    /// Highest generation whose snapshot Kotlin confirmed.
+    pub applied: std::sync::atomic::AtomicU64,
+}
+
+impl BlocklistSyncGate {
+    pub fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            generation: std::sync::atomic::AtomicU64::new(1),
+            applied: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for BlocklistSyncGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct AppState {
     pub provider: Box<dyn SecretProvider>,
     pub registry: Mutex<Registry>,
@@ -53,6 +94,10 @@ pub struct AppState {
     /// Serialize developer-options changes with the Kotlin collection gate and
     /// panel reads; a stale startup toggle must never re-enable diagnostics.
     pub diagnostics_lock: Mutex<()>,
+    /// Blocklist delivery bookkeeping for the Android WebView: the transfer
+    /// serialization lock plus the generation/applied pair that stops a delayed
+    /// snapshot from overwriting newer rules. See [`BlocklistSyncGate`].
+    pub blocklist_sync: BlocklistSyncGate,
 }
 
 #[derive(Debug, Clone)]
@@ -207,7 +252,16 @@ fn rebuild_blocklist(state: &AppState) {
         (s.blocklist.rules.clone(), s.blocklist.enabled)
     };
     let bl = Blocklist::from_rules(&rules, enabled);
-    *state.blocklist.lock().expect("blocklist lock") = bl;
+    // The generation is bumped while the matcher lock is STILL held, so a
+    // reader can never observe new rules under an old generation and conclude
+    // that Kotlin is already up to date.
+    let mut live = state.blocklist.lock().expect("blocklist lock");
+    *live = bl;
+    state
+        .blocklist_sync
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    drop(live);
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,6 +1797,84 @@ where
     }
 }
 
+/// A blocklist snapshot together with the generation it was read at.
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlocklistTransfer {
+    pub generation: u64,
+    pub entries: Vec<String>,
+}
+
+/// Read the authoritative Kotlin snapshot under the blocklist lock.
+///
+/// Entries and generation are taken from the same locked section, so the pair
+/// is consistent: the rules of generation N can never be labelled N+1, which
+/// would let a genuinely newer transfer be skipped as "already applied".
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn blocklist_transfer_snapshot(state: &AppState) -> BlocklistTransfer {
+    let list = lock_recover(&state.blocklist);
+    let entries = android_blocklist_entries(&list);
+    let generation = state
+        .blocklist_sync
+        .generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    drop(list);
+    BlocklistTransfer { generation, entries }
+}
+
+/// Serialize blocklist transfers and refuse to deliver a stale one.
+///
+/// **The race this closes.** `sync_android_blocklist` runs from `open_site`,
+/// `update_settings`, `set_pip_auto_enter`'s settings write and
+/// `reset_blocklist` — all *outside* `ANDROID_SESSION_LOCK`, because that lock
+/// guards the site lifecycle rather than the rule set, and the fail-closed
+/// close below has to take it. Kotlin's `SiteBlocklist.update` is a
+/// last-writer-wins atomic swap, so a transfer built from older settings could
+/// complete *after* a newer one and silently restore the old rules. Nothing
+/// would error: the settings file, the Rust matcher and the Kotlin snapshot
+/// would simply disagree.
+///
+/// Two mechanisms, both needed:
+///
+/// * `gate.lock` serializes transfers, so at most one push is in flight.
+/// * `read` is called **inside** that lock, so the value pushed is always the
+///   newest one no matter which caller won the race, and a caller whose
+///   generation is not newer than `applied` returns `Ok(())` without pushing.
+///   That is the success path, so an up-to-date caller never closes a live
+///   session.
+///
+/// `applied` advances only after a confirmed push. A failed transfer therefore
+/// leaves it behind and the next caller retries, while the fail-closed policy
+/// of [`transfer_blocklist_snapshot`] is reused unchanged — including the
+/// restart-required error when the close itself fails.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn transfer_blocklist_with_generation<S, P, C>(
+    gate: &BlocklistSyncGate,
+    read: S,
+    push: P,
+    close: C,
+) -> AppResult<()>
+where
+    S: Fn() -> BlocklistTransfer,
+    P: FnOnce(&[String]) -> AppResult<()>,
+    C: FnOnce() -> AppResult<()>,
+{
+    let _serialized = lock_recover(&gate.lock);
+    let current = read();
+    if current.generation <= gate.applied.load(std::sync::atomic::Ordering::SeqCst) {
+        // Kotlin already holds this generation or a newer one. Pushing would
+        // resurrect older rules; doing nothing is a success, so a live session
+        // must not be closed here.
+        return Ok(());
+    }
+    let result = transfer_blocklist_snapshot(|| push(&current.entries), close);
+    if result.is_ok() {
+        gate.applied
+            .store(current.generation, std::sync::atomic::Ordering::SeqCst);
+    }
+    result
+}
+
 /// Apply the current rules to the Android site WebView before any navigation.
 ///
 /// Called before every `open_site`, after `update_settings`, and after
@@ -1757,9 +1889,10 @@ where
 pub(crate) fn sync_android_blocklist(app: &AppHandle, state: &AppState) -> AppResult<()> {
     #[cfg(target_os = "android")]
     {
-        let entries = android_blocklist_entries(&lock_recover(&state.blocklist));
-        transfer_blocklist_snapshot(
-            || push_android_blocklist(&entries),
+        transfer_blocklist_with_generation(
+            &state.blocklist_sync,
+            || blocklist_transfer_snapshot(state),
+            push_android_blocklist,
             || close_active_android_site(app),
         )
     }
@@ -1908,6 +2041,7 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
             diagnostics_lock: Mutex::new(()),
+            blocklist_sync: BlocklistSyncGate::new(),
         }
     }
 
@@ -2379,5 +2513,491 @@ mod tests {
         assert!(poisoned.is_err());
         assert!(mutex.is_poisoned());
         assert_eq!(*lock_recover(&mutex), 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocklist transfer ordering (PR #27 security follow-up)
+    //
+    // These drive `transfer_blocklist_with_generation`, the real function the
+    // Android `sync_android_blocklist` path calls, against a fake Kotlin side
+    // that records every snapshot it would have received. What a host test
+    // cannot do is run the actual Tauri command boundary (`open_site`,
+    // `update_settings`, `reset_blocklist` need a live `AppHandle`), so the
+    // settings write / matcher rebuild half of the chain is driven through the
+    // real `write_settings_doc` + `rebuild_blocklist` below.
+    // -----------------------------------------------------------------------
+
+    /// Every snapshot that would have reached Kotlin's `SiteBlocklist.update`,
+    /// in arrival order, tagged with the generation it claimed.
+    type DeliveredLog = std::sync::Mutex<Vec<(u64, Vec<String>)>>;
+
+    fn delivered_last(log: &DeliveredLog) -> Option<(u64, Vec<String>)> {
+        log.lock().unwrap().last().cloned()
+    }
+
+    fn delivered_len(log: &DeliveredLog) -> usize {
+        log.lock().unwrap().len()
+    }
+
+    #[test]
+    fn first_blocklist_transfer_pushes_even_before_any_rebuild() {
+        use std::sync::atomic::Ordering;
+
+        // `lib.rs` builds the startup `Blocklist` directly, so no rebuild has
+        // bumped the generation yet. Kotlin starts EMPTY, so skipping this
+        // first push would run the site WebView with no user rules at all.
+        let gate = BlocklistSyncGate::new();
+        let delivered: DeliveredLog = std::sync::Mutex::new(Vec::new());
+        let closes = std::sync::atomic::AtomicU32::new(0);
+
+        let result = transfer_blocklist_with_generation(
+            &gate,
+            || BlocklistTransfer {
+                generation: gate.generation.load(Ordering::SeqCst),
+                entries: vec!["doubleclick.net".into()],
+            },
+            |entries| {
+                let generation = gate.generation.load(Ordering::SeqCst);
+                delivered.lock().unwrap().push((generation, entries.to_vec()));
+                Ok(())
+            },
+            || {
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(delivered_len(&delivered), 1, "the first open must push");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "a successful push must not disturb a live session"
+        );
+        assert_eq!(gate.applied.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_blocklist_snapshot_is_refused_without_closing_a_live_site() {
+        use std::sync::atomic::Ordering;
+
+        // Kotlin already holds generation 5; a delayed caller still carries
+        // generation 3. Pushing it would restore older rules, and closing the
+        // session would be wrong too: nothing failed.
+        let gate = BlocklistSyncGate::new();
+        gate.applied.store(5, Ordering::SeqCst);
+        let delivered: DeliveredLog = std::sync::Mutex::new(Vec::new());
+        let closes = std::sync::atomic::AtomicU32::new(0);
+
+        let result = transfer_blocklist_with_generation(
+            &gate,
+            || BlocklistTransfer {
+                generation: 3,
+                entries: vec!["stale.example".into()],
+            },
+            |entries| {
+                delivered.lock().unwrap().push((3, entries.to_vec()));
+                Ok(())
+            },
+            || {
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok(), "an up-to-date WebView is not an error");
+        assert_eq!(delivered_len(&delivered), 0, "a stale snapshot must not be pushed");
+        assert_eq!(closes.load(Ordering::SeqCst), 0, "and must not close the live site");
+        assert_eq!(gate.applied.load(Ordering::SeqCst), 5, "applied never goes backwards");
+    }
+
+    #[test]
+    fn delayed_transfer_delivers_the_newest_snapshot_not_the_captured_one() {
+        use std::sync::atomic::Ordering;
+
+        // The live Rust matcher, shared by a "fast" caller and a "delayed" one.
+        let live = std::sync::Mutex::new((1u64, vec!["gen-1.example".to_string()]));
+        let gate = BlocklistSyncGate::new();
+        let delivered: DeliveredLog = std::sync::Mutex::new(Vec::new());
+        // Passed by REFERENCE: `P`/`C` are `FnOnce`, so handing the closures
+        // over by value would move them and the three calls below would not
+        // compile. `&F` implements `Fn` (hence `FnOnce`) for any `F: Fn`.
+        let read_live = || {
+            let guard = live.lock().unwrap();
+            BlocklistTransfer {
+                generation: guard.0,
+                entries: guard.1.clone(),
+            }
+        };
+        let record = |entries: &[String]| -> AppResult<()> {
+            let generation = live.lock().unwrap().0;
+            delivered.lock().unwrap().push((generation, entries.to_vec()));
+            Ok(())
+        };
+        let no_close = || -> AppResult<()> { Ok(()) };
+
+        // Caller A transfers generation 1.
+        transfer_blocklist_with_generation(&gate, &read_live, &record, &no_close).unwrap();
+
+        // Settings change while caller B is already on its way: generation 2.
+        {
+            let mut guard = live.lock().unwrap();
+            guard.0 = 2;
+            guard.1 = vec!["gen-2.example".into()];
+        }
+        // Caller B (newer) transfers.
+        transfer_blocklist_with_generation(&gate, &read_live, &record, &no_close).unwrap();
+
+        // Caller A' — built from the OLD settings — finally completes. Because
+        // the snapshot is re-read inside the serialization lock, it cannot
+        // overwrite generation 2.
+        transfer_blocklist_with_generation(&gate, &read_live, &record, &no_close).unwrap();
+
+        let log = delivered.lock().unwrap();
+        assert_eq!(log.len(), 2, "the third call has nothing new to deliver");
+        assert_eq!(log[0].0, 1);
+        assert_eq!(log[1].0, 2);
+        assert_eq!(
+            log.last().unwrap().1,
+            vec!["gen-2.example".to_string()],
+            "Kotlin must end on the newest rules"
+        );
+        drop(log);
+        assert_eq!(gate.applied.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn blocklist_push_failure_closes_the_live_site_and_does_not_advance_applied() {
+        use std::sync::atomic::Ordering;
+        use std::sync::atomic::AtomicBool;
+
+        let gate = BlocklistSyncGate::new();
+        let delivered: DeliveredLog = std::sync::Mutex::new(Vec::new());
+        let closes = std::sync::atomic::AtomicU32::new(0);
+        let bridge_down = AtomicBool::new(true);
+
+        let result = transfer_blocklist_with_generation(
+            &gate,
+            || BlocklistTransfer {
+                generation: 7,
+                entries: vec!["doubleclick.net".into()],
+            },
+            |entries| {
+                if bridge_down.load(Ordering::SeqCst) {
+                    return Err(AppError::BlocklistUnavailable);
+                }
+                delivered.lock().unwrap().push((7, entries.to_vec()));
+                Ok(())
+            },
+            || {
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err().code(), "blocklist_unavailable");
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "fail closed: destroy the live view");
+        assert_eq!(delivered_len(&delivered), 0);
+        assert_eq!(
+            gate.applied.load(Ordering::SeqCst),
+            0,
+            "a failed push must not be recorded as delivered, or the retry would be skipped"
+        );
+
+        // The bridge recovers: the SAME generation is retried and delivered.
+        bridge_down.store(false, Ordering::SeqCst);
+        transfer_blocklist_with_generation(
+            &gate,
+            || BlocklistTransfer {
+                generation: 7,
+                entries: vec!["doubleclick.net".into()],
+            },
+            |entries| {
+                delivered.lock().unwrap().push((7, entries.to_vec()));
+                Ok(())
+            },
+            || {
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered_len(&delivered), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "the retry succeeded, nothing closed");
+        assert_eq!(gate.applied.load(Ordering::SeqCst), 7);
+    }
+
+    #[test]
+    fn blocklist_close_failure_is_restart_required_and_leaves_applied_behind() {
+        use std::sync::atomic::Ordering;
+
+        let gate = BlocklistSyncGate::new();
+        gate.applied.store(2, Ordering::SeqCst);
+
+        let result = transfer_blocklist_with_generation(
+            &gate,
+            || BlocklistTransfer {
+                generation: 3,
+                entries: vec!["doubleclick.net".into()],
+            },
+            |_| Err(AppError::BlocklistUnavailable),
+            || Err(AppError::Other("flush failed".into())),
+        );
+
+        let error = result.expect_err("a failed close must never be reported as success");
+        assert_eq!(error.code(), "other");
+        assert!(
+            error.to_string().contains("yeniden başlatın"),
+            "the user must be told the old snapshot may still be live, got: {error}"
+        );
+        assert_eq!(
+            gate.applied.load(Ordering::SeqCst),
+            2,
+            "nothing was delivered, so generation 3 stays pending"
+        );
+    }
+
+    #[test]
+    fn rebuild_blocklist_bumps_the_generation_once_per_rebuild() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        let before = st.blocklist_sync.generation.load(Ordering::SeqCst);
+        assert_eq!(before, 1, "a fresh gate starts above `applied` (0)");
+
+        rebuild_blocklist(&st);
+        assert_eq!(st.blocklist_sync.generation.load(Ordering::SeqCst), before + 1);
+        rebuild_blocklist(&st);
+        assert_eq!(st.blocklist_sync.generation.load(Ordering::SeqCst), before + 2);
+
+        // The generation and the rules must be readable together, consistently.
+        let snapshot = blocklist_transfer_snapshot(&st);
+        assert_eq!(
+            snapshot.generation,
+            st.blocklist_sync.generation.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn disabled_blocklist_still_transfers_an_empty_snapshot_through_the_guard() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        {
+            let mut s = st.settings.lock().unwrap();
+            s.blocklist.rules = "doubleclick.net\n*.tracker.example\n=exact.example\n".into();
+            s.blocklist.enabled = false;
+        }
+        rebuild_blocklist(&st);
+
+        let delivered: DeliveredLog = std::sync::Mutex::new(Vec::new());
+        let closes = std::sync::atomic::AtomicU32::new(0);
+        let generation = st.blocklist_sync.generation.load(Ordering::SeqCst);
+        transfer_blocklist_with_generation(
+            &st.blocklist_sync,
+            || blocklist_transfer_snapshot(&st),
+            |entries| {
+                delivered.lock().unwrap().push((generation, entries.to_vec()));
+                Ok(())
+            },
+            || {
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        // Disabling is a CHANGE, so it must be delivered — as an empty
+        // snapshot, which is the only way Kotlin understands "turned off".
+        let (_, entries) = delivered_last(&delivered).expect("the disable must be transferred");
+        assert!(entries.is_empty(), "disabled must push nothing, got {entries:?}");
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        assert_eq!(st.blocklist_sync.applied.load(Ordering::SeqCst), generation);
+    }
+
+    #[test]
+    fn reset_blocklist_reaches_android_with_the_default_snapshot() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        let delivered: DeliveredLog = std::sync::Mutex::new(Vec::new());
+        let closes = std::sync::atomic::AtomicU32::new(0);
+
+        // The user replaced the defaults with a single custom rule.
+        {
+            let mut s = st.settings.lock().unwrap();
+            s.blocklist.rules = "evil.example".into();
+            s.blocklist.enabled = true;
+            write_settings_doc(&st, &s).expect("settings write");
+        }
+        rebuild_blocklist(&st);
+        let sync = |delivered: &DeliveredLog| {
+            let generation = st.blocklist_sync.generation.load(Ordering::SeqCst);
+            transfer_blocklist_with_generation(
+                &st.blocklist_sync,
+                || blocklist_transfer_snapshot(&st),
+                |entries| {
+                    delivered.lock().unwrap().push((generation, entries.to_vec()));
+                    Ok(())
+                },
+                || {
+                    closes.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+        };
+        sync(&delivered).unwrap();
+        let (_, custom) = delivered_last(&delivered).expect("the custom list must arrive");
+        assert!(
+            custom.iter().any(|e| e.contains("evil.example")),
+            "baseline: the custom rule reached Android, got {custom:?}"
+        );
+
+        // Now the real reset chain: persist the defaults, rebuild the matcher,
+        // transfer. `reset_blocklist` is a Tauri command and needs a live
+        // `AppHandle`, so those three steps are driven directly here.
+        {
+            let mut live = st.settings.lock().unwrap();
+            let mut next = live.clone();
+            next.blocklist = BlocklistState::default_state();
+            write_settings_doc(&st, &next).expect("reset write");
+            *live = next;
+        }
+        rebuild_blocklist(&st);
+        sync(&delivered).unwrap();
+
+        let (generation, defaults) =
+            delivered_last(&delivered).expect("reset must actually reach Android");
+        assert_eq!(delivered_len(&delivered), 2, "reset is a change, so it transfers");
+        assert!(
+            defaults.iter().any(|e| e.contains("doubleclick.net")),
+            "the DEFAULT rules must be the snapshot, got {defaults:?}"
+        );
+        assert!(
+            !defaults.iter().any(|e| e.contains("evil.example")),
+            "the pre-reset custom rule must be gone from Android too"
+        );
+        assert_eq!(
+            generation,
+            st.blocklist_sync.generation.load(Ordering::SeqCst),
+            "the snapshot must carry the post-reset generation"
+        );
+        assert_eq!(st.blocklist_sync.applied.load(Ordering::SeqCst), generation);
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "both transfers succeeded, so no live session was closed"
+        );
+    }
+
+    #[test]
+    fn concurrent_out_of_order_transfers_never_restore_a_stale_snapshot() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        // The actual race: several commands call `sync_android_blocklist`
+        // without holding the session lock, so transfers overlap. Each worker
+        // writes newer settings, captures a snapshot, then stalls — and the
+        // guard must still leave Kotlin on the newest generation.
+        let gate = Arc::new(BlocklistSyncGate::new());
+        let live = Arc::new(std::sync::Mutex::new((
+            1u64,
+            vec!["gen-1.example".to_string()],
+        )));
+        let seq = Arc::new(AtomicU64::new(1));
+        let delivered = Arc::new(DeliveredLog::new(Vec::new()));
+        let closes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let mut handles = Vec::new();
+        for worker in 0..8u64 {
+            let gate = Arc::clone(&gate);
+            let live = Arc::clone(&live);
+            let seq = Arc::clone(&seq);
+            let delivered = Arc::clone(&delivered);
+            let closes = Arc::clone(&closes);
+            handles.push(std::thread::spawn(move || {
+                // A settings write + rebuild: the live generation only moves
+                // forward, exactly like `rebuild_blocklist` does.
+                let generation = seq.fetch_add(1, Ordering::SeqCst) + 1;
+                {
+                    let mut guard = live.lock().unwrap();
+                    if generation > guard.0 {
+                        guard.0 = generation;
+                        guard.1 = vec![format!("gen-{}.example", generation)];
+                    }
+                }
+                // Capture BEFORE stalling — this is the value a caller without
+                // the in-lock re-read would have pushed.
+                let captured = {
+                    let guard = live.lock().unwrap();
+                    BlocklistTransfer {
+                        generation: guard.0,
+                        entries: guard.1.clone(),
+                    }
+                };
+                std::thread::sleep(std::time::Duration::from_millis(worker % 3));
+                let result = transfer_blocklist_with_generation(
+                    &gate,
+                    || {
+                        let guard = live.lock().unwrap();
+                        BlocklistTransfer {
+                            generation: guard.0,
+                            entries: guard.1.clone(),
+                        }
+                    },
+                    |entries| {
+                        let generation = live.lock().unwrap().0;
+                        delivered.lock().unwrap().push((generation, entries.to_vec()));
+                        Ok(())
+                    },
+                    || {
+                        closes.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                );
+                (captured.generation, result.is_ok())
+            }));
+        }
+        let mut captured_generations = Vec::new();
+        for handle in handles {
+            let (captured, ok) = handle.join().expect("worker panicked");
+            assert!(ok, "no transfer may fail: the fake bridge always succeeds");
+            captured_generations.push(captured);
+        }
+
+        let log = delivered.lock().unwrap();
+        assert!(!log.is_empty(), "at least one transfer must reach Kotlin");
+        // Monotonic: no snapshot may be older than one already delivered. This
+        // is exactly the stale-overwrite the generation guard prevents.
+        for pair in log.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "a stale snapshot overwrote a newer one: {:?}",
+                *log
+            );
+        }
+        let newest = live.lock().unwrap().0;
+        assert_eq!(
+            log.last().unwrap().0,
+            newest,
+            "Kotlin must end on the newest generation, log: {:?}",
+            *log
+        );
+        assert_eq!(
+            log.last().unwrap().1,
+            vec![format!("gen-{}.example", newest)],
+            "and on the newest RULES, not just the newest label"
+        );
+        drop(log);
+        assert_eq!(gate.applied.load(Ordering::SeqCst), newest);
+        assert_eq!(closes.load(Ordering::SeqCst), 0, "no live session was disturbed");
+        assert!(
+            captured_generations.iter().max().copied() == Some(newest),
+            "the workers must have covered the newest generation: {captured_generations:?}"
+        );
     }
 }

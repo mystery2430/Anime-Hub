@@ -217,6 +217,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         pip_lock: Mutex::new(()),
         pip_generation: AtomicU64::new(0),
         diagnostics_lock: Mutex::new(()),
+        blocklist_sync: commands::BlocklistSyncGate::new(),
     });
 
     // Mirror the persisted gate into Kotlin before the developer panel can

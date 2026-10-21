@@ -214,7 +214,14 @@ site yolları hiç dokunmaz.
   site açılmaz; açık bir site varsa güvenlik için normal lifecycle yolundan
   kapatılır ve komut hata döner. Kapatma da başarısızsa kullanıcıya yeniden
   başlatma gerektiren açık bir hata gösterilir; eski snapshot ile devam
-  edildiği iddia edilmez.
+  edildiği iddia edilmez. Aktarımlar ayrıca **sıralanır**: `open_site`,
+  `update_settings` ve `reset_blocklist` oturum kilidi dışında çalıştığı ve
+  Kotlin tarafı "son yazan kazanır" bir atomik takas yaptığı için, eski
+  ayarlardan üretilmiş gecikmiş bir snapshot yeni kuralların üzerine
+  yazabilirdi. `BlocklistSyncGate` aktarımları serileştirir, snapshot'ı kilit
+  **içinde** yeniden okur ve zaten iletilmiş bir generation'ı atlar; iletim
+  yalnızca doğrulanmış bir push'tan sonra ilerler. Güncel olan bir aktarım
+  başarılı sayıldığı için açık oturumu gereksiz yere kapatmaz.
 
 #### Hangi kontrol nerede çalışıyor? (dürüst tablo)
 
@@ -235,8 +242,14 @@ cache'lenir. Motor bağlantı sırasında yeniden çözümleme yapabildiği içi
 ile soket arasında **TOCTOU** penceresi kalır: rebinding yapan bir host ön
 kontrole public, sokete private cevap verebilir. Gerçek çözüm, çözülen adresi
 bağlantıya sabitleyen bir ağ katmanıdır (yerel CONNECT proxy / sağlayıcı
-filtresi); bu PR'da uygulanmamıştır. Bu nedenle DNS rebinding **açık bir
-güvenlik riski** olarak kalır; belge veya test değişikliği onu kapatmaz.
+filtresi); bu PR'da uygulanmamıştır. Değerlendirilen ağ katmanı seçenekleri
+(`androidx.webkit.ProxyController` / `WebViewFeature.PROXY_OVERRIDE` ve reddedilen
+alternatifler) ile uygulanmadan önce çalışması gereken cihaz/emülatör matriksi
+`docs/security-residual-risks.md` içinde yazılıdır; bu ortamda Android SDK,
+Gradle, JVM, cihaz veya emülatör bulunmadığı için hiçbiri doğrulanamadı ve
+doğrulanmamış bir proxy varsayılan olarak eklenmedi. Bu nedenle DNS rebinding
+**açık bir güvenlik riski** olarak kalır; belge veya test değişikliği onu
+kapatmaz.
 
 ### ➕&nbsp; Kodsuz site ekleme
 

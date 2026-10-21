@@ -158,3 +158,119 @@ test("Actions pinning is reported as a blocker, not claimed as fixed", () => {
   const proposal = read("ci-fixes/ci.yml");
   assert.match(proposal, /uses:\s*actions\/checkout@[0-9a-f]{40} # v7/);
 });
+
+test("blocklist transfers are serialized and generation-guarded (PR #27 follow-up)", () => {
+  // The behaviour itself is covered by the Rust tests in commands.rs
+  // (`concurrent_out_of_order_transfers_never_restore_a_stale_snapshot`,
+  // `stale_blocklist_snapshot_is_refused_without_closing_a_live_site`, …).
+  // This is the wiring tripwire: it fails if a later edit drops the guard or
+  // routes a transfer around it while leaving those tests behind.
+  assert.match(commandsRs, /pub struct BlocklistSyncGate/);
+  assert.match(commandsRs, /fn transfer_blocklist_with_generation</);
+
+  // Every Android transfer must go through the guard, never around it.
+  const fromSync = commandsRs.slice(
+    commandsRs.indexOf("pub(crate) fn sync_android_blocklist"),
+  );
+  const androidBranch = fromSync.slice(0, fromSync.indexOf("#[cfg(not(target_os"));
+  assert.match(
+    androidBranch,
+    /transfer_blocklist_with_generation\(/,
+    "the Android path must use the generation-guarded transfer",
+  );
+  assert.equal(
+    /transfer_blocklist_snapshot\(/.test(androidBranch),
+    false,
+    "sync_android_blocklist must not call the unguarded helper directly",
+  );
+
+  // All three commands still propagate the failure (`?`), so a refused
+  // transfer can never be reported as success.
+  assert.equal(
+    (commandsRs.match(/sync_android_blocklist\(&app, &state\)\?;/g) || []).length,
+    3,
+    "open_site, update_settings and reset_blocklist must all propagate",
+  );
+
+  // The generation is bumped while the matcher lock is held, otherwise a reader
+  // could see new rules under an old generation and skip the transfer.
+  assert.match(
+    commandsRs,
+    /\.generation\s+\.fetch_add\(1, std::sync::atomic::Ordering::SeqCst\);/,
+  );
+  // gate starts above `applied` so the very first open pushes (Kotlin starts
+  // empty and lib.rs does not go through rebuild_blocklist).
+  assert.match(commandsRs, /generation: std::sync::atomic::AtomicU64::new\(1\)/);
+  assert.match(commandsRs, /applied: std::sync::atomic::AtomicU64::new\(0\)/);
+
+  // Every AppState construction carries the gate, or the crate would not build.
+  const windowsRs = read("src-tauri/src/web/windows.rs");
+  for (const [src, name] of [
+    [commandsRs, "commands.rs"],
+    [libRs, "lib.rs"],
+    [windowsRs, "windows.rs"],
+  ]) {
+    const gates = (src.match(/blocklist_sync: /g) || []).length;
+    const states = (src.match(/diagnostics_lock: /g) || []).length;
+    assert.ok(gates >= 1, `${name}: AppState must carry the blocklist sync gate`);
+    assert.equal(
+      gates,
+      states,
+      `${name}: every AppState construction needs blocklist_sync`,
+    );
+  }
+});
+
+test("R-05 and the 'Not closed' list agree about Android OAuth", () => {
+  // The claim has to match the shipped configuration: no Android intent filter,
+  // desktop scheme retained.
+  const conf = JSON.parse(read("src-tauri/tauri.conf.json"));
+  assert.deepEqual(conf.plugins["deep-link"].mobile, []);
+  assert.ok(conf.plugins["deep-link"].desktop.schemes.includes("animehub"));
+
+  const audit = read("docs/audit-item-status.md");
+  const risks = read("docs/security-residual-risks.md");
+
+  // An earlier round said another app can register the scheme "and receive the
+  // intent" on Android, contradicting both the R-05 row and this config.
+  // The correction quotes the wording it replaced, so strip quoted spans before
+  // checking: the phrase may only survive as a quotation, never as a claim.
+  const unquoted = audit.replace(/"[^"]*"/g, "");
+  assert.equal(
+    /and receive the intent/.test(unquoted),
+    false,
+    "Android sends no OAuth intent to a custom scheme: mobile deep-link is []",
+  );
+  assert.match(
+    audit,
+    /and receive the intent/,
+    "the correction must name the wording it replaced",
+  );
+  assert.equal(
+    /\(R-04, R-05\)/.test(audit),
+    false,
+    "R-05 is fixed for Android; only R-04 stays unresolved on the lost wording",
+  );
+  assert.match(audit, /scheme squatting/);
+  assert.match(audit, /Android only/);
+  assert.match(risks, /there is no OAuth intent for it to receive/);
+
+  // And the ordering the row asserts is real: refuse on Android, then validate
+  // the redirect, and only then write the pending state.
+  const loginStart = commandsRs.slice(
+    commandsRs.indexOf("pub async fn anilist_login_start"),
+  );
+  const refuseAt = loginStart.indexOf("mobile_native_login_allowed");
+  const validateAt = loginStart.indexOf("validate_redirect_uri");
+  const stateWriteAt = loginStart.indexOf("*s = Some(state_value)");
+  assert.ok(refuseAt > 0, "the Android custom-scheme refusal must exist");
+  assert.ok(
+    validateAt > refuseAt && stateWriteAt > validateAt,
+    "refusal and redirect validation must both precede the pending-state write",
+  );
+  assert.match(
+    loginStart.slice(validateAt, validateAt + 120),
+    /cfg!\(desktop\)/,
+    "allow_custom_scheme is desktop-only, so Android refuses the scheme",
+  );
+});

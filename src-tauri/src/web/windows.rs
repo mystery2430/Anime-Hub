@@ -3724,6 +3724,7 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
             diagnostics_lock: std::sync::Mutex::new(()),
+            blocklist_sync: crate::commands::BlocklistSyncGate::new(),
         }
     }
 
@@ -4422,6 +4423,7 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
             diagnostics_lock: std::sync::Mutex::new(()),
+            blocklist_sync: crate::commands::BlocklistSyncGate::new(),
         };
         (state, fail_flag, flag_writes)
     }
@@ -4894,6 +4896,7 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
             diagnostics_lock: std::sync::Mutex::new(()),
+            blocklist_sync: crate::commands::BlocklistSyncGate::new(),
         };
         (state, session_deletes)
     }
@@ -5166,6 +5169,7 @@ mod tests {
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
             diagnostics_lock: std::sync::Mutex::new(()),
+            blocklist_sync: crate::commands::BlocklistSyncGate::new(),
         };
         (state, writes, fail_generation_writes, fail_queue_writes)
     }

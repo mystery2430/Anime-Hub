@@ -94,6 +94,46 @@ A disabled list still arrives as an **empty** snapshot (Kotlin has no enabled
 flag), which is the only representation that matches `Blocklist::is_blocked`.
 A transport failure is never converted into that empty snapshot.
 
+### Blocklist transfers are ordered, so a stale snapshot cannot win
+
+Fail-closed answers "what if the push fails". It did not answer "what if two
+pushes race", and they can: `sync_android_blocklist` runs from `open_site`,
+`update_settings` and `reset_blocklist` **outside** `ANDROID_SESSION_LOCK`,
+because that lock guards the site lifecycle and the fail-closed close path has
+to take it. Kotlin's `SiteBlocklist.update` is a last-writer-wins atomic
+reference swap, so a transfer built from older settings could complete *after*
+a newer one and silently restore the old rules — the persisted settings, the
+Rust matcher and the Kotlin snapshot would then disagree with no error on any
+side.
+
+`transfer_blocklist_with_generation` closes that with two mechanisms:
+
+* `BlocklistSyncGate::lock` serializes transfers, so at most one push is in
+  flight. Lock order is `BlocklistSyncGate::lock` → `ANDROID_SESSION_LOCK`;
+  nothing acquires them the other way round and the close path never takes the
+  gate lock, so the existing lifecycle rules still hold and this cannot
+  deadlock against them.
+* The snapshot is **re-read inside that lock** (`blocklist_transfer_snapshot`)
+  and compared against `applied`. A caller whose generation is not newer returns
+  `Ok(())` *without pushing* — and, because that is the success path, without
+  touching a live session. `rebuild_blocklist` bumps the generation while the
+  matcher lock is still held, so new rules can never be observed under an old
+  generation. `applied` advances only after a confirmed push, so a failed
+  transfer is retried instead of being believed.
+
+`BlocklistSyncGate::new()` starts `generation = 1` and `applied = 0` on purpose:
+`lib.rs` builds the startup `Blocklist` directly rather than through
+`rebuild_blocklist`, and Kotlin starts empty, so treating "nothing delivered
+yet" as 0 on both sides would have let the first `open_site` skip the push and
+run the site WebView with no user rules at all.
+
+Coverage: the nine `*_blocklist_*` / `*_transfer_*` tests in `commands.rs`
+drive the real guarded function against a fake Kotlin side, including a
+multi-threaded out-of-order case asserting Kotlin's delivered generations are
+monotonic and end on the newest rules. **These are host tests.** They were
+written in an environment with no Rust toolchain, so they have not been executed
+here — `cargo test` in CI is the first run (R-04).
+
 ### Redirect DNS verdicts (partial)
 
 `NavigationDnsGate` is shared by `shouldOverrideUrlLoading` and
@@ -104,10 +144,14 @@ exists, and the answer is only cached for later requests. This is forced by the
 synchronous WebView callback (no UI-thread resolver), but it is not a guarantee
 for the navigation that triggered the probe. It is also **not** connection
 pinning: the engine resolves again when it connects, so a rebinding host can
-answer public to the check and private to the socket. A local CONNECT proxy /
-provider-level filter would be needed to pin the connected address; that network
-layer is not part of this PR. **R-01 (b) stays open.** No comment, test or doc
-change closes it.
+answer public to the check and private to the socket. A network layer that pins
+the connected address would be needed; the options that were actually evaluated
+(`androidx.webkit.ProxyController` / `PROXY_OVERRIDE` and the rejected
+alternatives) are written up under
+[DNS rebinding on Android](#dns-rebinding-on-android), together with the device
+matrix that has to run before any of it can be shipped. That network layer is
+**not** part of this PR. **R-01 (b) stays open.** No comment, test or doc change
+closes it.
 
 ### OAuth loopback redirect must be exactly the served endpoint
 
@@ -157,9 +201,62 @@ scope (or a maintainer running `ci-fixes/apply.sh`) lands the pinned files.
 Residual: **TOCTOU**. The WebView engine resolves again when it connects. A
 rebinding server could answer a public address to both pre-checks and a private
 one to the engine. The complete fix is a network layer that pins the resolved
-address for the connection (local CONNECT proxy or platform-level filter), not
-another WebView callback. A resolver outage is deliberately fail-open so an
-offline DNS server does not brick the app.
+address for the connection, not another WebView callback. A resolver outage is
+deliberately fail-open so an offline DNS server does not brick the app.
+
+#### Network-layer options actually evaluated (and why none is implemented here)
+
+This was researched against the platform APIs rather than assumed. Findings:
+
+* **`androidx.webkit.ProxyController` / `ProxyConfig` — the only supported
+  WebView network hook.** Feature constant is `WebViewFeature.PROXY_OVERRIDE`
+  (added in androidx.webkit 1.1.0); `getInstance()` throws
+  `UnsupportedOperationException` unless `isFeatureSupported` is true. A loopback
+  **CONNECT-only** proxy installed through it would resolve the hostname itself
+  and open the socket only to an address it has already classified, so the
+  resolver used for the check *is* the resolver used for the connection — that
+  is what actually closes the TOCTOU window. TLS stays end-to-end: CONNECT
+  forwards bytes unread, so certificate validation and the system-CA-only trust
+  policy are untouched, and each redirect hop is a new request through the same
+  guard. `androidx.webkit` is already a dependency here (for `MULTI_PROFILE`).
+* **Why it is not implemented on this branch.** The API is process-wide
+  ("used by all WebViews in the app") and asynchronous — "network connections
+  are not guaranteed to immediately use the new proxy setting; **wait for the
+  listener before loading a page**" — so it has to be ordered against
+  `open_site` and the activity lifecycle. `addDirect()` must be *omitted*,
+  otherwise the engine falls back to a direct connection that bypasses the
+  guard; omitting it means a proxy failure is a total loss of connectivity, so
+  the failure path needs its own design. The loopback listener is reachable by
+  other apps on the device, so it must not become a usable tunnel for them.
+  HTTP/3/QUIC is not carried by an HTTP CONNECT proxy and needs to be confirmed
+  disabled under a proxy override. The launcher WebView (local content) needs a
+  bypass rule. **None of that can be verified in this environment: there is no
+  Android SDK, no Gradle, no JVM, no device and no emulator here**, so TLS
+  behaviour, redirects, QUIC, provider differences and lifecycle ordering would
+  all be unverified. Shipping it unverified would trade a documented residual
+  risk for an undocumented one — and a bug in a mandatory proxy breaks every
+  site, not just the rebinding case.
+* **Rejected alternatives.** `shouldInterceptRequest`-side fetching would mean
+  reimplementing the network stack (streaming video, range requests,
+  `CookieManager` sync, HTTP auth, service workers) and is not called for every
+  main-frame navigation. Chromium's `--host-resolver-rules` is not settable on
+  Android WebView. `ConnectivityManager.bindProcessToNetwork` selects a network,
+  it does not filter destinations. A `VpnService` filter needs user consent for
+  a VPN and is a different product decision. Tauri's Rust HTTP client never
+  carries WebView traffic, so nothing in `src-tauri/src/web/dns.rs` can pin a
+  WebView connection.
+* **Decision left to a human.** Implementing the `PROXY_OVERRIDE` guard is a
+  real, bounded project — but it needs a device/emulator matrix first:
+  (1) `isFeatureSupported(PROXY_OVERRIDE)` across provider versions including
+  the downgrade path; (2) proof that no request escapes when `addDirect()` is
+  absent; (3) TLS to a public host through the tunnel, including redirects and
+  a rebinding host that flips its answer mid-chain; (4) private/loopback/
+  link-local destinations refused at CONNECT; (5) resolver failure behaviour;
+  (6) HTTP/3 confirmed off; (7) the launcher WebView still loads; (8) another
+  app on the device cannot use the loopback listener as a tunnel; (9) activity
+  recreation / process restart ordering. Until that runs, `ALLOW_AND_PROBE`
+  stays as it is and **R-01 (b) stays open**.
+
 
 ### Device verification (R-04)
 

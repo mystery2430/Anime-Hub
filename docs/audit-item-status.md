@@ -18,8 +18,16 @@ Consequences, stated rather than papered over:
   **status** is justified from the code as it stands now — each row cites files
   and lines you can open — but the *original* finding prose is not recoverable,
   so a row cannot quote it.
-* Where the lost wording was the thing that decided the verdict (R-04, R-05),
-  the item stays **unresolved** instead of being guessed at.
+* Where the lost wording was the thing that decided the verdict (R-04), the
+  item stays **unresolved** instead of being guessed at. An earlier round listed
+  R-05 here as well while its own row below said **fixed** — a direct
+  contradiction. It is resolved in favour of the code, because R-05's verdict
+  does not actually depend on the lost wording: `tauri.conf.json` ships
+  `plugins.deep-link.mobile: []`, and `commands::anilist_login_start` refuses a
+  custom-scheme redirect on Android (`mobile_native_login_allowed`, then
+  `validate_redirect_uri(uri, cfg!(desktop))`) **before** any pending state is
+  written. R-05 stays **fixed** for Android; see "Not closed" #2 for the narrow
+  fact that remains true.
 * `AH-01…AH-16`, `AH-P*` and `AH-G*` belong to those lost reports and are kept
   as separate identities. They are referenced here only where this branch's own
   code and tests already cite them (`AH-04 / R-07` in `web/windows.rs`,
@@ -30,11 +38,46 @@ Consequences, stated rather than papered over:
 
 | Item | Scope reviewed | Status | Evidence on this branch |
 | --- | --- | --- | --- |
-| **R-01** | Android network policy: user blocklist, private-host rules and DNS-rebinding protection | **partially fixed** — (a)/(c) fixed, **(b) DNS remains open** | **(a) Blocklist plumbing — fixed.** `Blocklist::entries()` serialises the rules; `commands::sync_android_blocklist(app, state)` pushes them before every open and after every settings change **and reset** (`reset_blocklist` previously returned without a push). Fail-closed now covers an already-open WebView: `transfer_blocklist_snapshot` pushes first, then closes the active site through `close_site_window` (`ANDROID_SESSION_LOCK`, flush, `current_site` release) before returning `AppError::BlocklistUnavailable`; a failed close is a restart-required `Other` error, never `Ok`. Kotlin: `SiteBlocklist.kt` is an atomic process-wide snapshot consumed by `SiteNavigationPolicy.hostAllowed` at both checkpoints. Rust tests `blocklist_transfer_success_does_not_close_an_open_site`, `blocklist_transfer_closes_the_live_site_before_returning_push_error`, `blocklist_transfer_close_failure_requires_a_restart_not_success`; the Kotlin suite pins replacement/revocation. **(b) DNS — partial, NOT fixed / OPEN.** `NavigationDnsGate` feeds both checkpoints. `shouldInterceptRequest` resolves off the UI thread and refuses private or changed answers; `shouldOverrideUrlLoading` can only use the cache and returns **`ALLOW_AND_PROBE` on a miss**, so the triggering navigation proceeds before its DNS answer exists. The engine resolves again at connect time, so there is **no connection pinning** and the TOCTOU window remains (`docs/security-residual-risks.md`). This is a residual security finding, not closed by tests or wording. **(c) Built-in host/IP rules — fixed**, shared vectors in `tests/fixtures/navigation-policy.tsv`. |
+| **R-01** | Android network policy: user blocklist, private-host rules and DNS-rebinding protection | **partially fixed** — (a)/(c) fixed, **(b) DNS remains open** | **(a) Blocklist plumbing — fixed.** `Blocklist::entries()` serialises the rules; `commands::sync_android_blocklist(app, state)` pushes them before every open and after every settings change **and reset** (`reset_blocklist` previously returned without a push). Fail-closed now covers an already-open WebView: `transfer_blocklist_snapshot` pushes first, then closes the active site through `close_site_window` (`ANDROID_SESSION_LOCK`, flush, `current_site` release) before returning `AppError::BlocklistUnavailable`; a failed close is a restart-required `Other` error, never `Ok`.
+  **Transfer ordering (new, separate):** `sync_android_blocklist` is called by
+  `open_site`, `update_settings` and `reset_blocklist` *outside*
+  `ANDROID_SESSION_LOCK` (that lock guards the site lifecycle, and the
+  fail-closed close has to take it), and Kotlin's `SiteBlocklist.update` is a
+  last-writer-wins atomic swap — so a transfer built from older settings could
+  previously land *after* a newer one and silently restore the old rules, with
+  the settings file, the Rust matcher and the Kotlin snapshot disagreeing and no
+  error anywhere. `commands::transfer_blocklist_with_generation` now serializes
+  transfers on `BlocklistSyncGate::lock`, **re-reads** the snapshot inside that
+  lock (`blocklist_transfer_snapshot`) and skips any generation already
+  delivered (`applied`), which is bumped by `rebuild_blocklist` while the
+  matcher lock is held. `applied` advances only after a confirmed push, so a
+  failure is retried rather than believed. Lock order is
+  `BlocklistSyncGate::lock` → `ANDROID_SESSION_LOCK`; nothing takes them the
+  other way round. Rust tests: `first_blocklist_transfer_pushes_even_before_any_rebuild`,
+  `stale_blocklist_snapshot_is_refused_without_closing_a_live_site`,
+  `delayed_transfer_delivers_the_newest_snapshot_not_the_captured_one`,
+  `blocklist_push_failure_closes_the_live_site_and_does_not_advance_applied`,
+  `blocklist_close_failure_is_restart_required_and_leaves_applied_behind`,
+  `rebuild_blocklist_bumps_the_generation_once_per_rebuild`,
+  `disabled_blocklist_still_transfers_an_empty_snapshot_through_the_guard`,
+  `reset_blocklist_reaches_android_with_the_default_snapshot`,
+  `concurrent_out_of_order_transfers_never_restore_a_stale_snapshot`. Kotlin: `SiteBlocklist.kt` is an atomic process-wide snapshot consumed by `SiteNavigationPolicy.hostAllowed` at both checkpoints. Rust tests `blocklist_transfer_success_does_not_close_an_open_site`, `blocklist_transfer_closes_the_live_site_before_returning_push_error`, `blocklist_transfer_close_failure_requires_a_restart_not_success`; the Kotlin suite pins replacement/revocation. **(b) DNS — partial, NOT fixed / OPEN.** `NavigationDnsGate` feeds both checkpoints. `shouldInterceptRequest` resolves off the UI thread and refuses private or changed answers; `shouldOverrideUrlLoading` can only use the cache and returns **`ALLOW_AND_PROBE` on a miss**, so the triggering navigation proceeds before its DNS answer exists. The engine resolves again at connect time, so there is **no connection pinning** and the TOCTOU window remains (`docs/security-residual-risks.md`). This is a residual security finding, not closed by tests or wording. **(c) Built-in host/IP rules — fixed**, shared vectors in `tests/fixtures/navigation-policy.tsv`. |
 | **R-02** | `get_site_cookies` / `set_site_cookies` removed from the IPC surface | **fixed** | Neither command is registered nor defined; the only occurrences left are the comments explaining the removal (`commands.rs:832`, `:1792`). Pinned by `lib.rs:598` `raw_cookie_jar_commands_are_gone_from_the_ipc_surface`, which builds both names at runtime and asserts they appear in neither `invoke_handler` nor `commands.rs` nor **any** frontend source; `lib.rs:637` `cookie_jar_storage_keys_still_have_a_production_user` keeps the legitimate jar (`cookies-<site_id>`, `CookieJar`) alive for the 0.3.4 import and the mobile open/clear/delete protocols. |
 | **R-03** | Shipped texts still described the 0.3.4 cookie-jar swap and an unsolved same-origin storage problem, while another section described per-site profiles | **fixed** (this round) | `README.md:8` (tagline), `:66` (security policy scope, now naming the Kotlin checkpoints and the shared vector fixture), `:117` (architecture table row), the encrypted-store and snapshot paragraphs; `src-tauri/tauri.conf.json` `bundle.longDescription` (this text ships inside the package metadata). Regression: `tests/gaps.test.js:37` carries the stale sentences **verbatim** as negative pins (whitespace-collapsed, so re-wrapping cannot hide them) plus positive pins for the profile model and the stated Android limits; reverting either file to the old wording was verified to fail that test. |
 | **R-04** | Android behaviour verified only by compilation and host unit tests | **unresolved** | Nothing in this branch changes that. `docs/android-storage-isolation.md:847` ("Verification status (honest)") records what CI does prove (Kotlin unit tests over real flow code with fake ports, an aarch64 debug APK build) and what it does not, followed by the device checklist that remains: MULTI_PROFILE present/absent on two provider versions, cookie non-mixing across sites, default-profile data untouched, back-button ladder, PiP handoff, one-time migration, deferred-deletion draining, real `flush()` latency and watchdog paths, kill-between-phases, late-callback races. **No physical device or emulator has run this build.** |
-| **R-05** | Android OAuth callback can be taken by another app that registers the same custom scheme | **fixed** (custom-scheme removal, separate from the loopback hardening) | The Android intent filter is gone: `tauri.conf.json` sets `plugins.deep-link.mobile: []`, and `anilist::validate_redirect_uri(uri, allow_custom_scheme)` is called in `anilist_login_start` **before** any pending state is written (custom scheme → `AppError::AniList` on Android). **Loopback hardening (new, separate):** `loopback_port()` now accepts exactly the endpoint `LoopbackListener` serves — `http://127.0.0.1:<explicit port>/callback`, no query/fragment/userinfo, no `localhost`/`[::1]` — so `/cb`, a missing port or a foreign port can no longer start a login that cannot finish; the listener starts only for `LoginRedirect::Loopback(port)`. Token handling itself (`state` single-use, constant-time compare) is unchanged. |
+| **R-05** | Android OAuth callback can be taken by another app that registers the same custom scheme | **fixed** (custom-scheme removal, separate from the loopback hardening) | The Android intent filter is gone: `tauri.conf.json` sets `plugins.deep-link.mobile: []`, and `anilist::validate_redirect_uri(uri, allow_custom_scheme)` is called in `anilist_login_start` **before** any pending state is written (custom scheme → `AppError::AniList` on Android). **Loopback hardening (new, separate):** `loopback_port()` now accepts exactly the endpoint `LoopbackListener` serves — `http://127.0.0.1:<explicit port>/callback`, no query/fragment/userinfo, no `localhost`/`[::1]` — so `/cb`, a missing port or a foreign port can no longer start a login that cannot finish; the listener starts only for `LoginRedirect::Loopback(port)`. Token handling itself (`state` single-use, constant-time compare) is unchanged.
+  **Scope of this verdict — Android only, and it is a statement about *this*
+  app.** Two facts must not be conflated: (i) any app can still *register*
+  `animehub://` with the OS — that is Android's behaviour and this branch cannot
+  change it; (ii) this app no longer *uses* that scheme on Android, so there is
+  no OAuth intent, code or `state` for a hijacker to receive. What (i) leaves
+  open is only scheme squatting against a URI this app never sends to.
+  **Desktop is different and is not covered by this row:**
+  `plugins.deep-link.desktop.schemes` still contains `animehub`, and
+  `validate_redirect_uri` is called with `cfg!(desktop)`, i.e.
+  `allow_custom_scheme = true` there. The desktop exact-host/path check
+  (`animehub://anilist/callback`, no other host or path) is unchanged and is a
+  separate, lower-severity surface. |
 | **R-06** | Is the Android HTTP-cache / Service-Worker limit shown to the user? | **fixed** | Shown in the UI, not only in docs: `src/logic/storage_scope.js:43` and `:48` build the clear-result message ("Android'de HTTP önbelleği ve servis çalışanları profil bazında silinemiyor; site önbellekten içerik gösterebilir."), imported by `src/main.js:39` and pinned by `tests/storage_scope.test.js:49` and `:66`. `docs/android-storage-isolation.md:237` states the same limit next to `cacheMode = LOAD_DEFAULT`. |
 | **R-07** | Profile deletion: the tombstone was lifted without securing the generation counter | **fixed** (this round, host-tested) | Order is now tombstone → provider delete → **secure the generation** → forget → retire, in both paths: `web/windows.rs:1503` `secure_tombstone_generation` and `:1555` `run_pending_delete_drain` (startup), plus `run_mobile_delete_protocol`; `lib.rs:332` `drain_pending_profile_deletes` is a thin adapter over them. `:974` `generation_past_name` is monotone, idempotent, re-derives the profile name to prove ownership (never trusts parsed digits) and refuses at `u32::MAX` while keeping the durable tombstone; `:1025` `match_queued_name_to_site` requires exactly one owner, and an unmatchable tombstone is **kept**, logged and reported (`DrainReport::kept_unmatched`) instead of being dropped. Queue entries carry their owner (`PendingOwner::{Site,Orphan,Unknown}`) with legacy string-list queues and corrupt-queue salvage preserved. Behavioural tests drive the real protocol against fakes at every kill point (`windows.rs` test module, 17 added cases, incl. "every kill point leaves the next open with a different name", a failing generation write, and repeated drains not consuming a second generation); `tests/android_isolation.test.js:400` and `:561` pin the order from the JS side; `docs/android-storage-isolation.md:554` and `:569` describe it. **What a host test cannot prove** — when a real provider finishes `deleteProfile` — is still device work (R-04). |
 | **R-08** | File/content access and popup/permission decisions must be explicit | **fixed** | Every decision is data in one tested plan: `SiteWebViewSettings.kt:43-95` — `allowFileAccess=false`, `allowContentAccess=false`, `allowFileAccessFromFileURLs=false`, `allowUniversalAccessFromFileURLs=false`, `mixedContentMode=NEVER_ALLOW` (the constant is pinned against the platform value), `geolocationEnabled=false` (no consent flow exists, so it is denied explicitly rather than left to a provider default), `supportMultipleWindows=false` with `javaScriptCanOpenWindowsAutomatically=true` — i.e. a popup becomes an ordinary same-view navigation that `SiteNavigationPolicy` judges — and `safeBrowsingEnabled=true`. `applySiteSettings(WebSettingsSink(...))` is the only code touching the platform object; `SiteWebViewSettingsTest` asserts the plan and that the adapter writes exactly these fields. |
@@ -54,9 +97,19 @@ These stay open pre-merge risks; documenting them is not closing them.
    at connect time, and there is no network-layer pinning. A hostname can still
    answer public to the pre-check and private to the socket. This remains an
    **open** residual risk (R-01 (b)); a test or comment does not close it.
-2. **Android OAuth custom-scheme hijack.** Another app can register
-   `animehub://anilist/callback` and receive the intent; the hardened
-   exact-match check only validates callbacks this app actually receives (R-05).
+2. **`animehub://` scheme squatting — not an OAuth hijack on Android.**
+   Corrected: an earlier round described this as "another app can register
+   `animehub://anilist/callback` **and receive the intent**", which contradicted
+   the R-05 row and `docs/security-residual-risks.md`. On Android there is no
+   intent to receive — `plugins.deep-link.mobile` is `[]`, so this app registers
+   no filter, and `anilist_login_start` refuses a custom-scheme redirect before
+   any pending state exists (`mobile_native_login_allowed` +
+   `validate_redirect_uri(uri, cfg!(desktop))`). What genuinely remains is
+   narrower: a third party can still register the scheme at OS level, and
+   **desktop** still uses it (`deep-link.desktop.schemes: ["animehub"]`,
+   `allow_custom_scheme = cfg!(desktop)`), where the exact host+path check only
+   validates callbacks this app actually receives. Do not read either fact as an
+   Android OAuth hijack (R-05).
 3. **No device or emulator testing.** Every Android claim on this branch is
    backed by compilation and host-side unit tests only (R-04).
 4. **No independent human review.** All review so far is agent review of the
@@ -81,6 +134,7 @@ These stay open pre-merge risks; documenting them is not closing them.
 | Loopback redirect must match the served endpoint | fixed | `anilist.rs` `loopback_port`, `validate_redirect_uri`, `LoginRedirect` |
 | Redirect validated before pending OAuth state | fixed | `commands.rs` `anilist_login_start` |
 | Flush worker replacement is bounded | fixed (host-tested; device behaviour still R-04) | `SiteProfileOps.kt` `MAX_ABANDONED_WORKERS`, `SiteFlushWorker.kt` refusal |
+| Blocklist transfers serialized + generation-guarded | fixed (host-tested; `cargo test` not runnable in the review environment — see R-04) | `commands.rs` `BlocklistSyncGate`, `transfer_blocklist_with_generation`, `blocklist_transfer_snapshot`, `rebuild_blocklist` |
 | Active workflows pinned to commit SHAs | **blocked — missing `workflow` scope** | see R-09 |
 
 ### Android 8/9 support was dropped
