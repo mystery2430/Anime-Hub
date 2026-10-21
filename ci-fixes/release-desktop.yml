@@ -1,0 +1,148 @@
+# Produces the desktop installers: Windows .exe, Linux AppImage/.deb/.rpm.
+#
+# macOS is intentionally absent — it is not a supported target for this
+# project.
+name: Release Desktop
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            label: windows
+          - platform: ubuntu-24.04
+            label: linux
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Install Linux system dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libfuse2 patchelf \
+            rpm pkg-config
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Rust tests
+        run: cargo test --all
+        working-directory: src-tauri
+
+      # Windows Authenticode signing is opt-in through repository secrets and
+      # rides on bundle.windows.signCommand (src-tauri/tauri.windows-signing.
+      # conf.json -> scripts/sign_windows.ps1). `tauri-action` itself reads no
+      # signing configuration; without secrets the bundle stays unsigned and
+      # no secret is referenced from the repository contents.
+      #
+      # Credential modes (see scripts/sign_windows.ps1):
+      #   WINDOWS_SIGN_CMD    - vendor command template for cloud-HSM tools
+      #                         (jsign, SSL.com eSigner, trusted-signing-cli).
+      #                         Any secrets the tool needs (e.g. the
+      #                         SSL_COM_* set) must also be forwarded in the
+      #                         env block of this step; keep passwords out of
+      #                         the template itself.
+      #   WINDOWS_CERTIFICATE - base64-encoded .pfx plus
+      #                         WINDOWS_CERTIFICATE_PASSWORD (exportable key).
+      - name: Prepare Windows signing
+        id: win-sign
+        if: matrix.label == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_SIGN_CMD: ${{ secrets.WINDOWS_SIGN_CMD }}
+        run: |
+          if ($env:WINDOWS_CERTIFICATE -or $env:WINDOWS_SIGN_CMD) {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+            "args=--config src-tauri/tauri.windows-signing.conf.json" >> $env:GITHUB_OUTPUT
+            Write-Host "Windows signing enabled"
+          } else {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            "args=" >> $env:GITHUB_OUTPUT
+            Write-Host "No Windows signing secrets; the bundle will be unsigned"
+          }
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGN_CMD: ${{ secrets.WINDOWS_SIGN_CMD }}
+          WINDOWS_TIMESTAMP_URL: http://timestamp.digicert.com
+        with:
+          # The shared config no longer pins Linux-only bundle targets, which
+          # made a Windows run try to build an AppImage. Name the bundles here.
+          # steps.win-sign appends the signing config overlay on Windows only,
+          # and only when signing secrets exist.
+          args: ${{ matrix.label == 'windows' && '--bundles nsis' || '--bundles appimage,deb,rpm' }} ${{ steps.win-sign.outputs.args }}
+      # scripts/sign_windows.ps1 already validates every file it signs; this
+      # re-checks the shipped artifacts so an unsigned installer can never
+      # reach the release silently. target/release holds only the final
+      # application executable(s); build scripts live under build/ and deps/.
+      - name: Verify Windows signatures
+        if: matrix.label == 'windows' && steps.win-sign.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targets = @(Get-ChildItem src-tauri/target/release -Filter *.exe -File)
+          $targets += @(Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe -File)
+          if ($targets.Count -eq 0) {
+            throw 'no Windows executables found to verify'
+          }
+          foreach ($file in $targets) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            Write-Host ("{0}: {1}" -f $file.FullName, $signature.Status)
+            if ($signature.Status -ne 'Valid') {
+              throw "signature status for $($file.Name) is $($signature.Status), expected Valid"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "signature for $($file.Name) has no timestamp"
+            }
+          }
+          Write-Host 'All Windows artifacts are signed and timestamped'
+
+      - name: Stage production installers
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find src-tauri/target/release/bundle -type f \( -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -exec cp {} release-assets/ \;
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: animehub-desktop-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error

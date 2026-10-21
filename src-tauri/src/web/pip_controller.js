@@ -45,6 +45,35 @@
 (function () {
   "use strict";
 
+  // WHERE THIS MAY RUN: the top frame only.
+  //
+  // The Android document-start channel (`addDocumentStartJavaScript`) applies
+  // to every frame whose origin matches the registered rule set, and that set
+  // has to stay "*" — cross-origin players and cross-origin ad frames are the
+  // normal case on these sites, and both need the popup guard and the cosmetic
+  // rules. This controller, though, is only ever *called* by the native side
+  // through `WebView.evaluateJavascript`, which runs in the main frame, and it
+  // is written to treat iframes as opaque surfaces from the top document. A
+  // copy installed inside a third-party frame could therefore do nothing
+  // useful; all it would do is advertise `window.__animehubPip*` (and the
+  // app's presence) to that origin. So a subframe returns without installing.
+  //
+  // Reading `window.top` from a cross-origin frame is allowed — comparing
+  // WindowProxies never throws — and the `catch` fails CLOSED: if the
+  // comparison cannot be made, do not install. PiP still works, because
+  // `AnimeHubPipController.prepareScript()` embeds this very file and installs
+  // it on demand in the main frame before entering PiP.
+  var isTopFrame = (function () {
+    try {
+      return !window.top || window.self === window.top;
+    } catch (e) {
+      return false;
+    }
+  })();
+  if (!isTopFrame) {
+    return;
+  }
+
   // Bump when the applied view changes shape: a document that already has a
   // newer copy refuses to be re-installed with an older one.
   var VERSION = 2;

@@ -17,7 +17,80 @@ object IpPolicy {
     // Test accessor – üretimdeki gerçek işlevi çağırır
     fun isPublicIpForTest(ip: String): Boolean = isPublicIp(ip)
 
+    /**
+     * WHATWG IPv4 parser (URL Standard, "IPv4 parser"): the same algorithm the
+     * Rust `url` crate and Chromium run. It accepts decimal, `0x`-hex and
+     * leading-zero octal labels plus N-part shorthand, and returns the canonical
+     * dotted quad. `null` means "this host is not an IPv4 literal" — callers
+     * must treat that as blocked, never as public.
+     *
+     * Needed because `android.net.Uri` does NOT normalise hosts the way the
+     * desktop parser does: without this, `https://010.1/` would be public on
+     * desktop (8.0.0.1) and blocked on Android, and `https://0177.0.0.1/` would
+     * be loopback on desktop (127.0.0.1) and something else here.
+     */
+    fun parseIpv4(host: String): String? {
+        val rawParts = host.split('.')
+        val parts = if (rawParts.size > 1 && rawParts.last().isEmpty()) rawParts.dropLast(1) else rawParts
+        if (parts.isEmpty() || parts.size > 4) return null
+        val numbers = mutableListOf<Long>()
+        for (part in parts) {
+            numbers.add(parseIpv4Part(part) ?: return null)
+        }
+        for (i in 0 until numbers.size - 1) {
+            if (numbers[i] > 255L) return null
+        }
+        val limit = when (numbers.size) {
+            1 -> 4294967296L
+            2 -> 16777216L
+            3 -> 65536L
+            else -> 256L
+        }
+        if (numbers.last() >= limit) return null
+        var value = numbers.last()
+        for (i in 0 until numbers.size - 1) {
+            value += numbers[i] shl (8 * (3 - i))
+        }
+        return "${(value shr 24) and 0xFF}.${(value shr 16) and 0xFF}.${(value shr 8) and 0xFF}.${value and 0xFF}"
+    }
+
+    private fun parseIpv4Part(part: String): Long? {
+        if (part.isEmpty()) return null
+        val lower = part.lowercase()
+        if (lower.startsWith("0x")) {
+            val rest = lower.substring(2)
+            if (rest.isEmpty()) return 0L
+            if (!rest.all { it in '0'..'9' || it in 'a'..'f' }) return null
+            return rest.toLongOrNull(16)
+        }
+        if (part.length > 1 && part[0] == '0') {
+            if (!part.all { it in '0'..'7' }) return null
+            return part.toLongOrNull(8)
+        }
+        if (!part.all { it in '0'..'9' }) return null
+        return part.toLongOrNull(10)
+    }
+
+    /**
+     * WHATWG "ends in a number": the last non-empty label is all ASCII digits,
+     * or a `0x`-prefixed hex string. Mirrors Rust `ends_in_a_number` exactly.
+     */
+    fun endsInANumber(host: String): Boolean {
+        val rawParts = host.split('.')
+        val parts = if (rawParts.size > 1 && rawParts.last().isEmpty()) rawParts.dropLast(1) else rawParts
+        val last = parts.lastOrNull() ?: return false
+        if (last.isEmpty()) return false
+        if (last.all { it in '0'..'9' }) return true
+        val lower = last.lowercase()
+        return lower.startsWith("0x") && lower.substring(2).all { it in '0'..'9' || it in 'a'..'f' }
+    }
+
     fun isPublicIpv4(ip: String): Boolean {
+        // A leading zero makes the octet ambiguous: browsers read "0177" as
+        // octal (127) while `toIntOrNull` reads it as 177. Chrome refuses such
+        // hosts outright, and so do we — otherwise `0177.0.0.1` would be public
+        // here and loopback on the desktop side.
+        if (ip.split('.').any { it.length > 1 && it.startsWith("0") }) return false
         val octets = ip.split('.').map { it.toIntOrNull() ?: return false }
         if (octets.size != 4 || octets.any { it !in 0..255 }) return false
         val a = octets[0]

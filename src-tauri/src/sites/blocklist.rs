@@ -117,7 +117,10 @@ impl Blocklist {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // A trailing dot is the DNS root form; normalise it away so the
+            // rule matches what `normalize_host` produces for a request host.
             let entry = line.to_ascii_lowercase();
+            let entry = entry.trim_end_matches('.').to_string();
             // A bare hostname in a text file is the "and its subdomains" form.
             if let Some(rest) = entry.strip_prefix('*') {
                 let rest = rest.trim_start_matches('.');
@@ -158,6 +161,16 @@ impl Blocklist {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Every configured rule, reconstructed in its source form so the same
+    /// semantics can be evaluated by the Android WebView.
+    pub fn entries(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.len());
+        out.extend(self.suffixes.iter().cloned());
+        out.extend(self.wildcard_only.iter().map(|host| format!("*.{host}")));
+        out.extend(self.exact.iter().map(|host| format!("={host}")));
+        out
     }
 
     /// Should requests/navigations to `host` be blocked?
@@ -233,6 +246,25 @@ mod tests {
     }
 
     #[test]
+    fn entries_round_trip_every_rule_kind() {
+        let b = Blocklist::from_rules(
+            "example.com\n*.wild.example\n=exact.example\n# comment\n",
+            true,
+        );
+        let entries = b.entries();
+        assert!(entries.contains(&"example.com".to_string()));
+        assert!(entries.contains(&"*.wild.example".to_string()));
+        assert!(entries.contains(&"=exact.example".to_string()));
+        let again = Blocklist::from_rules(&entries.join("\n"), true);
+        assert_eq!(again.len(), b.len());
+        assert!(again.is_blocked("a.example.com"));
+        assert!(!again.is_blocked("wild.example"));
+        assert!(again.is_blocked("a.wild.example"));
+        assert!(again.is_blocked("exact.example"));
+        assert!(!again.is_blocked("a.exact.example"));
+    }
+
+    #[test]
     fn blocks_listed_apex_and_subdomain() {
         let b = bl();
         assert!(b.is_blocked("doubleclick.net"));
@@ -247,6 +279,14 @@ mod tests {
         for h in ["openani.me", "animecix.tv", "anilist.co", "myanimelist.net"] {
             assert!(!b.is_blocked(h), "{h} must stay reachable");
         }
+    }
+
+    #[test]
+    fn trailing_dot_rules_match_normalized_hosts() {
+        let b = Blocklist::from_rules("Mixed.Example.\n", true);
+        assert!(b.is_blocked("mixed.example"));
+        assert!(b.is_blocked("a.MIXED.example."));
+        assert!(!b.is_blocked("notmixed.example"));
     }
 
     #[test]

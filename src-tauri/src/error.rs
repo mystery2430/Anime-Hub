@@ -47,9 +47,33 @@ pub enum AppError {
     #[error("Beklenmeyen hata: {0}")]
     Other(String),
 
+    /// A platform/feature the current environment cannot provide (e.g. a
+    /// WebView provider without `MULTI_PROFILE`). The message is written to
+    /// be shown to the user as-is.
+    #[error("{0}")]
+    Unsupported(String),
+
+    /// A site profile the platform side refuses to open because its last
+    /// in-place wipe timed out on a provider call that cannot be cancelled,
+    /// so the wipe is UNVERIFIED and may still be mutating the profile (see
+    /// `ProfileQuarantine` in the Kotlin flows). Transient by design — the
+    /// message names the recovery step and is shown to the user as-is, which
+    /// is why it is not folded into [`AppError::Other`]'s "unexpected error"
+    /// wording.
+    #[error("{0}")]
+    Quarantined(String),
+
     /// A tile photo the user attached. The message is already safe to show.
     #[error("{0}")]
     Icon(String),
+
+    /// The user's ad/tracker rules could not be handed to the Android site
+    /// WebView. Deliberately its own variant: continuing would mean the site
+    /// silently runs with stale or no rules (desktop-only enforcement). The
+    /// transfer helper closes an already-open site before this escapes, and a
+    /// failed close gets a separate restart-required `Other` error.
+    #[error("Engelleme listesi site görünümüne uygulanamadı; açık site güvenli biçimde kapatıldı.")]
+    BlocklistUnavailable,
 }
 
 /// Serializable payload for the `invoke` boundary.
@@ -78,31 +102,36 @@ impl AppError {
             AppError::Unauthorized => "unauthorized",
             AppError::Network(_) => "network",
             AppError::Other(_) => "other",
+            AppError::Unsupported(_) => "unsupported",
+            AppError::Quarantined(_) => "quarantined",
             AppError::Icon(_) => "icon",
+            AppError::BlocklistUnavailable => "blocklist_unavailable",
         }
     }
 }
 
 impl From<url::ParseError> for AppError {
-    fn from(e: url::ParseError) -> Self {
-        AppError::InvalidUrl(e.to_string())
+    fn from(_e: url::ParseError) -> Self {
+        // Parsing errors may quote user-controlled URL data. Keep only a safe
+        // class; diagnostics and command errors do not need parser internals.
+        AppError::InvalidUrl("adres biçimi geçersiz".into())
     }
 }
 
 impl From<std::io::Error> for AppError {
-    fn from(e: std::io::Error) -> Self {
-        // `Display` for io errors can include a filesystem path. The UI
-        // renders this string; the detail stays in the log.
-        log::error!("dosya işlemi başarısız: {e}");
+    fn from(_e: std::io::Error) -> Self {
+        // `Display` for io errors can include a filesystem path. Keep both
+        // the user-facing message and the system log to a static class.
+        log::error!("dosya işlemi başarısız");
         AppError::Storage("dosya işlemi başarısız".into())
     }
 }
 
 impl From<serde_json::Error> for AppError {
-    fn from(e: serde_json::Error) -> Self {
-        // Serde errors quote a fragment of the input. That fragment can be
-        // a site list or, on a settings file, a client secret.
-        log::error!("veri çözümlenemedi: {e}");
+    fn from(_e: serde_json::Error) -> Self {
+        // Serde errors can quote a fragment of a site list or settings file.
+        // Keep the log static; never emit parser input or exception text.
+        log::error!("veri çözümlenemedi");
         AppError::Storage("veri çözümlenemedi".into())
     }
 }
@@ -121,8 +150,8 @@ impl From<reqwest::Error> for AppError {
 }
 
 impl From<aes_gcm::Error> for AppError {
-    fn from(e: aes_gcm::Error) -> Self {
-        AppError::Crypto(e.to_string())
+    fn from(_e: aes_gcm::Error) -> Self {
+        AppError::Crypto("şifreleme işlemi başarısız".into())
     }
 }
 

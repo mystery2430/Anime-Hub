@@ -12,6 +12,7 @@
 pub mod android_bridge;
 pub mod anilist;
 pub mod commands;
+pub mod diagnostics;
 pub mod error;
 pub mod secure;
 pub mod sites;
@@ -44,6 +45,7 @@ pub fn run() {
         .setup(setup)
         .invoke_handler(tauri::generate_handler![
             commands::list_sites,
+            commands::list_hidden_sites,
             commands::add_site,
             commands::update_site,
             commands::remove_site,
@@ -51,8 +53,6 @@ pub fn run() {
             commands::open_site,
             commands::close_site,
             commands::clear_site_data,
-            commands::get_site_cookies,
-            commands::set_site_cookies,
             commands::get_settings,
             commands::update_settings,
             commands::reset_blocklist,
@@ -69,6 +69,7 @@ pub fn run() {
             commands::enter_pip,
             commands::set_pip_auto_enter,
             commands::debug_log,
+            commands::debug_log_reset,
             commands::set_window_theme,
             commands::app_info,
         ])
@@ -93,6 +94,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .flatten()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
+
+    crate::diagnostics::set_enabled(settings.developer_options);
+    crate::diagnostics::record("startup", "start", "started", None, None, None, None, None);
 
     let blocklist = Blocklist::from_rules(&settings.blocklist.rules, settings.blocklist.enabled);
     // Captured before `settings` moves into the managed state; applied to
@@ -150,7 +154,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 return;
                             }
                             Err(e) if attempt == 3 => {
-                                log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                                log::warn!("PiP auto-enter ayarı uygulanamadı");
                                 return;
                             }
                             Err(_) => {
@@ -171,7 +175,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                         Err(e) if attempt == 3 => {
-                            log::warn!("PiP auto-enter ayarı uygulanamadı: {e}");
+                            log::warn!("PiP auto-enter ayarı uygulanamadı");
                             return;
                         }
                         Err(_) => {}
@@ -184,11 +188,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    if let Some(w) = &warning {
-        log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü: {w}");
+    if warning.is_some() {
+        log::error!("kayıtlı site listesi okunamadı, varsayılanlara dönüldü");
     }
-    // The raw error stays in the log. The notice is a fixed sentence so a
-    // parse fragment never reaches the launcher.
+    // The user-facing notice is fixed text; parser details stay out of logs.
     let startup_warning = warning
         .as_ref()
         .map(|_| "Kayıtlı site listesi okunamadı, varsayılanlara dönüldü.".to_string());
@@ -213,7 +216,133 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         current_site: Mutex::new(None),
         pip_lock: Mutex::new(()),
         pip_generation: AtomicU64::new(0),
+        diagnostics_lock: Mutex::new(()),
+        blocklist_sync: commands::BlocklistSyncGate::new(),
     });
+
+    // Mirror the persisted gate into Kotlin before the developer panel can
+    // request events. The setting is re-read under diagnostics_lock on each
+    // retry so a stale startup value cannot re-enable collection after a user
+    // toggle wins the race.
+    #[cfg(target_os = "android")]
+    {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+            for attempt in 0..8 {
+                let mut retry = true;
+                if let Some(state) = handle.try_state::<AppState>() {
+                    if let Ok(_gate) = state.diagnostics_lock.lock() {
+                        let enabled = state
+                            .settings
+                            .lock()
+                            .map(|settings| settings.developer_options)
+                            .unwrap_or(false);
+                        crate::diagnostics::set_enabled(enabled);
+                        match crate::android_bridge::set_debug_logging(enabled) {
+                            Ok(()) => {
+                                if enabled {
+                                    crate::diagnostics::record(
+                                        "startup",
+                                        "capability",
+                                        "enabled",
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                }
+                                retry = false;
+                            }
+                            Err(_) if attempt == 7 => {
+                                crate::diagnostics::record(
+                                    "startup",
+                                    "capability",
+                                    "failed",
+                                    None,
+                                    None,
+                                    Some("provider"),
+                                    None,
+                                    None,
+                                );
+                                retry = false;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                if !retry {
+                    return;
+                }
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+        });
+    }
+
+    // Android: finish deferred profile deletions before the frontend can
+    // open anything (see `drain_pending_profile_deletes`). A throwaway
+    // thread, like the PiP startup apply: the Kotlin bridge may not answer
+    // in the first moments of the process, so failures are retried a few
+    // times and then left for the next start — the queue never loses an
+    // entry because of a slow boot.
+    #[cfg(target_os = "android")]
+    {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+            let _startup_scope = crate::diagnostics::scope_if_missing("startup");
+            for attempt in 0..8 {
+                let (stop, round_result, error_class) = match handle.try_state::<AppState>() {
+                    Some(state) => match crate::web::windows::lock_android_session() {
+                        Ok(_guard) => match drain_pending_profile_deletes(&state) {
+                            Ok(done) => (done, if done { "ok" } else { "pending" }, None),
+                            Err(_) => {
+                                // Storage failure: retrying now would fail the
+                                // same way; the queue stays for the next start.
+                                log::error!("ertelenen profil silmeleri okunamadı");
+                                (true, "failed", Some("storage"))
+                            }
+                        },
+                        Err(_) => {
+                            log::error!("ertelenen profil silmeleri kilitlenemedi");
+                            (false, "unavailable", Some("storage"))
+                        }
+                    },
+                    None => (false, "unavailable", Some("unavailable")),
+                };
+                crate::diagnostics::record_current(
+                    "startup",
+                    "worker_wait",
+                    round_result,
+                    None,
+                    None,
+                    error_class,
+                    Some(attempt as u64),
+                    None,
+                );
+                if stop {
+                    return;
+                }
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+            log::warn!(
+                "ertelenen profil silmeleri bu açılışta işlenemedi; sonraki açılışta yeniden denenecek"
+            );
+            crate::diagnostics::record_current(
+                "startup",
+                "drain",
+                "timeout",
+                None,
+                Some("fired"),
+                Some("timeout"),
+                Some(8),
+                None,
+            );
+        });
+    }
 
     // Route the OAuth redirect into the login command on every platform.
     //
@@ -221,8 +350,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // at startup from the `plugins.deep-link` config; on Android the
     // intent-filter in AndroidManifest.xml handles it instead.
     #[cfg(desktop)]
-    if let Err(e) = app.deep_link().register_all() {
-        log::warn!("deep-link şeması kaydedilemedi: {e}");
+    if app.deep_link().register_all().is_err() {
+        log::warn!("deep-link şeması kaydedilemedi");
     }
 
     // Desktop hosts site webviews inside the launcher window: keep them
@@ -238,15 +367,20 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             commands::ThemePref::Dark => Some(tauri::Theme::Dark),
             commands::ThemePref::Light => Some(tauri::Theme::Light),
         };
-        if let Err(e) = w.set_theme(target) {
-            log::warn!("kayıtlı tema uygulanamadı: {e}");
+        if w.set_theme(target).is_err() {
+            log::warn!("kayıtlı tema uygulanamadı");
         }
     }
 
     let handle = app.handle().clone();
     app.deep_link().on_open_url(move |event| {
         for url in event.urls() {
-            if url.scheme() != OAUTH_SCHEME || url.host_str() != Some("anilist") {
+            // Exact registered redirect only; see `is_registered_mobile_callback`.
+            if !is_registered_mobile_callback(url.as_ref()) {
+                log::warn!(
+                    "kayıtlı olmayan deep-link yok sayıldı (şema: {})",
+                    url.scheme()
+                );
                 continue;
             }
             let handle = handle.clone();
@@ -269,6 +403,141 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Drain the deferred Android profile-deletion queue for one round.
+///
+/// Returns `Ok(true)` when the queue needs no further attempts this process
+/// (emptied, or the remainder only awaits a later start), `Ok(false)` when
+/// the plugin bridge was not ready yet and the caller should retry.
+///
+/// Chromium refuses to delete a profile that is loaded in the current
+/// process (`AwBrowserContextStore::Delete` returns in-use), and a provider
+/// without `MULTI_PROFILE` cannot delete at all — both outcomes were queued
+/// by `remove_site` instead of being reported as a success. Draining runs at
+/// startup *before* any site can open, so a queued name can never be
+/// re-created while its on-disk deletion is still pending. A name that still
+/// refuses to delete stays queued; the "clear all" orphan sweep in
+/// `clear_site_data` is the second safety net.
+#[cfg(target_os = "android")]
+fn drain_pending_profile_deletes(state: &crate::commands::AppState) -> AppResult<bool> {
+    use crate::error::AppError;
+    use crate::web::windows as w;
+
+    let _operation_scope = crate::diagnostics::scope_if_missing("startup");
+    let entries = match w::read_pending_profile_delete_entries(state) {
+        Ok(entries) => entries,
+        Err(error) => {
+            crate::diagnostics::record_current(
+                "startup",
+                "drain",
+                "failed",
+                None,
+                None,
+                Some("storage"),
+                None,
+                None,
+            );
+            return Err(error);
+        }
+    };
+    let blocked = entries.iter().filter(|entry| entry.is_blocked()).count();
+    let owed = entries.len().saturating_sub(blocked);
+    crate::diagnostics::record_current(
+        "queue",
+        "profile_list",
+        "ok",
+        None,
+        None,
+        None,
+        Some(entries.len() as u64),
+        None,
+    );
+    crate::diagnostics::record_current(
+        "queue",
+        "resolve",
+        if blocked == 0 { "skipped" } else { "blocked" },
+        None,
+        None,
+        None,
+        Some(blocked as u64),
+        None,
+    );
+    crate::diagnostics::record_current(
+        "queue",
+        "resolve",
+        if owed == 0 { "skipped" } else { "owed" },
+        None,
+        None,
+        None,
+        Some(owed as u64),
+        None,
+    );
+    if entries.is_empty() {
+        crate::diagnostics::record_current(
+            "startup",
+            "drain",
+            "empty",
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+        );
+        return Ok(true);
+    }
+    log::info!("ertelenen profil silmeleri deneniyor: {}", entries.len());
+
+    // Registered site ids, collected once and WITHOUT holding the lock across
+    // a provider call. A tombstone an older build wrote as a bare name has no
+    // recorded owner, and a profile name is a one-way digest of the site id —
+    // so re-matching against the registry is the only way to find out whose
+    // generation has to be secured before the tombstone may be lifted.
+    let site_ids: Vec<String> = {
+        let reg = match state.registry.lock() {
+            Ok(registry) => registry,
+            Err(_) => {
+                crate::diagnostics::record_current(
+                    "startup",
+                    "drain",
+                    "failed",
+                    None,
+                    None,
+                    Some("storage"),
+                    None,
+                    None,
+                );
+                return Err(AppError::Storage("kilit alınamadı".into()));
+            }
+        };
+        reg.sites.iter().map(|site| site.id.clone()).collect()
+    };
+
+    // The order (delete → prove the name is underivable → lift → retire) lives
+    // in the host-tested `run_pending_delete_drain`, not here: `cargo test`
+    // proves it on every OS instead of leaving it to the aarch64 compile.
+    let report = w::run_pending_delete_drain(
+        state,
+        &entries,
+        crate::android_bridge::site_profile_delete,
+        crate::android_bridge::site_profile_retire,
+        |name| w::match_queued_name_to_site(name, &site_ids),
+    )?;
+
+    for name in &report.kept_unmatched {
+        log::warn!("deferred profile tombstone retained; owner or generation is unresolved");
+    }
+    if report.lifted > 0 || report.deferred > 0 || report.unsupported > 0 || report.blocked > 0 {
+        log::info!(
+            "ertelenen profil silmeleri: {} kaldırıldı, {} ertelendi, {} desteklenmiyor, {} kalıcı ad engeli, {} korundu",
+            report.lifted,
+            report.deferred,
+            report.unsupported,
+            report.blocked,
+            report.kept_unmatched.len()
+        );
+    }
+    Ok(!report.bridge_not_ready)
+}
+
 /// Choose the secret backend for this platform.
 fn build_provider(config_dir: &std::path::Path) -> AppResult<Box<dyn SecretProvider>> {
     #[cfg(target_os = "android")]
@@ -285,7 +554,39 @@ fn build_provider(config_dir: &std::path::Path) -> AppResult<Box<dyn SecretProvi
 
 /// Full callback URL for the mobile OAuth redirect.
 pub fn mobile_callback_url(query: &str) -> String {
-    format!("{OAUTH_SCHEME}://{OAUTH_CALLBACK_PATH}?{query}")
+    format!("{}?{query}", mobile_redirect_uri())
+}
+
+/// The exact redirect URI the mobile deep link is registered for.
+///
+/// Built from the same constants that build the callback URL, so the value the
+/// OAuth parser compares against and the value the OS intent filter matches
+/// cannot drift apart. It must stay equal to `plugins.deep-link.mobile` in
+/// `tauri.conf.json` (`scheme: animehub`, `host: anilist`,
+/// `pathPrefix: /callback`) — `tests/security.test.js` pins that.
+pub fn mobile_redirect_uri() -> String {
+    format!("{OAUTH_SCHEME}://{OAUTH_CALLBACK_PATH}")
+}
+
+/// True when `raw` is the registered mobile redirect URI (optionally with a
+/// query), and nothing else.
+///
+/// WHY A SEPARATE FUNCTION: the deep-link closure can only run on a device, so
+/// its decision is extracted here where host tests can exercise it. The old
+/// filter compared scheme and host only, which let `animehub://anilist/other`
+/// or `animehub://anilist/callback/extra` reach the login command; the command
+/// now rejects those too (`anilist::parse_callback`), but an intent that is not
+/// ours should not start a token exchange at all.
+pub fn is_registered_mobile_callback(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Ok(expected) = url::Url::parse(&mobile_redirect_uri()) else {
+        return false;
+    };
+    url.scheme() == expected.scheme()
+        && url.host_str() == expected.host_str()
+        && url.path() == expected.path()
 }
 
 #[cfg(test)]
@@ -296,10 +597,60 @@ mod tests {
     fn callback_url_uses_the_registered_scheme() {
         let u = mobile_callback_url("code=abc&state=s1");
         assert_eq!(u, "animehub://anilist/callback?code=abc&state=s1");
-        // Must be parseable by the same parser the command uses.
-        let (code, state) = crate::anilist::parse_callback(&u).unwrap();
+        // Must be parseable by the same parser the command uses, against the
+        // same redirect URI the command will pass in.
+        let (code, state) = crate::anilist::parse_callback(&u, &mobile_redirect_uri()).unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "s1");
+    }
+
+    #[test]
+    fn mobile_intent_filter_accepts_only_the_registered_redirect() {
+        assert!(is_registered_mobile_callback(&mobile_redirect_uri()));
+        assert!(is_registered_mobile_callback(&mobile_callback_url(
+            "code=a&state=b"
+        )));
+        assert!(is_registered_mobile_callback(
+            "ANIMEHUB://anilist/callback?code=a&state=b"
+        ));
+
+        // A hijacked or merely similar intent must not reach the login command.
+        for raw in [
+            "animehub://evil/callback?code=a&state=b",
+            "animehub://anilist/other?code=a&state=b",
+            "animehub://anilist/callback/extra?code=a&state=b",
+            "animehub://anilist?code=a&state=b",
+            "animehub:/anilist/callback?code=a&state=b",
+            "https://anilist/callback?code=a&state=b",
+            "http://127.0.0.1:17395/callback?code=a&state=b",
+            "",
+            "not a url",
+            "//anilist/callback?code=a&state=b",
+        ] {
+            assert!(!is_registered_mobile_callback(raw), "{raw} kabul edildi");
+        }
+    }
+
+    #[test]
+    fn mobile_deep_link_registration_is_empty_and_native_login_is_loopback_only() {
+        let conf = include_str!("../tauri.conf.json");
+        let conf: serde_json::Value = serde_json::from_str(conf).expect("tauri.conf.json");
+        let mobile = &conf["plugins"]["deep-link"]["mobile"];
+        assert_eq!(
+            mobile.as_array().map(Vec::len),
+            Some(0),
+            "mobile custom-scheme registration must stay empty: {mobile}"
+        );
+        assert!(
+            !crate::anilist::mobile_native_login_allowed(&mobile_redirect_uri()),
+            "the mobile custom scheme must never be an accepted login redirect"
+        );
+        assert!(crate::anilist::mobile_native_login_allowed(
+            "http://127.0.0.1:17395/callback"
+        ));
+        assert!(conf["plugins"]["deep-link"]["desktop"]["schemes"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(OAUTH_SCHEME))));
     }
 
     #[test]
@@ -337,5 +688,97 @@ mod tests {
         let p2 = build_provider(dir.path()).unwrap();
         let (reg, _) = p2.load_registry();
         assert!(reg.sites.iter().any(|s| s.name == "Kalıcı"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC surface
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn frontend_sources() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../src")),
+        &mut out,
+    );
+    out
+}
+
+#[cfg(test)]
+mod ipc_surface_tests {
+    /// Commands that must stay OFF the invoke surface.
+    ///
+    /// Both were reachable from any page in the launcher WebView and took the
+    /// site id / whole jar from the caller, i.e. they let the frontend read or
+    /// overwrite every site's encrypted cookie jar with no site ownership,
+    /// profile-generation or quarantine check in the path. Nothing in `src/`,
+    /// the mobile plugin or any other Rust path called them (the 0.3.4 jar
+    /// import lives inside `web::windows`), so they are gone rather than
+    /// gated.
+    #[test]
+    fn raw_cookie_jar_commands_are_gone_from_the_ipc_surface() {
+        let handlers = include_str!("lib.rs");
+        let commands = include_str!("commands.rs");
+        let mut checked = 0usize;
+
+        for prefix in ["get", "set"] {
+            // Built at runtime on purpose: writing the literal name in this
+            // test would make `contains` match the assertion itself.
+            let name = format!("{prefix}_site_cookies");
+            checked += 1;
+
+            let registration = format!("commands::{name}");
+            assert!(
+                !handlers.contains(&registration),
+                "{name} hâlâ invoke_handler'da kayıtlı"
+            );
+            let definition = format!("pub fn {name}");
+            assert!(
+                !commands.contains(&definition),
+                "{name} hâlâ bir komut olarak tanımlı"
+            );
+            let frontend = crate::frontend_sources();
+            assert!(!frontend.is_empty(), "frontend kaynakları bulunamadı");
+            for path in frontend {
+                let text = std::fs::read_to_string(&path).expect("kaynak okunabilmeli");
+                assert!(
+                    !text.contains(&name),
+                    "{} {name} komutuna başvuruyor (çağrı, alias, ne olursa)",
+                    path.display()
+                );
+            }
+        }
+        assert_eq!(checked, 2, "iki komut da denetlenmeli");
+    }
+
+    /// The jar itself is still used where it belongs: the 0.3.4 import and the
+    /// mobile open/clear/delete protocols read and write it directly through
+    /// the storage provider.
+    #[test]
+    fn cookie_jar_storage_keys_still_have_a_production_user() {
+        let windows = include_str!("web/windows.rs");
+        // Built at runtime so this assertion does not match its own text.
+        let needle = format!("cookies-{}", "{");
+        assert!(
+            windows.contains(&needle),
+            "web/windows.rs site çerez anahtarını üretmeli"
+        );
+        let jar = include_str!("web/session.rs");
+        assert!(jar.contains("pub struct CookieJar"), "CookieJar durmalı");
     }
 }

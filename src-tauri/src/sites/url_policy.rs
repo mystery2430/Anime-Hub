@@ -126,32 +126,117 @@ pub fn validate_site_url(raw: &str) -> Result<SafeUrl, Rejection> {
     Ok(SafeUrl { url, host })
 }
 
-/// Guard for in-WebView navigation.
+/// Why a navigation was refused.
 ///
-/// Stricter than [`validate_site_url`]: an `http` navigation is *denied*
-/// rather than reported as "not configured", and non-http schemes used by
-/// media players (`blob:` for MSE video, `data:` for tiny inline assets) are
-/// allowed through because blocking them breaks legitimate playback. The
-/// `blob`/`data` allowance is deliberate and scoped to navigation, never to
-/// stored site URLs.
-pub fn navigation_allowed(url: &Url) -> bool {
+/// The codes are stable strings, shared with the Android policy through
+/// `tests/fixtures/navigation-policy.tsv`: both implementations have to answer
+/// with the same allow/block decision *and* the same reason for every vector,
+/// or the two platforms drift apart silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavBlock {
+    /// `http://` — a downgrade, blocked rather than silently upgraded.
+    InsecureScheme,
+    /// Anything that is not https/blob/about (file:, javascript:, ftp:, …).
+    UnsupportedScheme,
+    /// A top-level `data:` document. See [`navigation_rejection`].
+    DataNavigation,
+    /// An `about:` page other than `about:blank`.
+    UnknownAbout,
+    /// Loopback, private, link-local, reserved or otherwise non-routable host.
+    PrivateHost,
+    /// An https URL without a host at all.
+    MissingHost,
+}
+
+impl NavBlock {
+    /// Machine-readable code used by logs and by the shared policy vectors.
+    pub fn code(self) -> &'static str {
+        match self {
+            NavBlock::InsecureScheme => "insecure_scheme",
+            NavBlock::UnsupportedScheme => "unsupported_scheme",
+            NavBlock::DataNavigation => "data_navigation",
+            NavBlock::UnknownAbout => "unknown_about",
+            NavBlock::PrivateHost => "private_host",
+            NavBlock::MissingHost => "missing_host",
+        }
+    }
+}
+
+/// Guard for in-WebView navigation: `None` means allowed, `Some(code)` why not.
+///
+/// This is a **top-level navigation** checkpoint (Tauri's `on_navigation`, and
+/// `SiteNavigationGuard.shouldOverrideUrlLoading` on Android). Sub-resources
+/// never pass through it, which is why `blob:` stays allowed — MSE players
+/// navigate the main frame to `blob:` object URLs, and blocking that breaks
+/// playback — and why `data:` is now *refused*: as a top-level document a
+/// `data:` URL is an opaque-origin HTML/script carrier (a "fake page" that no
+/// site legitimately needs), while the app's own `data:image/…` logos are
+/// sub-resources and are unaffected. `about:` is narrowed to `about:blank`,
+/// the only page a player or popup has a real reason to open.
+///
+/// Stricter than [`validate_site_url`]: an `http` navigation is *denied* rather
+/// than reported as "not configured".
+pub fn navigation_rejection(url: &Url) -> Option<NavBlock> {
     match url.scheme() {
         "https" => {}
-        // Downgrades are blocked, not silently upgraded.
-        "http" => return false,
-        // Playback/inline-asset schemes are permitted inside a session that
-        // already started on HTTPS.
-        "blob" | "data" | "about" => return true,
-        _ => return false,
+        "http" => return Some(NavBlock::InsecureScheme),
+        "blob" => {
+            // `blob:https://host/uuid` inherits its creator's origin; a blob
+            // created over plain http is a downgrade in disguise.
+            let inner = url.path();
+            if inner.starts_with("http://") {
+                return Some(NavBlock::InsecureScheme);
+            }
+            return None;
+        }
+        "data" => return Some(NavBlock::DataNavigation),
+        "about" => {
+            return if url.path() == "blank" {
+                None
+            } else {
+                Some(NavBlock::UnknownAbout)
+            }
+        }
+        _ => return Some(NavBlock::UnsupportedScheme),
     }
 
     match url.host_str() {
-        None => true, // blob:/data: have no host
+        None => Some(NavBlock::MissingHost),
         Some(h) => {
             let h = h.to_lowercase();
-            !(h == "localhost" || is_private_host(&h))
+            if h == "localhost" || is_private_host(&h) {
+                Some(NavBlock::PrivateHost)
+            } else {
+                None
+            }
         }
     }
+}
+
+/// Guard for in-WebView navigation. Thin wrapper over [`navigation_rejection`];
+/// callers that need to log or report a reason should use that instead.
+pub fn navigation_allowed(url: &Url) -> bool {
+    navigation_rejection(url).is_none()
+}
+
+/// True when a host's LAST label makes browsers run the IPv4 parser on it
+/// (all digits, or `0x`-prefixed hex) — the WHATWG "ends in a number" rule.
+fn ends_in_a_number(host: &str) -> bool {
+    let last = host.rsplit('.').next().unwrap_or(host);
+    if last.is_empty() {
+        return false;
+    }
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // "0x" on its own counts too (WHATWG allows an empty hex part, and
+    // `SiteNavigationPolicy`'s regex accepts it) — it is not a valid IPv4
+    // literal, so the fail-closed branch below refuses it on both platforms.
+    let rest = match last.get(2..) {
+        Some(rest) if last[..2].eq_ignore_ascii_case("0x") => rest,
+        _ => return false,
+    };
+    rest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// True for loopback, private, link-local and other non-routable hosts.
@@ -161,7 +246,15 @@ pub fn navigation_allowed(url: &Url) -> bool {
 /// to redirect the WebView to `https://192.168.1.1/` afterwards, and that
 /// navigation never passes through `validate_site_url` again.
 pub fn is_private_host(host: &str) -> bool {
-    let h = host.trim_end_matches('.');
+    // Lower-case here rather than trusting every caller: the shared vectors feed
+    // `LOCALHOST` and `openani.me.` straight in, and the Android rule lower-cases
+    // and trims internally too.
+    let lowered = host.to_lowercase();
+    let h = lowered.trim_end_matches('.');
+    // No host at all is not a destination we can reason about: fail closed.
+    if h.is_empty() {
+        return true;
+    }
 
     // Literal IPv6 in `url` keeps the brackets.
     let bare = h
@@ -177,6 +270,25 @@ pub fn is_private_host(host: &str) -> bool {
     }
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return !ip_is_public(&ip);
+    }
+
+    // A host that "ends in a number" (`0x7f000001`, `2130706433`, `127.1`,
+    // `010.1`, `0177.0.0.1`, `example.0x7f`) goes through the WHATWG IPv4
+    // parser, exactly like a browser and like the url crate do for full URLs.
+    // Reuse the crate's parser instead of writing a second one that could
+    // drift, and fail closed when it refuses the host: Android's `Uri` does
+    // NOT normalise these, so `SiteNavigationPolicy` runs the same parser in
+    // Kotlin and the shared vectors pin the two against each other.
+    if ends_in_a_number(bare) {
+        return match Url::parse(&format!("https://{bare}/")) {
+            Ok(parsed) => match parsed.host() {
+                Some(url::Host::Ipv4(v4)) => !ip_is_public(&std::net::IpAddr::V4(v4)),
+                Some(url::Host::Ipv6(v6)) => !ip_is_public(&std::net::IpAddr::V6(v6)),
+                // Not an IP literal the parser accepted (`example.0x7f`).
+                _ => true,
+            },
+            Err(_) => true,
+        };
     }
 
     // Hostname suffixes that resolve to the machine itself.
@@ -779,5 +891,134 @@ mod tests {
         let compat: std::net::IpAddr = "::7f00:1".parse().unwrap();
         let inner: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(is_public_ip(compat), is_public_ip(inner));
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared policy vectors (AH-14)
+    // -----------------------------------------------------------------------
+
+    /// The SAME fixture the Android unit test loads
+    /// (`SiteNavigationPolicyTest.shared vectors agree with the rust policy`,
+    /// copied into `app/src/test/resources/` by CI). Neither side keeps its own
+    /// list of expected answers, so a divergence between `navigation_rejection`
+    /// / `is_private_host` / `is_public_ip` and `SiteNavigationPolicy` /
+    /// `IpPolicy` fails one of the two suites instead of shipping.
+    #[test]
+    fn navigation_policy_vectors_match_the_android_policy() {
+        let fixture = include_str!("../../../tests/fixtures/navigation-policy.tsv");
+        let (mut urls, mut hosts, mut ips) = (0usize, 0usize, 0usize);
+
+        for raw in fixture.lines() {
+            let line = raw.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            match cols[0] {
+                "url" => {
+                    let target = cols[1];
+                    let url = Url::parse(target)
+                        .unwrap_or_else(|e| panic!("{target} ayrıştırılamadı: {e}"));
+                    let got = navigation_rejection(&url);
+                    let want_allowed = cols[2] == "allow";
+                    let want_reason = if want_allowed { None } else { Some(cols[3]) };
+                    assert_eq!(got.is_none(), want_allowed, "{target}");
+                    assert_eq!(got.map(NavBlock::code), want_reason, "{target}");
+                    urls += 1;
+                }
+                "host" => {
+                    let want_private = cols[2] == "private";
+                    assert_eq!(is_private_host(cols[1]), want_private, "host '{}'", cols[1]);
+                    hosts += 1;
+                }
+                "ip" => {
+                    let ip: std::net::IpAddr = cols[1]
+                        .parse()
+                        .unwrap_or_else(|e| panic!("{} ayrıştırılamadı: {e}", cols[1]));
+                    let want_public = cols[2] == "public";
+                    assert_eq!(is_public_ip(ip), want_public, "ip {}", cols[1]);
+                    ips += 1;
+                }
+                other => panic!("bilinmeyen vektör türü: {other} ({line})"),
+            }
+        }
+
+        // A truncated fixture must not pass by checking nothing.
+        assert!(urls >= 30, "url vektörleri kısalmış: {urls}");
+        assert!(hosts >= 30, "host vektörleri kısalmış: {hosts}");
+        assert!(ips >= 60, "ip vektörleri kısalmış: {ips}");
+    }
+
+    #[test]
+    fn navigation_refuses_top_level_data_and_narrows_about() {
+        // A top-level data: document is a fake page with an opaque origin; the
+        // app's own data:image/… logos are sub-resources and never reach this
+        // checkpoint, so refusing it here costs nothing.
+        let data = Url::parse("data:text/html,<script>alert(1)</script>").unwrap();
+        assert_eq!(navigation_rejection(&data), Some(NavBlock::DataNavigation));
+        assert!(!navigation_allowed(&data));
+
+        // about:blank is the only about: page a player or popup needs.
+        assert_eq!(
+            navigation_rejection(&Url::parse("about:blank").unwrap()),
+            None
+        );
+        assert_eq!(
+            navigation_rejection(&Url::parse("about:srcdoc").unwrap()),
+            Some(NavBlock::UnknownAbout)
+        );
+
+        // blob: stays allowed — MSE players navigate the main frame to blob
+        // object URLs, and blocking that breaks playback. A blob created over
+        // plain http is a downgrade in disguise.
+        assert!(navigation_allowed(
+            &Url::parse("blob:https://openani.me/8c1f0a2e").unwrap()
+        ));
+        assert_eq!(
+            navigation_rejection(&Url::parse("blob:http://openani.me/8c1f0a2e").unwrap()),
+            Some(NavBlock::InsecureScheme)
+        );
+
+        // `NavBlock::MissingHost` is unreachable through `Url::parse` (a special
+        // scheme without a host fails to parse) and stays as defence in depth for
+        // a hand-built `Url`; its code is part of the shared vector vocabulary.
+        assert_eq!(NavBlock::MissingHost.code(), "missing_host");
+        assert_eq!(
+            navigation_rejection(&Url::parse("https://openani.me/").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn numeric_hosts_follow_the_whatwg_ipv4_parser() {
+        // The url crate normalises these; Android's Uri does not, so both sides
+        // run the same parser and the shared vectors pin the answers.
+        for (host, private) in [
+            ("0x7f000001", true),
+            ("2130706433", true),
+            ("127.1", true),
+            ("0177.0.0.1", true),
+            ("010.0.0.1", false), // octal 010 == 8 -> 8.0.0.1, a public host
+            ("010.1", false),
+            ("example.0x7f", true),
+            ("foo.123", true),
+            ("a.1.2.3.4", true),
+            ("1.2.3.4.5", true),
+            ("0x", true),
+            ("999.1.1.1", true),
+            ("8.8.8.8", false),
+            ("openani.me", false),
+        ] {
+            assert_eq!(is_private_host(host), private, "host {host}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_uppercase_host_fails_closed() {
+        assert!(is_private_host(""));
+        assert!(is_private_host("."));
+        assert!(is_private_host("LOCALHOST"));
+        assert!(is_private_host("Tauri.Localhost."));
+        assert!(!is_private_host("OPENANI.ME"));
     }
 }

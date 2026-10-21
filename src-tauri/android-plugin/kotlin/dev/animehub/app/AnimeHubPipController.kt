@@ -64,14 +64,10 @@ import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.os.Build
 import android.os.Looper
-import android.util.Log
 import android.util.Rational
 import android.webkit.WebView
 import org.json.JSONObject
 import org.json.JSONTokener
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
 
@@ -108,14 +104,34 @@ object AnimeHubPipController {
   /** One preparation chain at a time; only touched from the main thread. */
   private var requestInFlight = false
 
+  /** Correlates entry, restore and PiP playback controls without page data. */
+  @Volatile
+  private var activeOperationId: String? = null
+
   // ------------------------------------------------------------------- API
 
-  /** Called from `MainActivity.onWebViewCreate(webView)`. */
-  fun attach(activity: Activity, webView: WebView) {
-    activityRef = WeakReference(activity)
-    webViewRef = WeakReference(webView)
-    requestInFlight = false
-    registerToggle(activity)
+  /** Called when a launcher or site WebView takes over the PiP target. */
+  fun attach(
+    activity: Activity,
+    webView: WebView,
+    operationId: String = AnimeHubDebugLog.newOperationId(),
+  ): Boolean {
+    val safeId = AnimeHubDebugLog.safeOperationId(operationId)
+      ?: AnimeHubDebugLog.newOperationId()
+    val attached = PipTransferFlow.attach(safeId) {
+      activityRef = WeakReference(activity)
+      webViewRef = WeakReference(webView)
+      activeOperationId = safeId
+      requestInFlight = false
+      registerToggle(activity)
+    }
+    if (!attached && activityRef?.get() === activity) {
+      activityRef = null
+      webViewRef = null
+      activeOperationId = null
+      requestInFlight = false
+    }
+    return attached
   }
 
   private fun registerToggle(activity: Activity) {
@@ -158,10 +174,19 @@ object AnimeHubPipController {
   /** The WebView currently hosting the launcher or a site page, if any. */
   fun webView(): WebView? = webViewRef?.get()
 
-  /** Logcat (tag AnimeHubPip) and the in-app developer panel, both. */
-  private fun note(message: String) {
-    Log.d(LOG_TAG, message)
-    AnimeHubDebugLog.add("pip", message)
+  /** Every diagnostic field is a closed code; page text and provider text stay out. */
+  private fun event(
+    phase: String,
+    result: String,
+    operationId: String? = activeOperationId,
+    errorClass: String? = null,
+    durationMs: Long? = null,
+  ) {
+    AnimeHubDebugLog.record(
+      "pip", phase, result, operationId,
+      errorClass = errorClass,
+      durationMs = durationMs,
+    )
   }
 
   /** PiP is API 26+ and needs the hardware feature; both are checked. */
@@ -176,12 +201,21 @@ object AnimeHubPipController {
    *
    * @return true when the preference was stored on a PiP-capable device.
    */
-  fun applyAutoEnter(activity: Activity, enabled: Boolean): Boolean {
+  fun applyAutoEnter(
+    activity: Activity,
+    enabled: Boolean,
+    operationId: String = AnimeHubDebugLog.newOperationId(),
+  ): Boolean {
+    val safeId = AnimeHubDebugLog.safeOperationId(operationId) ?: AnimeHubDebugLog.newOperationId()
     if (!isSupported(activity)) {
       autoEnterEnabled = false
+      AnimeHubDebugLog.record("pip", "capability", "unsupported", safeId, errorClass = "unsupported")
       return false
     }
     autoEnterEnabled = enabled
+    AnimeHubDebugLog.record(
+      "pip", "capability", if (enabled) "enabled" else "disabled", safeId,
+    )
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
     // Rejected ratios silently disable PiP, so the default parameters keep a
     // safe ratio and only switch auto-enter off.
@@ -213,23 +247,30 @@ object AnimeHubPipController {
     onResult: ((Boolean) -> Unit)? = null,
     fallbackNum: Int = DEFAULT_NUM,
     fallbackDen: Int = DEFAULT_DEN,
+    operationId: String = AnimeHubDebugLog.newOperationId(),
   ): Boolean {
-    if (!isSupported(activity)) return false
+    val safeId = AnimeHubDebugLog.safeOperationId(operationId) ?: AnimeHubDebugLog.newOperationId()
+    activeOperationId = safeId
+    val startedAt = System.nanoTime()
+    event("pip_prepare", "started", safeId)
+    if (!isSupported(activity)) {
+      event("capability", "unsupported", safeId, errorClass = "unsupported")
+      return false
+    }
     if (activity.isInPictureInPictureMode) {
+      event("pip_enter", "entered", safeId)
       onResult?.invoke(true)
       return true
     }
     val webView = webViewRef?.get()
-    note("request trigger=$trigger webView=${webView != null}")
     if (webView == null) {
-      // Claimed (nothing else may enter PiP either) but answered, so a caller
-      // that awaits a result — the `enter_pip` command — never waits forever.
-      note("PiP isteği WebView hazır değilken geldi ($trigger)")
+      // Claimed but answered: a bridge caller never waits forever.
+      event("pip_prepare", "unavailable", safeId, errorClass = "activity_gone")
       onResult?.invoke(false)
       return true
     }
     if (requestInFlight) {
-      note("PiP hazırlığı hâlâ sürüyor, istek yok sayıldı ($trigger)")
+      event("pip_prepare", "pending", safeId)
       onResult?.invoke(false)
       return true
     }
@@ -237,17 +278,20 @@ object AnimeHubPipController {
     runOnMain(activity) {
       if (rejectIfGone(activity, webView)) {
         requestInFlight = false
+        event("pip_prepare", "failed", safeId, errorClass = "activity_gone")
         onResult?.invoke(false)
         return@runOnMain
       }
       try {
         // Order matters: the JS answer decides whether PiP is entered at all.
         webView.evaluateJavascript(prepareScript()) { raw ->
-          finishRequest(activity, webView, trigger, raw, fallbackNum, fallbackDen, onResult)
+          finishRequest(
+            activity, webView, raw, fallbackNum, fallbackDen, safeId, startedAt, onResult,
+          )
         }
-      } catch (e: Exception) {
+      } catch (_: Exception) {
         requestInFlight = false
-        note("PiP hazırlık betiği çalıştırılamadı: ${e.javaClass.simpleName}")
+        event("pip_prepare", "failed", safeId, errorClass = "provider")
         onResult?.invoke(false)
       }
     }
@@ -255,21 +299,15 @@ object AnimeHubPipController {
   }
 
   /**
-   * DIAGNOSTIC (no behaviour change): read the page's PiP report on PiP exit
-   * and keep it in the in-app log (developer panel) and logcat. No Toast: a
-   * Toast over the site after leaving PiP covers the page. The script runs on
-   * the WebView, so the page gets no new interface.
+   * Kept for the generated Activity call site, but never reads page-provided
+   * report text: a site can replace the JavaScript hook with arbitrary content.
    */
   fun showDebugReport(webView: WebView?) {
-    webView?.evaluateJavascript(
-      "(window.__animehubPipReport ? window.__animehubPipReport() : 'no-report')",
-    ) { raw ->
-      // The page can replace __animehubPipReport, so its text is capped before
-      // it reaches the in-app buffer.
-      val text = (runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: raw ?: "")
-        .take(MAX_REPORT_CHARS)
-      note("report: $text")
-    }
+    event(
+      "pip_playback",
+      if (webView == null) "unavailable" else "available",
+      errorClass = if (webView == null) "activity_gone" else null,
+    )
   }
 
   /**
@@ -285,9 +323,13 @@ object AnimeHubPipController {
    * same there. Whether playback survives PiP entry is NOT verified on a device.
    */
   fun keepRenderingInPip(webView: WebView?) {
-    if (webView == null) return
+    if (webView == null) {
+      event("pip_playback", "unavailable", errorClass = "activity_gone")
+      return
+    }
     webView.onResume()
     webView.evaluateJavascript("if (window.__animehubPip) { window.__animehubPip(true); }", null)
+    event("pip_playback", "available")
   }
 
   /**
@@ -298,22 +340,35 @@ object AnimeHubPipController {
    * navigated while PiP was open there is nothing to restore and the call is a
    * no-op (`window.__animehubPip` is then undefined, not re-installed).
    */
-  fun restore(webView: WebView?, onDone: ((Boolean) -> Unit)? = null) {
+  fun restore(
+    webView: WebView?,
+    onDone: ((Boolean) -> Unit)? = null,
+    operationId: String? = activeOperationId,
+  ) {
+    val safeId = AnimeHubDebugLog.safeOperationId(operationId) ?: AnimeHubDebugLog.newOperationId()
+    event("pip_restore", "started", safeId)
     val view = webView ?: webViewRef?.get() ?: run {
+      event("pip_restore", "not_restored", safeId, errorClass = "activity_gone")
       onDone?.invoke(false)
       return
     }
     runOnMain(view) {
       if (view !== webViewRef?.get()) {
+        event("pip_restore", "not_restored", safeId, errorClass = "activity_gone")
         onDone?.invoke(false)
         return@runOnMain
       }
       try {
         view.evaluateJavascript(restoreScript()) { raw ->
-          onDone?.invoke(raw == "true")
+          val restored = raw == "true"
+          event(
+            "pip_restore", if (restored) "restored" else "not_restored", safeId,
+            errorClass = if (restored) null else "provider",
+          )
+          onDone?.invoke(restored)
         }
-      } catch (e: Exception) {
-        note("PiP görünümü geri alınamadı: ${e.javaClass.simpleName}")
+      } catch (_: Exception) {
+        event("pip_restore", "not_restored", safeId, errorClass = "provider")
         onDone?.invoke(false)
       }
     }
@@ -324,35 +379,35 @@ object AnimeHubPipController {
   private fun finishRequest(
     activity: Activity,
     webView: WebView,
-    trigger: String,
     raw: String?,
     fallbackNum: Int,
     fallbackDen: Int,
+    operationId: String,
+    startedAt: Long,
     onResult: ((Boolean) -> Unit)?,
   ) {
     requestInFlight = false
+    val duration = (System.nanoTime() - startedAt) / 1_000_000
     if (rejectIfGone(activity, webView)) {
+      event("pip_prepare", "failed", operationId, errorClass = "activity_gone", durationMs = duration)
       onResult?.invoke(false)
       return
     }
     if (raw == null || raw == "null") {
-      // The document was torn down mid-evaluation (navigation won the race).
-      note("PiP hazırlığı yanıtsız kaldı ($trigger)")
+      // The document was torn down mid-evaluation; do not retain or log its URL.
+      event("pip_prepare", "failed", operationId, errorClass = "provider", durationMs = duration)
       onResult?.invoke(false)
       return
     }
     val answer = try {
       JSONObject(raw)
-    } catch (e: Exception) {
-      note("PiP hazırlık yanıtı okunamadı: ${e.javaClass.simpleName}")
+    } catch (_: Exception) {
       null
     }
     if (answer == null || !answer.optBoolean("ok", false)) {
-      val reason = answer?.optString("reason") ?: "unreadable"
-      // Nothing was entered and the JS already restored what it touched; the
-      // extra restore only covers a partial failure inside the page.
-      note("PiP hazırlığı uygun oyuncu bulamadı ($trigger, $reason)")
-      restore(webView, null)
+      // The page-provided reason and all returned text are intentionally ignored.
+      event("pip_prepare", "unavailable", operationId, errorClass = "provider", durationMs = duration)
+      restore(webView, null, operationId)
       onResult?.invoke(false)
       return
     }
@@ -364,21 +419,20 @@ object AnimeHubPipController {
       // Only a <video> candidate can be played or paused from JS. An iframe
       // candidate gets no play/pause button, so the button never does nothing.
       enter(activity, num, den, rect, controllable = answer.optString("kind") == "video")
-    } catch (e: IllegalStateException) {
-      // "Activity must be resumed to enter picture-in-picture": the app was
-      // already stopped, so there is nothing to enter. Never crash for this.
-      note("PiP'ye girilemedi: Activity hazır değil ($trigger)")
+    } catch (_: IllegalStateException) {
+      // Activity is no longer resumed; preserve the existing non-crashing refusal.
+      event("pip_enter", "failed", operationId, errorClass = "activity_gone", durationMs = duration)
       false
-    } catch (e: Exception) {
-      note("PiP'ye girilemedi ($trigger): ${e.javaClass.simpleName}")
+    } catch (_: Exception) {
+      event("pip_enter", "failed", operationId, errorClass = "provider", durationMs = duration)
       false
     }
     if (!entered) {
-      // Leaving the page in player-only mode with no PiP window would strand
-      // the user on a stripped-down page, so undo it.
-      restore(webView, null)
+      event("pip_enter", "not_entered", operationId, errorClass = "provider", durationMs = duration)
+      // Never strand the user on a stripped-down page if the system refused PiP.
+      restore(webView, null, operationId)
     } else {
-      note("PiP'ye girildi ($trigger, ${answer.optString("kind")}, ${num}x$den)")
+      event("pip_enter", "entered", operationId, durationMs = duration)
       syncPlaybackAction(activity)
     }
     onResult?.invoke(entered)
@@ -395,28 +449,46 @@ object AnimeHubPipController {
 
   /** Read the page's playing state and show the matching button. Never plays or pauses. */
   private fun syncPlaybackAction(activity: Activity) {
-    val webView = webView() ?: return
+    val webView = webView() ?: run {
+      event("pip_playback", "unavailable", errorClass = "activity_gone")
+      return
+    }
     webView.evaluateJavascript(playbackScript("state")) { raw -> applyPlaybackState(activity, raw) }
   }
 
   /** A button press: play or pause the PiP player, then show the new state. */
   private fun togglePlayback() {
-    val activity = activityRef?.get() ?: return
-    val webView = webView() ?: return
+    val operationId = activeOperationId ?: AnimeHubDebugLog.newOperationId()
+    val activity = activityRef?.get()
+    val webView = webView()
+    if (activity == null || webView == null) {
+      event("pip_playback", "unavailable", operationId, errorClass = "activity_gone")
+      return
+    }
+    event("pip_playback", "started", operationId)
     webView.evaluateJavascript(playbackScript("toggle")) { raw ->
-      if (raw == "true") note("PiP düğmesi: oynatıldı")
-      if (raw == "false") note("PiP düğmesi: duraklatıldı")
-      applyPlaybackState(activity, raw)
+      applyPlaybackState(activity, raw, operationId)
     }
   }
 
   private fun playbackScript(cmd: String): String =
     "window.__animehubPipPlayback ? window.__animehubPipPlayback('$cmd') : null"
 
-  private fun applyPlaybackState(activity: Activity, raw: String?) {
+  private fun applyPlaybackState(
+    activity: Activity,
+    raw: String?,
+    operationId: String? = activeOperationId,
+  ) {
     when (raw) {
-      "true", "false" -> updatePlaybackAction(activity, raw == "true")
-      else -> note("PiP düğmesi: oynatıcı denetlenemiyor")
+      "true" -> {
+        event("pip_playback", "playing", operationId)
+        updatePlaybackAction(activity, true)
+      }
+      "false" -> {
+        event("pip_playback", "paused", operationId)
+        updatePlaybackAction(activity, false)
+      }
+      else -> event("pip_playback", "unavailable", operationId, errorClass = "provider")
     }
   }
 
@@ -526,8 +598,6 @@ object AnimeHubPipController {
 
   // --------------------------------------------------------------- constants
 
-  private const val LOG_TAG = "AnimeHubPip"
-  private const val MAX_REPORT_CHARS = 400
   private const val PREPARE_FN = "__animehubPreparePip"
   private const val TOGGLE_FN = "__animehubPip"
   private const val DEFAULT_NUM = 16

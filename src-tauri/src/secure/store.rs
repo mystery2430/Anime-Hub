@@ -146,7 +146,12 @@ impl SecureStore {
         let _guard = STORE_LOCK
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        for kind in ["cookies", "localstorage", "indexeddb"] {
+        // `profilemig` (the one-time Android profile-migration flag) rides
+        // along so a cleared/removed site can never re-import a jar that is
+        // about to be deleted. `profilegen` deliberately does NOT: the
+        // generation counter must outlive the session so a stale registry
+        // backup can never re-open an already-deleted profile name.
+        for kind in ["cookies", "localstorage", "indexeddb", "profilemig"] {
             let name = format!("{kind}-{site_id}");
             Self::delete_secret_locked(self, &name)?;
         }

@@ -36,21 +36,14 @@
       "desktop": {
         "schemes": ["animehub"]
       },
-      "mobile": [
-        {
-          "scheme": ["animehub"],
-          "host": "anilist",
-          "pathPrefix": ["/callback"],
-          "appLink": false
-        }
-      ]
+      "mobile": []
     }
   },
   "bundle": {
     "active": true,
     "category": "Video",
     "shortDescription": "Anime takip ve izleme sitelerini tek yerde toplayan başlatıcı",
-    "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve Animecix gibi siteleri tek bir uygulama altında toplar. Masaüstünde her site ayrı WebView profilinde açılır; Android'de CookieManager çerez kavanozu site geçişlerinde değiştirilir. Aynı kaynaklı localStorage/IndexedDB için sağlayıcılar arası yalıtım henüz çözülmemiştir. Uygulama şifreli deposuna yazılan oturum anlık görüntüleri şifrelenir; Android'in etkin CookieManager kavanozu WebView tarafından ayrı yönetilir. Yalnızca HTTPS adreslere izin verilir.",
+    "longDescription": "AnimeHub; MyAnimeList, AniList, OpenAnime ve Animecix gibi siteleri tek bir uygulama altında toplar. Masaüstünde her site ayrı WebView profilinde, Android'de androidx.webkit MULTI_PROFILE ile site başına kendi WebView profilinde açılır; çerezler, localStorage/IndexedDB ve konum izinleri profil başına ayrıdır. Uygulamanın şifreli deposuna yazılan oturum anlık görüntüleri AES-256-GCM ile şifrelenir. Gezinti politikası üst düzey gezintileri HTTPS ile sınırlar, cleartext ile özel/loopback adresleri üst düzeyde ve alt kaynaklarda reddeder; Android'de kullanıcı engel listesi site WebView'ine aktarılır ve aktarım başarısızsa açık site oturumu kapatılır; DNS rebinding'e karşı bağlantı pinleme yoktur. Bu sürüm fiziksel bir Android cihazında test edilmemiştir.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -64,7 +57,7 @@
       }
     },
     "android": {
-      "minSdkVersion": 26
+      "minSdkVersion": 29
     },
     "windows": {
       "nsis": {

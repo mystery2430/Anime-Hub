@@ -40,7 +40,8 @@ the WebView is created and is keyed by WebView id (`URL_LOADING_OVERRIDE` in wry
 Tauri calls `load()` from `on_webview_created`, which runs after wry calls
 `setWebViewClient(RustWebViewClient)` (wry `src/android/main_pipe.rs`). So the
 guard wraps wry's client, not a default one. `WebView.getWebViewClient()` is
-public from API 26, which matches `minSdkVersion` 26.
+public from API 26; the app requires `minSdkVersion` 29 because
+MULTI_PROFILE needs the multi-process WebView available from Android 10.
 
 The *first* `loadUrl` for the launcher URL runs before `addJavascriptInterface` and
 before `on_webview_created` (see wry `main_pipe.rs` order below). That initial
@@ -103,7 +104,7 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 | App-initiated `loadUrl` | Not routed through `shouldOverrideUrlLoading`; `open_on_mobile` checks the first URL with `validate_site_url`. |
 | Redirects | Whether the WebView calls `shouldOverrideUrlLoading` for every server redirect is not verified. |
 | `window.open` | Wry does not enable multiple windows, and the init script overrides `window.open` when popup blocking is on. The Android default is that multi-window is off; not device-verified. |
-| The back affordance (`animehub://close-site`) | Verified from source: the overlay snippet (`OVERLAY_SNIPPET`) is installed only by the desktop child-WebView builder (`web/windows.rs`). `open_on_mobile` never installs it, so the app never produces this URL on Android. The guard refuses it there, which blocks no working path. There is no in-site way back on Android. A native return path would need a Kotlin-to-Rust hand-off to `close_site_window` (cookie and storage export first). That is not built and not device-verified. Whether the system back button returns to the launcher is not verified. |
+| The back affordance (`animehub://close-site`) | Verified from source: the overlay snippet (`OVERLAY_SNIPPET`) is installed only by the desktop child-WebView builder (`web/windows.rs`). `open_on_mobile` never installs it, so the app never produces this URL on Android. The guard refuses it there, which blocks no working path. **Built since the per-site profile change:** the system back button is handled natively while a site view is up — fullscreen video first, then the site's own history (`goBack()`), then a launcher-side `window.__animehubBackToLauncher()` evaluation that runs the normal `close_site` flow (native direct close is only the fallback). The Activity is never finished from the site view. See `AnimeHubSiteController` and `docs/android-storage-isolation.md`. Still **not device-verified**. |
 
 ## Verification status
 

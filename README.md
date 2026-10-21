@@ -5,7 +5,7 @@
 
 # AnimeHub
 
-**Anime takip ve izleme sitelerini tek yerde toplayan; masaüstünde profilleri ayıran, Android'de çerez kavanozlarını site geçişlerinde değiştiren Tauri 2 başlatıcısı.**
+**Anime takip ve izleme sitelerini tek yerde toplayan; masaüstünde ve Android'de her siteyi kendi WebView profilinde açan Tauri 2 başlatıcısı.**
 
 <br/>
 
@@ -31,11 +31,17 @@
 AnimeHub bir **başlatıcı**dır: tek bir siteye bağlanan bir istemci değil. Ekranda
 gruplanmış bir ikon ızgarası görürsünüz, birine dokunursunuz ve site uygulama
 WebView'ında açılır (yeni pencere/sekme yok; üstteki geri düğmesi veya `Esc` ile
-başlatıcıya dönersiniz). Masaüstünde her site ayrı profil kullanır. Android,
-tek bir sistem WebView'ı kullandığından site geçişlerinde çerez kavanozları
-uygulama tarafından değiştirilir; aynı kaynaklı `localStorage`/IndexedDB için
-sağlayıcılar arası yalıtım henüz çözülmemiştir. Bu nedenle Android'de tam site
-verisi yalıtımı garantisi verilmez.
+başlatıcıya dönersiniz). Masaüstünde her site ayrı bir WebView profil **dizini**
+kullanır. Android'de her site `androidx.webkit` MULTI_PROFILE ile kendi WebView
+**profilini** alır (çerezler, `localStorage`/IndexedDB ve konum izinleri profil
+başına ayrı); sağlayıcı bunu desteklemiyorsa site hiç açılmaz ve nedeni
+kullanıcıya söylenir — sessizce ortak profile dönülmez.
+
+0.3.4'ten kalan şifreli çerez kavanozu ilk açılışta **bir kez** içe aktarılır.
+Eski `localStorage`/IndexedDB anlık görüntüleri içe aktarılmaz (aktarım
+kayıplıydı ve hangi belgeye yazılacağı garanti edilemiyordu); bu yüzden bazı
+sitelerde yeniden giriş gerekir ve uygulama bunu ilk çalıştırmada bir kez,
+arayüzde söyler — yalnızca belgelerde değil.
 
 İki grup vardır:
 
@@ -57,9 +63,19 @@ motorunda açar. Sitelerin kullanım koşullarına uymak size aittir.
 
 ## 🏗️&nbsp; Mimari Genel Bakış
 
-Tüm güvenlik politikası **Rust tarafında** uygulanır. Site WebView'ları hiçbir
-Tauri komutuna erişemez; başlatıcı arayüzü ise yalnızca beyaz listelenmiş
-komutları çağırabilir.
+Güvenlik politikasının **çekirdeği Rust tarafındadır**: URL/gezinti politikası,
+şifreli depo, IPC beyaz listesi ve OAuth. Android'de site WebView'ının kendi
+kontrol noktaları Kotlin'de çalışır — üst düzey ve alt kaynak gezinti filtreleri
+(`SiteNavigationPolicy` + `SiteNavigationGuard`) ile WebView ayar planı
+(`SiteWebViewSettings`) — ve Rust'taki kuralla **ortak bir vektör dosyası**
+üzerinden (`tests/fixtures/navigation-policy.tsv`) birebir aynı kararı verir.
+Site WebView'ları hiçbir Tauri komutuna erişemez; başlatıcı arayüzü ise yalnızca
+beyaz listelenmiş komutları çağırabilir.
+
+Politikanın her platformda **nerede çalıştığı ve nerede çalışmadığı** aşağıdaki
+"Hangi kontrol nerede çalışıyor? (dürüst tablo)" bölümünde: kullanıcı engel
+listesi ve DNS çözümlemesine dayalı özel adres kontrolü Android'de
+uygulanmıyor.
 
 ```mermaid
 flowchart TB
@@ -98,7 +114,7 @@ flowchart TB
 | **Rust çekirdeği** | `src-tauri/src/*.rs` | Komutlar, site kaydı, URL politikası, şifreli depo, AniList OAuth, site görünümünü barındırma |
 | **Güvenlik katmanı** | `secure/`, `sites/`, `web/` | AES-256-GCM depo, HTTPS zorunluluğu, alan adı engelleme, gezinti/yeni pencere reddi |
 | **Başlatıcı arayüzü** | `src/` | Izgara, site ekleme/düzenleme, Ayarlar ve Hakkında ekranları — `innerHTML` kullanmadan |
-| **Android köprüsü** | `src-tauri/android-plugin/` | CookieManager çerez takası + AndroidKeyStore (şifreleme) + Picture-in-Picture |
+| **Android köprüsü** | `src-tauri/android-plugin/` | Site başına WebView profili (androidx.webkit `MULTI_PROFILE`), profil bazlı temizleme/silme + karantina, Kotlin gezinti filtresi ve WebView ayar planı, AndroidKeyStore (şifreleme), Picture-in-Picture |
 | **CI/CD** | `.github/workflows/` | Test matrisi, Android APK ve masaüstü paketlerinin otomatik derlenmesi |
 
 ---
@@ -121,29 +137,39 @@ başlatıcı WebView'ına kapsüllüdür, şüpheli bir site Rust komutlarına
 ulaşamaz.
 
 > [!IMPORTANT]
-> Android'de sistem WebView'ının site başına profil API'si **yoktur**; tüm
-> sağlayıcılar aynı WebView ve `CookieManager` kavanozunu paylaşır. Uygulama,
-> geçişte eski sağlayıcının çerezlerini şifreli depoya kaydeder, ortak kavanozu
-> temizler ve hedef sağlayıcının çerezlerini geri yükledikten sonra gezinir.
-> Bu, çerez oturumlarını ayırır; ilk açılışta tüm WebView verisini silen genel
-> temizleme yapılmaz.
+> **Android'de yalıtım, `androidx.webkit` MULTI_PROFILE özelliğine dayanır.**
+> Her site kendi profilini alır; profil adı yalnızca `site_id`'den türetilir ve
+> bir "nesil" sayacı ile korunur. Sağlayıcı özelliği desteklemiyorsa site
+> **açılmaz** (hata mesajı Android 10+ ve güncel WebView gerektiğini söyler) — ortak/default
+> profile sessiz geri dönüş yoktur. Başlatıcının kendi profili hiçbir site
+> yolunda adreslenmez.
 >
-> Çerez anlık görüntüleri AnimeHub'ın şifreli deposuna kaydedilir; Android'in
-> etkin `CookieManager` kavanozu ise WebView tarafından ayrıca yönetilir.
-> `localStorage` ve IndexedDB için şifreli dışa/içe aktarma köprüleri vardır,
-> ancak aynı kaynakta yeniden kullanılan WebView'da **sağlayıcılar arası
-> yalıtımı garanti etmez**. Özellikle aynı-origin `localStorage`/IndexedDB
-> izolasyonu henüz çözülmemiştir; güvenlik sınırı olarak kabul etmeyin.
-> IndexedDB aktarımı en iyi çabadır ve indeks/key path/Blob gibi tüm özellikleri
-> korumaz.
+> Bu bir **depolama** yalıtımıdır: çerezler, `localStorage`/IndexedDB, WebSQL ve
+> konum izinleri profil başına ayrıdır. Bir **ağ güvenlik duvarı değildir** —
+> sitenin hangi sunucularla konuşabileceğini sınırlamaz. Ağ tarafı için aşağıdaki
+> "Sıkı gezinti politikası" bölümüne ve sınırlarına bakın.
+>
+> 0.3.4'ten geçiş: eski sürümün ortak kavanoz modeli, şifreli depoda duran çerez
+> kavanozunu ilk açılışta **bir kez** yeni profile yazar. `localStorage` ve
+> IndexedDB anlık görüntüleri içe aktarılmaz (dump kayıplıydı: indeksler, key
+> path'ler ve Blob değerleri taşınmıyordu) ve diskte durmaya devam eder;
+> yalnızca siz "temizle" veya "sil" derseniz silinir. Yani bazı sitelerde
+> yeniden giriş gerekir.
+>
+> **Fiziksel cihaz testi yapılmadı.** CI aarch64 derlemesi ve birim testleri
+> cihaz doğrulaması değildir; `hasCookies()` semantiği, profil silme/nesil
+> davranışı, PiP ve gerçek `flush()` gecikmesi cihaz bekleyen maddeler olarak
+> `docs/android-storage-isolation.md` içinde listelenir.
 
 ### 🔒&nbsp; Diskte şifreli duran veriler
 
 AnimeHub'ın şifreli deposuna yazılan oturum anlık görüntüleri ve API anahtarları
-AES-256-GCM ile şifrelenir (`AHB1` zarf biçimi). Android'in etkin ortak
-`CookieManager` kavanozu WebView tarafından ayrı yönetilir ve bu uygulama
-şifreli depo sarmalayıcısına dahil değildir. Anahtar hiçbir zaman düz metin
-saklanmaz, platformun kendi anahtar kaynağından gelir:
+AES-256-GCM ile şifrelenir (`AHB1` zarf biçimi). Android'de site çerezleri
+artık o sitenin **kendi WebView profilinde** durur (sağlayıcının yönettiği
+profil çerez deposu) ve şifreli depo sarmalayıcısına dahil değildir; depodaki
+`cookies-<site>` kavanozu yalnızca 0.3.4'ten geçişte **bir kez** içe aktarılır.
+Anahtar hiçbir zaman düz metin saklanmaz, platformun kendi anahtar kaynağından
+gelir:
 
 | Platform | Anahtar kaynağı |
 |---|---|
@@ -152,12 +178,13 @@ saklanmaz, platformun kendi anahtar kaynağından gelir:
 | Android | AndroidKeyStore (donanım destekli) |
 | Hiçbiri yoksa | `0600` izinli dosya — **ve Hakkında ekranında bu açıkça yazar** |
 
-**Oturum anlık görüntüleri:** açık oturumların çerezleri 30 saniyede bir
-şifreli depoya eşitlenir; Android'de `localStorage`/IndexedDB anlık görüntüleri
-5 dakikada bir denenir ve en iyi çaba niteliğindedir. Kapanış anında son bir
-kayıt alınır. Android depolama köprüsü, aynı-origin `localStorage`/IndexedDB
-verisini sağlayıcı bazında güvenilir biçimde ayırmaz; bu anlık görüntüler tam
-izolasyon garantisi değildir.
+**Oturum anlık görüntüleri:** masaüstünde açık oturumun çerezleri 30 saniyede
+bir şifreli depoya eşitlenir ve kapanışta son bir kayıt alınır. Android'de
+`localStorage`/IndexedDB anlık görüntüsü **alınmaz** — o aktarım mekanizması
+kaldırıldı: sitenin çerezleri, `localStorage`/IndexedDB verisi ve konum izinleri
+kendi profilinde durur, 30 saniyelik tik yalnızca aktif site profilinin çerez
+deposunu diske yazdırır (`flush`). Başlatıcının kendi (default profil) verisine
+site yolları hiç dokunmaz.
 
 ### 🛡️&nbsp; Sıkı gezinti politikası
 
@@ -171,14 +198,58 @@ izolasyon garantisi değildir.
 - **Aynı özel adres kuralı gezinti sırasında da uygulanır.** Bir site sizi
   `https://192.168.1.1/` adresine yönlendirmeye çalışırsa kesilir; bu kural
   `tests/audit.rs` içinde regresyon testiyle kilitlidir.
-- **DNS rebinding.** Herkese açık görünen bir ad, gezinti veya site açılışı
-  anında özel bir adrese çözülüyorsa kesilir. Çözümleme eşzamanlı kalır
-  (kısa zaman aşımı, `web/dns.rs`); zaman aşımında metin politikası geçerli
-  kalır, DNS kesintisi siteleri kapatmaz. Sayfa yüklendikten sonra WebView'ın
-  kendi çözümleyicisiyle yapılan alt istekler (XHR/`fetch`) bu kontrolden
-  geçmez — onu kapatmak bir filtreleyen vekil ister ve v1'de yok.
-- **Alan adı engel listesi** reklam ve izleyici alanlarını istek düzeyinde
-  keser; liste koda gömülüdür ve güncellenebilir.
+- **DNS rebinding (yalnızca masaüstü).** Herkese açık görünen bir ad, gezinti
+  anında özel bir adrese çözülüyorsa kesilir. Çözümleme eşzamanlı kalır (kısa
+  zaman aşımı, `web/dns.rs`); zaman aşımında/NXDOMAIN'de metin politikası
+  geçerli kalır, yani **DNS kesintisi siteleri kapatmaz** (fail-open, bilinçli
+  seçim). Bu kontrol gezinti anındadır: WebView'ın kendi bağlantısı bu cevabı
+  kullanmaz, yani kararlı bir DNS-rebinding koruması değil, pencereyi daraltan
+  bir kontroldür.
+- **Alan adı engel listesi** reklam ve izleyici alanlarını masaüstünde
+  **gezinti düzeyinde** (ana çerçeve) keser; liste koda gömülüdür, Ayarlar'dan
+  düzenlenebilir ve kapatılabilir. Masaüstünde alt kaynak isteklerinde
+  (XHR/`fetch`/görsel) böyle bir kesme noktası yoktur. Android'de liste Rust'tan
+  site WebView'ine açılış ve her ayar/sıfırlama sonrasında aktarılır ve hem üst
+  düzey hem alt kaynak kontrollerinde uygulanır. Aktarım başarısız olursa yeni
+  site açılmaz; açık bir site varsa güvenlik için normal lifecycle yolundan
+  kapatılır ve komut hata döner. Kapatma da başarısızsa kullanıcıya yeniden
+  başlatma gerektiren açık bir hata gösterilir; eski snapshot ile devam
+  edildiği iddia edilmez. Aktarımlar ayrıca **sıralanır**: `open_site`,
+  `update_settings` ve `reset_blocklist` oturum kilidi dışında çalıştığı ve
+  Kotlin tarafı "son yazan kazanır" bir atomik takas yaptığı için, eski
+  ayarlardan üretilmiş gecikmiş bir snapshot yeni kuralların üzerine
+  yazabilirdi. `BlocklistSyncGate` aktarımları serileştirir, snapshot'ı kilit
+  **içinde** yeniden okur ve zaten iletilmiş bir generation'ı atlar; iletim
+  yalnızca doğrulanmış bir push'tan sonra ilerler. Güncel olan bir aktarım
+  başarılı sayıldığı için açık oturumu gereksiz yere kapatmaz.
+
+#### Hangi kontrol nerede çalışıyor? (dürüst tablo)
+
+| Kontrol | Masaüstü (üst düzey gezinti) | Masaüstü (alt kaynak) | Android (üst düzey) | Android (alt kaynak) |
+|---|---|---|---|---|
+| `http://` reddi | ✅ `on_navigation` | ⚠️ motorun mixed-content politikası | ✅ `SiteNavigationPolicy` | ✅ `shouldInterceptRequest` |
+| Özel/loopback **IP literalleri** ve host kuralları | ✅ | ❌ | ✅ | ✅ |
+| Kullanıcı engel listesi | ✅ | ❌ masaüstünde alt kaynak kesme noktası yok | ✅ | ✅ |
+| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol, bağlantı pinlenmiyor | ❌ | ⚠️ ön kontrol, bağlantı pinlenmiyor | ⚠️ ön kontrol, bağlantı pinlenmiyor |
+| `data:` üst düzey belge | ✅ reddedilir | ➖ (alt kaynak olarak serbest) | ✅ reddedilir | ➖ serbest |
+
+**Android'de DNS ön kontrolü vardır; bağlantı sabitleme yoktur.**
+`shouldInterceptRequest` her istekten önce çözer ve özel/loopback/link-local ya
+da değişmiş bir cevabı reddeder. Üst düzey `shouldOverrideUrlLoading` çağrısı
+eşzamanlı yanıt vermek zorundadır; cache miss'te `ALLOW_AND_PROBE` döner, yani
+DNS sonucu gelmeden gezinti devam eder ve cevap yalnızca sonraki istekler için
+cache'lenir. Motor bağlantı sırasında yeniden çözümleme yapabildiği için cevap
+ile soket arasında **TOCTOU** penceresi kalır: rebinding yapan bir host ön
+kontrole public, sokete private cevap verebilir. Gerçek çözüm, çözülen adresi
+bağlantıya sabitleyen bir ağ katmanıdır (yerel CONNECT proxy / sağlayıcı
+filtresi); bu PR'da uygulanmamıştır. Değerlendirilen ağ katmanı seçenekleri
+(`androidx.webkit.ProxyController` / `WebViewFeature.PROXY_OVERRIDE` ve reddedilen
+alternatifler) ile uygulanmadan önce çalışması gereken cihaz/emülatör matriksi
+`docs/security-residual-risks.md` içinde yazılıdır; bu ortamda Android SDK,
+Gradle, JVM, cihaz veya emülatör bulunmadığı için hiçbiri doğrulanamadı ve
+doğrulanmamış bir proxy varsayılan olarak eklenmedi. Bu nedenle DNS rebinding
+**açık bir güvenlik riski** olarak kalır; belge veya test değişikliği onu
+kapatmaz.
 
 ### ➕&nbsp; Kodsuz site ekleme
 
@@ -200,10 +271,31 @@ UUID v4'tür ve sabit zamanlı karşılaştırma ile doğrulanır. Dönen token 
 depoya yazılır; `client_id` / `client_secret` sizindir, depoya asla girmez.
 
 Bağlantı, Ayarlar → AniList bölümündeki **"AniList ile giriş yap"**
-düğmesiyle başlar: OAuth ekranı sistem tarayıcınızda açılır, yetki
-`animehub://auth` deep-link'i ile uygulamaya döner ve durum satırı
-kendiliğinden güncellenir. Client ID kaydedilmediyse düğme pasif görünür ve
-site kutucuğu siteyi WebView'da açmaya devam eder.
+düğmesiyle başlar: OAuth ekranı sistem tarayıcınızda açılır, yetki uygulamaya
+geri döner ve durum satırı kendiliğinden güncellenir. Dönüş adresi platforma
+göre değişir ve `tauri.conf.json`'daki kayıt ile birebir aynıdır:
+
+| Platform | Dönüş adresi |
+|---|---|
+| Masaüstü | `http://127.0.0.1:17395/callback` (yerel dinleyici; `ANILIST_REDIRECT_URI` ile değiştirilebilir) |
+| Android | `http://127.0.0.1:17395/callback` (aynı loopback dinleyicisi; özel şema kullanılmıyor) |
+
+Gelen adres **harfi harfine** doğrulanır: şema, host, port ve yol beklenen
+dönüş adresiyle uyuşmazsa (`animehub://evil/callback`, başka bir loopback portu,
+uzak bir `http://` host'u) kod reddedilir; tekrarlanan `code`/`state`
+parametreleri ve boş değerler de reddedilir. `state` tek kullanımlıktır ve
+yalnızca eşleştiğinde kilit altında tüketilir — aynı `state` ile gelen ikinci bir
+çağrı ikinci bir token değişimi başlatamaz, uydurma bir çağrı ise gerçek girişi
+yakmaz. Client ID kaydedilmediyse düğme pasif görünür ve site kutucuğu siteyi
+WebView'da açmaya devam eder.
+
+> [!IMPORTANT]
+> **Android'de özel şema OAuth'u kapatıldı.** `animehub://` şemasını başka bir
+> uygulama da kaydettirebilir ve yetki kodu ile `state`'i alabilir. Bu yüzden
+> Android'de yerel giriş yalnızca loopback dinleyicisiyle çalışır;
+> `plugins.deep-link.mobile` boştur ve özel şemayla giriş state yazılmadan
+> reddedilir. Kalan sınırlar
+> [`docs/security-residual-risks.md`](docs/security-residual-risks.md) içinde.
 
 ### 🎨&nbsp; Tema: sistem / koyu / açık
 
@@ -229,7 +321,7 @@ kaldığı yerden, kaydırma konumu ve oynatma durumu korunarak geri gelir.
 
 - API 30+ (`Android 11`): `onPictureInPictureRequested()`; uygulama `true`
   döndüğü için sistem kendi (hazırlıksız) akışına karışmaz.
-- API 26-29 (`Android 8.0-10`): `onUserLeaveHint()` geri dönüş yolu.
+- API 29 (`Android 10`): `onUserLeaveHint()` geri dönüş yolu.
 - Sistemin kendi otomatik girişi (`setAutoEnterEnabled(true)`) **bilinçli
   olarak** kullanılmaz: Android belgelerine göre bu ayar açıkken
   `onPictureInPictureRequested()` hiç çağrılmaz, yani PiP hazırlıksız açılırdı.
@@ -246,16 +338,20 @@ Ayrıntılı akış, oynatıcı seçim kuralları ve doğrulama durumu:
 
 **v0.3.4 için fiziksel Android testi yapılmadı.** CI derlemesi cihaz doğrulaması
 anlamına gelmez; PiP, IPC, gezinti, çerez kalıcılığı ve performans cihaz testi bekliyor.
-**Android’de sağlayıcılar arası aynı-origin localStorage/IndexedDB izolasyonu
-garanti edilmez.** Best-effort aktarım bir güvenlik sınırı değildir. **Çerez/oturum yaşam döngüsü** düzeltmeleri (aktif site wipe’ın sayfa+sync’i yeniden yazmasını engellemesi, stale Site ile yeniden oluşturmayı engelleyen re-validasyon, `STORE_LOCK`’un seal dahil baştan tutulması) PR #26 ile eklendi.
+Yayımlanan v0.3.4, **ortak çerez kavanozu** modelini kullanıyordu: sağlayıcılar
+arası aynı-origin `localStorage`/IndexedDB izolasyonu orada garanti edilmez ve
+best-effort aktarım bir güvenlik sınırı değildir. **Çerez/oturum yaşam döngüsü**
+düzeltmeleri (aktif site wipe’ın sayfa+sync’i yeniden yazmasını engellemesi,
+stale Site ile yeniden oluşturmayı engelleyen re-validasyon, `STORE_LOCK`’un
+seal dahil baştan tutulması) PR #26 ile eklendi.
+
+Sonraki iş (PR #27) bu modeli Android’de **site başına WebView profili** ile
+değiştirir; o değişiklik henüz yayımlanmadı ve cihazda doğrulanmadı. Yani
+yukarıdaki sınır v0.3.4 için geçerliliğini korur.
 
 Üretim paketleri PR CI ve iki release workflow kontrolünden sonra yayımlanır.
-CI’daki `animehub-aarch64-debug.apk` yalnızca test içindir, GitHub Release varlığı değildir.
-Ayrıntılar: [v0.3.3 yayın prosedürü](docs/releasing.md) (v0.3.4 aynı akış).
-
-Üretim paketleri PR CI ve iki release workflow kontrolünden sonra yayımlanır.
-CI’daki `animehub-aarch64-debug.apk` yalnızca test içindir, GitHub Release varlığı değildir.
-Ayrıntılar: [v0.3.3 yayın prosedürü](docs/releasing.md).
+CI’daki `animehub-aarch64-debug.apk` yalnızca test içindir, GitHub Release
+varlığı değildir. Ayrıntılar: [yayın prosedürü](docs/releasing.md).
 
 ## 📦&nbsp; Kurulum
 
@@ -282,7 +378,15 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 > [!NOTE]
 > **Windows paketleri henüz kod imzalı değildir (v0.3.4 dahil);** SmartScreen çıkarsa Ek bilgi → Yine de çalıştır. Kod imzalama altyapısı hazır — imzalı sürümler için sertifika bağlandığında (Certum OV / Microsoft Store) duyurulacak.
 
-### 📱&nbsp; Android &nbsp;·&nbsp; `Android 8.0+ (API 26)`
+### 📱&nbsp; Android &nbsp;·&nbsp; `Android 10+ (API 29)`
+
+> **Android 8.x ve 9 artık desteklenmiyor.** Bu dal `minSdkVersion` değerini
+> **29 (Android 10)** yapar; site başına yalıtım `androidx.webkit`
+> MULTI_PROFILE çok süreçli WebView tabanına dayanır. Android 8/9 cihazlara APK
+> kurulmaz; `MULTI_PROFILE` sunmayan bir sağlayıcıda site **açılmaz** ve nedeni
+> gösterilir — ortak profile sessiz dönüş yoktur. Bu, depolama yalıtımı için
+> bilinçli bir kapsam kararıdır.
+
 
 | Yöntem | Boyut | Açıklama |
 |---|---|---|
@@ -303,7 +407,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 |---|---|---|---|
 | 🐧 **Linux** | ✅ Doğrulandı | `.deb`, `.rpm`, AppImage | Releases sayfasındaki paketler CI sürümünde üretildi |
 | 🪟 **Windows** | ✅ Doğrulandı | `.exe` (NSIS) | DPAPI + WebView2 profili; kurulum Windows üzerinde elle doğrulandı |
-| 🤖 **Android** | ⚠️ CI derlemesi; fiziksel test yok | 3 ABI için imzalı `.apk` | CookieManager çerez kavanozu takası; aynı-origin localStorage/IndexedDB sağlayıcı yalıtımı çözülmedi |
+| 🤖 **Android** | ⚠️ CI derlemesi; fiziksel test yok | 3 ABI için imzalı `.apk` | Site başına ayrı WebView profili (androidx.webkit MULTI_PROFILE): çerez/localStorage/IndexedDB site bazında izole; sağlayıcı `MULTI_PROFILE` desteklemiyorsa site açılmaz ve hata gösterilir |
 | 🍎 **macOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 | 🍏 **iOS** | ❌ Desteklenmiyor | — | Bilinçli kapsam dışı |
 
@@ -317,6 +421,7 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 | Android geri tuşu | `Esc` ile aynı davranış |
 | Site menüsü → **Düzenle** | Ad, adres, harf ve rengi değiştirir. Varsayılan olmayan sitelere fotoğraf eklenebilir |
 | Site menüsü → **Başlatıcıdan gizle** | Siteyi listeden kaldırır, verisini silmez |
+| Ayarlar → **Gizlenen siteler** → *Geri göster*          | Gizlenen siteyi başlatıcıya döndürür; gizleme veriyi silmez            |
 | Site menüsü → **Çerezleri ve site verilerini temizle** | O sitenin tüm oturum verisini yok eder |
 
 ---
@@ -408,11 +513,13 @@ v1'e kadar bilinçli olarak dar tutuldu. Ertelenenler:
 **Hâlâ doğrulanmayanlar:**
 
 - **Android cihaz doğrulaması.** Önceki CI adayı bir cihazda site açarken
-  çökmedi, ancak yavaş yüklendi. v0.3.2'deki asenkron CookieManager
-  kalıcılaştırması yeni bir fiziksel cihaz ölçümü bekliyor; performans kazancı
-  doğrulanmış değildir. PiP ve gerçek sağlayıcılar arası same-origin
-  localStorage/IndexedDB yalıtımı da doğrulanmadı; IndexedDB aktarımı
-  kayıpsız değildir (ikincil indeksler ve Blob değerleri taşınmaz).
+  çökmedi, ancak yavaş yüklendi. Site başına profil modeli (PR #27) hiç cihazda
+  çalıştırılmadı: `hasCookies()` semantiği, profil silme/nesil protokolü,
+  karantina davranışı, PiP/geri zinciri, gerçek `flush()` gecikmesi ve süreç
+  öldürme yarışları cihaz bekliyor. Performans iddiası doğrulanmış değildir.
+  Same-origin `localStorage`/IndexedDB yalıtımı artık profillere dayanıyor ve
+  cihazda kanıtlanmadı; eski anlık görüntüler **içe aktarılmıyor** (kayıpsız
+  olmadıkları için) — yani sorun "aktarım kayıplı" değil, "aktarım yok".
   Kontrollü PiP zinciri (hazırlık → PiP → geri yükleme) birim testleriyle
   doğrulandı ve Android hâli CI'da derlenip kurulabilir bir debug APK olarak
   paketlendi; ancak çalışma zamanı fiziksel cihazda **denenmedi**.
