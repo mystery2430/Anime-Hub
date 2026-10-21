@@ -69,9 +69,10 @@ pub enum AppError {
 
     /// The user's ad/tracker rules could not be handed to the Android site
     /// WebView. Deliberately its own variant: continuing would mean the site
-    /// silently runs with stale or no rules (desktop-only enforcement), so
-    /// `open_site` refuses and `update_settings` reports it.
-    #[error("Engelleme listesi site görünümüne uygulanamadı; site açılmadı.")]
+    /// silently runs with stale or no rules (desktop-only enforcement). The
+    /// transfer helper closes an already-open site before this escapes, and a
+    /// failed close gets a separate restart-required `Other` error.
+    #[error("Engelleme listesi site görünümüne uygulanamadı; açık site güvenli biçimde kapatıldı.")]
     BlocklistUnavailable,
 }
 

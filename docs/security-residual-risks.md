@@ -81,22 +81,33 @@ inspects the resolved dependency graph.
 ### Android blocklist is fail-closed
 
 `commands::sync_android_blocklist` returns `AppResult<()>`
-(`AppError::BlocklistUnavailable`). `open_site` refuses to open the site and
-`update_settings` reports the failure when the snapshot cannot be applied;
-a failed transfer can no longer leave a site running with stale or no rules.
+(`AppError::BlocklistUnavailable`). It is called by `open_site`,
+`update_settings` and `reset_blocklist`. The transfer helper first pushes the
+snapshot; only if that fails does it close an already-open site through the
+normal lifecycle-locked close path. The command then fails instead of returning
+a success view. A failed close is a separate restart-required `Other` error, not
+a claim that the old snapshot is harmless — that state stays risky until the
+user restarts. Rust tests pin the push→close order and the no-success-on-close-
+failure rule; the Android close/device path is still host/CI-only (R-04).
+
 A disabled list still arrives as an **empty** snapshot (Kotlin has no enabled
 flag), which is the only representation that matches `Blocklist::is_blocked`.
+A transport failure is never converted into that empty snapshot.
 
 ### Redirect DNS verdicts (partial)
 
 `NavigationDnsGate` is shared by `shouldOverrideUrlLoading` and
 `shouldInterceptRequest`. The top-level checkpoint cancels a target whose
-**cached** answer is private or changed and probes off the UI thread otherwise
-(it must answer synchronously and must not resolve on the UI thread). This
-blocks redirect chains that previously reached a private address without any
-check. It is **not** connection pinning: the engine resolves again when it
-connects, so a rebinding host can still answer public to the check and private
-to the socket. **R-01 (b) stays open.**
+**cached** answer is private or changed. On a cache miss it returns
+`ALLOW_AND_PROBE`: the navigation proceeds before the DNS answer for that target
+exists, and the answer is only cached for later requests. This is forced by the
+synchronous WebView callback (no UI-thread resolver), but it is not a guarantee
+for the navigation that triggered the probe. It is also **not** connection
+pinning: the engine resolves again when it connects, so a rebinding host can
+answer public to the check and private to the socket. A local CONNECT proxy /
+provider-level filter would be needed to pin the connected address; that network
+layer is not part of this PR. **R-01 (b) stays open.** No comment, test or doc
+change closes it.
 
 ### OAuth loopback redirect must be exactly the served endpoint
 

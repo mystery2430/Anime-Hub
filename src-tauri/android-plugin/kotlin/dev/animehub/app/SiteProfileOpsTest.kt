@@ -2241,6 +2241,24 @@ class SiteProfileOpsTest {
   }
 
   @Test
+  fun `android blocklist replacement revokes the old snapshot for a live view`() {
+    SiteBlocklist.resetForTests()
+    SiteBlocklist.update(listOf("old-tracker.example"))
+    Assert.assertTrue(SiteBlocklist.isBlocked("old-tracker.example"))
+
+    // reset_blocklist pushes the default snapshot. A live WebView must see the
+    // replacement, not keep consulting the previous process-wide rules.
+    SiteBlocklist.update(listOf("new-tracker.example"))
+    Assert.assertFalse(SiteBlocklist.isBlocked("old-tracker.example"))
+    Assert.assertTrue(SiteBlocklist.isBlocked("new-tracker.example"))
+
+    // The reset's disabled/default representation is an empty snapshot.
+    SiteBlocklist.update(emptyList())
+    Assert.assertEquals(0, SiteBlocklist.size())
+    SiteBlocklist.resetForTests()
+  }
+
+  @Test
   fun `migration requires a virgin profile and never touches an existing one`() {
     val port = FakeMigrationPort(exists = true)
     var outcome: MigrationOutcome? = null

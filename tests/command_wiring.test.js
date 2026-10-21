@@ -81,19 +81,28 @@ test("the Android prepare step treats every referenced Kotlin unit as required",
 // Round 6 (security follow-up) source-level guards. Behaviour that needs a
 // device (WebView callbacks, native flush) is covered by the Kotlin unit tests
 // for the pure policy code; these pins catch the wiring being undone.
-test("blocklist sync is fail-closed and both call sites propagate the failure", () => {
+test("blocklist sync is fail-closed for opens, settings and reset", () => {
   assert.match(
     commandsRs,
-    /fn sync_android_blocklist\(state: &AppState\) -> AppResult<\(\)>/,
-    "sync must return a result",
+    /fn sync_android_blocklist\(app: &AppHandle, state: &AppState\) -> AppResult<\(\)>/,
+    "sync must take the app handle (to close a live view) and return a result",
   );
-  assert.match(commandsRs, /sync_android_blocklist\(&state\)\?;/);
-  const callSites = commandsRs.match(/sync_android_blocklist\(&state\)\??;/g) ?? [];
+  const callSites = commandsRs.match(/sync_android_blocklist\(&app, &state\)\??;/g) ?? [];
+  assert.equal(callSites.length, 3, "open, settings and reset must all transfer the snapshot");
   assert.equal(
     callSites.some((line) => line.endsWith(");")),
     false,
     "no call site may ignore the transfer result",
   );
+  assert.match(commandsRs, /fn transfer_blocklist_snapshot/);
+  assert.match(commandsRs, /Err\(push_error\) => match close\(\)/);
+  assert.match(commandsRs, /close_active_android_site\(app\)/);
+  assert.match(
+    commandsRs,
+    /blocklist_transfer_close_failure_requires_a_restart_not_success/,
+    "a close failure must be proven to surface as an error, not success",
+  );
+  assert.match(commandsRs, /pub fn reset_blocklist\(app: AppHandle/);
   // A poisoned lock must not become an empty (re-enabled-looking) snapshot.
   assert.equal(/blocklist\.lock\(\)[\s\S]{0,80}unwrap_or_default/.test(commandsRs), false);
 });

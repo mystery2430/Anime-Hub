@@ -519,9 +519,10 @@ pub fn set_site_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> 
 pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     let state = app.state::<AppState>();
     // The WebView policy needs the current user rules BEFORE any navigation,
-    // and a failed push must abort the open (fail-closed). Logging it and
-    // continuing used to leave the site running with stale or no rules.
-    sync_android_blocklist(&state)?;
+    // and a failed push must abort the open (fail-closed). If a previous site
+    // WebView is still open, sync_android_blocklist destroys it before returning
+    // the error: otherwise that view would keep enforcing the old snapshot.
+    sync_android_blocklist(&app, &state)?;
     let (site, settings) = {
         let state = app.state::<AppState>();
         let reg = state
@@ -956,6 +957,7 @@ fn commit_settings_with_diagnostics_preflight(
 
 #[tauri::command]
 pub fn update_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     patch: SettingsPatch,
 ) -> AppResult<SettingsView> {
@@ -1089,8 +1091,10 @@ pub fn update_settings(
     rebuild_blocklist(&state);
     // The new rules are persisted above; if the Android WebView did not accept
     // them, the caller must see a failure, not a refreshed settings view that
-    // implies the change took effect everywhere.
-    sync_android_blocklist(&state)?;
+    // implies the change took effect everywhere. The helper also destroys an
+    // already-open view, because failing the command alone would leave it on
+    // the previous snapshot.
+    sync_android_blocklist(&app, &state)?;
     get_settings(state)
 }
 
@@ -1126,7 +1130,7 @@ pub fn take_startup_warning(state: State<'_, AppState>) -> AppResult<Option<Stri
 }
 
 #[tauri::command]
-pub fn reset_blocklist(state: State<'_, AppState>) -> AppResult<usize> {
+pub fn reset_blocklist(app: AppHandle, state: State<'_, AppState>) -> AppResult<usize> {
     {
         let mut live = state
             .settings
@@ -1138,11 +1142,13 @@ pub fn reset_blocklist(state: State<'_, AppState>) -> AppResult<usize> {
         *live = next;
     }
     rebuild_blocklist(&state);
-    let bl = state
-        .blocklist
-        .lock()
-        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-    Ok(bl.len())
+    let count = lock_recover(&state.blocklist).len();
+    // Resetting Rust state is not enough: the Android WebView evaluates its own
+    // process-wide snapshot and would otherwise keep enforcing the old rules.
+    // A failed transfer closes an already-open site before the error escapes,
+    // so the caller never gets a success view that hides stale enforcement.
+    sync_android_blocklist(&app, &state)?;
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,32 +1680,92 @@ fn android_blocklist_entries(list: &Blocklist) -> Vec<String> {
     }
 }
 
-/// Push the current blocklist snapshot into the Android site WebView.
+/// Push a snapshot through the Android bridge.
 ///
-/// Called before every site open and after a settings change, because the
-/// WebView evaluates the rules itself (Kotlin has no access to Rust state).
+/// Kotlin has no failure mode for a well-formed command: `SiteBlocklist.update`
+/// is an atomic reference swap. A transfer can still fail before Kotlin runs
+/// (plugin unavailable, IPC rejection, webview/activity gone), which is why the
+/// caller must fail closed rather than assume the old snapshot is harmless.
+#[cfg(any(target_os = "android", test))]
+fn push_android_blocklist(entries: &[String]) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        crate::android_bridge::site_blocklist_update(entries)
+            .map_err(|_| AppError::BlocklistUnavailable)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = entries;
+        Ok(())
+    }
+}
+
+/// Destroy the active Android site WebView after a failed blocklist transfer.
 ///
-/// FAIL-CLOSED: this returns the transfer error instead of logging it. A site
-/// WebView must not start navigating with the previous (or no) rule set: that
-/// is silent desktop-only enforcement, which is exactly the regression R-01
-/// was supposed to close. Both call sites propagate the error — `open_site`
-/// refuses the open, `update_settings` reports the failure instead of a
-/// success.
+/// Uses the lifecycle-locked close path (`ANDROID_SESSION_LOCK`, profile flush,
+/// `current_site` release and `site-closed` event). Kotlin's close is
+/// idempotent, so this is safe when no view is open. On desktop it is a no-op;
+/// that is also the only place the host test fake needs to model.
+#[cfg(any(target_os = "android", test))]
+fn close_active_android_site(app: &AppHandle) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        crate::web::windows::close_site_window(app, "blocklist-sync")
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+/// The fail-closed policy, independent of Tauri so it is host-testable.
+///
+/// A successful push must not disturb an open session. A failed push must close
+/// it before the original error is returned. If the close itself fails, the
+/// caller gets a restart-required error — never `Ok` and never the reassuring
+/// `blocklist_unavailable` message, because old rules may still be live.
+#[cfg(any(target_os = "android", test))]
+fn transfer_blocklist_snapshot<P, C>(push: P, close: C) -> AppResult<()>
+where
+    P: FnOnce() -> AppResult<()>,
+    C: FnOnce() -> AppResult<()>,
+{
+    match push() {
+        Ok(()) => Ok(()),
+        Err(push_error) => match close() {
+            Ok(()) => Err(push_error),
+            Err(_close_error) => Err(AppError::Other(
+                "Engelleme listesi güncellenemedi ve açık site güvenli biçimde kapatılamadı; AnimeHub'ı yeniden başlatın."
+                    .into(),
+            )),
+        },
+    }
+}
+
+/// Apply the current rules to the Android site WebView before any navigation.
+///
+/// Called before every `open_site`, after `update_settings`, and after
+/// `reset_blocklist`. The WebView evaluates the rules itself (Kotlin cannot read
+/// Rust state), so a failure here is not just an error to display:
+/// `transfer_blocklist_snapshot` destroys an already-active view, under the
+/// normal close path, before the command fails.
 ///
 /// The lock is recovered, never mapped to an empty rule set: an empty snapshot
 /// means "the user disabled the list" to Kotlin, so turning a poisoned lock
 /// into `vec![]` would quietly switch enforcement off.
-pub(crate) fn sync_android_blocklist(state: &AppState) -> AppResult<()> {
+pub(crate) fn sync_android_blocklist(app: &AppHandle, state: &AppState) -> AppResult<()> {
     #[cfg(target_os = "android")]
     {
         let entries = android_blocklist_entries(&lock_recover(&state.blocklist));
-        crate::android_bridge::site_blocklist_update(&entries)
-            .map_err(|_| AppError::BlocklistUnavailable)?;
-        Ok(())
+        transfer_blocklist_snapshot(
+            || push_android_blocklist(&entries),
+            || close_active_android_site(app),
+        )
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = state;
+        let _ = (app, state);
         Ok(())
     }
 }
@@ -2237,6 +2303,70 @@ mod tests {
         let disabled = Blocklist::from_rules(rules, false);
         assert!(!disabled.is_blocked("doubleclick.net"));
         assert!(android_blocklist_entries(&disabled).is_empty());
+    }
+
+    #[test]
+    fn blocklist_transfer_success_does_not_close_an_open_site() {
+        use std::cell::Cell;
+
+        let pushes = Cell::new(0u32);
+        let closes = Cell::new(0u32);
+        let result = transfer_blocklist_snapshot(
+            || {
+                pushes.set(pushes.get() + 1);
+                Ok(())
+            },
+            || {
+                closes.set(closes.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(pushes.get(), 1);
+        assert_eq!(closes.get(), 0, "a successful push must not disturb the live site");
+    }
+
+    #[test]
+    fn blocklist_transfer_closes_the_live_site_before_returning_push_error() {
+        use std::cell::RefCell;
+
+        let calls = RefCell::new(Vec::<&'static str>::new());
+        let result = transfer_blocklist_snapshot(
+            || {
+                calls.borrow_mut().push("push");
+                Err(AppError::BlocklistUnavailable)
+            },
+            || {
+                calls.borrow_mut().push("close");
+                Ok(())
+            },
+        );
+
+        assert_eq!(*calls.borrow(), vec!["push", "close"]);
+        assert_eq!(result.unwrap_err().code(), "blocklist_unavailable");
+    }
+
+    #[test]
+    fn blocklist_transfer_close_failure_requires_a_restart_not_success() {
+        use std::cell::Cell;
+
+        let closes = Cell::new(0u32);
+        let result = transfer_blocklist_snapshot(
+            || Err(AppError::BlocklistUnavailable),
+            || {
+                closes.set(closes.get() + 1);
+                Err(AppError::Other("close flush failed".into()))
+            },
+        );
+
+        assert_eq!(closes.get(), 1);
+        let error = result.expect_err("a failed close must never be reported as success");
+        assert_eq!(error.code(), "other");
+        assert!(
+            error.to_string().contains("yeniden başlatın"),
+            "the user must be told the old snapshot may still be live"
+        );
     }
 
     #[test]

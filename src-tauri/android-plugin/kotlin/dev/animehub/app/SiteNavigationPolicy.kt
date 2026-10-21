@@ -93,18 +93,24 @@ internal object SiteNavigationPolicy {
    *    request, main frame or not, so a page cannot make the WebView fetch
    *    `https://192.168.1.1/admin` or `https://169.254.169.254/…`.
    *
-   * WHAT THIS DOES **NOT** DO, and why (see docs/android-storage-isolation.md):
+   * WHAT THIS DOES AND DOES **NOT** DO (see docs/security-residual-risks.md):
    *
-   *  - No DNS. `shouldInterceptRequest` returning null hands the request back to
-   *    the engine, which resolves and connects on its own — so a lookup here
-   *    would be a TOCTOU check that a rebinding hostname trivially defeats, and
-   *    it would add latency to every request. Hostnames that resolve to private
-   *    addresses are NOT caught on Android; only IP literals and the host rules
-   *    are. The desktop side does resolve (`web::dns`), and even there the
-   *    answer is not pinned to the connection.
-   *  - No user blocklist. The Rust blocklist is not plumbed to the WebView yet;
-   *    until it is, this checkpoint enforces the private-host and scheme rules
-   *    only. Reported as deferred rather than claimed as done.
+   *  - DNS is a PRE-CHECK, not connection pinning. Both checkpoints share
+   *    [NavigationDnsGate]: `shouldInterceptRequest` resolves off the UI thread
+   *    before handing the request to the engine and refuses a private, loopback,
+   *    link-local or changed answer. `shouldOverrideUrlLoading` must answer
+   *    synchronously, so a cache miss returns `ALLOW_AND_PROBE`: the navigation
+   *    proceeds and the answer is cached for later requests. The engine resolves
+   *    again when it connects, so a rebinding host can answer public to the gate
+   *    and private to the socket (TOCTOU). That remains an OPEN risk; neither
+   *    this comment nor a unit test closes it.
+   *  - The user blocklist IS connected. Rust pushes the snapshot before every
+   *    open and after every settings change or reset; [SiteBlocklist] is a
+   *    process-wide atomic snapshot, so a replacement applies to a live WebView
+   *    immediately. If the Rust→Kotlin transfer fails, Rust aborts the open and
+   *    closes an already-open site on the normal lifecycle path before returning
+   *    an error. If that close also fails, the caller gets a restart-required
+   *    error instead of a claim that the old snapshot is still safe.
    *  - `blob:` inherits its creator's origin and is allowed, because refusing it
    *    stops MSE playback dead.
    */

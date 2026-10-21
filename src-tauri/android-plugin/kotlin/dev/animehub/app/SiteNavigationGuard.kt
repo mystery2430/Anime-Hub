@@ -48,7 +48,10 @@ import java.util.concurrent.Executors
  *    connection pinning: the engine resolves again when it connects (TOCTOU).
  *    See `docs/security-residual-risks.md` — R-01 stays partial.
  *  - Blocklist: the user's Rust rules are pushed into [SiteBlocklist] before
- *    every open; both the top-level and sub-resource checkpoints consult it.
+ *    every open and after settings/reset changes; both the top-level and
+ *    sub-resource checkpoints consult it. A failed transfer is handled in Rust
+ *    (abort the open, close an already-open site, surface a restart error if the
+ *    close cannot complete); Kotlin never treats a failed push as empty rules.
  *
  * Every other callback is forwarded unchanged, so wry's custom-protocol
  * handling, the IPC page-started tracking and the error recovery keep working.

@@ -1694,9 +1694,21 @@ test("the user blocklist is pushed from Rust into the Android WebView", () => {
   assert.match(bridgeRs, /pub fn site_blocklist_update\(entries: &\[String\]\)/);
   assert.match(pluginKt, /fun site_blocklist_update\(invoke: Invoke\)/);
   assert.match(pluginKt, /SiteBlocklist\.update\(rules\)/);
-  assert.match(commandsRs, /fn sync_android_blocklist\(state: &AppState\)/);
-  assert.match(commandsRs, /sync_android_blocklist\(&state\)/);
-  assert.match(commandsRs, /site_blocklist_update\(&entries\)/);
+  assert.match(commandsRs, /fn sync_android_blocklist\(app: &AppHandle, state: &AppState\)/);
+  assert.match(
+    commandsRs,
+    /fn push_android_blocklist\(entries: &\[String\]\)[\s\S]{0,220}site_blocklist_update\(entries\)/,
+  );
+  const syncCalls = commandsRs.match(/sync_android_blocklist\(&app, &state\)/g) || [];
+  assert.ok(syncCalls.length >= 3, "open/settings/reset must all transfer the snapshot");
+  assert.match(
+    commandsRs,
+    /pub fn reset_blocklist\(app: AppHandle, state: State<'_, AppState>\)[\s\S]{0,900}sync_android_blocklist\(&app, &state\)\?/,
+  );
+  assert.match(commandsRs, /fn transfer_blocklist_snapshot/);
+  assert.match(commandsRs, /Err\(push_error\) => match close\(\)/);
+  assert.match(commandsRs, /close_active_android_site\(app\)/);
+  assert.match(commandsRs, /blocklist_transfer_closes_the_live_site_before_returning_push_error/);
 
   // Matching: same three rule forms + lookalike safety, and enforcement in
   // BOTH the navigation and sub-resource checkpoints via hostAllowed.

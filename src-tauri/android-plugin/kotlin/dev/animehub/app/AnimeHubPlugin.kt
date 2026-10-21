@@ -458,9 +458,14 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   /**
    * Replace the user blocklist snapshot used by the site WebView.
    *
-   * Rust calls this before every site open and after a settings change. The
-   * WebView never reads the Rust state directly, so this is the only path that
-   * makes the user's ad/redirect rules effective on Android.
+   * Rust calls this before every site open and after every settings change or
+   * reset. The snapshot is process-wide and atomic, so a live WebView sees the
+   * replacement at its next navigation/request checkpoint. The WebView never
+   * reads Rust state directly.
+   *
+   * A failure BEFORE this command (bridge unavailable/activity gone) is handled
+   * fail-closed by Rust: no new open, and an active site is closed. Kotlin must
+   * not be described as making that failure safe, because it never observes it.
    */
   @Command
   fun site_blocklist_update(invoke: Invoke) {

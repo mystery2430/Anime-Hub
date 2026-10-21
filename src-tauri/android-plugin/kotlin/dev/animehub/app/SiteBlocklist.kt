@@ -76,9 +76,14 @@ data class BlocklistRules(
 }
 
 /**
- * Process-wide snapshot. Rust replaces it before an open (and on a settings
- * change); the matcher never blocks anything until the first snapshot arrives,
- * which is safe because a site cannot be opened before that push.
+ * Process-wide snapshot. Rust replaces it before every open and after every
+ * settings change or reset. The reference swap is atomic, so an already-open
+ * WebView sees the new rules on its next checkpoint without being recreated.
+ *
+ * A transfer that fails before this object is reached is NOT represented as an
+ * empty snapshot: Rust aborts the open / closes the active site and returns an
+ * error. This object cannot observe the bridge failure itself, so it must never
+ * be described as making a failed transfer safe.
  *
  * A DISABLED blocklist arrives as an empty snapshot: the rule file lives in
  * Rust, and this object deliberately has no separate `enabled` bit that could

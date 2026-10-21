@@ -205,10 +205,16 @@ site yolları hiç dokunmaz.
   seçim). Bu kontrol gezinti anındadır: WebView'ın kendi bağlantısı bu cevabı
   kullanmaz, yani kararlı bir DNS-rebinding koruması değil, pencereyi daraltan
   bir kontroldür.
-- **Alan adı engel listesi** reklam ve izleyici alanlarını **gezinti
-  düzeyinde** (ana çerçeve) keser; liste koda gömülüdür, Ayarlar'dan
-  düzenlenebilir ve kapatılabilir. Alt kaynak isteklerinde (XHR/`fetch`/görsel)
-  uygulanmaz — masaüstünde böyle bir kesme noktası yoktur.
+- **Alan adı engel listesi** reklam ve izleyici alanlarını masaüstünde
+  **gezinti düzeyinde** (ana çerçeve) keser; liste koda gömülüdür, Ayarlar'dan
+  düzenlenebilir ve kapatılabilir. Masaüstünde alt kaynak isteklerinde
+  (XHR/`fetch`/görsel) böyle bir kesme noktası yoktur. Android'de liste Rust'tan
+  site WebView'ine açılış ve her ayar/sıfırlama sonrasında aktarılır ve hem üst
+  düzey hem alt kaynak kontrollerinde uygulanır. Aktarım başarısız olursa yeni
+  site açılmaz; açık bir site varsa güvenlik için normal lifecycle yolundan
+  kapatılır ve komut hata döner. Kapatma da başarısızsa kullanıcıya yeniden
+  başlatma gerektiren açık bir hata gösterilir; eski snapshot ile devam
+  edildiği iddia edilmez.
 
 #### Hangi kontrol nerede çalışıyor? (dürüst tablo)
 
@@ -216,20 +222,21 @@ site yolları hiç dokunmaz.
 |---|---|---|---|---|
 | `http://` reddi | ✅ `on_navigation` | ⚠️ motorun mixed-content politikası | ✅ `SiteNavigationPolicy` | ✅ `shouldInterceptRequest` |
 | Özel/loopback **IP literalleri** ve host kuralları | ✅ | ❌ | ✅ | ✅ |
-| Kullanıcı engel listesi | ✅ | ❌ | ❌ | ❌ |
-| DNS ile özel adrese çözümleme | ✅ (gezinti anı, fail-open) | ❌ | ❌ | ❌ |
+| Kullanıcı engel listesi | ✅ | ❌ masaüstünde alt kaynak kesme noktası yok | ✅ | ✅ |
+| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol, bağlantı pinlenmiyor | ❌ | ⚠️ ön kontrol, bağlantı pinlenmiyor | ⚠️ ön kontrol, bağlantı pinlenmiyor |
 | `data:` üst düzey belge | ✅ reddedilir | ➖ (alt kaynak olarak serbest) | ✅ reddedilir | ➖ serbest |
 
-**Android'de DNS kontrolü yoktur ve bu bilerek böyledir.**
-`shouldInterceptRequest` içinde DNS çözmek, motorun kendi çözümlemesini
-bağlamaz: cevap ile bağlantı arasında bir TOCTOU penceresi kalır (rebinding'i
-engellemez) ve her isteğe gecikme ekler. Gerçek çözüm bağlantı anında sabitleme
-(connection pinning) veya filtreleyen bir vekildir; Android'de WebView başına
-vekil API'si yoktur ve TLS'i araya girmeden gövdeyi kendimiz sunmak mümkün
-değildir. Bu yüzden Android'de **host adı özel bir adrese çözülen istekler
-engellenmez** — bu, birleştirme öncesi açık bir güvenlik riski olarak
-`docs/android-storage-isolation.md` ve PR açıklamasında durur, belgeyle
-"kapatılmış" sayılmaz.
+**Android'de DNS ön kontrolü vardır; bağlantı sabitleme yoktur.**
+`shouldInterceptRequest` her istekten önce çözer ve özel/loopback/link-local ya
+da değişmiş bir cevabı reddeder. Üst düzey `shouldOverrideUrlLoading` çağrısı
+eşzamanlı yanıt vermek zorundadır; cache miss'te `ALLOW_AND_PROBE` döner, yani
+DNS sonucu gelmeden gezinti devam eder ve cevap yalnızca sonraki istekler için
+cache'lenir. Motor bağlantı sırasında yeniden çözümleme yapabildiği için cevap
+ile soket arasında **TOCTOU** penceresi kalır: rebinding yapan bir host ön
+kontrole public, sokete private cevap verebilir. Gerçek çözüm, çözülen adresi
+bağlantıya sabitleyen bir ağ katmanıdır (yerel CONNECT proxy / sağlayıcı
+filtresi); bu PR'da uygulanmamıştır. Bu nedenle DNS rebinding **açık bir
+güvenlik riski** olarak kalır; belge veya test değişikliği onu kapatmaz.
 
 ### ➕&nbsp; Kodsuz site ekleme
 
