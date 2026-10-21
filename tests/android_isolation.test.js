@@ -1460,9 +1460,17 @@ test("navigation policy wraps the site client too", () => {
   );
   assert.match(guardKt, /class SiteNavigationGuard/);
   assert.match(guardKt, /InetAddress\.getAllByName\(host\)/);
-  assert.match(guardKt, /ResolvedHostPolicy\.classify\(previous, answer\)/);
-  assert.match(guardKt, /DnsVerdict\.ALLOW/);
-  assert.match(guardKt, /MAX_CACHED_HOSTS/);
+  // The verdict cache is shared by both checkpoints (round 6): the guard keeps
+  // the resolver calls, NavigationDnsGate owns classify/caching/bounds.
+  assert.match(guardKt, /dnsGate\.decide\(uri\.host/);
+  assert.match(guardKt, /dnsGate\.cachedVerdict\(host, now\)/);
+  const dnsGateKt = read(
+    "src-tauri/android-plugin/kotlin/dev/animehub/app/NavigationDnsGate.kt",
+  );
+  assert.match(dnsGateKt, /ResolvedHostPolicy\.classify\(previous, answer\)/);
+  assert.match(dnsGateKt, /DnsVerdict\.PRIVATE_ADDRESS/);
+  assert.match(dnsGateKt, /MAX_HOSTS/);
+  assert.match(preparePy, /"NavigationDnsGate"/);
   assert.match(read(`${KOTLIN}/SiteNavigationPolicy.kt`), /object ResolvedHostPolicy/);
   assert.match(read(`${KOTLIN}/SiteNavigationPolicy.kt`), /CHANGED_ADDRESS/);
   assert.match(guardKt, /SiteNavigationPolicy\.rejection\(uri\)/);

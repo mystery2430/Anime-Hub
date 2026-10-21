@@ -567,6 +567,9 @@ pub fn error_class(error: &crate::error::AppError) -> &'static str {
         AppError::Unsupported(_) => "unsupported",
         AppError::Quarantined(_) => "quarantined",
         AppError::Icon(_) => "unknown",
+        // Fail-closed blocklist transfer: a storage-class failure the user can
+        // retry by reopening the site.
+        AppError::BlocklistUnavailable => "storage",
     }
 }
 
