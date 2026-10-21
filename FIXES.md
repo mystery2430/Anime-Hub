@@ -26,14 +26,14 @@ Based on `mystery2430/Anime-Hub` PR #27 head
 ## Verification
 
 ```text
-npm test        249 / 249
-Kotlin JUnit    107 / 107 (pure flows + navigation policy)
+npm test        250 / 250
+Kotlin JUnit    108 / 108 (pure flows + navigation policy)
 cargo fmt       clean
 npm run build   OK
 python3 -m py_compile scripts/android_prepare.py  OK
 ```
 
-`cargo test` and a device run were not available in this environment.
+`cargo test` and a device run were not available in this environment; `cargo fmt --check` and the Kotlin compiler were run locally.
 
 ## Applying the workflow hardening
 
