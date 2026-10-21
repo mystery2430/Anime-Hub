@@ -38,7 +38,7 @@
 //! never a silent fallback to the shared profile. See
 //! `docs/android-storage-isolation.md`.
 
-use crate::commands::{AppState, CurrentSite};
+use crate::commands::{lock_recover, AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
@@ -297,7 +297,7 @@ fn open_in_main_window_inner(
             // must not stall every other command waiting on the blocklist.
             let preliminary = {
                 let state = app.state::<AppState>();
-                let bl = state.blocklist.lock().expect("blocklist lock");
+                let bl = lock_recover(&state.blocklist);
                 decide_navigation(target, &nav_host, &bl)
             };
             let decision = if preliminary == NavDecision::Allow {
@@ -374,7 +374,7 @@ fn open_in_main_window_inner(
             window_label: label.clone(),
             entered_fullscreen,
         };
-        *state.current_site.lock().expect("current_site lock") = Some(value);
+        *lock_recover(&state.current_site) = Some(value);
     }
 
     // Live-session sync: snapshot the session into the encrypted store on a
@@ -391,7 +391,7 @@ fn open_in_main_window_inner(
 fn close_current_child_locked(app: &AppHandle) -> AppResult<()> {
     let label = {
         let state = app.state::<AppState>();
-        let current = state.current_site.lock().expect("current_site lock");
+        let current = lock_recover(&state.current_site);
         current
             .as_ref()
             .filter(|c| c.window_label != LAUNCHER_LABEL)
@@ -432,7 +432,7 @@ pub fn install_main_window_handlers(app: &AppHandle) {
         let app = app_handle.clone();
         let label = {
             let state = app.state::<AppState>();
-            let current = state.current_site.lock().expect("current_site lock");
+            let current = lock_recover(&state.current_site);
             current.as_ref().map(|c| c.window_label.clone())
         };
         if let Some(label) = label {
@@ -462,7 +462,7 @@ pub fn install_main_window_handlers(app: &AppHandle) {
 /// rather than trust a value captured when the thread was spawned, so a stale
 /// thread can never write one site's session data into another site's blob.
 fn session_is_current(state: &AppState, site_id: &str) -> bool {
-    let current = state.current_site.lock().expect("current_site lock");
+    let current = lock_recover(&state.current_site);
     current.as_ref().is_some_and(|c| c.site_id == site_id)
 }
 
@@ -3199,14 +3199,10 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
 
     // 1. Close the outgoing site, if any. One site WebView at a time; its
     //    data stays in its profile, so there is no export step any more.
-    let previous = state
-        .current_site
-        .lock()
-        .expect("current_site lock")
-        .clone();
+    let previous = lock_recover(&state.current_site).clone();
     if previous.is_some() {
         crate::android_bridge::site_close(true)?;
-        *state.current_site.lock().expect("current_site lock") = None;
+        *lock_recover(&state.current_site) = None;
         if let Some(closed) = previous {
             let _ = app.emit("animehub://site-closed", closed.site_id);
         }
@@ -3228,7 +3224,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     log::debug!("site profili açıldı");
 
     let label = label_for(&site.id);
-    *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
+    *lock_recover(&state.current_site) = Some(CurrentSite {
         site_id: site.id.clone(),
         host: site.host(),
         window_label: label.clone(),
@@ -3269,11 +3265,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     }
     let state = app.state::<AppState>();
 
-    let previous_site = state
-        .current_site
-        .lock()
-        .expect("current_site lock")
-        .clone();
+    let previous_site = lock_recover(&state.current_site).clone();
     if let Some(current) = previous_site.as_ref() {
         export_cookies(&window, &current.site_id, &current.host)?;
     }
@@ -3297,7 +3289,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
         return Err(AppError::Other("sayfa açılamadı".into()));
     }
 
-    *state.current_site.lock().expect("current_site lock") = Some(CurrentSite {
+    *lock_recover(&state.current_site) = Some(CurrentSite {
         site_id: site.id.clone(),
         host: site.host(),
         window_label: LAUNCHER_LABEL.into(),
@@ -3419,11 +3411,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
         let state = app.state::<AppState>();
         // Bind first: the `MutexGuard` temporary must be dropped before
         // `state`, whose borrow it holds.
-        let value = state
-            .current_site
-            .lock()
-            .expect("current_site lock")
-            .clone();
+        let value = lock_recover(&state.current_site).clone();
         value
     };
 
@@ -3439,11 +3427,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
     #[cfg(not(target_os = "android"))]
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         let state = app.state::<AppState>();
-        let back = state
-            .launcher_url
-            .lock()
-            .expect("launcher_url lock")
-            .clone();
+        let back = lock_recover(&state.launcher_url).clone();
         if let Some(url) = back {
             window.navigate(url).map_err(|_| {
                 log::error!("başlatıcıya dönülemedi");
@@ -3454,7 +3438,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
 
     let closed_site = current.as_ref().map(|c| c.site_id.clone());
     let state = app.state::<AppState>();
-    *state.current_site.lock().expect("current_site lock") = None;
+    *lock_recover(&state.current_site) = None;
     if let Some(site_id) = closed_site {
         let _ = app.emit("animehub://site-closed", site_id);
     }
@@ -3472,11 +3456,7 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
 pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
-        let value = state
-            .current_site
-            .lock()
-            .expect("current_site lock")
-            .clone();
+        let value = lock_recover(&state.current_site).clone();
         value
     };
     let child_label = current
@@ -3496,7 +3476,7 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     let mut closed_site = None;
     {
         let state = app.state::<AppState>();
-        let mut guard = state.current_site.lock().expect("current_site lock");
+        let mut guard = lock_recover(&state.current_site);
         if guard
             .as_ref()
             .is_some_and(|c| c.window_label == child_label)
@@ -3549,11 +3529,7 @@ pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<
 pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
-        let value = state
-            .current_site
-            .lock()
-            .expect("current_site lock")
-            .clone();
+        let value = lock_recover(&state.current_site).clone();
         value
     };
     // Only proceed if the site to delete is still the active one; otherwise
@@ -3573,11 +3549,7 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
     {
         let back = {
             let state = app.state::<AppState>();
-            let value = state
-                .launcher_url
-                .lock()
-                .expect("launcher_url lock")
-                .clone();
+            let value = lock_recover(&state.launcher_url).clone();
             value
         };
         if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
@@ -3593,7 +3565,7 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
     let closed_site = current.as_ref().map(|c| c.site_id.clone());
     {
         let state = app.state::<AppState>();
-        let mut guard = state.current_site.lock().expect("current_site lock");
+        let mut guard = lock_recover(&state.current_site);
         if guard.as_ref().is_some_and(|c| c.site_id == site_id) {
             *guard = None;
         }
@@ -3621,11 +3593,7 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
         let state = app.state::<AppState>();
         // Bind first: the `MutexGuard` temporary must be dropped before
         // `state`, whose borrow it holds.
-        let value = state
-            .current_site
-            .lock()
-            .expect("current_site lock")
-            .clone();
+        let value = lock_recover(&state.current_site).clone();
         value
     };
     // `label` comes from the launcher UI, which tracks the label it was
@@ -3652,7 +3620,7 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
     let mut closed_site = None;
     {
         let state = app.state::<AppState>();
-        let mut guard = state.current_site.lock().expect("current_site lock");
+        let mut guard = lock_recover(&state.current_site);
         if guard
             .as_ref()
             .is_some_and(|c| c.window_label == child_label)
@@ -3693,7 +3661,7 @@ pub fn open_externally(app: &AppHandle, raw: &str) -> AppResult<()> {
         .map_err(|r| AppError::InvalidUrl(r.reason().to_string()))?;
     let state = app.state::<AppState>();
     let blocked = {
-        let bl = state.blocklist.lock().expect("blocklist lock");
+        let bl = lock_recover(&state.blocklist);
         bl.is_blocked(safe.host())
     };
     if blocked {
@@ -4235,7 +4203,7 @@ mod tests {
             let started_clone = sync_started.clone();
             let done_clone = sync_done.clone();
             let handle = std::thread::spawn(move || {
-                let _guard = lock_desktop_session().expect("sync lock");
+                let _guard = lock_desktop_session();
                 started_clone.store(true, Ordering::SeqCst);
                 // Simulate sync's ownership check + export under the lock.
                 assert!(session_is_current(&state_clone, "s1"));
@@ -4250,7 +4218,7 @@ mod tests {
             // not deadlock, until sync releases.
             let wipe_start = std::time::Instant::now();
             {
-                let _guard = lock_desktop_session().expect("wipe lock");
+                let _guard = lock_desktop_session();
                 let elapsed = wipe_start.elapsed();
                 assert!(
                     elapsed >= std::time::Duration::from_millis(50),

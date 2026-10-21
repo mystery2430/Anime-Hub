@@ -16,6 +16,19 @@ Based on `mystery2430/Anime-Hub` PR #27 head
 | MNT-03 | Capability description matches the native per-site WebView model. | `capabilities/default.json` |
 | VER-01 / MNT-02 | Behavioral tests added for migration, flush recovery, DNS verdicts, blocklist matching and action pinning. | test suites |
 
+## Review round 4 — found while auditing this branch
+
+| Review id | Fix | Evidence |
+| --- | --- | --- |
+| SEC-03 (new) | `sync_android_blocklist` pushed `Blocklist::entries()` regardless of `BlocklistState.enabled`. Kotlin has no enabled flag, so turning the blocklist off left every listed host blocked inside the Android site WebView while desktop `is_blocked` answered `false`. The snapshot is now gated by `Blocklist::is_enabled()` through one helper, `android_blocklist_entries`. | `commands.rs`, `SiteBlocklist.kt` |
+| SEC-04 (new) | The same function used `lock().map(..).unwrap_or_default()`: after one panic the poisoned lock pushed an **empty** rule set, i.e. Android enforcement silently regressed to desktop-only, with no log line. It now recovers the guard and keeps the warn log. | `commands.rs` |
+| BUG-04 (new) | 23 production `lock().expect("… lock")` sites in `web/windows.rs` panicked on a poisoned mutex. One panic in a background flush/resolver poisoned `current_site` / `launcher_url` / `blocklist`, after which every navigation callback and launcher navigation panicked as well (crash loop). Added `commands::lock_recover` and used it at every site, including `lock_desktop_session`. | `commands.rs`, `web/windows.rs` |
+| VER-02 (new) | Unit tests pin both regressions: a disabled blocklist produces an empty Android snapshot and still answers `false` locally; `lock_recover` returns the value of a poisoned mutex. | `commands.rs` tests |
+
+Not re-verified in this round: the reviewing environment had no Rust or Kotlin
+toolchain, so `cargo test`, `cargo clippy -D warnings` and the Gradle unit tests
+were not run here. `npm test` (250 tests) passes.
+
 ## Remaining release gates
 
 - **DNS rebinding TOCTOU** still needs a connection-pinning network layer.

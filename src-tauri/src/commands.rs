@@ -1620,6 +1620,35 @@ pub fn pip_startup_should_apply(
     captured_val == live_val
 }
 
+/// Lock without the `expect()` panic-on-poison trap.
+///
+/// Everything guarded by these mutexes is plain state: a panic while one lock
+/// was held (a background flush, a resolver task) used to poison it, and every
+/// later `lock().expect(..)` then panicked too — permanently, and inside the
+/// WebView navigation callback, where a panic is far worse than a stale read.
+/// Recovering the guard keeps the app usable; a poisoned lock says a writer
+/// panicked, not that the guarded value is unusable, and refusing to start is
+/// strictly worse than continuing with the last consistent state.
+pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The blocklist snapshot handed to the Android WebView.
+///
+/// Kotlin has no `enabled` flag of its own: an empty snapshot is the only way
+/// to say "the user turned the blocklist off". Pushing `entries()` while
+/// disabled kept ads and trackers blocked on Android long after the desktop
+/// matcher started answering `false`, so the gate lives here — next to
+/// `Blocklist::is_blocked`, which applies the same rule.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn android_blocklist_entries(list: &Blocklist) -> Vec<String> {
+    if list.is_enabled() {
+        list.entries()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Push the current blocklist snapshot into the Android site WebView.
 ///
 /// Called before every site open and after a settings change, because the
@@ -1627,11 +1656,9 @@ pub fn pip_startup_should_apply(
 fn sync_android_blocklist(state: &AppState) {
     #[cfg(target_os = "android")]
     {
-        let entries = state
-            .blocklist
-            .lock()
-            .map(|list| list.entries())
-            .unwrap_or_default();
+        // Recover a poisoned lock instead of sending an empty rule set: the old
+        // `unwrap_or_default()` silently disabled enforcement after one panic.
+        let entries = android_blocklist_entries(&lock_recover(&state.blocklist));
         if let Err(error) = crate::android_bridge::site_blocklist_update(&entries) {
             // Enforcement must not silently regress to desktop-only.
             log::warn!("Android blocklist could not be synchronised: {error}");
@@ -2163,5 +2190,30 @@ mod tests {
         drop(guard);
         // After release, try_lock should succeed.
         assert!(st.pip_lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn android_blocklist_snapshot_is_empty_when_disabled() {
+        let rules = "doubleclick.net\n*.tracker.example\n=exact.example\n";
+        let enabled = Blocklist::from_rules(rules, true);
+        assert_eq!(android_blocklist_entries(&enabled).len(), 3);
+        // Disabled must push NOTHING: Kotlin only understands rules, so a
+        // snapshot sent while disabled would keep blocking on Android while
+        // the desktop matcher returns false for every host.
+        let disabled = Blocklist::from_rules(rules, false);
+        assert!(!disabled.is_blocked("doubleclick.net"));
+        assert!(android_blocklist_entries(&disabled).is_empty());
+    }
+
+    #[test]
+    fn lock_recover_survives_a_poisoned_mutex() {
+        let mutex = Mutex::new(7u32);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("poison the mutex on purpose");
+        }));
+        assert!(poisoned.is_err());
+        assert!(mutex.is_poisoned());
+        assert_eq!(*lock_recover(&mutex), 7);
     }
 }

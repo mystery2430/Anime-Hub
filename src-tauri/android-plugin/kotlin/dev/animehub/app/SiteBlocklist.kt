@@ -79,6 +79,11 @@ data class BlocklistRules(
  * Process-wide snapshot. Rust replaces it before an open (and on a settings
  * change); the matcher never blocks anything until the first snapshot arrives,
  * which is safe because a site cannot be opened before that push.
+ *
+ * A DISABLED blocklist arrives as an empty snapshot: the rule file lives in
+ * Rust, and this object deliberately has no separate `enabled` bit that could
+ * disagree with the desktop matcher (`Blocklist::is_blocked` returns false
+ * when disabled).
  */
 object SiteBlocklist {
   private val current = AtomicReference(BlocklistRules())

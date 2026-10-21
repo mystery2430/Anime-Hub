@@ -38,6 +38,24 @@ same suffix / `*` / `=` semantics in both the top-level navigation checkpoint
 and the sub-resource checkpoint. Matching is pinned by Kotlin unit tests,
 including the `notdoubleclick.net` lookalike.
 
+### Disabled blocklist on Android
+
+The rule text stays in Rust; the WebView receives a parsed snapshot. A
+**disabled** blocklist therefore arrives as an **empty** snapshot, produced by
+`android_blocklist_entries` from the same `Blocklist::is_enabled()` gate that
+`is_blocked` honours. Previously the rules were pushed while disabled, so
+Android kept blocking after the user turned the list off.
+
+### Poisoned locks
+
+`commands::lock_recover` takes the guard out of a poisoned mutex instead of
+panicking. The old `lock().expect("… lock")` sites sat in the navigation
+callback, so one panic elsewhere (a flush or resolver task holding
+`current_site`, `launcher_url` or `blocklist`) turned into a permanent panic
+loop. Recovery is not a correctness proof: a panic between two writes can still
+leave the in-memory state at the last completed step, which is exactly what the
+persisted state is re-read for on startup.
+
 ### Android minimum version
 
 `minSdkVersion` is 29 (Android 10), the multi-process WebView baseline for
