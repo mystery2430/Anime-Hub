@@ -28,10 +28,23 @@ import java.util.LinkedHashMap
  * a miss. The request path resolves synchronously — it is already off the UI
  * thread — and feeds the answer back through [record], which is what makes the
  * NEXT top-level navigation block a redirect to a private address.
+ *
+ * TWO THINGS THIS DELIBERATELY REFUSES TO DO:
+ *
+ *  * cache an answer it does not have. [record] writes nothing for an empty
+ *    answer (see there): "no address" is not "a public address", and storing it
+ *    would make the next [decide] answer ALLOW from a verdict nobody proved.
+ *  * queue an unbounded amount of resolver work. [probing] holds at most
+ *    [maxProbing] hosts, so a page that fires many distinct hostnames at the
+ *    top-level checkpoint cannot grow the set — and, through it, the single
+ *    resolver executor's task queue — without bound. Reaching the budget is
+ *    fail-open, exactly like a cache miss: the navigation proceeds without a
+ *    probe, and the request checkpoint still resolves synchronously.
  */
 class NavigationDnsGate(
   private val cacheMs: Long = CACHE_MS,
   private val maxHosts: Int = MAX_HOSTS,
+  private val maxProbing: Int = MAX_PROBING,
 ) {
   enum class Verdict { PUBLIC, PRIVATE, CHANGED }
 
@@ -81,15 +94,33 @@ class NavigationDnsGate(
     }
     // Unknown is fail-open, deliberately: a resolver outage must not brick
     // every navigation. The caller probes and the verdict lands here.
-    if (probing.add(host)) return Decision.ALLOW_AND_PROBE
-    return Decision.ALLOW
+    if (probing.contains(host)) return Decision.ALLOW
+    if (probing.size >= maxProbing.coerceAtLeast(0)) {
+      // Probe budget exhausted: do NOT add another host. This is the back
+      // pressure that keeps `probing` and the resolver executor's task queue
+      // bounded when a page navigates through many distinct hostnames; the
+      // navigation is treated like a normal cache miss (allowed, unprobed) and
+      // the request checkpoint still resolves it synchronously.
+      return Decision.ALLOW
+    }
+    return if (probing.add(host)) Decision.ALLOW_AND_PROBE else Decision.ALLOW
   }
 
   /** Record a resolver answer; returns the decision it implies for this host. */
   @Synchronized
   fun record(rawHost: String, answer: List<String>, now: Long): Decision {
     val host = normalize(rawHost) ?: return Decision.BLOCK
+    // Whatever the answer, this host is no longer being probed.
     probing.remove(host)
+    if (answer.isEmpty()) {
+      // An EMPTY answer is not evidence of a public address, so it must not be
+      // cached: [SiteNavigationPolicy.ResolvedHostPolicy.classify] reports it as
+      // ALLOW only because the caller fails open on a resolver outage, and
+      // storing that as `PUBLIC` (with an empty `pinned` set) manufactured a
+      // "safe" verdict for a host that was never resolved. Write nothing and
+      // let the next navigation probe again.
+      return Decision.ALLOW
+    }
     val previous = entries[host]?.takeIf { isFresh(it.checkedAt, now) }?.pinned
     val verdict = SiteNavigationPolicy.ResolvedHostPolicy.classify(previous, answer)
     val decision =
@@ -104,13 +135,11 @@ class NavigationDnsGate(
         SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.CHANGED_ADDRESS -> Verdict.CHANGED
         SiteNavigationPolicy.ResolvedHostPolicy.DnsVerdict.ALLOW -> Verdict.PUBLIC
       }
-    // An empty answer pins nothing: there is no address to compare later.
-    val pinned =
-      if (answer.isEmpty()) {
-        emptySet()
-      } else {
-        answer.map { it.substringBefore('%').trim() }.toSet()
-      }
+    // Only a non-empty answer reaches here, so `pinned` always has at least one
+    // address to compare a later answer against (see the empty-answer return
+    // above). The scope id suffix of a link-local IPv6 address is stripped
+    // because it is per-interface and would otherwise read as a "change".
+    val pinned = answer.map { it.substringBefore('%').trim() }.toSet()
     if (entries.size >= maxHosts && !entries.containsKey(host)) {
       entries.remove(entries.keys.first())
     }
@@ -128,12 +157,28 @@ class NavigationDnsGate(
   @Synchronized
   fun size(): Int = entries.size
 
+  /** Hosts currently holding a probe slot (diagnostics and budget tests). */
+  @Synchronized
+  fun probingCount(): Int = probing.size
+
   private fun isFresh(checkedAt: Long, now: Long): Boolean =
     now >= checkedAt && now - checkedAt < cacheMs
 
   companion object {
     const val CACHE_MS: Long = 60_000L
     const val MAX_HOSTS: Int = 256
+
+    /**
+     * Hard cap on hosts with a probe in flight.
+     *
+     * The probe executor is a single-thread queue, so an uncapped `probing` set
+     * was also an uncapped task queue: a page that walks many hostnames (ad
+     * redirector chains do exactly that) could enqueue one resolver task per
+     * name, each of which blocks for the resolver timeout. The cap bounds both
+     * the set and the queue; a host that is refused a slot is simply not
+     * probed, which is the same "unknown, fail open" state as a cache miss.
+     */
+    const val MAX_PROBING: Int = 32
 
     /**
      * Lower-case, strip the DNS root dot and IPv6 brackets. IP literals are

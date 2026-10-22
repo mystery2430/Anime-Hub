@@ -346,6 +346,78 @@ class SiteNavigationPolicyTest {
     }
 
     @Test
+    fun `an empty resolver answer is never cached as a safe verdict`() {
+        val gate = NavigationDnsGate()
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("empty.example", 0L))
+
+        // Regression: `record(host, emptyList())` used to be classified as
+        // ALLOW and stored as Verdict.PUBLIC with an empty `pinned` set, so the
+        // NEXT navigation was allowed from the cache — a "safe" verdict for a
+        // host whose address was never established. The answer proves nothing,
+        // so nothing may be cached.
+        assertEquals(
+            NavigationDnsGate.Decision.ALLOW,
+            gate.record("empty.example", emptyList(), 10L),
+        )
+        assertNull(gate.cachedVerdict("empty.example", 20L))
+        assertEquals(0, gate.size())
+        assertEquals(0, gate.probingCount())
+
+        // A later navigation therefore probes again instead of trusting a
+        // fabricated PUBLIC entry.
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("empty.example", 30L))
+    }
+
+    @Test
+    fun `a failed lookup caches no verdict and frees the probe slot`() {
+        val gate = NavigationDnsGate(maxProbing = 1)
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("outage.example", 0L))
+        assertEquals(1, gate.probingCount())
+
+        gate.recordLookupFailure("OUTAGE.example.") // what the probe's catch does
+        assertEquals(0, gate.probingCount())
+        assertNull(gate.cachedVerdict("outage.example", 1L))
+        // Fail-open: the navigation is not blocked by a resolver outage, and the
+        // freed slot lets the next navigation probe again.
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("outage.example", 2L))
+    }
+
+    @Test
+    fun `the probe budget bounds the resolver queue and recovers when a slot frees`() {
+        val gate = NavigationDnsGate(maxProbing = 2)
+
+        // Two distinct hosts take the budget; each asks for exactly one probe.
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("one.example", 0L))
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("two.example", 0L))
+        assertEquals(2, gate.probingCount())
+
+        // Further hosts are still ALLOWED (fail-open, the same decision as a
+        // cache miss) but get NO probe, so neither `probing` nor the
+        // single-threaded resolver queue can grow with the page's host count.
+        for (i in 0 until 100) {
+            assertEquals(NavigationDnsGate.Decision.ALLOW, gate.decide("flood$i.example", 1L))
+        }
+        assertEquals(2, gate.probingCount())
+
+        // A settled probe frees its slot, and the next host gets one again.
+        assertEquals(
+            NavigationDnsGate.Decision.ALLOW,
+            gate.record("one.example", listOf("93.184.216.34"), 2L),
+        )
+        assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("three.example", 3L))
+        assertEquals(2, gate.probingCount())
+
+        // An answer for a host that never held a slot is still recorded (the
+        // synchronous request checkpoint records every host it resolves) but
+        // must not push the set over the cap.
+        assertEquals(
+            NavigationDnsGate.Decision.ALLOW,
+            gate.record("flood7.example", listOf("93.184.216.34"), 4L),
+        )
+        assertEquals(2, gate.probingCount())
+    }
+
+    @Test
     fun `cached verdicts expire and honour the entry cap`() {
         val gate = NavigationDnsGate(cacheMs = 1_000L, maxHosts = 3)
         gate.decide("x.example", 0L)

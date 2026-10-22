@@ -145,6 +145,31 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
   }
 
   /**
+   * Release the single resolver thread of THIS guard.
+   *
+   * The controller creates one guard per site WebView, and
+   * `Executors.newSingleThreadExecutor` keeps its core thread alive until the
+   * executor is shut down. Nothing shut it down, so every open of a site
+   * leaked one daemon thread for the life of the process — a slow but real
+   * resource leak on a flow the user can repeat as often as they like. The
+   * controller calls this from every teardown path (normal close, failed open
+   * rollback, Activity destroy), next to `webView.destroy()`.
+   *
+   * Safe to call twice and while a probe is running: `shutdownNow` interrupts
+   * the worker (a blocked `InetAddress` call may ignore it, but the thread is
+   * a daemon), and `probeInBackground` already turns a rejected submission
+   * into `recordLookupFailure`, so a navigation after close cannot wedge.
+   */
+  fun close() {
+    try {
+      probeExecutor.shutdownNow()
+    } catch (_: Exception) {
+      // Already shut down (or the platform refused): the thread is a daemon,
+      // so there is nothing else to release here.
+    }
+  }
+
+  /**
    * Best-effort DNS pre-check. `shouldInterceptRequest` runs on a WebView
    * background thread, so the resolver call cannot block the UI.
    */
@@ -154,8 +179,12 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
     val host = uri.host?.lowercase()?.trimEnd('.') ?: return false
     if (host.isEmpty()) return false
     // IP literals are already covered by the pure policy; skip the resolver.
+    // The "is this a number" rule is `IpPolicy.endsInANumber`, the SAME one
+    // `NavigationDnsGate.normalize` uses — two slightly different definitions
+    // (this used to be "all digits and dots") is how one path resolves a host
+    // the other deliberately leaves to the policy.
     val bare = host.removePrefix("[").removeSuffix("]")
-    if (bare.contains(':') || bare.all { it.isDigit() || it == '.' }) return false
+    if (bare.contains(':') || IpPolicy.endsInANumber(bare)) return false
     val now = SystemClock.elapsedRealtime()
     when (dnsGate.cachedVerdict(host, now)) {
       NavigationDnsGate.Verdict.PUBLIC -> return false

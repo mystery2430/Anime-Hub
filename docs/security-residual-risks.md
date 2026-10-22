@@ -80,6 +80,165 @@ verified SHA table and the exact change a maintainer has to make.
 `ci-fixes/` proposal to also assert the **resolved** Gradle graph in CI is
 deliberately unapplied: it cannot be exercised in this environment.
 
+## Round 15 — what this round fixed, and what it did not
+
+### CI: rustfmt and the Vite advisory (both verified, nothing loosened)
+
+`cargo fmt --all -- --check` failed in the Ubuntu, Windows and macOS jobs of
+run `39662014373` in `anilist.rs`, `commands.rs` and `error.rs`. The formatting
+was applied to the sources; the check itself, the failure exit code and every
+workflow condition are untouched.
+
+`npm audit` failed on `vite 8.3.1`. Six advisories (`GHSA-698v-4r3x-3vcv`,
+`GHSA-r825-w8mm-5pxw`, `GHSA-587h-7wmj-h5pm`, `GHSA-9jrq-w75r-8gcw`,
+`GHSA-rq7h-c2jc-7f22`, `GHSA-vfpm-58rq-9qcg`) cover `vite >=8.3.0 <=8.3.2` with
+`first_patched_version 8.3.3`, so the fix is a patch bump inside the existing
+`^8` range: `package.json` now says `^8.3.3` and the lock resolves `8.3.5`
+(current stable). No major upgrade, no `npm audit fix --force`, no ignored
+advisory and no workflow change.
+
+### The two CI gates that only started running once the format check passed
+
+`Rust format` runs before `Clippy` and `npm audit` runs before `cargo audit`, so
+failing the first step hid the second in every earlier run. Fixing the format
+and the Vite advisory therefore surfaced two more failures, both real:
+
+* `cargo clippy --all-targets -- -D warnings` reported `push_android_blocklist`
+  and `close_active_android_site` as never used, plus three `needless_borrow`
+  hits. Both helpers were gated on `#[cfg(any(target_os = "android", test))]`
+  but are only called from the `#[cfg(target_os = "android")]` branch of
+  `sync_android_blocklist`, so on a host `--all-targets` build they were
+  compiled and unreachable. They are now Android-only (the non-Android fallback
+  bodies were stubs no test could observe). The borrow hits were `&read_live`,
+  `&record`, `&no_close` in the transfer-ordering test: those closures capture
+  only shared references, so they are `Copy` and the borrows were redundant.
+  No behaviour change, and no `#[allow]` was added to silence anything.
+* `cargo audit --file src-tauri/Cargo.lock` reported two advisories from the
+  same CA-distrust event (19–20 October 2026, `CVE-2026-111943`):
+  `RUSTSEC-2026-0381` for `webpki-roots 1.0.9` (fixed in `1.0.10`) and
+  `RUSTSEC-2026-0382` for `rustls-webpki 0.103.15` (fixed in `0.103.16`).
+  Both are patch bumps inside the ranges their dependents already allow
+  (`rustls 0.23.46` wants `^0.103.14`; `reqwest`/`hyper-rustls` want `^1`), and
+  neither changes a resolved dependency in `Cargo.lock` — verified against the
+  crates.io index entries for the two target versions, including their
+  checksums. Both crates decide which roots a TLS connection may trust, so this
+  is the one place where the patch bump is a security fix rather than hygiene.
+
+`cargo audit` also prints eleven `unmaintained`/`unsound` informational warnings
+(`glib`, `zvariant`, `unic-*`, `ring`, `proc-macro-error`, `zbus_names`) that
+come from the Tauri/Linux stack and do not fail the gate; they are not
+vulnerabilities and none of them was silenced.
+
+### Android DNS gate: two real defects, and what is still open
+
+The call chain was re-verified against the WebView contract rather than the
+comments:
+
+* `shouldOverrideUrlLoading` covers main-frame navigations and main-frame
+  server redirects on API 24+ (`WebResourceRequest.isRedirect()` exists for
+  exactly that reason); it may also be called for subframes. It must answer
+  synchronously, so a cache miss returns `ALLOW_AND_PROBE`.
+* `shouldInterceptRequest` covers sub-resources and frames, but the platform
+  documents that **for redirects it is only called for the initial URL, not
+  the subsequent redirect URLs**, and that it is **not** called for
+  `javascript:` or `blob:` URLs. That is precisely why the top-level
+  checkpoint consults the shared verdict cache instead of trusting the request
+  checkpoint to see every hop.
+* `WebView.loadUrl` (the first navigation in `buildWebView`) bypasses
+  `shouldOverrideUrlLoading`; it is covered by the policy check in
+  `open_on_mobile` before the view is built, not by the guard.
+
+Two defects were found and fixed in `NavigationDnsGate`:
+
+1. **An empty resolver answer was cached as a public verdict.** `record(host,
+   emptyList())` classified as ALLOW and stored `Verdict.PUBLIC` with an empty
+   `pinned` set, so the next top-level navigation was allowed *from the cache*
+   for a host whose address was never established. A "no answer" is not
+   evidence of a public address: `record` now writes no entry at all (the
+   host's probe slot is still released) and the next navigation probes again.
+   Regression test: `an empty resolver answer is never cached as a safe
+   verdict` (fails on the previous code, which answered `PUBLIC`).
+2. **The probe set, and therefore the resolver queue, was unbounded.**
+   `probing` grew with every distinct hostname a page navigated through, and
+   each entry queued a task on the guard's single-thread executor, where it
+   blocks for the resolver timeout. `NavigationDnsGate` now caps the set at
+   `MAX_PROBING` (32); a host that cannot get a slot is simply not probed,
+   which is the same "unknown, fail open" state as a cache miss (the request
+   checkpoint still resolves synchronously). Regression test: `the probe budget
+   bounds the resolver queue and recovers when a slot frees`.
+
+One resource leak was found and fixed: `SiteNavigationGuard` owns
+`Executors.newSingleThreadExecutor`, and the controller creates one guard per
+site open, but nothing called `shutdown`. Each open therefore leaked one daemon
+resolver thread for the life of the process. The guard now has `close()`, and
+every teardown path (`finishClose`, the failed-open rollback, `destroy`,
+including its no-view early return) releases the guard next to
+`webView.destroy()`.
+
+**R-01 (b) remains OPEN.** None of the above pins the address used for the
+connection: the engine still re-resolves when it connects, so a rebinding host
+can answer public to both checkpoints and private to the socket. The probe cap
+and the empty-answer rule make the pre-check honest, not complete. The required
+fix (a network layer that owns the resolution, e.g. the evaluated
+`PROXY_OVERRIDE` CONNECT proxy) and the device matrix it needs are unchanged —
+see [DNS rebinding on Android](#dns-rebinding-on-android). No test in this
+round is a substitute for that matrix.
+
+### Blocklist: a rebuild could install older rules under a newer generation
+
+`rebuild_blocklist` read the settings and installed the matcher in two separate
+steps. `update_settings` and `reset_blocklist` are synchronous commands (Tauri
+runs them on the main thread), but `set_pip_auto_enter` is
+`#[tauri::command(async)]` and calls the same function from the async runtime.
+Interleaving: A reads rules R1, the user saves R2 and B installs R2 at
+generation 5, A resumes and installs R1 at generation **6**. The delivery guard
+then pushes R1 as the newest snapshot and `applied = 6` keeps R2 out for good.
+
+The read+install pair now runs under `BlocklistSyncGate::lock`, so rebuilds are
+serialized against each other and against transfers; the generation order is
+the settings-read order again. Lock order is `gate` → `settings` → `blocklist`
+and `gate` → `ANDROID_SESSION_LOCK`; nothing takes the gate while holding
+settings, the matcher or the session lock, so no cycle is added. Regression
+test: `rebuild_blocklist_cannot_install_while_a_transfer_holds_the_gate`
+(asserts no install happens while another thread holds the gate, and that
+exactly one install happens afterwards).
+
+Both of `rebuild_blocklist`'s locks used `lock().expect(..)`, i.e. the exact
+panic-on-poison trap `lock_recover` was introduced to remove: a panic elsewhere
+while holding `settings` or `blocklist` used to make every later open/settings
+change panic. They now go through `lock_recover`; regression test
+`rebuild_blocklist_survives_poisoned_settings_and_blocklist_locks`.
+
+### Documentation corrected
+
+`AnimeHubSiteController`'s header claimed the one-time migration requires
+"every `setCookie` callback accepted", which contradicts the implementation and
+the section above: `SiteMigrationFlow` skips an individually rejected cookie
+(usually a foreign Domain a site profile cannot own) and treats a durable
+`flush()` as the success criterion. The header now says what the code does.
+
+### OAuth: a pending state that no longer had a listener
+
+`anilist_login_start` writes the `state` value and then serves the loopback
+callback from a background task. When that task failed — the port was taken, or
+no callback arrived inside the listener's 300 s window — it reported the error
+and exited, leaving the state armed in the slot. This is not exploitable by
+itself (`take_pending_state` consumes only the *current* value, so a leftover
+cannot be replayed with another attempt's `code`), but it made "a login is
+pending" untrue and would have masked a future regression where the slot is
+read more broadly. The failure path now calls `abandon_pending_state`, which
+clears the slot **only if it still holds this attempt's value** — a login
+started in the meantime keeps its state. Regression test:
+`abandoning_a_pending_state_clears_only_its_own_attempt`.
+
+### Actions pinning (R-09) is still blocked, not fixed
+
+The active workflows still use mutable tags. `workflow_dispatch` is also
+refused for this token (`HTTP 403: Resource not accessible by integration`), so
+CI can only be triggered by a pull request. Nothing in this round changed a
+`.github/workflows/` file; see
+[Actions pinning — explicit blocker](#actions-pinning--explicit-blocker).
+
 ## Round 6 — what is fixed and what is still blocked
 
 ### Android blocklist is fail-closed
@@ -281,11 +440,30 @@ Two things a maintainer should know before choosing how to apply it:
   host (flip detection);
 * all IP literals and built-in host suffixes.
 
+Both checkpoints share `NavigationDnsGate`. Since round 15 it also refuses to
+cache an answer it does not have (an empty resolver answer writes no verdict)
+and caps in-flight probes at `MAX_PROBING`, so the verdict set and the single
+resolver queue cannot grow with a page's host count. A verdict is remembered
+for `CACHE_MS` (60 s); after that a host is unknown again and must be re-probed
+— the request checkpoint re-resolves synchronously, so this does not turn a
+known-bad host into an allowed connection, but it is another reason the
+pre-check is not a guarantee.
+
 Residual: **TOCTOU**. The WebView engine resolves again when it connects. A
 rebinding server could answer a public address to both pre-checks and a private
 one to the engine. The complete fix is a network layer that pins the resolved
 address for the connection, not another WebView callback. A resolver outage is
 deliberately fail-open so an offline DNS server does not brick the app.
+
+Why the two checkpoints are not equivalent (verified against the platform
+documentation this round, not inferred from the code): for redirects,
+`shouldInterceptRequest` is called only for the initial resource URL and not
+for the subsequent redirect URLs, and it is not called at all for
+`javascript:` or `blob:` URLs; `shouldOverrideUrlLoading` does receive
+main-frame redirects on API 24+ (`WebResourceRequest.isRedirect`). So a
+redirect hop that skips the request checkpoint is only ever judged by the
+top-level checkpoint — from the cache, synchronously, which is exactly the
+window R-01 (b) describes.
 
 #### Network-layer options actually evaluated (and why none is implemented here)
 

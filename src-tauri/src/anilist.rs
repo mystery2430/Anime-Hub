@@ -406,6 +406,30 @@ pub fn take_pending_state(
     })
 }
 
+/// Drop the pending state of an attempt that can no longer complete.
+///
+/// `anilist_login_start` writes the state BEFORE the loopback listener is bound
+/// and then serves the callback from a background task. When binding fails
+/// (the port is taken) or no callback arrives within the listener's window,
+/// that task reports the error and is done — but the state value stayed in the
+/// slot, i.e. an armed login nothing would ever complete. Clearing it is not a
+/// security fix by itself (`take_pending_state` only ever consumes the CURRENT
+/// value, so the leftover cannot be replayed with a fresh attempt's code), but
+/// it keeps the slot honest: "pending" then always means "a listener is
+/// actually waiting for it".
+///
+/// Conditional on purpose: a newer attempt may have overwritten the slot
+/// between the failure and this call, and clearing THAT attempt's state would
+/// break the login the user is actually running.
+pub fn abandon_pending_state(slot: &std::sync::Mutex<Option<String>>, expected: &str) -> bool {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.as_deref() == Some(expected) && !expected.is_empty() {
+        *guard = None;
+        return true;
+    }
+    false
+}
+
 /// Constant-time comparison of the returned `state`.
 pub fn state_matches(expected: &str, got: &str) -> bool {
     use subtle::ConstantTimeEq;
@@ -1765,6 +1789,27 @@ mod tests {
                 "{bad} must be refused before a pending state is written"
             );
         }
+    }
+
+    #[test]
+    fn abandoning_a_pending_state_clears_only_its_own_attempt() {
+        let slot: Mutex<Option<String>> = Mutex::new(Some("ours".to_string()));
+        assert!(abandon_pending_state(&slot, "ours"));
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "a failed attempt must not leave an armed state behind"
+        );
+        // Nothing pending: a second abandon is a no-op, not a panic.
+        assert!(!abandon_pending_state(&slot, "ours"));
+
+        // A newer attempt owns the slot: never clear somebody else's login.
+        let slot: Mutex<Option<String>> = Mutex::new(Some("newer".to_string()));
+        assert!(!abandon_pending_state(&slot, "ours"));
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("newer"));
+
+        // An empty expected value is never a match.
+        let slot: Mutex<Option<String>> = Mutex::new(Some("".to_string()));
+        assert!(!abandon_pending_state(&slot, ""));
     }
 
     #[test]

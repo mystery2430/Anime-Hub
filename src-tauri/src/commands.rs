@@ -246,16 +246,42 @@ fn write_settings_doc(state: &AppState, value: &Settings) -> AppResult<()> {
         .save_doc_bytes("settings.bin", bytes.as_slice())
 }
 
+/// Install the current settings' rules as the live matcher and advance the
+/// delivery generation.
+///
+/// Both locks go through [`lock_recover`], not `expect`: this function is on
+/// the `open_site` / `update_settings` / `reset_blocklist` path, so a panic
+/// while some other thread held either mutex used to turn every later blocklist
+/// action into a permanent panic loop — the same failure mode `lock_recover`
+/// already removed from the navigation callback.
+///
+/// **Why the transfer gate is taken here.** The settings read and the matcher
+/// install are two separate steps, and they are called from BOTH a synchronous
+/// command (`update_settings`, `reset_blocklist` — main thread) and an
+/// asynchronous one (`set_pip_auto_enter`, `#[tauri::command(async)]` — Tauri's
+/// async runtime). Two of them could therefore interleave: A reads rules R1,
+/// the user changes the list to R2 and B rebuilds (installs R2, generation 5),
+/// then A resumes and installs R1 under generation **6**. The delivery guard
+/// would then push R1 as the newest snapshot — the stale-over-newer overwrite
+/// it exists to prevent — and `applied = 6` would block R2 forever.
+///
+/// Taking [`BlocklistSyncGate::lock`] for the read+install pair serializes
+/// rebuilds against each other *and* against the transfers, so the generation
+/// order below is also the settings-read order. Lock order stays
+/// `gate` → `settings` → `blocklist`, and nothing acquires the gate while
+/// holding settings, the matcher or the session lock, so this adds no cycle to
+/// the documented `gate` → `ANDROID_SESSION_LOCK` order.
 fn rebuild_blocklist(state: &AppState) {
+    let _serialized = lock_recover(&state.blocklist_sync.lock);
     let (rules, enabled) = {
-        let s = state.settings.lock().expect("settings lock");
+        let s = lock_recover(&state.settings);
         (s.blocklist.rules.clone(), s.blocklist.enabled)
     };
     let bl = Blocklist::from_rules(&rules, enabled);
     // The generation is bumped while the matcher lock is STILL held, so a
     // reader can never observe new rules under an old generation and conclude
     // that Kotlin is already up to date.
-    let mut live = state.blocklist.lock().expect("blocklist lock");
+    let mut live = lock_recover(&state.blocklist);
     *live = bl;
     state
         .blocklist_sync
@@ -1262,6 +1288,10 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
 
     // A fresh, unpredictable state value; the callback must echo it.
     let state_value = uuid::Uuid::new_v4().to_string();
+    // Kept for the loopback task below: if that task cannot complete the
+    // attempt (bind failure, or no callback inside the listener's window), it
+    // has to disarm an armed login instead of leaving the state pending.
+    let attempt_state = state_value.clone();
     let url = anilist::authorize_url(&cfg, &state_value)?;
     {
         let mut s = state
@@ -1296,6 +1326,16 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
                     let _ = handle.emit("animehub://anilist-login", user.name);
                 }
                 Err(e) => {
+                    // This attempt can no longer finish: nothing is listening
+                    // for its callback. Clear the pending state it armed — but
+                    // only if the slot still holds THIS attempt's value, so a
+                    // login started in the meantime is left untouched.
+                    // `try_state`, not `state`: a failure here must not turn a
+                    // background task into a panic while the app is shutting
+                    // down.
+                    if let Some(live) = handle.try_state::<AppState>() {
+                        anilist::abandon_pending_state(&live.oauth_state, &attempt_state);
+                    }
                     let _ = handle.emit("animehub://error", e.to_string());
                 }
             }
@@ -1742,37 +1782,26 @@ fn android_blocklist_entries(list: &Blocklist) -> Vec<String> {
 /// is an atomic reference swap. A transfer can still fail before Kotlin runs
 /// (plugin unavailable, IPC rejection, webview/activity gone), which is why the
 /// caller must fail closed rather than assume the old snapshot is harmless.
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 fn push_android_blocklist(entries: &[String]) -> AppResult<()> {
-    #[cfg(target_os = "android")]
-    {
-        crate::android_bridge::site_blocklist_update(entries)
-            .map_err(|_| AppError::BlocklistUnavailable)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = entries;
-        Ok(())
-    }
+    crate::android_bridge::site_blocklist_update(entries)
+        .map_err(|_| AppError::BlocklistUnavailable)
 }
 
 /// Destroy the active Android site WebView after a failed blocklist transfer.
 ///
 /// Uses the lifecycle-locked close path (`ANDROID_SESSION_LOCK`, profile flush,
 /// `current_site` release and `site-closed` event). Kotlin's close is
-/// idempotent, so this is safe when no view is open. On desktop it is a no-op;
-/// that is also the only place the host test fake needs to model.
-#[cfg(any(target_os = "android", test))]
+/// idempotent, so this is safe when no view is open.
+///
+/// Android-only, like `push_android_blocklist`: the only caller is the
+/// `#[cfg(target_os = "android")]` branch of `sync_android_blocklist`, so
+/// compiling a non-Android fallback body here produced an unused-function
+/// error under `clippy --all-targets -D warnings` and a stub that no host test
+/// could ever observe.
+#[cfg(target_os = "android")]
 fn close_active_android_site(app: &AppHandle) -> AppResult<()> {
-    #[cfg(target_os = "android")]
-    {
-        crate::web::windows::close_site_window(app, "blocklist-sync")
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = app;
-        Ok(())
-    }
+    crate::web::windows::close_site_window(app, "blocklist-sync")
 }
 
 /// The fail-closed policy, independent of Tauri so it is host-testable.
@@ -2255,6 +2284,101 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_blocklist_survives_poisoned_settings_and_blocklist_locks() {
+        // A panic elsewhere while holding either mutex used to make every
+        // later blocklist action panic too (`lock().expect(..)`), which on the
+        // Android path means the user can never open a site or change the
+        // rules again. `lock_recover` keeps the last consistent value instead.
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        {
+            let mut s = st.settings.lock().unwrap();
+            s.blocklist.rules = "evil.example".into();
+        }
+        for mutex_selector in 0..2 {
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if mutex_selector == 0 {
+                    let _guard = st.settings.lock().unwrap();
+                    panic!("poison the settings lock on purpose");
+                } else {
+                    let _guard = st.blocklist.lock().unwrap();
+                    panic!("poison the blocklist lock on purpose");
+                }
+            }));
+            assert!(poisoned.is_err());
+        }
+        assert!(st.settings.is_poisoned());
+        assert!(st.blocklist.is_poisoned());
+
+        let before = st
+            .blocklist_sync
+            .generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        rebuild_blocklist(&st);
+        assert_eq!(
+            st.blocklist_sync
+                .generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "a poisoned lock must still install the rules and advance once"
+        );
+        let bl = lock_recover(&st.blocklist);
+        assert!(bl.is_blocked("evil.example"));
+        assert!(!bl.is_blocked("doubleclick.net"));
+    }
+
+    #[test]
+    fn rebuild_blocklist_cannot_install_while_a_transfer_holds_the_gate() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        // The real interleaving behind the stale-overwrite: `set_pip_auto_enter`
+        // is an ASYNC command and rebuilds on Tauri's async runtime while
+        // `update_settings` rebuilds on the main thread. Without the gate, the
+        // slower rebuild installs OLDER rules under a NEWER generation.
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(state_in(dir.path()));
+        let before = st.blocklist_sync.generation.load(Ordering::SeqCst);
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let holder = {
+            let st = Arc::clone(&st);
+            let held = Arc::clone(&held);
+            std::thread::spawn(move || {
+                let _gate = lock_recover(&st.blocklist_sync.lock);
+                ready_tx.send(()).expect("signal");
+                while held.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        ready_rx.recv().expect("the gate holder must start");
+
+        let worker = {
+            let st = Arc::clone(&st);
+            std::thread::spawn(move || rebuild_blocklist(&st))
+        };
+        // The rebuild must be blocked on the gate, not installing behind it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            st.blocklist_sync.generation.load(Ordering::SeqCst),
+            before,
+            "a rebuild ran while the transfer gate was held: settings read and \
+             install are not serialized"
+        );
+
+        held.store(false, Ordering::SeqCst);
+        holder.join().expect("gate holder");
+        worker.join().expect("rebuild thread");
+        assert_eq!(
+            st.blocklist_sync.generation.load(Ordering::SeqCst),
+            before + 1,
+            "the rebuild must install exactly once after the gate is released"
+        );
+    }
+
+    #[test]
     fn token_secret_roundtrips_through_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let st = state_in(dir.path());
@@ -2664,7 +2788,7 @@ mod tests {
         let no_close = || -> AppResult<()> { Ok(()) };
 
         // Caller A transfers generation 1.
-        transfer_blocklist_with_generation(&gate, &read_live, &record, &no_close).unwrap();
+        transfer_blocklist_with_generation(&gate, read_live, record, no_close).unwrap();
 
         // Settings change while caller B is already on its way: generation 2.
         {
@@ -2673,12 +2797,12 @@ mod tests {
             guard.1 = vec!["gen-2.example".into()];
         }
         // Caller B (newer) transfers.
-        transfer_blocklist_with_generation(&gate, &read_live, &record, &no_close).unwrap();
+        transfer_blocklist_with_generation(&gate, read_live, record, no_close).unwrap();
 
         // Caller A' — built from the OLD settings — finally completes. Because
         // the snapshot is re-read inside the serialization lock, it cannot
         // overwrite generation 2.
-        transfer_blocklist_with_generation(&gate, &read_live, &record, &no_close).unwrap();
+        transfer_blocklist_with_generation(&gate, read_live, record, no_close).unwrap();
 
         let log = delivered.lock().unwrap();
         assert_eq!(log.len(), 2, "the third call has nothing new to deliver");

@@ -24,12 +24,18 @@
 //   0.3.4 install is imported **once**, into a profile that does not exist
 //   yet, through `Profile.getCookieManager()` (never the static
 //   `CookieManager.getInstance()`, which is the launcher's default profile).
-//   Success is strict: every `setCookie` callback accepted AND `flush()`
-//   completed before the WebView is constructed. Any rejection, exception,
-//   timeout or an already-existing profile fails the attempt with the
-//   `migration-partial` sentinel; Rust then retires that profile name
-//   (queue + generation bump) and retries on a virgin one. The legacy
-//   snapshot is only consumed after a real success.
+//   Success criterion: the profile did not exist yet, every cookie write
+//   settled (an individual rejection is SKIPPED — it is usually a foreign
+//   Domain a site profile cannot own, and failing the whole login for one
+//   ad/CDN cookie locked upgraded users out), and the blocking `flush()`
+//   completed before the WebView is constructed. Any exception, timeout,
+//   write that never answered or an already-existing profile fails the
+//   attempt with the `migration-partial` sentinel; Rust then retires that
+//   profile name (queue + generation bump) and retries on a virgin one. The
+//   legacy snapshot is only consumed after a real success — see
+//   `SiteMigrationFlow`, which is the code that implements this (this header
+//   previously claimed "every callback accepted", which the flow deliberately
+//   does not require).
 // * localStorage / IndexedDB snapshots are NOT imported: the old JSON dump
 //   was lossy (indexes, key paths, structured-clone values) and re-injecting
 //   it would recreate the cross-site TOCTOU problems this architecture
@@ -138,6 +144,15 @@ object AnimeHubSiteController {
 
   /** Registered once; enabled only while a site WebView is attached. */
   private var backCallback: OnBackPressedCallback? = null
+
+  /**
+   * The navigation guard of the CURRENT site WebView. Kept so its single
+   * resolver thread is shut down when that view goes away: one guard is built
+   * per open, and an executor nobody shuts down keeps its thread for the life
+   * of the process (see [SiteNavigationGuard.close]).
+   */
+  @Volatile
+  private var navigationGuard: SiteNavigationGuard? = null
 
   /** Fullscreen video view currently shown by [SiteChromeClient]. */
   private var customView: View? = null
@@ -441,7 +456,12 @@ object AnimeHubSiteController {
       // casts to RustWebView). Blocklist/DNS checks stay in Rust — unchanged
       // documented Android limitation.
       val evalOnPageStart = !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
-      webView.webViewClient = SiteNavigationGuard(SiteWebViewClient(initScript, evalOnPageStart))
+      // Drop any guard left over from a previous view before replacing it, so
+      // the previous resolver thread cannot outlive its WebView.
+      releaseNavigationGuard()
+      val guard = SiteNavigationGuard(SiteWebViewClient(initScript, evalOnPageStart))
+      webView.webViewClient = guard
+      navigationGuard = guard
       webView.webChromeClient =
         SiteChromeClient({ view, callback -> enterCustomView(view, callback) }, { exitCustomViewIfNeeded() })
 
@@ -542,6 +562,7 @@ object AnimeHubSiteController {
       // must never be cleared by a stale failure), then restore global state
       // — but only while no other site view is active.
       if (webView != null) active.releaseIf(webView)
+      releaseNavigationGuard()
       if (!active.hasActive()) {
         if (backCallback?.isEnabled == true) backCallback?.isEnabled = false
         exitCustomViewIfNeeded()
@@ -610,6 +631,9 @@ object AnimeHubSiteController {
   private fun finishClose(activity: Activity, operationId: String) {
     val webView = active.activeToken
     active.clear()
+    // The navigation guard belongs to the view being destroyed. Its resolver
+    // thread is not a WebView resource, so it has to be shut down explicitly.
+    releaseNavigationGuard()
     if (webView != null) {
       try {
         (webView.parent as? ViewGroup)?.removeView(webView)
@@ -628,6 +652,24 @@ object AnimeHubSiteController {
     // launcher or a failed native attach is diagnostic, not a close failure.
     transferPipToLauncher(activity, operationId)
     AnimeHubDebugLog.record("close", "destroy", "ok", operationId)
+  }
+
+  /**
+   * Shut down the current guard's resolver thread. UI thread; idempotent.
+   *
+   * `SiteNavigationGuard` owns `Executors.newSingleThreadExecutor`, whose core
+   * thread lives until `shutdownNow()`. Nothing used to shut it down, so every
+   * site open leaked one daemon thread. Called from every path that destroys
+   * the site WebView: failed-open rollback, normal close and Activity destroy.
+   */
+  private fun releaseNavigationGuard() {
+    val guard = navigationGuard ?: return
+    navigationGuard = null
+    try {
+      guard.close()
+    } catch (_: Exception) {
+      // A guard that cannot be closed must never break a teardown path.
+    }
   }
 
   private fun transferPipToLauncher(activity: Activity, operationId: String) {
@@ -674,6 +716,7 @@ object AnimeHubSiteController {
     exitCustomViewIfNeeded()
     backCallback?.isEnabled = false
     if (webView == null) {
+      releaseNavigationGuard()
       AnimeHubDebugLog.record("shutdown", "destroy", "started", operationId)
       AnimeHubDebugLog.record("shutdown", "destroy_flush", "not_needed", operationId)
       AnimeHubDebugLog.record("shutdown", "complete", "ok", operationId)
@@ -749,6 +792,7 @@ object AnimeHubSiteController {
         },
         operationId = operationId,
       )
+    releaseNavigationGuard()
     if (outcome == ShutdownFlush.TimedOut) {
       // The generated Activity kills the process right after this when it is
       // finishing, so a timeout means the write may never land: say so.
