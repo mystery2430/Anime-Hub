@@ -956,13 +956,11 @@ pub fn cookie_belongs_to_site(stored: &crate::web::session::StoredCookie, site_u
     if host.is_empty() {
         return false;
     }
-    let Some(domain) = stored
-        .domain
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-    else {
-        // No Domain attribute: a host-only cookie captured for this site.
+    // `None` only: an absent Domain attribute is a host-only cookie captured
+    // for this site. A Domain that is present but blank is malformed (RFC 6265
+    // forbids an empty value), and treating it as host-only let such a cookie
+    // ride a migration into a profile whose site never owned it.
+    let Some(domain) = stored.domain.as_deref().map(str::trim) else {
         return true;
     };
     let domain = domain.trim_start_matches('.').to_lowercase();
@@ -4471,7 +4469,10 @@ mod tests {
             .unwrap();
 
         let mut ops = ScriptedOpenOps::ok();
-        let err = run_mobile_open_protocol(&state, id, "https://a.example/", "", &mut ops)
+        // The jar's parent cookie is scoped to `.example.com`, so the site has
+        // to be a host inside it; `a.example` is not, and the filter would
+        // (correctly) drop the cookie before phase 1.
+        let err = run_mobile_open_protocol(&state, id, "https://a.example.com/", "", &mut ops)
             .expect_err("a failed flag write must abort the open");
         let profile = android_profile_name(id, 0);
 
@@ -7081,7 +7082,11 @@ mod tests {
         run_mobile_open_protocol(&state, id, "https://a.example.com/watch/1", "", &mut ops)
             .unwrap();
         assert_eq!(ops.cookies_seen, vec![2]);
-        assert!(ops.calls.iter().any(|call| call == "open:site-"));
+        assert!(
+            ops.calls.iter().any(|call| call.starts_with("open:site-")),
+            "the site view must still open: {:?}",
+            ops.calls
+        );
     }
 
     #[test]
