@@ -1715,7 +1715,9 @@ pub fn pip_startup_should_apply(
 /// panicked, not that the guarded value is unusable, and refusing to start is
 /// strictly worse than continuing with the last consistent state.
 pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The blocklist snapshot handed to the Android WebView.
@@ -1819,7 +1821,10 @@ pub(crate) fn blocklist_transfer_snapshot(state: &AppState) -> BlocklistTransfer
         .generation
         .load(std::sync::atomic::Ordering::SeqCst);
     drop(list);
-    BlocklistTransfer { generation, entries }
+    BlocklistTransfer {
+        generation,
+        entries,
+    }
 }
 
 /// Serialize blocklist transfers and refuse to deliver a stale one.
@@ -2458,7 +2463,11 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(pushes.get(), 1);
-        assert_eq!(closes.get(), 0, "a successful push must not disturb the live site");
+        assert_eq!(
+            closes.get(),
+            0,
+            "a successful push must not disturb the live site"
+        );
     }
 
     #[test]
@@ -2558,7 +2567,10 @@ mod tests {
             },
             |entries| {
                 let generation = gate.generation.load(Ordering::SeqCst);
-                delivered.lock().unwrap().push((generation, entries.to_vec()));
+                delivered
+                    .lock()
+                    .unwrap()
+                    .push((generation, entries.to_vec()));
                 Ok(())
             },
             || {
@@ -2606,9 +2618,21 @@ mod tests {
         );
 
         assert!(result.is_ok(), "an up-to-date WebView is not an error");
-        assert_eq!(delivered_len(&delivered), 0, "a stale snapshot must not be pushed");
-        assert_eq!(closes.load(Ordering::SeqCst), 0, "and must not close the live site");
-        assert_eq!(gate.applied.load(Ordering::SeqCst), 5, "applied never goes backwards");
+        assert_eq!(
+            delivered_len(&delivered),
+            0,
+            "a stale snapshot must not be pushed"
+        );
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "and must not close the live site"
+        );
+        assert_eq!(
+            gate.applied.load(Ordering::SeqCst),
+            5,
+            "applied never goes backwards"
+        );
     }
 
     #[test]
@@ -2631,7 +2655,10 @@ mod tests {
         };
         let record = |entries: &[String]| -> AppResult<()> {
             let generation = live.lock().unwrap().0;
-            delivered.lock().unwrap().push((generation, entries.to_vec()));
+            delivered
+                .lock()
+                .unwrap()
+                .push((generation, entries.to_vec()));
             Ok(())
         };
         let no_close = || -> AppResult<()> { Ok(()) };
@@ -2668,8 +2695,8 @@ mod tests {
 
     #[test]
     fn blocklist_push_failure_closes_the_live_site_and_does_not_advance_applied() {
-        use std::sync::atomic::Ordering;
         use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
 
         let gate = BlocklistSyncGate::new();
         let delivered: DeliveredLog = std::sync::Mutex::new(Vec::new());
@@ -2696,7 +2723,11 @@ mod tests {
         );
 
         assert_eq!(result.unwrap_err().code(), "blocklist_unavailable");
-        assert_eq!(closes.load(Ordering::SeqCst), 1, "fail closed: destroy the live view");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "fail closed: destroy the live view"
+        );
         assert_eq!(delivered_len(&delivered), 0);
         assert_eq!(
             gate.applied.load(Ordering::SeqCst),
@@ -2723,7 +2754,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(delivered_len(&delivered), 1);
-        assert_eq!(closes.load(Ordering::SeqCst), 1, "the retry succeeded, nothing closed");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "the retry succeeded, nothing closed"
+        );
         assert_eq!(gate.applied.load(Ordering::SeqCst), 7);
     }
 
@@ -2767,9 +2802,15 @@ mod tests {
         assert_eq!(before, 1, "a fresh gate starts above `applied` (0)");
 
         rebuild_blocklist(&st);
-        assert_eq!(st.blocklist_sync.generation.load(Ordering::SeqCst), before + 1);
+        assert_eq!(
+            st.blocklist_sync.generation.load(Ordering::SeqCst),
+            before + 1
+        );
         rebuild_blocklist(&st);
-        assert_eq!(st.blocklist_sync.generation.load(Ordering::SeqCst), before + 2);
+        assert_eq!(
+            st.blocklist_sync.generation.load(Ordering::SeqCst),
+            before + 2
+        );
 
         // The generation and the rules must be readable together, consistently.
         let snapshot = blocklist_transfer_snapshot(&st);
@@ -2799,7 +2840,10 @@ mod tests {
             &st.blocklist_sync,
             || blocklist_transfer_snapshot(&st),
             |entries| {
-                delivered.lock().unwrap().push((generation, entries.to_vec()));
+                delivered
+                    .lock()
+                    .unwrap()
+                    .push((generation, entries.to_vec()));
                 Ok(())
             },
             || {
@@ -2812,7 +2856,10 @@ mod tests {
         // Disabling is a CHANGE, so it must be delivered — as an empty
         // snapshot, which is the only way Kotlin understands "turned off".
         let (_, entries) = delivered_last(&delivered).expect("the disable must be transferred");
-        assert!(entries.is_empty(), "disabled must push nothing, got {entries:?}");
+        assert!(
+            entries.is_empty(),
+            "disabled must push nothing, got {entries:?}"
+        );
         assert_eq!(closes.load(Ordering::SeqCst), 0);
         assert_eq!(st.blocklist_sync.applied.load(Ordering::SeqCst), generation);
     }
@@ -2840,7 +2887,10 @@ mod tests {
                 &st.blocklist_sync,
                 || blocklist_transfer_snapshot(&st),
                 |entries| {
-                    delivered.lock().unwrap().push((generation, entries.to_vec()));
+                    delivered
+                        .lock()
+                        .unwrap()
+                        .push((generation, entries.to_vec()));
                     Ok(())
                 },
                 || {
@@ -2871,7 +2921,11 @@ mod tests {
 
         let (generation, defaults) =
             delivered_last(&delivered).expect("reset must actually reach Android");
-        assert_eq!(delivered_len(&delivered), 2, "reset is a change, so it transfers");
+        assert_eq!(
+            delivered_len(&delivered),
+            2,
+            "reset is a change, so it transfers"
+        );
         assert!(
             defaults.iter().any(|e| e.contains("doubleclick.net")),
             "the DEFAULT rules must be the snapshot, got {defaults:?}"
@@ -2951,7 +3005,10 @@ mod tests {
                     },
                     |entries| {
                         let generation = live.lock().unwrap().0;
-                        delivered.lock().unwrap().push((generation, entries.to_vec()));
+                        delivered
+                            .lock()
+                            .unwrap()
+                            .push((generation, entries.to_vec()));
                         Ok(())
                     },
                     || {
@@ -2994,7 +3051,11 @@ mod tests {
         );
         drop(log);
         assert_eq!(gate.applied.load(Ordering::SeqCst), newest);
-        assert_eq!(closes.load(Ordering::SeqCst), 0, "no live session was disturbed");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "no live session was disturbed"
+        );
         assert!(
             captured_generations.iter().max().copied() == Some(newest),
             "the workers must have covered the newest generation: {captured_generations:?}"

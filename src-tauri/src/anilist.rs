@@ -1130,7 +1130,10 @@ pub enum LoginRedirect {
 /// * anything else (`https://`, a remote host, a missing port, another path,
 ///   a query, a fragment, userinfo) → error, and the caller must not write
 ///   `pending state` or build an authorization URL.
-pub fn validate_redirect_uri(redirect_uri: &str, allow_custom_scheme: bool) -> AppResult<LoginRedirect> {
+pub fn validate_redirect_uri(
+    redirect_uri: &str,
+    allow_custom_scheme: bool,
+) -> AppResult<LoginRedirect> {
     if let Some(port) = loopback_port(redirect_uri) {
         return Ok(LoginRedirect::Loopback(port));
     }
@@ -1147,7 +1150,9 @@ pub fn validate_redirect_uri(redirect_uri: &str, allow_custom_scheme: bool) -> A
         return Ok(LoginRedirect::CustomScheme);
     }
     if is_expected_custom_scheme {
-        return Err(AppError::AniList(ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.into()));
+        return Err(AppError::AniList(
+            ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED.into(),
+        ));
     }
     Err(AppError::AniList(
         "dönüş adresi desteklenmiyor: yalnızca http://127.0.0.1:<port>/callback \
@@ -1695,22 +1700,24 @@ mod tests {
         );
     }
 
-
     // -----------------------------------------------------------------------
     // Redirect URI validation (must match what the listener serves)
     // -----------------------------------------------------------------------
 
     #[test]
     fn loopback_port_accepts_only_the_listener_endpoint() {
-        assert_eq!(loopback_port("http://127.0.0.1:17395/callback"), Some(17395));
+        assert_eq!(
+            loopback_port("http://127.0.0.1:17395/callback"),
+            Some(17395)
+        );
         // Every form below used to pass the old prefix-only check and then
         // fail at the listener: the login burned its state and never finished.
         for bad in [
-            "http://127.0.0.1:17395/cb",            // listener answers /callback
+            "http://127.0.0.1:17395/cb", // listener answers /callback
             "http://127.0.0.1:17395/callback/x",
-            "http://127.0.0.1/callback",            // port 80, nothing bound
-            "http://127.0.0.1:17395/callback?a=1",  // query on the registered URI
-            "http://127.0.0.1:17395/callback#f",    // fragment
+            "http://127.0.0.1/callback", // port 80, nothing bound
+            "http://127.0.0.1:17395/callback?a=1", // query on the registered URI
+            "http://127.0.0.1:17395/callback#f", // fragment
             "http://user@127.0.0.1:17395/callback", // userinfo
             "http://user:pw@127.0.0.1:17395/callback",
             "http://localhost:17395/callback", // listener binds 127.0.0.1
@@ -1720,7 +1727,11 @@ mod tests {
             "animehub://anilist/callback",
             "not a url",
         ] {
-            assert_eq!(loopback_port(bad), None, "{bad} must not be a loopback redirect");
+            assert_eq!(
+                loopback_port(bad),
+                None,
+                "{bad} must not be a loopback redirect"
+            );
         }
     }
 

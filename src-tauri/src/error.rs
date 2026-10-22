@@ -72,7 +72,9 @@ pub enum AppError {
     /// silently runs with stale or no rules (desktop-only enforcement). The
     /// transfer helper closes an already-open site before this escapes, and a
     /// failed close gets a separate restart-required `Other` error.
-    #[error("Engelleme listesi site görünümüne uygulanamadı; açık site güvenli biçimde kapatıldı.")]
+    #[error(
+        "Engelleme listesi site görünümüne uygulanamadı; açık site güvenli biçimde kapatıldı."
+    )]
     BlocklistUnavailable,
 }
 
