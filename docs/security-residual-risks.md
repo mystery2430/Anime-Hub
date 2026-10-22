@@ -217,6 +217,31 @@ the section above: `SiteMigrationFlow` skips an individually rejected cookie
 (usually a foreign Domain a site profile cannot own) and treats a durable
 `flush()` as the success criterion. The header now says what the code does.
 
+### Three gates that had never run, and the one real bug behind them
+
+`Rust tests` runs after `Clippy`, which runs after `Rust format`, and every one
+of those steps had been failing at the format step for several rounds. Clearing
+the format and clippy failures ran `cargo test` for the first time: 9 of 331
+tests failed. Six are covered above (three stale assertions, three cases of one
+real cookie bug):
+
+* **Real bug.** `cookie_belongs_to_site` treated a *blank* `Domain` attribute as
+  a host-only cookie: `.filter(|d| !d.is_empty())` turned `Some("")` into the
+  `None` arm, which returns `true` for any site. RFC 6265 forbids an empty
+  `Domain`, so this was a malformed cookie being treated as owned by whatever
+  site the migration was for — the exact case the function guards. Only `None`
+  is host-only now; a blank or dot-only value falls through and is refused.
+* Stale assertions: a site URL outside the test jar's cookie scope
+  (`https://a.example/` vs `.example.com`), and an equality check against
+  `"open:site-"` where profile names are `site-<32 hex>-g<gen>`.
+* The three `anilist` failures were stale in the other direction: `loopback_port`
+  was deliberately narrowed to exactly `http://127.0.0.1:<port>/callback`
+  (`localhost` can resolve to `::1`, an omitted port means 80, and the listener
+  binds only `127.0.0.1:<port>` on `/callback`), and the refusal text no longer
+  contains the word "loopback". The tests now assert that contract, including
+  that the refusal names the only accepted form and never echoes the configured
+  redirect.
+
 ### OAuth: a pending state that no longer had a listener
 
 `anilist_login_start` writes the `state` value and then serves the loopback

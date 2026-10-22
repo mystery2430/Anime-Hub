@@ -1714,7 +1714,10 @@ mod tests {
         assert!(mobile_native_login_allowed(
             "http://127.0.0.1:17395/callback"
         ));
-        assert!(mobile_native_login_allowed(
+        // `localhost` is NOT enough: `bind_port` listens on 127.0.0.1 only and
+        // localhost may resolve to ::1 first, so a login armed for it could
+        // never be completed. Refusing is the same fixed error as above.
+        assert!(!mobile_native_login_allowed(
             "http://localhost:17395/callback"
         ));
         // The refusal is fixed text: it must never echo the hostile redirect.
@@ -1773,7 +1776,10 @@ mod tests {
         // Custom scheme on Android (allow=false) is refused, not downgraded.
         let refused = validate_redirect_uri("animehub://anilist/callback", false).unwrap_err();
         assert_eq!(refused.code(), "anilist");
-        assert!(refused.to_string().contains("loopback"));
+        // The refusal names the only accepted form and never echoes the
+        // configured redirect (it may carry a hostile host or credentials).
+        assert!(refused.to_string().contains("127.0.0.1"));
+        assert!(!refused.to_string().contains("animehub://anilist/callback"));
         // Unsupported/insecure forms are refused for both platforms.
         for bad in [
             "https://anilist.co/callback",
@@ -1863,14 +1869,18 @@ mod tests {
     }
 
     #[test]
-    fn loopback_port_accepts_local_http_uris() {
+    fn loopback_port_accepts_only_the_exact_listener_endpoint() {
         assert_eq!(
             loopback_port("http://127.0.0.1:17395/callback"),
             Some(17395)
         );
-        assert_eq!(loopback_port("http://localhost:8080/cb"), Some(8080));
-        // Default port of the scheme applies when none is written.
-        assert_eq!(loopback_port("http://127.0.0.1/callback"), Some(80));
+        // Everything the old rule waved through is refused here: `localhost`
+        // (may resolve to ::1, never bound), another path (`/cb`), and an
+        // omitted port (which would mean 80, never bound — and the registered
+        // redirect always carries a port).
+        assert_eq!(loopback_port("http://localhost:8080/callback"), None);
+        assert_eq!(loopback_port("http://127.0.0.1:8080/cb"), None);
+        assert_eq!(loopback_port("http://127.0.0.1/callback"), None);
     }
 
     #[test]
