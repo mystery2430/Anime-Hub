@@ -1454,7 +1454,19 @@ test("navigation policy wraps the site client too", () => {
   // guard was split out of AnimeHubPlugin.kt so the CI unit test can
   // type-check it — android_prepare.py MUST copy the new file or neither
   // the APK nor the test compile resolves it.
-  assert.match(controllerKt, /webView\.webViewClient = SiteNavigationGuard\(/);
+  // The guard is built once into a field so every teardown path can shut its
+  // resolver thread down (`SiteNavigationGuard.close`); it is still the only
+  // client the site WebView ever gets.
+  assert.match(controllerKt, /val guard = SiteNavigationGuard\(SiteWebViewClient\(/);
+  assert.match(controllerKt, /webView\.webViewClient = guard\n/);
+  assert.match(controllerKt, /navigationGuard = guard/);
+  assert.match(controllerKt, /private fun releaseNavigationGuard\(\)/);
+  assert.match(controllerKt, /guard\.close\(\)/);
+  assert.doesNotMatch(
+    controllerKt,
+    /webView\.webViewClient = SiteWebViewClient\(/,
+    "the raw client must never be installed without the policy guard",
+  );
   const guardKt = read(
     "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt",
   );
