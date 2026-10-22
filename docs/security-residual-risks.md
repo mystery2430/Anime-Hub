@@ -219,11 +219,11 @@ the section above: `SiteMigrationFlow` skips an individually rejected cookie
 
 ### Three gates that had never run, and the one real bug behind them
 
-`Rust tests` runs after `Clippy`, which runs after `Rust format`, and every one
-of those steps had been failing at the format step for several rounds. Clearing
-the format and clippy failures ran `cargo test` for the first time: 9 of 331
-tests failed. Six are covered above (three stale assertions, three cases of one
-real cookie bug):
+`Rust tests` runs after `Clippy`, which runs after `Rust format`, and the
+format step had been failing for several rounds, so `cargo test` had not run at
+all. Running it for the first time (322 tests) surfaced 9 failures: six on the
+first pass (one real cookie bug, two stale assertions, and three more on the
+following pass), all fixed:
 
 * **Real bug.** `cookie_belongs_to_site` treated a *blank* `Domain` attribute as
   a host-only cookie: `.filter(|d| !d.is_empty())` turned `Some("")` into the
