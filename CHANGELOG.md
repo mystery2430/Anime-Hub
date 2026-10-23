@@ -106,6 +106,20 @@ Notable user-facing changes are recorded here. Production assets are built and c
   - Tests: real-socket `DnsPinnedProxyTest` and `SiteProxyGateTest` (CONNECT parsing, single resolution, mixed/empty answers, every private/loopback/link-local/ULA/mapped spelling, connect-by-address, address verification, timeouts, concurrency ceiling, clean shutdown, early disconnect, cleartext refusal, gate refusal paths) run by the CI Gradle step; Rust/JS source-contract tests pin the wiring and the absent bypass calls.
   - **Not device-tested:** the WebView↔proxy path, QUIC suppression, redirect hops and launcher/IPC behaviour under the override need the matrix in `docs/android-dns-pinning-device-checklist.md`. R-01 (b) therefore stays open until that run, and desktop keeps its pre-check (no supported network hook there).
 
+- Dependency advisory: `ctutils` 0.4.2 → 0.4.5 in `src-tauri/Cargo.lock`
+  (RUSTSEC-2026-0385, published 2026-10-23, non-constant-time mask generation /
+  `u128` comparisons). Transitive via `digest 0.11.3` ← `sha2 0.11`/`hmac 0.13`;
+  `digest` requires `ctutils = "0.4"` and `ctutils 0.4.5` requires
+  `cmov = "0.5.3"` (lock has 0.5.4), so nothing else moved. The checksum is the
+  one RustCrypto's own `traits` lockfile records for 0.4.5 (and that file
+  records our previous 0.4.2 checksum, which cross-checks the source); no
+  `cargo`/crates.io access existed here, so CI's build is what proves the
+  checksum. Honest note: 0.4.2 already declared `rust-version = 1.85`
+  (edition 2024) while this crate still declares 1.77, so the 0.4.5 bump
+  (1.87) does not newly break a supported toolchain — but the declared MSRV
+  was already below what this dependency chain needs and should be revisited
+  separately. No advisory was ignored and no audit step was loosened.
+
 ## [0.3.4] — 2026-10-14
 
 ### Session & cookie lifecycle (PR #26)
