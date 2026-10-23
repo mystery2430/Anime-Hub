@@ -106,9 +106,11 @@ jobs:
           fi
 
       # The declared MSRV is a promise, and it has been wrong before: tauri
-      # 2.11.6 needs 1.77.2, the RustCrypto 0.11 line needs 1.85, and ctutils
-      # 0.4.5 (the RUSTSEC-2026-0385 fix) declares 1.87. This step READS the
-      # value declared in src-tauri/Cargo.toml and builds with exactly that
+      # 2.11.6 needs 1.77.2, the RustCrypto 0.11 line 1.85, ctutils 0.4.5 (the
+      # RUSTSEC-2026-0385 fix) 1.87, darling/icu_*/keyring/plist/serde_with/
+      # time 1.88 and aes 0.9.3 1.89 — which is how 1.89 was arrived at: this
+      # step rejected the guessed 1.87 with the exact list. It READS the value
+      # declared in src-tauri/Cargo.toml and builds with exactly that
       # toolchain, so a dependency bump that outgrows the promise fails here
       # instead of on a user's machine.
       - name: MSRV (declared rust-version)
