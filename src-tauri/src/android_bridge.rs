@@ -796,10 +796,9 @@ mod tests {
 
         // The pinning-proxy refusal is its own message: the site is refused so
         // it cannot run unpinned, and the text never suggests opening anyway.
-        let unpinned = classify_site_open_error(animehub_android::Error::Bridge(format!(
-            "{}",
-            animehub_android::PROXY_SENTINEL
-        )));
+        let unpinned = classify_site_open_error(animehub_android::Error::Bridge(
+            animehub_android::PROXY_SENTINEL.to_string(),
+        ));
         assert_eq!(unpinned.code(), "unsupported");
         assert_eq!(unpinned.to_string(), PROXY_UNAVAILABLE_MSG);
         assert!(!unpinned

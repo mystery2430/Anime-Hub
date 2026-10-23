@@ -122,16 +122,23 @@ object SiteProxyController {
       return
     }
 
-    val started = try {
-      proxy = DnsPinnedProxy().also { it.start() }
+    val startedPort = try {
+      val bound = DnsPinnedProxy()
+      bound.start()
+      proxy = bound
+      bound.port ?: error("proxy bound no port")
     } catch (e: Exception) {
+      // A half-started proxy is stopped again: the gate refuses from here on,
+      // so nothing is using the port and holding it would only leak.
       logCoarse("proxy could not bind loopback")
+      stopQuietly()
       gate.markFailed()
       return
     }
-    val rule = SiteProxyPolicy.proxyRule(started.port)
+    val rule = SiteProxyPolicy.proxyRule(startedPort)
     if (rule == null || !SiteProxyPolicy.isLoopbackRule(rule)) {
       logCoarse("proxy rule rejected")
+      stopQuietly()
       gate.markFailed()
       return
     }
@@ -156,6 +163,7 @@ object SiteProxyController {
       // IllegalArgumentException (invalid config) or UnsupportedOperationException
       // (feature vanished between the check and the call): both are refusals.
       logCoarse("setProxyOverride rejected")
+      stopQuietly()
       gate.markFailed()
     }
   }
@@ -168,6 +176,17 @@ object SiteProxyController {
    * gate check and the build is caught.
    */
   fun isPinned(): Boolean = gate.canOpen()
+
+  /** Release a proxy that never became authoritative. Never called on success. */
+  private fun stopQuietly() {
+    val current = proxy ?: return
+    proxy = null
+    try {
+      current.stop()
+    } catch (e: Exception) {
+      logCoarse("proxy stop failed")
+    }
+  }
 
   private fun logCoarse(message: String) {
     // Never the rule, a host, a URL or a port: those are policy inputs.
