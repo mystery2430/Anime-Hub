@@ -371,6 +371,23 @@ jobs:
           # file"), which `| head || true` then hid.
           cd "$GITHUB_WORKSPACE"
           echo "=== final TEST_TASK=$TEST_TASK status=$status ==="
+          # A green `--tests "dev.animehub.app.*Test"` run only proves that SOME
+          # matching class ran. These suites are the ones a regression must not
+          # be able to silently drop (the connection-pinning tests are the only
+          # proof that a rebinding answer cannot reach a private address), so
+          # require a results file per class. Printed counts make the evidence
+          # visible in the log; a missing file fails the step.
+          if [ $status -eq 0 ]; then
+            for cls in SiteProfileOpsTest SiteNavigationPolicyTest SiteWebViewSettingsTest DnsPinnedProxyTest SiteProxyGateTest; do
+              xml=$(find . -type f -name "TEST-*${cls}.xml" | head -n 1)
+              if [ -n "$xml" ]; then
+                echo "OK ${cls}: $(grep -o 'tests=\"[0-9]*\"' "$xml" | head -n 1) $(grep -o 'failures=\"[0-9]*\"' "$xml" | head -n 1) ($xml)"
+              else
+                echo "::error::${cls} produced no TEST-*.xml - the class did not run"
+                status=1
+              fi
+            done
+          fi
           echo "=== Gradle tail 600 ==="
           cat /tmp/kotlin-test.log | tail -n 600
           echo "=== find test results ==="
