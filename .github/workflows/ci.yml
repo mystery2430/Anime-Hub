@@ -123,7 +123,17 @@ jobs:
           fi
           echo "declared MSRV: $msrv"
           rustup toolchain install "$msrv" --profile minimal --no-self-update
-          cargo "+$msrv" check --locked --all-targets
+          rustc "+$msrv" --version
+          set +e
+          cargo "+$msrv" check --locked --all-targets > "$RUNNER_TEMP/msrv.log" 2>&1
+          status=$?
+          tail -n 60 "$RUNNER_TEMP/msrv.log" || true
+          if [ "$status" -ne 0 ]; then
+            # Same channel as Clippy: the annotation is what survives when the
+            # job log blob is not readable from the checks API.
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" "$RUNNER_TEMP/msrv.log" msrv || true
+            exit "$status"
+          fi
 
   # ------------------------------------------------ Android actually compiles
   # The previous handoff could not run `tauri android build` (no SDK). This
