@@ -130,9 +130,12 @@ test("the declared MSRV is one value, and CI actually builds with it", () => {
     /^0\.4\.(4|5|[6-9])$/.test(ctutils[1]),
     `ctutils ${ctutils[1]} is vulnerable to RUSTSEC-2026-0385`,
   );
+  // 1.89 is what the graph needs (aes 0.9.3); the CI gate reads this same
+  // value, so a dependency bump that outgrows it fails on the PR.
+  const [major, minor] = main.split(".").map(Number);
   assert.ok(
-    Number(main.split(".")[1]) >= 85,
-    `declared MSRV ${main} is below what the locked graph needs`,
+    major > 1 || (major === 1 && minor >= 89),
+    `declared MSRV ${main} is below what the locked graph needs (1.89)`,
   );
 
   const ci = read(".github/workflows/ci.yml");

@@ -323,18 +323,24 @@ handler thread, and 16 of those would wedge every site request. What changed:
   in `stop_closes_live_handshakes_and_tunnels`, which also covers a client
   parked mid-handshake, and the upstream side is torn down with it.
 
-### 4. Declared MSRV: 1.77 was not true, and is now 1.87 with a CI gate
+### 4. Declared MSRV: 1.77 was not true, and is now 1.89 with a CI gate
 
 `src-tauri/Cargo.toml` declared `rust-version = "1.77"` while the locked graph
 already needed 1.77.2 (tauri 2.11.6), 1.85 (`crypto-common` 0.2.2, `sha2` 0.11,
-`hmac` 0.13, `cmov` 0.5.4 — all `edition = "2024"`) and, after the
-RUSTSEC-2026-0385 fix, 1.87 (`ctutils` 0.4.5). Cargo refuses to build a crate
-whose declared `rust-version` is below a dependency's, so 1.77 was never a
-working promise. Both manifests now declare **1.87**, the README says so, and a
-CI step reads the value from `Cargo.toml` and runs
-`cargo +<declared> check --locked --all-targets`, so the next dependency bump
-that outgrows it fails on the PR. The security fix was not reverted and no
-advisory is ignored: `ctutils` stays at 0.4.5.
+`hmac` 0.13, `cmov` 0.5.4 — all `edition = "2024"`), 1.87 (`ctutils` 0.4.5,
+after the RUSTSEC-2026-0385 fix), 1.88 (`darling` 0.24.1, `icu_*` 2.3,
+`keyring` 4.2, `plist` 1.10.1, `serde_with` 3.23, `time` 0.3.55) and finally
+**1.89** (`aes` 0.9.3). Cargo refuses to build a crate whose declared
+`rust-version` is below a dependency's, so 1.77 was never a working promise.
+
+Both manifests now declare **1.89**, the README says so, and a CI step reads the
+value from `Cargo.toml` and runs `cargo +<declared> check --locked
+--all-targets`. This is how 1.87 was rejected: the first version of this change
+guessed `1.87` from the crates the review named, the new gate answered `error:
+rustc 1.87.0 is not supported by the following packages: … aes@0.9.3 requires
+rustc 1.89`, and the declared value was corrected to what the graph actually
+needs instead of the gate being weakened. The security fix was not reverted and
+no advisory is ignored: `ctutils` stays at 0.4.5.
 
 ### The old pre-check is now defence in depth, not the guarantee
 

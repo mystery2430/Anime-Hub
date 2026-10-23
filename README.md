@@ -459,9 +459,10 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 ### 1. Ön gereksinimler
 
 - [Rust](https://www.rust-lang.org/tools/install) — güncel stable önerilir
-  (MSRV **`1.87`**, bkz. `src-tauri/Cargo.toml`). Değer 1.77'den yükseltildi:
-  bağımlılık zinciri (tauri 2.11.6 → 1.77.2, RustCrypto 0.11 ailesi → 1.85,
-  `ctutils` 0.4.5 → 1.87) 1.77 ile derlenmiyordu. CI, ilan edilen değeri
+  (MSRV **`1.89`**, bkz. `src-tauri/Cargo.toml`). Değer 1.77'den yükseltildi:
+  kilitli grafik 1.77 ile hiç derlenmiyordu (tauri 2.11.6 → 1.77.2, RustCrypto
+  0.11 ailesi → 1.85, `ctutils` 0.4.5 → 1.87, `darling`/`icu`/`keyring`/`plist`/
+  `serde_with`/`time` → 1.88, `aes` 0.9.3 → **1.89**). CI, ilan edilen değeri
   `Cargo.toml`'dan okuyup o toolchain ile `cargo check --locked --all-targets`
   çalıştırır; yani iddia her koşuda ölçülür.
 - [Node.js](https://nodejs.org/) 20.19+ (`package.json` `engines`; CI Node 22 kullanır)
