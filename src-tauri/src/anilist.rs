@@ -2258,7 +2258,7 @@ mod tests {
             );
 
         let mut flood = b"GET /callback HTTP/1.1\r\nX-Pad: ".to_vec();
-        flood.extend(std::iter::repeat(b'a').take(MAX_REQUEST_BYTES + 4096));
+        flood.extend(std::iter::repeat_n(b'a', MAX_REQUEST_BYTES + 4096));
         let answer = exchange(port, &flood).await;
         assert!(
             answer.starts_with("HTTP/1.1 413"),
