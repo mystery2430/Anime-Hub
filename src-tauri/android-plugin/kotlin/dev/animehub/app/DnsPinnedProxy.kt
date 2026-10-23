@@ -43,11 +43,15 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -103,6 +107,18 @@ class DnsPinnedProxy(
   data class Limits(
     val handshakeMs: Int = 5_000,
     val connectMs: Int = 10_000,
+    /**
+     * How long one `CONNECT` may spend waiting for the resolver.
+     *
+     * `InetAddress.getAllByName` has no timeout and cannot be cancelled, so a
+     * stuck DNS answer would otherwise block a handler thread for as long as
+     * the platform resolver takes (minutes, on a captive portal). The wait is
+     * bounded here instead, and the abandoned lookup keeps its own thread —
+     * [resolveThreads] at most, never one per connection.
+     */
+    val resolveMs: Int = 10_000,
+    /** Dedicated resolver threads; a rejected submission is a refusal, not a queue. */
+    val resolveThreads: Int = 4,
     val idleMs: Int = 180_000,
     val headerBytes: Int = 8 * 1024,
     val bufferBytes: Int = 16 * 1024,
@@ -118,6 +134,18 @@ class DnsPinnedProxy(
   private var acceptThread: Thread? = null
   private var handlerPool: ThreadPoolExecutor? = null
   private var pumpPool: ThreadPoolExecutor? = null
+  private var resolvePool: ThreadPoolExecutor? = null
+
+  /**
+   * Every socket this proxy owns: accepted clients and upstream connections.
+   *
+   * [stop] closes exactly this set. `shutdownNow()` interrupts a thread, but a
+   * thread blocked in `Socket.inputStream.read()` does not respond to an
+   * interrupt — it only returns when the socket is closed. Without this set a
+   * stop would leave the handshake reads and both tunnel copies running, with
+   * their file descriptors, until the peer or the idle timeout gave up.
+   */
+  private val live: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
 
   @Volatile
   private var boundPort: Int? = null
@@ -156,6 +184,10 @@ class DnsPinnedProxy(
     running = true
     handlerPool = pool("AnimeHubProxy", limits.maxConnections)
     pumpPool = pool("AnimeHubProxyTunnel", limits.maxConnections)
+    // Small and fixed: a resolver call that never returns can strand at most
+    // this many threads, and a fifth concurrent lookup is refused rather than
+    // queued behind the stuck ones.
+    resolvePool = pool("AnimeHubProxyResolve", limits.resolveThreads)
     acceptThread = Thread({ acceptLoop(socket) }, "AnimeHubProxyAccept").apply {
       isDaemon = true
       start()
@@ -163,7 +195,16 @@ class DnsPinnedProxy(
     return socket.localPort
   }
 
-  /** Stop accepting and close every live tunnel. Safe to call twice. */
+  /**
+   * Stop accepting and close every live connection. Safe to call twice.
+   *
+   * `shutdownNow()` only interrupts idle workers; a worker inside
+   * `InputStream.read()` or `Socket.connect()` stays there until its socket
+   * changes state. So the interrupt is followed by closing every tracked
+   * socket, which is what actually ends the handshake reads and both tunnel
+   * copies. Callers therefore observe EOF promptly, and no descriptor or
+   * handler slot survives the stop.
+   */
   fun stop() = synchronized(lock) {
     running = false
     closeQuietly(server)
@@ -174,6 +215,12 @@ class DnsPinnedProxy(
     handlerPool = null
     pumpPool?.shutdownNow()
     pumpPool = null
+    resolvePool?.shutdownNow()
+    resolvePool = null
+    for (socket in live.toList()) {
+      closeQuietly(socket)
+    }
+    live.clear()
     boundPort = null
   }
 
@@ -206,6 +253,10 @@ class DnsPinnedProxy(
         if (!running) return
         continue
       }
+      // Tracked from the first moment: a connection that is still sending its
+      // head when `stop()` runs must be closed too, or the handshake read
+      // would sit there for the whole handshake timeout.
+      track(client)
       val pool = handlerPool
       if (pool == null) {
         refuseBusy(client)
@@ -288,6 +339,7 @@ class DnsPinnedProxy(
           continue
         }
         remote = socket
+        track(socket)
         break
       }
       if (remote == null) {
@@ -305,17 +357,48 @@ class DnsPinnedProxy(
       // line there would corrupt a tunnel that is being torn down anyway.
       if (!established) refuse(client, Refusal.HANDSHAKE)
     } finally {
-      closeQuietly(remote)
-      closeQuietly(client)
+      drop(remote)
+      drop(client)
       active.decrementAndGet()
     }
   }
 
-  /** Resolve [host] exactly once. IP literals are parsed, never resolved. */
+  /**
+   * Resolve [host] exactly once, with a bounded wait. IP literals are parsed,
+   * never resolved.
+   *
+   * A timeout is a REFUSAL, never a verdict: the abandoned lookup may still be
+   * running inside the platform resolver (there is no cancellation API), but
+   * its answer is dropped, no address is classified from it, and no socket is
+   * opened for it. A later attempt for the same name resolves again instead of
+   * reusing the failure — there is no cache here in either direction, so
+   * neither a broken answer nor a good one can become a stale public verdict.
+   */
   private fun resolveOnce(host: String): List<InetAddress> {
     literal(host)?.let { return listOf(it) }
+    val pool = resolvePool ?: throw IOException("proxy not started")
     resolutions.incrementAndGet()
-    val answer = resolver(host)
+    val future = try {
+      pool.submit(Callable { resolver(host) })
+    } catch (_: RejectedExecutionException) {
+      // Every resolver thread is busy (typically with lookups that never
+      // returned). Refusing is the fail-closed answer: nothing is queued.
+      throw IOException("resolver busy")
+    }
+    val answer = try {
+      future.get(limits.resolveMs.toLong(), TimeUnit.MILLISECONDS)
+    } catch (_: TimeoutException) {
+      // Best effort only: `cancel(true)` cannot interrupt a blocking
+      // `getAllByName`. The task keeps its (bounded) resolver thread.
+      future.cancel(true)
+      throw IOException("resolver timed out")
+    } catch (e: ExecutionException) {
+      throw IOException("resolver failed", e.cause)
+    } catch (e: InterruptedException) {
+      future.cancel(true)
+      Thread.currentThread().interrupt()
+      throw IOException("interrupted")
+    }
     if (answer.isEmpty()) throw IOException("empty answer")
     return answer
   }
@@ -369,8 +452,8 @@ class DnsPinnedProxy(
       // EOF, reset, timeout, no stream: all of them end the tunnel.
     } finally {
       if (closed.compareAndSet(false, true)) {
-        closeQuietly(client)
-        closeQuietly(remote)
+        drop(client)
+        drop(remote)
       }
     }
   }
@@ -433,7 +516,30 @@ class DnsPinnedProxy(
   private fun refuseBusy(client: Socket) {
     accepted.incrementAndGet()
     refuse(client, Refusal.BUSY)
-    closeQuietly(client)
+    drop(client)
+  }
+
+  /**
+   * Register a socket so [stop] can close it.
+   *
+   * A socket that appears after [stop] started (a handler that was inside
+   * `connect()` when the listener closed) is closed immediately instead of
+   * being added to a set that has already been drained — otherwise it would
+   * live on until its idle timeout.
+   */
+  private fun track(socket: Socket) {
+    live.add(socket)
+    if (!running) {
+      live.remove(socket)
+      closeQuietly(socket)
+    }
+  }
+
+  /** Close a socket this proxy owns and forget it. Idempotent. */
+  private fun drop(socket: Socket?) {
+    if (socket == null) return
+    live.remove(socket)
+    closeQuietly(socket)
   }
 
   private fun pool(name: String, threads: Int): ThreadPoolExecutor {

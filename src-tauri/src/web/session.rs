@@ -320,6 +320,14 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
         ""
     };
 
+    // Same rule as the popup guard: omitted, never emitted-and-disabled, so the
+    // shipped text for desktop does not contain the override at all.
+    let webrtc_guard = if cfg.webrtc_guard {
+        include_str!("webrtc_guard.js")
+    } else {
+        ""
+    };
+
     let cosmetic = if cfg.hide_selectors.is_empty() {
         String::new()
     } else {
@@ -340,7 +348,7 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
   if (window.__animehubInstalled) return;
   window.__animehubInstalled = true;
   var CFG = {payload};
-{popup_guard}{cosmetic}{pip_controller}}})();"#
+{popup_guard}{webrtc_guard}{cosmetic}{pip_controller}}})();"#
     )
 }
 
@@ -375,6 +383,20 @@ pub struct InjectedConfig {
     /// anything the launcher's eval installed. Keeping it in the init script
     /// as well means the site page has it from the first paint on.
     pub pip_controller: bool,
+    /// Android only: append [`WEBRTC_GUARD_JS`] to the injected script.
+    ///
+    /// An HTTP `CONNECT` proxy carries TCP only, and Chromium does not send
+    /// WebRTC's UDP through a configured proxy by default (RFC 8828 §5.1
+    /// principle 4). The API is therefore removed in every frame a site page
+    /// can run in. This is defence in depth, not the guarantee: the guard is a
+    /// page script, and the residual is documented in
+    /// `docs/security-residual-risks.md`.
+    ///
+    /// `serde(skip)`: the flag decides which code the native side injects, it
+    /// is not data for the page — and telling a page which guards are on is a
+    /// hint it does not need.
+    #[serde(skip)]
+    pub webrtc_guard: bool,
 }
 
 impl Default for InjectedConfig {
@@ -387,6 +409,8 @@ impl Default for InjectedConfig {
                 .collect(),
             // Off by default: only the Android caller turns it on.
             pip_controller: false,
+            // Same: desktop has no pinned path to protect here.
+            webrtc_guard: false,
         }
     }
 }
@@ -835,6 +859,7 @@ mod tests {
             block_popups: true,
             hide_selectors: vec!["</script><script>alert(1)</script>".into()],
             pip_controller: false,
+            webrtc_guard: false,
         };
         let js = build_init_script(&cfg);
         assert!(
@@ -885,6 +910,7 @@ mod tests {
             block_popups: false,
             hide_selectors: vec![],
             pip_controller: false,
+            webrtc_guard: false,
         });
         assert!(!off.contains("window.open"));
     }
@@ -895,6 +921,7 @@ mod tests {
             block_popups: false,
             hide_selectors: vec![],
             pip_controller: false,
+            webrtc_guard: false,
         });
         assert!(!js.contains("window.open = function"));
     }
@@ -916,6 +943,45 @@ mod tests {
         assert!(!init.contains("__animehub-back"));
     }
 
+    /// WebRTC is not carried by an HTTP `CONNECT` proxy, so a page that opens a
+    /// peer connection can create traffic the pinning proxy never sees. The
+    /// API is removed where the pinned path exists (Android), and the flag
+    /// itself is never serialised into the page's config payload.
+    #[test]
+    fn init_script_removes_webrtc_where_the_pinned_path_exists() {
+        let js = build_init_script(&InjectedConfig {
+            webrtc_guard: true,
+            ..Default::default()
+        });
+        assert!(js.contains("RTCPeerConnection"), "the guard must ship");
+        assert!(
+            js.contains("configurable: false") && js.contains("writable: false"),
+            "a page must not be able to restore the constructor"
+        );
+        assert!(
+            js.contains("NotSupportedError"),
+            "the refusal must be explicit, not a silent no-op"
+        );
+        // The switch is native-side only: the page payload stays the three
+        // display settings.
+        assert!(!js.contains("webrtcGuard"), "the flag leaked into CFG");
+        // Guard text must satisfy the same inertness rules as the rest.
+        let lowered = js.to_lowercase();
+        for needle in ["token", "secret", "cookie", "authorization", "http:"] {
+            assert!(!lowered.contains(needle), "guard mentions {needle}");
+        }
+    }
+
+    #[test]
+    fn the_webrtc_guard_is_android_only() {
+        let desktop = build_init_script(&InjectedConfig::default());
+        assert!(
+            !desktop.contains("RTCPeerConnection"),
+            "desktop has no pinned path to protect, so the API stays"
+        );
+        assert!(!desktop.contains("NotSupportedError"));
+    }
+
     /// AH-P2: the document-start channel cannot be scoped to the top frame, so
     /// the controller scopes itself. A subframe must not end up with the PiP
     /// globals; the top frame must (that is the copy `pip_controller.js`'s own
@@ -924,6 +990,7 @@ mod tests {
     fn init_script_scopes_the_pip_controller_to_the_top_frame() {
         let js = build_init_script(&InjectedConfig {
             pip_controller: true,
+            webrtc_guard: false,
             ..Default::default()
         });
         assert!(
@@ -959,6 +1026,7 @@ mod tests {
     fn init_script_carries_the_pip_controller_only_when_asked() {
         let with_pip = build_init_script(&InjectedConfig {
             pip_controller: true,
+            webrtc_guard: false,
             ..Default::default()
         });
         // The controller installs through computed keys, so the exact source
@@ -1094,6 +1162,7 @@ mod tests {
             block_popups: true,
             hide_selectors: vec![".ad-container".to_string(), "#popup".to_string()],
             pip_controller: true,
+            webrtc_guard: false,
         };
         let script = build_init_script(&cfg);
         let lowered = script.to_lowercase();

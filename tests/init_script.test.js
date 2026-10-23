@@ -37,6 +37,8 @@ const read = (rel) => readFileSync(join(ROOT, rel), "utf8").replace(/\r\n/g, "\n
 const SESSION_RS = read("src-tauri/src/web/session.rs");
 const POPUP_GUARD = read("src-tauri/src/web/popup_guard.js");
 const PIP_CONTROLLER = read("src-tauri/src/web/pip_controller.js");
+const WEBRTC_GUARD = read("src-tauri/src/web/webrtc_guard.js");
+const COMMANDS_RS = read("src-tauri/src/commands.rs");
 
 const CFG = { blockPopups: true, hideSelectors: [".ad-container", "#popup"], pipController: true };
 
@@ -45,7 +47,7 @@ const CFG = { blockPopups: true, hideSelectors: [".ad-container", "#popup"], pip
  * wrapper, the same three pieces, the same order. `session.rs` is pinned below
  * so this mirror cannot drift from what ships.
  */
-function compose({ popup = true, pip = true } = {}) {
+function compose({ popup = true, pip = true, webrtc = false } = {}) {
   const cosmetic = `
   var style = document.createElement("style");
   style.id = "animehub-cosmetic";
@@ -57,7 +59,7 @@ function compose({ popup = true, pip = true } = {}) {
   if (window.__animehubInstalled) return;
   window.__animehubInstalled = true;
   var CFG = ${JSON.stringify(CFG)};
-${popup ? POPUP_GUARD : ""}${cosmetic}${pip ? PIP_CONTROLLER : ""}})();`;
+${popup ? POPUP_GUARD : ""}${webrtc ? WEBRTC_GUARD : ""}${cosmetic}${pip ? PIP_CONTROLLER : ""}})();`;
 }
 
 function run(dom, script) {
@@ -122,6 +124,74 @@ test("the popup guard neutralises window.open in the top frame and in a subframe
     assert.equal(dom.window.open, applied, `${label}: never applied twice`);
     assert.equal(dom.window.open("https://player.example/x"), null, `${label}: still guarded`);
   }
+});
+
+test("the WebRTC guard removes the API and cannot be undone by the page", () => {
+  // Executed, not grepped: the shipped file runs against a window that has a
+  // platform `RTCPeerConnection`, the way a site page would see it.
+  const dom = createFakeDom({ width: 360, height: 800 });
+  let constructed = 0;
+  class NativePeerConnection {
+    constructor() {
+      constructed += 1;
+    }
+  }
+  dom.window.RTCPeerConnection = NativePeerConnection;
+  dom.window.webkitRTCPeerConnection = NativePeerConnection;
+
+  run(dom, compose({ webrtc: true }));
+
+  for (const name of ["RTCPeerConnection", "webkitRTCPeerConnection"]) {
+    const value = dom.window[name];
+    assert.equal(typeof value, "function", `${name} is still something callable`);
+    assert.notEqual(value, NativePeerConnection, `${name} is replaced, not wrapped`);
+    // Calling it must refuse loudly instead of silently returning null.
+    assert.throws(
+      () => new value(),
+      (error) => error && error.name === "NotSupportedError",
+      `${name} must refuse with NotSupportedError`,
+    );
+  }
+  // The original constructor is unreachable: it was never captured, and the
+  // property cannot be reassigned or deleted.
+  assert.throws(() => {
+    "use strict";
+    dom.window.RTCPeerConnection = NativePeerConnection;
+  });
+  assert.equal(dom.window.RTCPeerConnection, dom.window.RTCPeerConnection);
+  assert.notEqual(dom.window.RTCPeerConnection, NativePeerConnection);
+  const descriptor = Object.getOwnPropertyDescriptor(dom.window, "RTCPeerConnection");
+  assert.equal(descriptor.configurable, false);
+  assert.equal(descriptor.writable, false);
+  // Applying it twice (document-start + the page-start fallback) must not
+  // stack a second override or re-expose anything.
+  const applied = dom.window.RTCPeerConnection;
+  run(dom, compose({ webrtc: true }));
+  assert.equal(dom.window.RTCPeerConnection, applied);
+  assert.equal(constructed, 0, "the native constructor never ran");
+});
+
+test("the WebRTC guard is omitted, not merely disabled, where there is no pin", () => {
+  const dom = createFakeDom({ width: 360, height: 800 });
+  const NativePeerConnection = function NativePeerConnection() {};
+  dom.window.RTCPeerConnection = NativePeerConnection;
+  run(dom, compose({ webrtc: false }));
+  assert.equal(
+    dom.window.RTCPeerConnection,
+    NativePeerConnection,
+    "desktop keeps the platform API",
+  );
+  assert.ok(WEBRTC_GUARD.includes("RTCPeerConnection"), "the shipped file is the override");
+  // The composition is the only thing that decides: the shipped text exists in
+  // session.rs exactly once, behind the Android-only flag.
+  const production = SESSION_RS.split("mod tests")[0];
+  assert.match(production, /include_str!\("webrtc_guard\.js"\)/);
+  assert.match(production, /if cfg\.webrtc_guard/);
+  assert.match(
+    COMMANDS_RS,
+    /webrtc_guard: cfg!\(target_os = "android"\)/,
+    "the Android open path turns the guard on",
+  );
 });
 
 test("the popup guard source keeps no reference to the original function", () => {
@@ -207,6 +277,11 @@ test("session.rs composes exactly these files, in this order", () => {
   // the controller from these files, in the order they are composed here.
   assert.match(SESSION_RS, /include_str!\("popup_guard\.js"\)/);
   assert.match(SESSION_RS, /include_str!\("pip_controller\.js"\)/);
+  assert.match(
+    SESSION_RS,
+    /include_str!\("webrtc_guard\.js"\)/,
+    "the shipped WebRTC guard must come from its own file",
+  );
   const wrapper = SESSION_RS.indexOf("(function () {{");
   assert.ok(wrapper > 0, "the generated wrapper is missing");
   const template = SESSION_RS.slice(wrapper);
@@ -214,6 +289,9 @@ test("session.rs composes exactly these files, in this order", () => {
   const popupAt = template.indexOf("{popup_guard}");
   const cosmeticAt = template.indexOf("{cosmetic}");
   const pipAt = template.indexOf("{pip_controller}");
+  const webrtcAt = template.indexOf("{webrtc_guard}");
+  assert.ok(webrtcAt > popupAt, "the WebRTC guard runs after the popup guard");
+  assert.ok(cosmeticAt > webrtcAt, "and before the cosmetic rules");
   assert.ok(payloadAt > 0, "config payload");
   assert.ok(popupAt > payloadAt, "popup guard after the payload");
   assert.ok(cosmeticAt > popupAt, "cosmetic rules after the popup guard");

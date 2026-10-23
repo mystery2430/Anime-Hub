@@ -185,6 +185,11 @@ proxy were misconfigured.
 * **HTTP/3 / QUIC.** An HTTP CONNECT proxy carries TCP tunnels; Chromium does
   not use QUIC for a proxied request. That is a property of the engine, not of
   this code, and it is on the device checklist as a packet-capture item.
+* **WebRTC / ICE / STUN / TURN / UDP is NOT pinned.** The proxy carries TCP
+  only and Android WebView cannot be told to force WebRTC through it — see
+  [round 16.1](#1-webrtc-ice-stunturn-and-udp-not-covered-still-open). The
+  Android init script removes the WebRTC API as defence in depth; that is not a
+  guarantee and this document does not treat it as one.
 * **Other apps on the device.** The listener is `127.0.0.1` only, so it is not
   reachable from the network, but another app on the same device could connect
   to it. Doing so gains that app nothing it could not do directly (the proxy
@@ -193,6 +198,143 @@ proxy were misconfigured.
 * **A process crash** leaves the OS with no override once the process is gone;
   a new process starts unpinned and refuses to open a site until it installs
   the override again. That is the intended fail-closed path, not a gap.
+
+## Round 16.1 — what the proxy does NOT cover
+
+Round 16 pinned one thing: the TCP connection a site WebView makes for an
+HTTPS/WSS request. This section is the honest boundary of that statement, plus
+the three problems an independent review found in the implementation.
+
+### 1. WebRTC, ICE, STUN/TURN and UDP: NOT covered, still open
+
+**The proxy carries TCP only.** An HTTP `CONNECT` proxy cannot carry UDP, and
+this is not an implementation gap — it is what the protocol is. The relevant
+standards and platform behaviour, checked rather than assumed:
+
+* RFC 8828 §5.1, principle 4: *"By default, WebRTC traffic should not be sent
+  through proxy servers … However, it should be possible to force WebRTC to send
+  its traffic through a configured proxy if desired."* Mode 4 ("Force proxy") is
+  the opt-in: media goes through the proxy, and *"if the proxy does not support
+  UDP (as is the case for all HTTP and most SOCKS proxies) … the use of UDP will
+  be disabled, and TCP will be used to send and receive media through the
+  proxy."*
+* Chromium exposes that opt-in as the `WebRtcIPHandling` enterprise policy /
+  `disable_non_proxied_udp` preference. Even that is not a clean guarantee:
+  Chromium's own tracker records that with `disable_non_proxied_udp` and no
+  proxy configured it still permits **TCP** TURN, and that its Mode-4 behaviour
+  falls back to "a TCP-only version of Mode 3" (Chromium issue 41345813,
+  closed as working-as-intended).
+* **Android WebView gives an app no way to set it.** `ProxyController` sets a
+  proxy; there is no WebView API for the WebRTC IP-handling policy, no
+  `chrome://flags`, no `--webrtc-ip-handling-policy` switch, and no per-app
+  preference file the app may write.
+
+So: **a page in a site WebView can create traffic that never reaches the
+pinning proxy.** ICE/STUN/TURN datagrams go out over the device's own network
+stack, from the device's own addresses, with no DNS answer of ours and no socket
+of ours involved. Nothing in `SiteWebViewSettings` changes that (it has no
+WebRTC field), and the document-start script runs *inside the page*, which is
+not where the network is decided.
+
+**What was done about it (defence in depth, explicitly not the guarantee).**
+`src-tauri/src/web/webrtc_guard.js` is appended to the Android init script: it
+replaces `RTCPeerConnection` and `webkitRTCPeerConnection` in every frame with a
+constructor that throws `NotSupportedError`, using a non-configurable,
+non-writable property, and keeps no reference to the platform constructor.
+Tests execute the shipped file (not a paraphrase) against a window that has a
+platform constructor, and assert that a page cannot reassign or delete the
+override, that the native constructor is never invoked, and that the desktop
+script does not contain the override at all. **A page-level script is not a
+security boundary**: the document-start hook can be missed by a provider without
+`DOCUMENT_START_SCRIPT` (the fallback `onPageStarted` can lose the race with an
+inline script), and a future engine could expose another path. Anyone reading
+this section should treat WebRTC as *uncovered* and the guard as reducing the
+chance, not closing it.
+
+**What would actually close it, and why it is not in this PR.** A
+`VpnService` that routes the app's traffic through a userspace filter (or
+refuses non-TCP) is the Android mechanism that covers UDP by construction — it
+is also a user-consent-gated VPN session with a persistent notification, it
+interacts with the user's own VPN, and it is a product decision, not a bug fix.
+The alternative, a per-connection firewall for the app UID, needs root/`netd`
+access an app does not have. Until one of those ships, the honest statement is:
+**Android site views are IP-pinned for HTTP(S)/WSS and not for WebRTC/UDP.**
+The device checklist turns this into a measurement (packet capture while a page
+creates a peer connection) instead of an argument.
+
+### 2. The loopback listener is reachable by other apps: open, bounded, documented
+
+`DnsPinnedProxy` binds `127.0.0.1` only, which stops *network* access. It does
+**not** make the port private to this app: Android's loopback is shared between
+apps, and the platform documentation says so directly — *"We have seen some
+applications use localhost network ports for handling sensitive IPC. We
+discourage this approach since these interfaces are accessible by other
+applications on the device. Instead, you should use an Android IPC mechanism
+where authentication is possible such as with a Service."* (Android security
+guidance, quoted in CERT DRD23-J; the same property is what the "Bridges to
+Self" research exploits across browsers and native apps).
+
+What that means here, precisely:
+
+| Question | Answer |
+| --- | --- |
+| Can another app reach the port? | **Yes**, if it scans or guesses it. The port is ephemeral and per-process, which is a speed bump, not access control. |
+| Can it use the proxy as a general egress path? | **Yes** — the proxy only refuses non-public destinations, so it is not an open relay into the device or LAN, but it *is* a working public HTTP(S) egress. |
+| Can it read this app's traffic or credentials? | **No.** It cannot see other connections' bytes (each tunnel is its own socket pair), TLS is end-to-end so no plaintext exists, and the proxy holds no cookies or tokens. |
+| Can it make the site WebView bypass the pin? | **No.** Nothing another app does can remove the `ProxyController` override; the override is process-wide and never cleared. |
+| Can it deny service to the site WebView? | **Partially.** It can occupy handler slots. Measured bounds: 16 connections (`maxConnections`), a 5 s handshake deadline per connection, no queue at all (`SynchronousQueue`), and a flood beyond the ceiling is refused with `503` immediately (`an_idle_handshake_flood_is_bounded_by_the_handshake_timeout`, `the_connection_ceiling_refuses_instead_of_queueing`). So the worst case is a bounded, self-healing refusal window, not a deadlock. |
+
+**Authentication is not available.** `ProxyConfig.Builder` has no credentials
+API, and the WebView offers no hook that would attach a `Proxy-Authorization`
+header to its own `CONNECT` for a fixed proxy. A `407`-challenge scheme would
+therefore have to be answered by engine-supplied credentials that do not exist;
+a mechanism that *probably* works on one provider and breaks site loading on
+another is worse than a documented bound. So the listener stays unauthenticated
+and the residual is stated, not papered over. The mitigations that are real:
+loopback-only bind, ephemeral port, public destinations only (so it is not a
+pivot into the device or the user's LAN — see
+`another_app_cannot_use_the_proxy_to_reach_local_or_private_services`),
+bounded concurrency and handshake deadlines, and no logging of hosts or URLs, so
+another app's use of the port leaves no data behind for this app to leak.
+
+### 3. Resolver timeout and socket lifecycle: fixed, with tests
+
+`InetAddress.getAllByName` has **no timeout and no cancellation** — with a
+captive portal or a blackholed DNS server a single `CONNECT` could hold a
+handler thread, and 16 of those would wedge every site request. What changed:
+
+* Resolution now runs on a **fixed pool** (`Limits.resolveThreads = 4`) with a
+  bounded wait (`Limits.resolveMs = 10 s`). A timed-out future is cancelled best
+  effort; because the platform call cannot be interrupted, the abandoned lookup
+  keeps its pool thread — bounded by construction, never one thread per
+  connection. When all four are stuck, a further `CONNECT` is refused
+  immediately (a `RejectedExecutionException` mapped to `RESOLVE_FAILED`), so
+  the proxy degrades to "DNS is broken, request refused" instead of queueing.
+  Measured by `stuck_resolutions_hold_at_most_their_own_threads_and_never_queue`
+  (six attempts, ≤ 2 resolver threads, no 6× timeout wait) and
+  `a_stuck_resolver_is_refused_after_a_bounded_wait`.
+* A timeout, a resolver exception and an empty answer are all `502` refusals and
+  **no address is classified from them**; nothing is cached in either
+  direction, so a failure cannot become a public verdict
+  (`a_failed_resolution_is_not_remembered_as_a_verdict`).
+* `stop()` now closes every socket the proxy owns (accepted clients and upstream
+  connections) **after** `shutdownNow()`. The interrupt does not end a thread
+  blocked in `InputStream.read()`; closing the socket does. Clients observed EOF
+  in `stop_closes_live_handshakes_and_tunnels`, which also covers a client
+  parked mid-handshake, and the upstream side is torn down with it.
+
+### 4. Declared MSRV: 1.77 was not true, and is now 1.87 with a CI gate
+
+`src-tauri/Cargo.toml` declared `rust-version = "1.77"` while the locked graph
+already needed 1.77.2 (tauri 2.11.6), 1.85 (`crypto-common` 0.2.2, `sha2` 0.11,
+`hmac` 0.13, `cmov` 0.5.4 — all `edition = "2024"`) and, after the
+RUSTSEC-2026-0385 fix, 1.87 (`ctutils` 0.4.5). Cargo refuses to build a crate
+whose declared `rust-version` is below a dependency's, so 1.77 was never a
+working promise. Both manifests now declare **1.87**, the README says so, and a
+CI step reads the value from `Cargo.toml` and runs
+`cargo +<declared> check --locked --all-targets`, so the next dependency bump
+that outgrows it fails on the PR. The security fix was not reverted and no
+advisory is ignored: `ctutils` stays at 0.4.5.
 
 ### The old pre-check is now defence in depth, not the guarantee
 

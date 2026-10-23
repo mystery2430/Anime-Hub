@@ -105,6 +105,26 @@ jobs:
             exit "$status"
           fi
 
+      # The declared MSRV is a promise, and it has been wrong before: tauri
+      # 2.11.6 needs 1.77.2, the RustCrypto 0.11 line needs 1.85, and ctutils
+      # 0.4.5 (the RUSTSEC-2026-0385 fix) declares 1.87. This step READS the
+      # value declared in src-tauri/Cargo.toml and builds with exactly that
+      # toolchain, so a dependency bump that outgrows the promise fails here
+      # instead of on a user's machine.
+      - name: MSRV (declared rust-version)
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$msrv" ]; then
+            echo "::error::src-tauri/Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          echo "declared MSRV: $msrv"
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+          cargo "+$msrv" check --locked --all-targets
+
   # ------------------------------------------------ Android actually compiles
   # The previous handoff could not run `tauri android build` (no SDK). This
   # job is that missing compile: one ABI is enough to type-check the Kotlin

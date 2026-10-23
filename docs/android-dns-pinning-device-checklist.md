@@ -36,6 +36,11 @@ adb shell dumpsys webviewupdate | head -20          # current provider + version
 # 2) a deliberately older provider (the downgrade path)
 ```
 
+Build/toolchain check that belongs with this matrix: the declared MSRV is
+`1.87` (`src-tauri/Cargo.toml`); CI reads that value and runs
+`cargo +<value> check --locked --all-targets`, so a local `rustc` older than
+that is a support question, not a bug report.
+
 Tools:
 
 ```bash
@@ -171,6 +176,61 @@ already say which phase stopped.
     process-wide and never cleared), the connection behaves the same, and no
     second proxy instance is started.
 
+## 5b. Traffic the proxy does NOT carry (WebRTC / UDP / QUIC)
+
+The proxy is `CONNECT`-only, so **UDP never passes through it**. Two separate
+claims are tested here, and only the first one is a guarantee:
+
+* `HTTP(S)/WSS` really goes through the tunnel and is pinned (sections 3, 4, 5);
+* `WebRTC` is **not** pinned and can only be removed at the API level, which is
+  defence in depth.
+
+26. **Baseline capture.** With a site open and a video playing, run
+    `tcpdump -ni any 'udp port 443 or udp port 19302 or udp port 3478' -w base.pcap`
+    for 60 s. Expect: no packets from the app's UID. (Chromium does not use QUIC
+    for a proxied request, so no UDP 443 either.)
+27. **WebRTC attempt.** Load a test page that runs
+    `new RTCPeerConnection({iceServers:[{urls:'stun:stun.example:3478'}]})` and
+    `createOffer()` against a STUN server you control on the capture host.
+    Expected in the app: the constructor throws `NotSupportedError` and the
+    page sees no candidates; expected in the capture: **no UDP from the app**.
+28. **Prove the guard is what stops it, not the engine.** On a debug build,
+    build once with `webrtc_guard: false` (commands.rs) and repeat 27. Expected:
+    STUN datagrams **do** leave from the device's own address, bypassing the
+    proxy entirely. This is the residual that is documented as open; if this
+    step produces no datagrams either, the test is inconclusive (check the
+    capture filter and that the page really created a peer connection).
+29. Repeat 27 on a provider without `DOCUMENT_START_SCRIPT` (older System
+    WebView) — the fallback `onPageStarted` can lose the race with an inline
+    page script. If candidates appear there, that provider is **not** covered by
+    the API guard; record it.
+
+## 5c. The loopback listener is reachable from another app (expected)
+
+30. From a second app (or `adb shell` on a rooted/debuggable image), scan for
+    the proxy port and connect with
+    `printf 'CONNECT example.com:443 HTTP/1.1\r\n\r\n' | nc 127.0.0.1 <port>`.
+    Expected: **it works** — the port is not private to the app (documented; see
+    `docs/security-residual-risks.md` round 16.1 §2). Record it as observed
+    behaviour, not as a bug.
+31. From the same second app, ask the proxy for a local target
+    (`CONNECT 127.0.0.1:22`, `CONNECT 192.168.1.1:443`) and for a name that
+    resolves to a private address. Expected: `403` every time and no socket
+    opened — the listener cannot be used as a pivot into the device or the LAN.
+32. Flood it: open ~50 sockets that send nothing, then use the site in the app.
+    Expected: refused (`503`) while the flood holds the slots, and recovery
+    within about 5 s (the handshake deadline) without restarting the app.
+
+## 5d. Resolver behaviour on a real device
+
+33. Point the device's DNS at a blackholed address (or enable airplane-mode DNS
+    behaviour on a captive portal) and open a site. Expected: requests fail
+    within ~10 s (`502`), the app stays responsive, and repeat attempts fail
+    just as fast rather than queueing. Check `dumpsys` / thread dump: at most a
+    handful of resolver threads (`AnimeHubProxyResolve`), not one per attempt.
+34. Restore DNS and retry. Expected: the site opens — nothing about the failed
+    lookup is remembered.
+
 ## 6. Isolation, unchanged by this work (regression check)
 
 23. Two sites in two windows: log into both, confirm each keeps its own
@@ -190,10 +250,17 @@ already say which phase stopped.
 * **Proof:** capture showing the only outbound TCP connection for a hostname is
   to the address that was classified, with a second resolution answering a
   private address producing **no** connection at all; plus the refusal message
-  on unsupported providers; plus items 6, 7 and 17–21 passing.
+  on unsupported providers; plus items 6, 7 and 17–21 passing. **WebRTC is not
+  part of that proof**: item 28 shows UDP leaving the device when the API guard
+  is off, which is why the honest claim is "HTTP(S)/WSS is pinned", never "all
+  network traffic is". Item 30 (another app reaching the port) is expected
+  behaviour and must be recorded, not "passed".
 * **Not proof:** the site loads; the unit tests pass; the JVM socket tests pass
   (they pin the *logic*, not the engine); the source contains the right calls.
 
 Report each item as PASS/FAIL with the capture file and log excerpt. This
 document moves R-01 (b) from "mitigated by design" to "verified" only when
-items 1–19 have run on at least two provider versions.
+items 1–19 have run on at least two provider versions. Even then, the WebRTC
+residual (items 26–29) and the shared-loopback residual (30–32) stay open;
+they need a `VpnService` filter and proxy authentication respectively, neither
+of which exists.

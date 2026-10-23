@@ -108,6 +108,47 @@ test("README and the packaged description describe the profile model, not the 0.
   assert.ok(parsed.bundle.shortDescription.length > 10);
 });
 
+test("the declared MSRV is one value, and CI actually builds with it", () => {
+  // The manifests said 1.77 for a long time while the dependency graph needed
+  // 1.77.2 (tauri) and, after the RUSTSEC-2026-0385 fix, 1.87 (ctutils). A
+  // declared MSRV nobody builds with is a claim, not a gate.
+  const version = (text) => {
+    const match = text.match(/^rust-version = "([^"]+)"/m);
+    return match ? match[1] : null;
+  };
+  const main = version(read("src-tauri/Cargo.toml"));
+  const plugin = version(read("src-tauri/android-plugin/Cargo.toml"));
+  assert.ok(main, "src-tauri/Cargo.toml must declare rust-version");
+  assert.equal(main, plugin, "both manifests must declare the same MSRV");
+
+  // The lock is the real constraint: every crate that carries the RustCrypto
+  // 0.11/0.2 line needs 1.85+ and ctutils 0.4.5 needs 1.87.
+  const lock = read("src-tauri/Cargo.lock");
+  const ctutils = lock.match(/name = "ctutils"\nversion = "([^"]+)"/);
+  assert.ok(ctutils, "ctutils must be in the lock");
+  assert.ok(
+    /^0\.4\.(4|5|[6-9])$/.test(ctutils[1]),
+    `ctutils ${ctutils[1]} is vulnerable to RUSTSEC-2026-0385`,
+  );
+  assert.ok(
+    Number(main.split(".")[1]) >= 85,
+    `declared MSRV ${main} is below what the locked graph needs`,
+  );
+
+  const ci = read(".github/workflows/ci.yml");
+  assert.match(ci, /name: MSRV \(declared rust-version\)/);
+  assert.match(ci, /sed -n 's\/\^rust-version/, "the step reads the manifest");
+  assert.match(ci, /cargo "\+\$msrv" check --locked --all-targets/);
+  // The README must not promise a lower number than the manifest.
+  const readme = read("README.md");
+  assert.ok(
+    readme.includes(`MSRV \`${main}\``) || readme.includes(`MSRV **\`${main}\`**`),
+    `README must state MSRV ${main}`,
+  );
+  assert.ok(!readme.includes("MSRV `1.77`"), "the 1.77 promise must be gone");
+  assert.ok(!ci.includes('"-D warnings" --all-targets > "$RUNNER_TEMP/clippy.log" 2>&1 || true'));
+});
+
 test("every external GitHub Action is pinned to a commit SHA, not a mutable tag", () => {
   // The hardened copies live in ci-fixes/ because the branch token has no
   // workflow scope; apply.sh installs them. Validate the proposed files here.

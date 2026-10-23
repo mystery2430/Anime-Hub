@@ -235,6 +235,7 @@ site yolları hiç dokunmaz.
 | Kullanıcı engel listesi | ✅ | ❌ masaüstünde alt kaynak kesme noktası yok | ✅ | ✅ |
 | DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol, bağlantı pinlenmiyor | ❌ | ✅ **CONNECT proxy'si bağlantıyı denetlenen IP'ye sabitler** (cihazda doğrulanmadı) | ✅ aynı (her istek yeni karar) |
 | `data:` üst düzey belge | ✅ reddedilir | ➖ (alt kaynak olarak serbest) | ✅ reddedilir | ➖ serbest |
+| **WebRTC / ICE / STUN / TURN (UDP)** | ❌ | ❌ | ❌ **proxy kapsamı dışı** (API init script ile kaldırılır — garanti değil) | ❌ |
 
 **Android'de bağlantı artık denetlenen IP'ye sabitleniyor (round 16).**
 Site WebView'ının trafiği, uygulama içindeki loopback CONNECT proxy'sinden
@@ -256,6 +257,16 @@ sınıflandırır (karışık/boş/hatalı cevap → ret) ve soketi
 sonlandırılmaz veya araya girilmez; sertifika doğrulaması WebView'da kalır ve
 sertifika hataları yutulmaz. Her yeni `CONNECT` (her redirect, her WSS/WebSocket
 isteği) yeni bir karardır.
+
+**Proxy'nin kapsamadığı trafik:** HTTP `CONNECT` yalnızca TCP taşır. Bir sayfa
+`RTCPeerConnection` ile ICE/STUN/TURN için UDP açabilir ve bu trafik proxy'ye
+hiç uğramaz (RFC 8828 §5.1 ilke 4; Chromium'un `WebRtcIPHandling` politikası
+WebView'da ayarlanamaz). Bu yüzden Android'de init script `RTCPeerConnection`
+API'sini kaldırır — ama bu bir **savunma derinliğidir, güvenlik sınırı değildir**;
+WebRTC/UDP sabitlenmiş sayılmaz. Gerçek çözüm kullanıcı onayı gerektiren bir
+`VpnService` filtresidir ve bu PR'ın kapsamında değildir. Ayrıntı ve cihaz testi
+senaryosu: `docs/security-residual-risks.md` (round 16.1) ve
+`docs/android-dns-pinning-device-checklist.md`.
 
 `NavigationDnsGate` / `shouldInterceptRequest` ön kontrolleri **savunma
 derinliği** olarak korunur; artık garanti olarak sunulmaz. Bu ortamda Android
@@ -448,7 +459,11 @@ sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
 ### 1. Ön gereksinimler
 
 - [Rust](https://www.rust-lang.org/tools/install) — güncel stable önerilir
-  (MSRV `1.77`, bkz. `src-tauri/Cargo.toml`)
+  (MSRV **`1.87`**, bkz. `src-tauri/Cargo.toml`). Değer 1.77'den yükseltildi:
+  bağımlılık zinciri (tauri 2.11.6 → 1.77.2, RustCrypto 0.11 ailesi → 1.85,
+  `ctutils` 0.4.5 → 1.87) 1.77 ile derlenmiyordu. CI, ilan edilen değeri
+  `Cargo.toml`'dan okuyup o toolchain ile `cargo check --locked --all-targets`
+  çalıştırır; yani iddia her koşuda ölçülür.
 - [Node.js](https://nodejs.org/) 20.19+ (`package.json` `engines`; CI Node 22 kullanır)
 - Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`
 - Android: SDK platform 36, NDK `29.0.13846066`, `ANDROID_HOME` ve `NDK_HOME` tanımlı

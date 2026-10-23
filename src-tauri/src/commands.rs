@@ -679,6 +679,9 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         // drives with `evaluateJavascript` right before entering PiP. Desktop
         // has no PiP window for a site WebView, so it stays out.
         pip_controller: cfg!(target_os = "android"),
+        // Android only: the pinning proxy covers HTTP(S)/WSS (TCP CONNECT),
+        // not WebRTC's UDP. Desktop has no pinned path, so nothing to guard.
+        webrtc_guard: cfg!(target_os = "android"),
     };
     let init_script = build_init_script(&injected);
 

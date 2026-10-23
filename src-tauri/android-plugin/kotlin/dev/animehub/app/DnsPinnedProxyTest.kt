@@ -702,6 +702,266 @@ class DnsPinnedProxyTest {
     assertFalse("a stopped proxy must not accept", proxy.canAccept(port))
   }
 
+  // -------------------------------------------------------------------------
+  // 11. Resolver timeout, shutdown and who else can reach the listener
+  // -------------------------------------------------------------------------
+
+  /**
+   * A resolver that never answers, the way a captive portal or a dead DNS
+   * server behaves: `InetAddress.getAllByName` has no timeout of its own.
+   */
+  private class StuckResolver {
+    val calls = java.util.concurrent.atomic.AtomicInteger(0)
+
+    @Suppress("UNUSED_PARAMETER")
+    fun resolve(host: String): List<InetAddress> {
+      calls.incrementAndGet()
+      val latch = java.util.concurrent.CountDownLatch(1)
+      try {
+        // Released in teardown via interruption of the daemon thread when the
+        // proxy's pool is shut down; until then it blocks like a real lookup.
+        latch.await()
+      } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+      }
+      return emptyList()
+    }
+  }
+
+  private fun resolverThreads(): Int =
+    Thread.getAllStackTraces().keys.count { it.name.startsWith("AnimeHubProxyResolve") && it.isAlive }
+
+  @Test
+  fun a_stuck_resolver_is_refused_after_a_bounded_wait() {
+    val resolver = StuckResolver()
+    var dialled = 0
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(resolveMs = 250),
+      resolver = resolver::resolve,
+      connector = { _, _, _ -> dialled++; throw java.io.IOException("must not be called") },
+    )
+    val port = proxy.start()
+    try {
+      val client = Socket("127.0.0.1", port)
+      client.soTimeout = 5_000
+      send(client, "CONNECT slow.example:443 HTTP/1.1\r\n\r\n")
+      val started = System.currentTimeMillis()
+      val line = statusLine(client)
+      val elapsed = System.currentTimeMillis() - started
+
+      // A resolver that never answers is a gateway failure — never a 200, and
+      // never a public verdict, because no address was ever classified.
+      assertEquals("HTTP/1.1 502 Bad Gateway", line)
+      assertTrue("the wait must be bounded, took $elapsed ms", elapsed < 2_500)
+      assertEquals("nothing may be dialled without an address", 0, dialled)
+      assertEquals(1L, proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_FAILED))
+      // The handler slot is released even though the lookup is still running.
+      assertTrue(
+        "the handler must not stay occupied",
+        awaitCondition { proxy.activeConnections() == 0 },
+      )
+      client.close()
+    } finally {
+      proxy.stop()
+    }
+  }
+
+  @Test
+  fun stuck_resolutions_hold_at_most_their_own_threads_and_never_queue() {
+    val resolver = StuckResolver()
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(resolveMs = 150, resolveThreads = 2),
+      resolver = resolver::resolve,
+      connector = { _, _, _ -> throw java.io.IOException("must not be called") },
+    )
+    val port = proxy.start()
+    try {
+      val started = System.currentTimeMillis()
+      repeat(6) {
+        val client = Socket("127.0.0.1", port)
+        client.soTimeout = 5_000
+        send(client, "CONNECT stuck.example:443 HTTP/1.1\r\n\r\n")
+        assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(client))
+        client.close()
+      }
+      val elapsed = System.currentTimeMillis() - started
+
+      // Six attempts cost roughly one timeout, not six: the third one is
+      // refused immediately because both resolver threads are still stuck
+      // inside the platform lookup. `cancel(true)` cannot stop that call, so a
+      // thread per connection would be unbounded growth — it is a fixed pool.
+      assertTrue("six attempts took $elapsed ms", elapsed < 4_000)
+      assertEquals("every attempt must be a refusal", 6L, proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_FAILED))
+      assertTrue("resolver threads must stay bounded, saw ${resolverThreads()}", resolverThreads() <= 2)
+      assertEquals(6, resolver.calls.get())
+      // Nothing reached the connector: no address was ever classified.
+      assertEquals(0L, proxy.activeConnections().toLong())
+    } finally {
+      proxy.stop()
+      assertTrue(
+        "the resolver pool must be released on stop, saw ${resolverThreads()} threads",
+        awaitCondition(3_000) { resolverThreads() == 0 },
+      )
+    }
+  }
+
+  @Test
+  fun a_failed_resolution_is_not_remembered_as_a_verdict() {
+    // First attempt fails, the second answer for the SAME name is loopback.
+    // A cache of "this host was allowed/failed" would either let the second
+    // connection through or refuse it without asking again; both would hide a
+    // rebinding answer behind a stale decision.
+    var calls = 0
+    val proxy = DnsPinnedProxy(
+      resolver = { _ ->
+        calls++
+        if (calls == 1) throw java.io.IOException("resolver down") else listOf(address(127, 0, 0, 1))
+      },
+      connector = { _, _, _ -> throw java.io.IOException("must not be called") },
+    )
+    val port = proxy.start()
+    try {
+      val first = Socket("127.0.0.1", port)
+      send(first, "CONNECT again.example:443 HTTP/1.1\r\n\r\n")
+      assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(first))
+      first.close()
+
+      val second = Socket("127.0.0.1", port)
+      send(second, "CONNECT again.example:443 HTTP/1.1\r\n\r\n")
+      assertEquals("HTTP/1.1 403 Forbidden", statusLine(second))
+      second.close()
+
+      assertEquals("the name must be resolved again", 2, calls)
+      assertEquals(1L, proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_FAILED))
+      assertEquals(1L, proxy.refusalCount(DnsPinnedProxy.Refusal.NON_PUBLIC))
+      // One resolution attempt per connection, never a verdict carried over.
+      assertEquals(2L, proxy.resolutionCount())
+    } finally {
+      proxy.stop()
+    }
+  }
+
+  @Test
+  fun stop_closes_live_handshakes_and_tunnels() {
+    val origin = EchoOrigin()
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(idleMs = 120_000),
+      resolver = { listOf(publicA) },
+      connector = { address, _, _ ->
+        PinnedFakeSocket(
+          Socket().apply { connect(InetSocketAddress(InetAddress.getByName("127.0.0.1"), origin.port), 2_000) },
+          address,
+        )
+      },
+    )
+    val port = proxy.start()
+    // One established tunnel and one client parked mid-handshake.
+    val tunnelled = Socket("127.0.0.1", port)
+    send(tunnelled, "CONNECT live.example:443 HTTP/1.1\r\n\r\n")
+    assertEquals("HTTP/1.1 200 Connection Established", statusLine(tunnelled))
+    assertTrue(awaitCondition { origin.accepted.isNotEmpty() })
+    val silent = Socket("127.0.0.1", port)
+    silent.soTimeout = 5_000
+    assertTrue("the proxy must have accepted the silent client", awaitCondition { proxy.activeConnections() == 2 })
+
+    proxy.stop()
+
+    // `shutdownNow()` interrupts threads but not a blocked `read()`: the
+    // sockets must actually be closed. EOF on the page side is the proof.
+    tunnelled.soTimeout = 3_000
+    silent.soTimeout = 3_000
+    assertTrue("the tunnel must end", tunnelled.getInputStream().read() < 0)
+    assertTrue("the parked handshake must end", silent.getInputStream().read() < 0)
+    assertTrue(
+      "the upstream socket must be closed too",
+      awaitCondition(3_000) { origin.ended.isNotEmpty() },
+    )
+    assertTrue(
+      "every handler slot must be released",
+      awaitCondition(3_000) { proxy.activeConnections() == 0 },
+    )
+    tunnelled.close()
+    silent.close()
+    origin.close()
+  }
+
+  @Test
+  fun another_app_cannot_use_the_proxy_to_reach_local_or_private_services() {
+    // The listener is on 127.0.0.1, so any app on the device that finds the
+    // port can talk to it (documented residual: see
+    // docs/security-residual-risks.md). What it must NOT become is a pivot
+    // into the device or the user's LAN — every one of these is refused
+    // before a socket is opened.
+    var dialled = 0
+    val proxy = DnsPinnedProxy(
+      resolver = { host ->
+        when (host) {
+          "router.example" -> listOf(address(192, 168, 1, 1))
+          "meta.example" -> listOf(InetAddress.getByName("169.254.169.254"))
+          else -> emptyList()
+        }
+      },
+      connector = { _, _, _ -> dialled++; throw java.io.IOException("must not be called") },
+    )
+    val port = proxy.start()
+    try {
+      for (target in listOf("127.0.0.1:22", "[::1]:443", "10.0.0.5:80", "router.example:443", "meta.example:80")) {
+        val client = Socket("127.0.0.1", port)
+        send(client, "CONNECT $target HTTP/1.1\r\n\r\n")
+        assertEquals("$target must be refused", "HTTP/1.1 403 Forbidden", statusLine(client))
+        client.close()
+      }
+      assertEquals("no socket may be opened for a non-public target", 0, dialled)
+      assertEquals(5L, proxy.refusalCount(DnsPinnedProxy.Refusal.NON_PUBLIC))
+    } finally {
+      proxy.stop()
+    }
+  }
+
+  @Test
+  fun an_idle_handshake_flood_is_bounded_by_the_handshake_timeout() {
+    val origin = EchoOrigin()
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(maxConnections = 2, handshakeMs = 300),
+      resolver = { listOf(publicA) },
+      connector = { address, _, _ ->
+        PinnedFakeSocket(
+          Socket().apply { connect(InetSocketAddress(InetAddress.getByName("127.0.0.1"), origin.port), 2_000) },
+          address,
+        )
+      },
+    )
+    val port = proxy.start()
+    val parked = mutableListOf<Socket>()
+    try {
+      repeat(2) { parked.add(Socket("127.0.0.1", port)) }
+      assertTrue(awaitCondition { proxy.activeConnections() == 2 })
+
+      // While both slots are held by clients that never speak, a real request
+      // is refused outright (503) rather than queued behind them.
+      val blocked = Socket("127.0.0.1", port)
+      blocked.soTimeout = 3_000
+      send(blocked, "CONNECT site.example:443 HTTP/1.1\r\n\r\n")
+      assertEquals("HTTP/1.1 503 Service Unavailable", statusLine(blocked))
+      blocked.close()
+
+      // The hold is bounded by the handshake deadline, so the page recovers on
+      // its own: no state to clear, no restart needed.
+      assertTrue(
+        "the parked handshakes must expire",
+        awaitCondition(3_000) { proxy.activeConnections() == 0 },
+      )
+      val client = Socket("127.0.0.1", port)
+      send(client, "CONNECT site.example:443 HTTP/1.1\r\n\r\n")
+      assertEquals("HTTP/1.1 200 Connection Established", statusLine(client))
+      client.close()
+    } finally {
+      parked.forEach { DnsPinnedProxy.closeQuietly(it) }
+      proxy.stop()
+      origin.close()
+    }
+  }
+
   private fun DnsPinnedProxy.canAccept(port: Int): Boolean = try {
     Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 500) }
     true
