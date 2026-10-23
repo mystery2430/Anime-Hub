@@ -80,6 +80,129 @@ verified SHA table and the exact change a maintainer has to make.
 `ci-fixes/` proposal to also assert the **resolved** Gradle graph in CI is
 deliberately unapplied: it cannot be exercised in this environment.
 
+## Round 16 — DNS rebinding is decided where the connection is made
+
+### The guarantee, stated precisely
+
+For an Android **site WebView**, the IP address actually connected to is now
+the IP address that was classified. That is not a check that runs earlier or
+more often; it is a different component making the decision:
+
+```
+WebView ──CONNECT host:port──▶ DnsPinnedProxy (127.0.0.1:ephemeral)
+                                    │ 1. parse the authority, refuse anything ambiguous
+                                    │ 2. resolve the name ONCE
+                                    │ 3. classify EVERY address with IpPolicy
+                                    │    (a mixed answer is refused as a whole)
+                                    ▼
+                              PinnedConnect.connect(InetAddress, port)
+                                    │ InetSocketAddress(address, port) — no lookup
+                                    │ then verify socket.inetAddress == address
+                                    ▼
+                              byte tunnel (TLS untouched, end-to-end)
+```
+
+Because the resolver call that produced the vetted address *is* the resolver
+call that produced the socket argument, a name cannot answer one address to the
+check and another to the connection: there is no second query to poison. That
+is the entire fix, and it is why the `ALLOW_AND_PROBE` behaviour of the old
+pre-check no longer matters for a site view — the pre-check is no longer what
+decides the connection.
+
+Files: `DnsPinnedProxy.kt` (proxy, CONNECT parsing, classification, bounded
+tunnel), `PinnedConnect.kt` (the only place a socket is opened, plus the
+verification), `SiteProxyGate.kt` (install state, config policy, refusal),
+`SiteProxyController.kt` (the `ProxyController` adapter and the open gate).
+
+### Fail-closed, in one table
+
+| Situation | Behaviour |
+| --- | --- |
+| `PROXY_OVERRIDE` not supported by the provider | site open refused (`proxy-unavailable`) |
+| loopback proxy cannot bind | site open refused |
+| `setProxyOverride` throws | site open refused |
+| install callback never arrives (5 s) | site open refused |
+| proxy stopped/unreachable | WebView has **no** route: never a direct fallback |
+| DNS answer empty, throws, or is mixed public+private | CONNECT refused (502/403), socket closed |
+| any loopback/private/link-local/reserved/ULA/mapped/reserved-literal address | CONNECT refused (403) |
+| cleartext HTTP through the proxy | refused (405) — the policy is HTTPS/WSS only |
+| connection ceiling reached | refused (503), no queueing |
+| socket's remote address differs from the vetted one | tunnel refused, socket closed |
+
+`ProxyConfig` is built with exactly one rule and nothing else:
+
+```kotlin
+ProxyConfig.Builder().addProxyRule("127.0.0.1:<ephemeral>").removeImplicitRules().build()
+```
+
+No `addBypassRule`, no `addDirect()`, no `bypassSimpleHostnames()` — each of
+those is a documented way to make a request skip the proxy — and the implicit
+localhost/link-local bypass is removed explicitly. A fixed (non-PAC) proxy list
+containing no `DIRECT` entry has no fallback: a failed proxy is a failed
+request, which is the property the whole feature depends on. `clearProxyOverride`
+is never called, not on close, not on a failed open, not on Activity destroy —
+clearing it means "all connections direct".
+
+### Why the WebView is not exempted from its own proxy
+
+`ProxyController` is process-wide, so the Tauri launcher is governed too. Its
+own origin is served *before* any network I/O: wry's `RustWebViewClient`
+answers `WebViewAssetLoader`'s domain (and the Tauri IPC path) inside
+`shouldInterceptRequest` (verified in wry 0.55.1's `RustWebViewClient.kt`), so
+those requests never reach a proxy. This is deliberate: no bypass rule is
+added, because a bypass would also let a *site* page reach a `.localhost`
+address directly. If a future Tauri version moved the launcher to a real
+loopback HTTP server, the proxy would classify it, refuse it as loopback, and
+the launcher would break — loudly and closed, which is the direction a security
+regression has to fail in. The device checklist includes this check.
+
+The site WebView's own navigation policy still refuses `tauri.localhost`,
+`.localhost`, `.local`, `.internal`, `.lan`, `.home` and IP literals at both
+checkpoints, so the app's IPC origin stays unreachable from a page even if the
+proxy were misconfigured.
+
+### What is still NOT claimed
+
+* **No device verification yet.** There is no Android SDK, emulator or physical
+  device in this environment: the proxy, the pinned connect, the CONNECT parser
+  and the tunnel are covered by real-socket JVM tests and the whole chain is
+  compiled by the Android CI job, but the WebView↔proxy path itself (does the
+  engine send `CONNECT` for every HTTPS/WSS request, does it disable QUIC under
+  a proxy, does the launcher still render) is unverified. See
+  `docs/android-dns-pinning-device-checklist.md`; until that matrix runs, this
+  is "closed by design and by unit/socket tests", not "observed on a device".
+* **Desktop is unchanged.** Tauri's desktop child WebView has no equivalent
+  network hook; `web/dns.rs` + `decide_navigation` remain a pre-check with the
+  same TOCTOU shape. Nothing in this round changed desktop behaviour or its
+  documentation.
+* **The launcher WebView before the first site open.** The override is
+  installed on the first site open (and kept for the process lifetime), so the
+  launcher's own remote sub-resources (thumbnails) are direct until then. The
+  launcher loads only this app's UI from the local asset loader, so this is a
+  timing note, not a policy hole: a site page cannot run before the first open.
+* **Plain HTTP** stays refused everywhere (navigation policy + proxy 405), so
+  the proxy never carries a cleartext request.
+* **HTTP/3 / QUIC.** An HTTP CONNECT proxy carries TCP tunnels; Chromium does
+  not use QUIC for a proxied request. That is a property of the engine, not of
+  this code, and it is on the device checklist as a packet-capture item.
+* **Other apps on the device.** The listener is `127.0.0.1` only, so it is not
+  reachable from the network, but another app on the same device could connect
+  to it. Doing so gains that app nothing it could not do directly (the proxy
+  only reaches public addresses and holds no credentials, and it never sees
+  plaintext), and it cannot make the app's WebViews bypass the proxy.
+* **A process crash** leaves the OS with no override once the process is gone;
+  a new process starts unpinned and refuses to open a site until it installs
+  the override again. That is the intended fail-closed path, not a gap.
+
+### The old pre-check is now defence in depth, not the guarantee
+
+`NavigationDnsGate` and `SiteNavigationPolicy` are unchanged and still run:
+they refuse IP literals, private host suffixes and (cached) private or flipping
+answers before a request is attempted, and they remain the only protection that
+can give a *synchronous* answer on the UI thread. They are now the second line
+behind a check that cannot be raced. Their comments and this document say so;
+none of them is described as connection pinning anymore.
+
 ## Round 15 — what this round fixed, and what it did not
 
 ### CI: rustfmt and the Vite advisory (both verified, nothing loosened)
@@ -175,9 +298,12 @@ every teardown path (`finishClose`, the failed-open rollback, `destroy`,
 including its no-view early return) releases the guard next to
 `webView.destroy()`.
 
-**R-01 (b) remains OPEN.** None of the above pins the address used for the
-connection: the engine still re-resolves when it connects, so a rebinding host
-can answer public to both checkpoints and private to the socket. The probe cap
+**R-01 (b) — superseded by round 16 (below).** None of *this* round pins the
+address used for the connection: the engine still re-resolves when it connects,
+so a rebinding host can answer public to both checkpoints and private to the
+socket. Round 16 replaces the decision with a loopback proxy that owns the
+connection; until a device run confirms it, treat the note in this section as
+the accurate description of the pre-check alone. The probe cap
 and the empty-answer rule make the pre-check honest, not complete. The required
 fix (a network layer that owns the resolution, e.g. the evaluated
 `PROXY_OVERRIDE` CONNECT proxy) and the device matrix it needs are unchanged —
@@ -454,94 +580,77 @@ Two things a maintainer should know before choosing how to apply it:
 
 ## Partially mitigated / residual
 
-### DNS rebinding on Android
+### DNS rebinding on Android (R-01 b)
 
-`shouldInterceptRequest` resolves hostnames and refuses:
+**Status: mitigated by construction on Android site views since round 16;
+still OPEN pending a device run.** The connection decision moved into an
+in-process loopback proxy (see
+[Round 16](#round-16--dns-rebinding-is-decided-where-the-connection-is-made)),
+so a site WebView no longer has a resolver of its own to be raced. What is
+missing is not code or tests but observation on a real WebView engine:
+whether the engine sends `CONNECT` for every HTTPS/WSS request, whether QUIC
+is suppressed under an override, and whether the launcher and IPC still work.
+Those are the checklist items in
+`docs/android-dns-pinning-device-checklist.md`. Until they pass, this finding
+must not be reported as `fixed`.
 
-* any non-empty answer containing a private, loopback, link-local, reserved or
-  malformed address;
-* a public answer that **differs** from the first pinned public set for that
-  host (flip detection);
-* all IP literals and built-in host suffixes.
+The two WebView-callback checkpoints (`NavigationDnsGate` +
+`SiteNavigationPolicy`) are retained unchanged **as defence in depth**. They are
+no longer presented as the guarantee, and their own documentation says so:
 
-Both checkpoints share `NavigationDnsGate`. Since round 15 it also refuses to
-cache an answer it does not have (an empty resolver answer writes no verdict)
-and caps in-flight probes at `MAX_PROBING`, so the verdict set and the single
-resolver queue cannot grow with a page's host count. A verdict is remembered
-for `CACHE_MS` (60 s); after that a host is unknown again and must be re-probed
-— the request checkpoint re-resolves synchronously, so this does not turn a
-known-bad host into an allowed connection, but it is another reason the
-pre-check is not a guarantee.
+* they refuse any non-empty answer containing a private, loopback, link-local,
+  reserved or malformed address;
+* they refuse a public answer that **differs** from the first pinned public set
+  for that host (flip detection);
+* they refuse all IP literals and built-in host suffixes;
+* an empty resolver answer writes no verdict and in-flight probes are capped at
+  `MAX_PROBING`, so neither the verdict set nor the single resolver queue grows
+  with a page's host count;
+* a verdict lasts `CACHE_MS` (60 s), after which the host is unknown and is
+  re-probed; the request checkpoint re-resolves synchronously, so an expired
+  verdict cannot turn a known-bad host into an allowed connection.
 
-Residual: **TOCTOU**. The WebView engine resolves again when it connects. A
-rebinding server could answer a public address to both pre-checks and a private
-one to the engine. The complete fix is a network layer that pins the resolved
-address for the connection, not another WebView callback. A resolver outage is
-deliberately fail-open so an offline DNS server does not brick the app.
+Their residual is the **TOCTOU** window: the engine resolves again when it
+connects, so a rebinding server could answer a public address to both
+checkpoints and a private one to the socket. That window is what the proxy
+removes — by owning the connect, not by adding a callback. A resolver outage
+remains deliberately fail-open inside `NavigationDnsGate` so an offline DNS
+server does not brick the app; the proxy is the component that turns an empty or
+broken answer into a refusal (502) instead.
 
-Why the two checkpoints are not equivalent (verified against the platform
-documentation this round, not inferred from the code): for redirects,
-`shouldInterceptRequest` is called only for the initial resource URL and not
-for the subsequent redirect URLs, and it is not called at all for
-`javascript:` or `blob:` URLs; `shouldOverrideUrlLoading` does receive
-main-frame redirects on API 24+ (`WebResourceRequest.isRedirect`). So a
-redirect hop that skips the request checkpoint is only ever judged by the
-top-level checkpoint — from the cache, synchronously, which is exactly the
-window R-01 (b) describes.
+What remains genuinely open on Android, stated as open:
 
-#### Network-layer options actually evaluated (and why none is implemented here)
+* **Desktop has no equivalent.** The Tauri desktop child WebView offers no
+  supported network hook; `src-tauri/src/web/dns.rs` + `decide_navigation` keep
+  the same pre-check shape and the same TOCTOU residual. Unchanged here.
+* **Provider coverage is unverified.** A provider without `PROXY_OVERRIDE`
+  cannot be pinned, and the app refuses to open a site there rather than
+  degrading. That is a fail-closed availability cost, not a security hole, but
+  which providers are affected is a device-matrix question.
+* **The launcher's first remote sub-resource** (before any site has been
+  opened, hence before the override is installed) is direct. The launcher only
+  renders this app's own local UI, so no untrusted page exists at that moment.
 
-This was researched against the platform APIs rather than assumed. Findings:
+#### Alternatives that were rejected
 
-* **`androidx.webkit.ProxyController` / `ProxyConfig` — the only supported
-  WebView network hook.** Feature constant is `WebViewFeature.PROXY_OVERRIDE`
-  (added in androidx.webkit 1.1.0); `getInstance()` throws
-  `UnsupportedOperationException` unless `isFeatureSupported` is true. A loopback
-  **CONNECT-only** proxy installed through it would resolve the hostname itself
-  and open the socket only to an address it has already classified, so the
-  resolver used for the check *is* the resolver used for the connection — that
-  is what actually closes the TOCTOU window. TLS stays end-to-end: CONNECT
-  forwards bytes unread, so certificate validation and the system-CA-only trust
-  policy are untouched, and each redirect hop is a new request through the same
-  guard. `androidx.webkit` is already a dependency here (for `MULTI_PROFILE`).
-* **Why it is not implemented on this branch.** The API is process-wide
-  ("used by all WebViews in the app") and asynchronous — "network connections
-  are not guaranteed to immediately use the new proxy setting; **wait for the
-  listener before loading a page**" — so it has to be ordered against
-  `open_site` and the activity lifecycle. `addDirect()` must be *omitted*,
-  otherwise the engine falls back to a direct connection that bypasses the
-  guard; omitting it means a proxy failure is a total loss of connectivity, so
-  the failure path needs its own design. The loopback listener is reachable by
-  other apps on the device, so it must not become a usable tunnel for them.
-  HTTP/3/QUIC is not carried by an HTTP CONNECT proxy and needs to be confirmed
-  disabled under a proxy override. The launcher WebView (local content) needs a
-  bypass rule. **None of that can be verified in this environment: there is no
-  Android SDK, no Gradle, no JVM, no device and no emulator here**, so TLS
-  behaviour, redirects, QUIC, provider differences and lifecycle ordering would
-  all be unverified. Shipping it unverified would trade a documented residual
-  risk for an undocumented one — and a bug in a mandatory proxy breaks every
-  site, not just the rebinding case.
-* **Rejected alternatives.** `shouldInterceptRequest`-side fetching would mean
-  reimplementing the network stack (streaming video, range requests,
-  `CookieManager` sync, HTTP auth, service workers) and is not called for every
-  main-frame navigation. Chromium's `--host-resolver-rules` is not settable on
-  Android WebView. `ConnectivityManager.bindProcessToNetwork` selects a network,
-  it does not filter destinations. A `VpnService` filter needs user consent for
-  a VPN and is a different product decision. Tauri's Rust HTTP client never
-  carries WebView traffic, so nothing in `src-tauri/src/web/dns.rs` can pin a
-  WebView connection.
-* **Decision left to a human.** Implementing the `PROXY_OVERRIDE` guard is a
-  real, bounded project — but it needs a device/emulator matrix first:
-  (1) `isFeatureSupported(PROXY_OVERRIDE)` across provider versions including
-  the downgrade path; (2) proof that no request escapes when `addDirect()` is
-  absent; (3) TLS to a public host through the tunnel, including redirects and
-  a rebinding host that flips its answer mid-chain; (4) private/loopback/
-  link-local destinations refused at CONNECT; (5) resolver failure behaviour;
-  (6) HTTP/3 confirmed off; (7) the launcher WebView still loads; (8) another
-  app on the device cannot use the loopback listener as a tunnel; (9) activity
-  recreation / process restart ordering. Until that runs, `ALLOW_AND_PROBE`
-  stays as it is and **R-01 (b) stays open**.
+Researched against the platform APIs rather than assumed:
 
+* **`androidx.webkit.ProxyController` is the only supported WebView network
+  hook** — `WebViewFeature.PROXY_OVERRIDE`, `getInstance()` throws
+  `UnsupportedOperationException` otherwise. This is the approach now used, and
+  the reasons it is the right one (single resolver for check and connect,
+  no TLS termination, every redirect hop a fresh `CONNECT`) are in the round-16
+  section.
+* **`shouldInterceptRequest`-side fetching** would mean reimplementing the
+  network stack (streaming video, range requests, `CookieManager` sync, HTTP
+  auth, service workers) and is not called for every main-frame navigation.
+* **Chromium's `--host-resolver-rules`** is not settable on Android WebView.
+* **`ConnectivityManager.bindProcessToNetwork`** selects a network; it does not
+  filter destinations.
+* **`VpnService`** filtering needs user consent for a VPN and is a different
+  product decision.
+* **Tauri's Rust HTTP client** never carries WebView traffic, so nothing in
+  `src-tauri/src/web/dns.rs` can pin a WebView connection.
 
 ### Device verification (R-04)
 

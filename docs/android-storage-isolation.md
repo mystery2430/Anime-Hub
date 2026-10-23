@@ -258,7 +258,7 @@ Two checkpoints, deliberately different rules:
 | cleartext `http://` / `ws://` | blocked (`on_navigation`) | engine mixed-content policy | blocked (`SiteNavigationPolicy`) | blocked (`shouldInterceptRequest`) |
 | private/loopback/reserved **IP literals** and host rules | blocked | not checked | blocked | blocked |
 | user blocklist | blocked | not checked | **not enforced** | **not enforced** |
-| DNS answer resolving to a private address | checked at navigation time (fail-open) | not checked | **no DNS at all** | **no DNS at all** |
+| DNS answer resolving to a private address | checked at navigation time (fail-open) | not checked | **refused at CONNECT by the pinning proxy** (authoritative); `NavigationDnsGate` pre-check kept as defence in depth | same (every request is a new `CONNECT`) |
 | top-level `data:` document | refused | n/a (`data:` sub-resources stay allowed) | refused | allowed (sub-resource) |
 | `WebView.loadUrl` by the app itself | Rust validates the first URL | — | bypasses the guard | — |
 
@@ -267,17 +267,40 @@ it returns an empty `403` (no body, no headers, nothing about the request or the
 reason handed back to the page) for a refused request and forwards everything
 else unchanged. It runs on the WebView's background thread.
 
-**Why no DNS on Android, and why that is not solved by docs:** resolving a
-hostname inside `shouldInterceptRequest` and returning `null` afterwards does not
-bind the engine's own resolution — the answer we checked is not the address it
-connects to, so a rebinding hostname defeats it while paying a lookup per
-request. Real protection needs connection-time pinning or a filtering proxy;
-Android exposes no per-WebView proxy and serving the bodies ourselves would mean
-terminating TLS. So a hostname that resolves to a private address **is not
-caught on Android**. This stays an open pre-merge security risk (see
-`## Verification status`), not a closed item. The desktop DNS check narrows the
+**DNS is now decided at connect time (round 16).** Resolving a hostname inside
+`shouldInterceptRequest` and returning `null` does not bind the engine's own
+resolution — the answer we checked is not the address it connects to — so that
+callback alone cannot see a rebinding hostname. Android does expose a
+process-wide hook, `androidx.webkit.ProxyController` (`PROXY_OVERRIDE`), and
+from round 16 a site WebView's traffic goes through an in-process loopback
+proxy that owns the connection:
+
+* `SiteProxyController` installs one `ProxyConfig` with a single
+  `addProxyRule("127.0.0.1:<ephemeral>")` and `removeImplicitRules()`. There is
+  no `addDirect()`, no bypass rule and no ruleless config, so there is **no
+  direct fallback**; and the override is never cleared (clearing it means
+  "everything direct").
+* `open_site` waits for the `setProxyOverride` listener before the first
+  `loadUrl` of a new site view (5 s watchdog). Unsupported provider, failed
+  bind, thrown exception or a missing callback → the open is refused with
+  `proxy-unavailable`; it never falls back to `ALLOW_AND_PROBE`.
+* `DnsPinnedProxy` accepts **CONNECT only** (cleartext `HTTP` is refused), parses
+  the authority strictly, resolves the name **once**, classifies every answer
+  address with the shared `IpPolicy` (mixed, empty, broken → refuse), and then
+  connects with `InetSocketAddress(address, port)` — no second lookup — and
+  verifies `socket.inetAddress` before tunnelling bytes. TLS is never
+  terminated, never intercepted and never downgraded: certificate validation
+  stays in the WebView. Every new `CONNECT`, including every redirect hop and
+  every WSS/WebSocket request, is a fresh decision.
+
+The MV3-style details, the failure table and the honest limits (no device run
+yet) are in `docs/security-residual-risks.md` (round 16 section) and the matrix
+to run on hardware is `docs/android-dns-pinning-device-checklist.md`. The
+WebView-callback checkpoints and `NavigationDnsGate` are retained unchanged and
+are **defence in depth**, not the guarantee. The desktop DNS check narrows the
 window but has the same TOCTOU shape and fails open on resolver errors so a DNS
-outage cannot make every site unopenable.
+outage cannot make every site unopenable; desktop has no equivalent hook and was
+not changed.
 
 ### Injected script: origin and frame scope (AH-P2)
 

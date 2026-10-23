@@ -85,12 +85,16 @@ test("README and the packaged description describe the profile model, not the 0.
   assert.match(readmeFlat, /SiteNavigationPolicy/);
   assert.match(readmeFlat, /SiteWebViewSettings/);
   assert.match(readmeFlat, /Android'de liste Rust'tan site WebView'ine açılış ve her ayar\/sıfırlama sonrasında aktarılır/);
-  assert.match(readmeFlat, /bağlantı sabitleme yoktur/);
+  assert.match(readmeFlat, /bağlantı artık denetlenen IP'ye sabitleniyor/);
+  assert.match(readmeFlat, /doğrudan bağlantıya\s+düşmez/);
+  assert.match(readmeFlat, /NavigationDnsGate[\s\S]{0,80}savunma derinliği/);
+  assert.match(readmeFlat, /android-dns-pinning-device-checklist/);
   assert.match(readmeFlat, /Aktarım başarısız olursa yeni site açılmaz/);
   assert.match(readmeFlat, /androidx\.webkit `MULTI_PROFILE`/);
   assert.match(confFlat, /MULTI_PROFILE ile site başına kendi WebView profilinde açılır/);
   assert.match(confFlat, /Android'de kullanıcı engel listesi site WebView'ine aktarılır/);
-  assert.match(confFlat, /bağlantı pinleme yoktur/);
+  assert.match(confFlat, /bağlantı denetlenen IP adresine sabitlenir/);
+  assert.match(confFlat, /proxy uygulanamazsa site açılmaz/);
   assert.match(confFlat, /fiziksel bir Android cihazında test edilmemiştir/);
 
   // The config stays parseable and the deep-link registration the OAuth

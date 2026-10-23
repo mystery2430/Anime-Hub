@@ -11,17 +11,18 @@ const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
 const AREAS = new Set([
   "app", "back", "bridge", "clear", "close", "delete", "devlog", "flush", "ipc",
-  "migration", "open", "pip", "profile", "queue", "shutdown", "site", "startup", "webview",
+  "migration", "open", "pip", "profile", "proxy", "queue", "shutdown", "site", "startup",
+  "webview",
 ]);
 const PHASES = new Set([
   "back_pressed", "back_step", "capability", "clear", "close", "complete", "cookie_verify",
   "cookie_wipe", "cookie_write", "destroy", "destroy_flush", "drain", "enumerate",
-  "flag_write", "flush", "fullscreen", "gate", "generation", "geolocation",
+  "flag_write", "flush", "fullscreen", "gate", "generation", "geolocation", "install",
   "geolocation_origins", "geolocation_wipe", "ipc_dispatch", "ipc_setup", "late_callback",
   "launcher_close", "migration", "native_close", "native_fallback", "navigation_start",
   "open", "orphan_sweep", "pip_enter", "pip_playback", "pip_prepare", "pip_restore",
   "pip_transfer", "poll", "profile_bind", "profile_check", "profile_create", "profile_delete",
-  "profile_flush", "profile_list", "provider_delete", "quarantine", "quarantine_retire",
+  "profile_flush", "profile_list", "provider_delete", "quarantine", "quarantine_retire", "ready",
   "queue_remove", "reset", "resolve", "retire", "script", "slot_claim", "start", "storage",
   "sync", "tombstone", "transfer_to_launcher", "view_attach", "view_create", "web_history",
   "verified", "watchdog", "watchdog_arm", "worker_start", "worker_wait",

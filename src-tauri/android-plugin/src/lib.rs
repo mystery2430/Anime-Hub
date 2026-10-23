@@ -144,6 +144,19 @@ pub const MIGRATION_RETRY_SENTINEL: &str = "migration-partial";
 /// profile is the user's live one and the wipe simply has to be verified.
 pub const QUARANTINE_SENTINEL: &str = "profile-quarantined";
 
+/// Kotlin's `SiteProxyController.ERR_PROXY_UNAVAILABLE`. A bridge error
+/// containing this string means the site was NOT opened because the
+/// connection-pinning proxy is not in effect: the WebView provider lacks
+/// `PROXY_OVERRIDE`, the loopback proxy could not bind, or the
+/// `setProxyOverride` callback never arrived.
+///
+/// This is a security refusal, not a transient failure to retry quietly: with
+/// no proxy, the WebView's own resolver decides which address a rebinding
+/// hostname reaches, and that is exactly the DNS TOCTOU window the proxy
+/// removes. Callers must surface guidance (`PROXY_UNAVAILABLE_MSG`) and must
+/// never open the site on the unpinned stack.
+pub const PROXY_SENTINEL: &str = "proxy-unavailable";
+
 /// Alias under which the Kotlin side is registered.
 pub const PLUGIN_ALIAS: &str = "animehub-android";
 
@@ -306,6 +319,16 @@ pub fn is_migration_retry(error: &Error) -> bool {
 pub fn is_profile_quarantined(error: &Error) -> bool {
     match error {
         Error::Bridge(message) => message.contains(QUARANTINE_SENTINEL),
+        _ => false,
+    }
+}
+
+/// See [`PROXY_SENTINEL`]: the site was refused because the connection-pinning
+/// proxy is not confirmed applied. Disjoint from the other two sentinels, so a
+/// refusal can never be mistaken for "retire the profile" or "wipe unverified".
+pub fn is_proxy_unavailable(error: &Error) -> bool {
+    match error {
+        Error::Bridge(message) => message.contains(PROXY_SENTINEL),
         _ => false,
     }
 }
@@ -882,6 +905,19 @@ mod tests {
         assert_eq!(MULTI_PROFILE_SENTINEL, "unsupported-multi-profile");
         assert_eq!(MIGRATION_RETRY_SENTINEL, "migration-partial");
         assert_eq!(QUARANTINE_SENTINEL, "profile-quarantined");
+        assert_eq!(PROXY_SENTINEL, "proxy-unavailable");
+        assert!(is_proxy_unavailable(&Error::Bridge(
+            "proxy-unavailable".into()
+        )));
+        assert!(!is_proxy_unavailable(&Error::Bridge(
+            "migration-partial: profil zaten mevcut".into()
+        )));
+        assert!(!is_migration_retry(&Error::Bridge(
+            "proxy-unavailable".into()
+        )));
+        assert!(!is_profile_quarantined(&Error::Bridge(
+            "proxy-unavailable".into()
+        )));
         // The classifier must key off exactly the const Kotlin produces.
         assert!(is_migration_retry(&Error::Bridge(
             "migration-partial: çerez reddedildi (1/2)".into()
@@ -1064,6 +1100,104 @@ mod tests {
             controller.contains("SiteClearFlow.run(isSupported(), profileName, port)"),
             "the flow needs the profile name to quarantine the right profile"
         );
+    }
+
+    /// The pinning contract, pinned from the Rust side too.
+    ///
+    /// The Kotlin unit tests prove the proxy's behaviour; this test proves the
+    /// files that decide *whether the site may open at all* still say what the
+    /// Rust classifier assumes. A re-enabled bypass list, a `DIRECT` rule or a
+    /// resumed `clearProxyOverride` would silently reopen the direct path that
+    /// `docs/security-residual-risks.md` claims is closed.
+    #[test]
+    fn kotlin_pins_the_connection_pinning_contract() {
+        let gate = include_str!("../kotlin/dev/animehub/app/SiteProxyGate.kt");
+        let proxy = include_str!("../kotlin/dev/animehub/app/DnsPinnedProxy.kt");
+        let connect = include_str!("../kotlin/dev/animehub/app/PinnedConnect.kt");
+        let adapter = include_str!("../kotlin/dev/animehub/app/SiteProxyController.kt");
+        // Comments name the forbidden calls to explain why they are absent, so
+        // the checks below run over CODE lines only.
+        let code = |src: &str| -> String {
+            src.lines()
+                .filter(|line| {
+                    let t = line.trim();
+                    !t.is_empty()
+                        && !t.starts_with("//")
+                        && !t.starts_with('*')
+                        && !t.starts_with("/*")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let adapter_code = code(adapter);
+        let connect_code = code(connect);
+        let controller = include_str!("../kotlin/dev/animehub/app/AnimeHubSiteController.kt");
+
+        // The literal Rust classifies is the one Kotlin produces.
+        assert!(
+            gate.contains(&format!(
+                "const val ERR_PROXY_UNAVAILABLE: String = \"{PROXY_SENTINEL}\""
+            )),
+            "the proxy sentinel must match the Kotlin constant"
+        );
+
+        // ONE loopback rule, implicit bypass removed, and no bypass/`DIRECT`
+        // rule of any shape: those are the builder calls that would let a
+        // request reach an origin without classification.
+        assert!(gate.contains("const val LOOPBACK_HOST: String = \"127.0.0.1\""));
+        assert!(adapter_code.contains(".addProxyRule(rule)"));
+        assert!(
+            adapter_code.contains(
+                "const val ERR_PROXY_UNAVAILABLE: String = SiteProxyPolicy.ERR_PROXY_UNAVAILABLE"
+            ),
+            "the controller refuses with the same literal Rust classifies"
+        );
+        assert!(adapter_code.contains(".removeImplicitRules()"));
+        for forbidden in [
+            "addBypassRule",
+            "addDirect",
+            "bypassSimpleHostnames",
+            "clearProxyOverride",
+        ] {
+            assert!(
+                !adapter_code.contains(forbidden),
+                "{forbidden} must never be used: it is a direct path"
+            );
+        }
+        assert_eq!(
+            adapter_code.matches("addProxyRule(").count(),
+            1,
+            "exactly one proxy rule, never a fallback list"
+        );
+        // The provider feature gate comes before the install.
+        assert!(adapter_code.contains("WebViewFeature.PROXY_OVERRIDE"));
+        assert!(adapter_code.contains("isFeatureSupported"));
+
+        // The proxy binds loopback only and never a wildcard address.
+        assert!(proxy.contains("const val LOOPBACK: String = \"127.0.0.1\""));
+        assert!(
+            !proxy.contains("\"0.0.0.0\""),
+            "the proxy must never listen on a routable wildcard"
+        );
+
+        // The connection is made from the classified address: a name-based
+        // Socket constructor would resolve again and reopen the TOCTOU window.
+        assert!(connect_code.contains("InetSocketAddress(address, port)"));
+        assert!(
+            !connect_code.contains("Socket(host"),
+            "PinnedConnect must never take a hostname"
+        );
+        assert!(connect_code.contains("actual.address.contentEquals(expected.address)"));
+        assert!(
+            !proxy.contains("Socket(target.host") && !proxy.contains("Socket(host,"),
+            "the proxy must not open sockets by name"
+        );
+
+        // A site WebView is built only after the pin is confirmed, and the
+        // refusal is the sentinel above.
+        assert!(controller.contains("SiteProxyController.ensureReady(operationId)"));
+        assert!(controller.contains("onResult(SiteProxyController.ERR_PROXY_UNAVAILABLE)"));
+        assert!(controller.contains("if (!SiteProxyController.isPinned())"));
     }
 
     #[test]

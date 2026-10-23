@@ -48,6 +48,7 @@ object AnimeHubDebugLog {
   private val areas = setOf(
     "app", "back", "bridge", "clear", "close", "delete", "devlog", "flush", "ipc",
     "migration", "open", "pip", "profile", "queue", "shutdown", "site", "startup", "webview",
+    "proxy",
   )
   private val phases = setOf(
     "back_pressed", "back_step", "capability", "clear", "close", "complete", "cookie_verify",
@@ -59,6 +60,7 @@ object AnimeHubDebugLog {
     "pip_transfer", "poll", "profile_bind", "profile_check", "profile_create", "profile_delete",
     "profile_flush", "profile_list", "provider_delete", "quarantine", "quarantine_retire",
     "queue_remove", "reset", "resolve", "retire", "script", "slot_claim", "start", "storage",
+    "install", "ready",
     "sync", "tombstone", "transfer_to_launcher", "view_attach", "view_create", "web_history",
     "verified", "watchdog", "watchdog_arm", "worker_start", "worker_wait",
   )

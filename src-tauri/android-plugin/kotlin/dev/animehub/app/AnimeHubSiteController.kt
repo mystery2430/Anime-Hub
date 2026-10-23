@@ -309,6 +309,13 @@ object AnimeHubSiteController {
    * was written into the profile's own cookie manager and flushed to disk
    * during [migrate], before this WebView was even constructed, i.e. before
    * the first navigation.
+   *
+   * Pinning contract: the view is only built after the process-wide loopback
+   * proxy is CONFIRMED applied ([SiteProxyController.ensureReady]). If it
+   * cannot be (`PROXY_OVERRIDE` unsupported, the proxy cannot bind, the
+   * install callback never arrives) the open fails with
+   * [SiteProxyController.ERR_PROXY_UNAVAILABLE] and no view is created — the
+   * site is refused rather than opened on an unpinned network stack.
    */
   fun open(
     activity: Activity,
@@ -340,23 +347,45 @@ object AnimeHubSiteController {
       onResult(quarantined)
       return
     }
-    activity.runOnUiThread {
-      if (!liveActivity(activity)) {
-        AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "activity_gone")
-        onResult("Android Activity artık kullanılamıyor")
-        return@runOnUiThread
+    // CONNECTION PINNING GATE (see SiteProxyController). Every request this
+    // view makes must travel through the loopback proxy that classifies a
+    // hostname once and connects to that exact address; a WebView created
+    // before the override is confirmed would make its first requests
+    // directly. `ProxyController` is process-wide and its listener is the only
+    // proof that the override is actually in effect, so the open waits for it
+    // and REFUSES (no direct fallback, no "probe and continue") if it never
+    // arrives. Nothing is built, claimed or navigated before this callback.
+    SiteProxyController.ensureReady(operationId) { pinned ->
+      if (!pinned) {
+        AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "unavailable")
+        onResult(SiteProxyController.ERR_PROXY_UNAVAILABLE)
+        return@ensureReady
       }
-      if (active.hasActive()) {
-        AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "active_site")
-        onResult(ERR_ACTIVE_SITE)
-        return@runOnUiThread
-      }
-      try {
-        buildWebView(activity, url, profileName, initScript, operationId, onResult)
-      } catch (_: Exception) {
-        Log.e(LOG_TAG, "site open failed")
-        AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "provider")
-        onResult("site açılamadı")
+      activity.runOnUiThread {
+        if (!liveActivity(activity)) {
+          AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "activity_gone")
+          onResult("Android Activity artık kullanılamıyor")
+          return@runOnUiThread
+        }
+        if (active.hasActive()) {
+          AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "active_site")
+          onResult(ERR_ACTIVE_SITE)
+          return@runOnUiThread
+        }
+        // Re-checked immediately before the view is built: a state that
+        // regressed between the gate and here must still refuse.
+        if (!SiteProxyController.isPinned()) {
+          AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "unavailable")
+          onResult(SiteProxyController.ERR_PROXY_UNAVAILABLE)
+          return@runOnUiThread
+        }
+        try {
+          buildWebView(activity, url, profileName, initScript, operationId, onResult)
+        } catch (_: Exception) {
+          Log.e(LOG_TAG, "site open failed")
+          AnimeHubDebugLog.record("open", "complete", "failed", operationId, errorClass = "provider")
+          onResult("site açılamadı")
+        }
       }
     }
   }
@@ -453,8 +482,9 @@ object AnimeHubSiteController {
 
       // (4) Navigation protection: the same SiteNavigationGuard policy the
       // launcher WebView uses, over a plain client (never wry's client, which
-      // casts to RustWebView). Blocklist/DNS checks stay in Rust — unchanged
-      // documented Android limitation.
+      // casts to RustWebView). The DNS gate inside it is now a SECOND line:
+      // the actual connection for this view is pinned by the process-wide
+      // loopback proxy (SiteProxyController), which is what decides the IP.
       val evalOnPageStart = !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
       // Drop any guard left over from a previous view before replacing it, so
       // the previous resolver thread cannot outlive its WebView.

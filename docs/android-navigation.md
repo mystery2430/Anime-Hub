@@ -99,8 +99,8 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 | Numeric IPv4 spellings | Fixed in the Kotlin policy: `2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1` are refused (previously allowed). Relies on WHATWG parsing; not tested in a WebView. |
 | Documentation IPv4 ranges | Fixed: `198.51.100.0/24` and `203.0.113.0/24` are refused, as in Rust. |
 | Multicast / reserved IPv4 (`224.0.0.0/4`, `240.0.0.0/4`, `0.0.0.0/8`, `192.88.99.0/24`) | Both Kotlin and Rust refuse them (aligned to IANA 2025-10-09; Rust `a >= 224` + `a == 0` + `192.88.99/24`). |
-| DNS rebinding | DNS on the UI thread would stall the WebView. Not done. |
-| Subframes and sub-resources | The guard only sees top-level navigations. |
+| DNS rebinding (this policy layer) | The checkpoints here are **defence in depth** since round 16. A synchronous check on the UI thread would stall the WebView, and `shouldInterceptRequest` cannot bind the engine's own resolution — so the guarantee moved to the loopback `CONNECT` proxy (`DnsPinnedProxy.kt`), which resolves once, classifies with `IpPolicy`, connects to the vetted address and is installed process-wide via `ProxyController`. See `docs/security-residual-risks.md` (round 16). |
+| Subframes and sub-resources (this policy layer) | The `shouldInterceptRequest` checkpoint sees sub-resources but not every frame type; the proxy sees every `CONNECT` regardless of frame. The guard's own rules remain top-level-only for host/IP shape. |
 | App-initiated `loadUrl` | Not routed through `shouldOverrideUrlLoading`; `open_on_mobile` checks the first URL with `validate_site_url`. |
 | Redirects | Whether the WebView calls `shouldOverrideUrlLoading` for every server redirect is not verified. |
 | `window.open` | Wry does not enable multiple windows, and the init script overrides `window.open` when popup blocking is on. The Android default is that multi-window is off; not device-verified. |
@@ -112,8 +112,11 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
   `on_webview_created` ordering; Android `WebView.getWebViewClient()` (API 26).
 - Compiled: not compiled locally (no Android SDK or Kotlin compiler in the
   sandbox). The CI "Android compile (aarch64)" job is the compile check.
-- Behaviour: **not tested on a device.** The policy has no unit test that runs
-  Kotlin; the node test only checks the shared host rules.
+- Behaviour: the Kotlin policy/dns-gate/gateway files now run in the local
+  harness and in CI's Gradle unit-test step (shared vector fixture included),
+  and the round-16 proxy has real-socket JVM tests. **Nothing here has run in a
+  real WebView on a device**; the network matrix is
+  `docs/android-dns-pinning-device-checklist.md`.
 
 ## Next steps
 

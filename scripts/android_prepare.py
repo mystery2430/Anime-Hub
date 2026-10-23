@@ -526,6 +526,16 @@ def prepare(root: Path, gen: Path) -> list[str]:
         "SiteClearFlow",
         "SiteMigrationFlow",
         "SiteBackStatus",
+        # Connection pinning (round 16). DnsPinnedProxy/PinnedConnect/SiteProxyGate
+        # are pure JVM (java.net only) and own the decision that makes a
+        # hostname resolve ONCE; SiteProxyController is the androidx.webkit
+        # adapter that installs the process-wide override. All four are
+        # REQUIRED: without them the controller cannot refuse an unpinned open,
+        # and the APK would silently go back to engine-side DNS.
+        "DnsPinnedProxy",
+        "PinnedConnect",
+        "SiteProxyGate",
+        "SiteProxyController",
     ):
         aux_src = kotlin_source(root, package, aux)
         if not aux_src.is_file():

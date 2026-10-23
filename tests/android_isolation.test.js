@@ -55,6 +55,11 @@ const PURE_FILES = [
   "SiteClearFlow.kt",
   "SiteMigrationFlow.kt",
   "SiteBackStatus.kt",
+  // Connection pinning: the CONNECT proxy, the socket it dials and the gate
+  // that decides whether a site may open at all. All three are java.net only.
+  "DnsPinnedProxy.kt",
+  "PinnedConnect.kt",
+  "SiteProxyGate.kt",
 ];
 const pureKotlin = PURE_FILES.map((f) => read(`${KOTLIN}/${f}`)).join("\n");
 const pureFile = (f) => read(`${KOTLIN}/${f}`);
@@ -1492,6 +1497,87 @@ test("navigation policy wraps the site client too", () => {
   assert.match(preparePy, /"SiteProfileOps"/);
 });
 
+test("connection pinning is wired from the proxy to the refusal", () => {
+  // Round 16: the DNS gate is a pre-check; the GUARANTEE is that every site
+  // request leaves through the loopback proxy, which resolves a hostname once
+  // and connects to that exact address. These assertions pin the wiring that
+  // makes that true, and the absence of every direct path around it.
+  const proxyKt = read(`${KOTLIN}/DnsPinnedProxy.kt`);
+  const connectKt = read(`${KOTLIN}/PinnedConnect.kt`);
+  const gateKt = read(`${KOTLIN}/SiteProxyGate.kt`);
+  const adapterKt = read(`${KOTLIN}/SiteProxyController.kt`);
+  // Code only: the headers NAME the unsafe form to explain why it is absent.
+  const codeOf = (src) => src
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      return t !== "" && !t.startsWith("//") && !t.startsWith("*") && !t.startsWith("/*");
+    })
+    .join("\n");
+  const connectCode = codeOf(connectKt);
+  const proxyCode = codeOf(proxyKt);
+  const adapterCode = codeOf(adapterKt);
+
+  // Loopback only, ephemeral port, no wildcard listener anywhere.
+  assert.match(proxyKt, /const val LOOPBACK: String = "127\.0\.0\.1"/);
+  assert.doesNotMatch(proxyKt, /"0\.0\.0\.0"/);
+  assert.match(proxyKt, /socket\.bind\(InetSocketAddress\(InetAddress\.getByName\(LOOPBACK\), 0\)/);
+
+  // CONNECT is the only method; anything else (cleartext HTTP) is refused.
+  assert.match(proxyKt, /if \(parts\[0\] != "CONNECT"\) return null/);
+  assert.match(proxyKt, /Refusal\.METHOD -> METHOD_NOT_ALLOWED/);
+
+  // One resolution per connection, then classification of EVERY address: a
+  // mixed answer is refused as a whole, never "the public half".
+  assert.match(proxyKt, /resolutions\.incrementAndGet\(\)/);
+  assert.match(proxyKt, /if \(!IpPolicy\.isPublicIp\(text\)\)/);
+  assert.match(proxyKt, /Refusal\.NON_PUBLIC/);
+
+  // The socket is opened from the CLASSIFIED address (never a name) and the
+  // result is verified against it.
+  assert.match(connectKt, /InetSocketAddress\(address, port\)/);
+  assert.doesNotMatch(connectCode, /Socket\(\s*(host|hostname|name)/, "a name-based socket would resolve again");
+  assert.doesNotMatch(proxyCode, /Socket\(\s*target\.host/);
+  assert.match(connectKt, /actual\.address\.contentEquals\(expected\.address\)/);
+  assert.match(proxyKt, /if \(!sameAddress\(socket, address\)\)/);
+
+  // Bounded resources: header cap, buffer, idle/connect timeouts, ceiling.
+  assert.match(proxyKt, /headerBytes: Int = 8 \* 1024/);
+  assert.match(proxyKt, /maxConnections: Int = 16/);
+  assert.match(proxyKt, /SynchronousQueue/);
+  assert.match(proxyKt, /Refusal\.BUSY/);
+
+  // The ONLY configuration: one loopback rule, implicit bypass removed, and no
+  // bypass/DIRECT/clear call that would restore a direct path.
+  assert.match(gateKt, /const val LOOPBACK_HOST: String = "127\.0\.0\.1"/);
+  assert.match(adapterCode, /\.addProxyRule\(rule\)/);
+  assert.match(adapterCode, /\.removeImplicitRules\(\)/);
+  for (const forbidden of ["addBypassRule", "addDirect", "bypassSimpleHostnames", "clearProxyOverride"]) {
+    assert.ok(!adapterCode.includes(forbidden), `${forbidden} is a direct path and must never be used`);
+  }
+  assert.equal(adapterCode.match(/addProxyRule\(/g).length, 1, "one rule, never a fallback list");
+  assert.match(adapterKt, /WebViewFeature\.isFeatureSupported\(WebViewFeature\.PROXY_OVERRIDE\)/);
+
+  // The open path refuses when the pin is not confirmed, before any view or
+  // navigation exists, and Rust maps that refusal to user-facing guidance.
+  assert.match(controllerKt, /SiteProxyController\.ensureReady\(operationId\)/);
+  assert.match(controllerKt, /onResult\(SiteProxyController\.ERR_PROXY_UNAVAILABLE\)/);
+  assert.match(pluginLibRs, /pub const PROXY_SENTINEL: &str = "proxy-unavailable"/);
+  assert.match(bridgeRs, /animehub_android::is_proxy_unavailable\(&error\)/);
+  const openIndex = controllerKt.indexOf("SiteProxyController.ensureReady(operationId)");
+  const loadIndex = controllerKt.indexOf("webView.loadUrl(url)");
+  assert.ok(openIndex > 0 && loadIndex > openIndex, "the pin is confirmed before the first navigation");
+
+  // Packaging and CI copy: a dropped file must not silently remove the tests.
+  for (const f of ["DnsPinnedProxy", "PinnedConnect", "SiteProxyGate", "SiteProxyController"]) {
+    assert.ok(preparePy.includes(`"${f}"`), `android_prepare.py must copy ${f}`);
+  }
+  const ci = read(".github/workflows/ci.yml");
+  for (const f of ["DnsPinnedProxyTest.kt", "SiteProxyGateTest.kt"]) {
+    assert.ok(ci.includes(`app/${f}`), `CI must copy ${f} into the test source set`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Build pipeline
 // ---------------------------------------------------------------------------
@@ -1524,6 +1610,9 @@ test("the pure Kotlin split is packaged, pure, copied and homed", () => {
     "SiteClearFlow.kt": ["object SiteClearFlow", "object CookieWipes", "interface SiteClearPort"],
     "SiteMigrationFlow.kt": ["object SiteMigrationFlow", "sealed class MigrationOutcome"],
     "SiteBackStatus.kt": ["object SiteBackStatus"],
+    "DnsPinnedProxy.kt": ["class DnsPinnedProxy", "fun parseConnectHead", "data class Limits"],
+    "PinnedConnect.kt": ["object PinnedConnect", "class AddressChangedException"],
+    "SiteProxyGate.kt": ["object SiteProxyPolicy", "class SiteProxyGate", "enum class State"],
   };
   for (const [f, markers] of Object.entries(homes)) {
     for (const m of markers) {
@@ -1692,6 +1781,67 @@ test("docs describe the profile architecture, migration and what survives", () =
   assert.match(changelog, /profil/i);
 });
 
+
+
+test("the pinning proxy is documented as design-verified, not device-verified", () => {
+  // Round 16 closed the TOCTOU gap by construction (the proxy owns the
+  // connect), but nothing has run on a device. The docs are therefore required
+  // to say three things at once — and this test fails if the balance slips:
+  // (a) R-01 (b) is NOT reported fixed, (b) the proxy is named as the
+  // guarantee while NavigationDnsGate is demoted to defence in depth, and
+  // (c) a device checklist exists and states it has not been run.
+  const risks = read("docs/security-residual-risks.md");
+  const audit = read("docs/audit-item-status.md");
+  const checklist = read("docs/android-dns-pinning-device-checklist.md");
+
+  // (a) never "fixed" for the DNS half. The R-01 row may only say OPEN /
+  // mitigated-by-design until the checklist passes.
+  // The row spans several physical lines (sub-items (a)/(b)/(c)), so collect
+  // the block up to the next table row before reading it.
+  const lines = audit.split("\n");
+  const from = lines.findIndex((line) => line.startsWith("| **R-01**"));
+  assert.ok(from >= 0, "the R-01 row must exist");
+  const to = lines.findIndex((line, i) => i > from && line.startsWith("| **R-02**"));
+  const row = lines.slice(from, to > from ? to : from + 1).join("\n");
+  assert.match(row, /OPEN/i);
+  assert.equal(
+    /\*\*\(b\) DNS[^*]*\*\*fixed/i.test(row),
+    false,
+    "R-01 (b) cannot be marked fixed before a device run",
+  );
+  assert.match(row, /android-dns-pinning-device-checklist/);
+
+  // (b) which component is the guarantee, stated rather than implied.
+  assert.match(risks, /Round 16 — DNS rebinding is decided where the connection is made/);
+  assert.match(risks, /defence in depth/);
+  assert.match(risks, /NavigationDnsGate/);
+  assert.match(risks, /direct fallback/i);
+  assert.match(risks, /device verification|No device verification yet/i);
+  const storage = read("docs/android-storage-isolation.md");
+  assert.match(storage, /refused at CONNECT by the pinning proxy/);
+  assert.equal(
+    /no DNS at all/.test(storage),
+    false,
+    "the old 'Android does no DNS' claim must not survive the proxy",
+  );
+
+  // (c) the checklist is a real script, and admits that it is unrun.
+  assert.match(checklist, /NOT YET RUN/);
+  for (const item of [
+    /PROXY_OVERRIDE/,
+    /rebind/i,
+    /tcpdump/,
+    /launcher/i,
+    /IPC/,
+    /WSS|WebSocket/,
+    /QUIC/,
+    /PiP/,
+    /MULTI_PROFILE|cookie/i,
+    /process.*(kill|recreation)|force-stop/i,
+  ]) {
+    assert.match(checklist, item);
+  }
+});
 
 test("the user blocklist is pushed from Rust into the Android WebView", () => {
   const bridgeRs = read("src-tauri/src/android_bridge.rs");

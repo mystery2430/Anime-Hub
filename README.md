@@ -73,9 +73,12 @@ Site WebView'ları hiçbir Tauri komutuna erişemez; başlatıcı arayüzü ise 
 beyaz listelenmiş komutları çağırabilir.
 
 Politikanın her platformda **nerede çalıştığı ve nerede çalışmadığı** aşağıdaki
-"Hangi kontrol nerede çalışıyor? (dürüst tablo)" bölümünde: kullanıcı engel
-listesi ve DNS çözümlemesine dayalı özel adres kontrolü Android'de
-uygulanmıyor.
+"Hangi kontrol nerede çalışıyor? (dürüst tablo)" bölümünde. Kullanıcı engel
+listesi Android'de site WebView'ına aktarılır ve iki kontrol noktasında birden
+uygulanır. DNS'e dayalı özel adres kontrolü ise Android'de artık bir ön kontrol
+değil, uygulama içi loopback CONNECT proxy'sinin bağlantı anındaki kararıdır:
+çözülen adres ile soketin bağlandığı adres aynıdır. Masaüstünde desteklenen bir
+ağ kancası olmadığı için orada yalnızca ön kontrol vardır.
 
 ```mermaid
 flowchart TB
@@ -230,26 +233,40 @@ site yolları hiç dokunmaz.
 | `http://` reddi | ✅ `on_navigation` | ⚠️ motorun mixed-content politikası | ✅ `SiteNavigationPolicy` | ✅ `shouldInterceptRequest` |
 | Özel/loopback **IP literalleri** ve host kuralları | ✅ | ❌ | ✅ | ✅ |
 | Kullanıcı engel listesi | ✅ | ❌ masaüstünde alt kaynak kesme noktası yok | ✅ | ✅ |
-| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol, bağlantı pinlenmiyor | ❌ | ⚠️ ön kontrol, bağlantı pinlenmiyor | ⚠️ ön kontrol, bağlantı pinlenmiyor |
+| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol, bağlantı pinlenmiyor | ❌ | ✅ **CONNECT proxy'si bağlantıyı denetlenen IP'ye sabitler** (cihazda doğrulanmadı) | ✅ aynı (her istek yeni karar) |
 | `data:` üst düzey belge | ✅ reddedilir | ➖ (alt kaynak olarak serbest) | ✅ reddedilir | ➖ serbest |
 
-**Android'de DNS ön kontrolü vardır; bağlantı sabitleme yoktur.**
-`shouldInterceptRequest` her istekten önce çözer ve özel/loopback/link-local ya
-da değişmiş bir cevabı reddeder. Üst düzey `shouldOverrideUrlLoading` çağrısı
-eşzamanlı yanıt vermek zorundadır; cache miss'te `ALLOW_AND_PROBE` döner, yani
-DNS sonucu gelmeden gezinti devam eder ve cevap yalnızca sonraki istekler için
-cache'lenir. Motor bağlantı sırasında yeniden çözümleme yapabildiği için cevap
-ile soket arasında **TOCTOU** penceresi kalır: rebinding yapan bir host ön
-kontrole public, sokete private cevap verebilir. Gerçek çözüm, çözülen adresi
-bağlantıya sabitleyen bir ağ katmanıdır (yerel CONNECT proxy / sağlayıcı
-filtresi); bu PR'da uygulanmamıştır. Değerlendirilen ağ katmanı seçenekleri
-(`androidx.webkit.ProxyController` / `WebViewFeature.PROXY_OVERRIDE` ve reddedilen
-alternatifler) ile uygulanmadan önce çalışması gereken cihaz/emülatör matriksi
-`docs/security-residual-risks.md` içinde yazılıdır; bu ortamda Android SDK,
-Gradle, JVM, cihaz veya emülatör bulunmadığı için hiçbiri doğrulanamadı ve
-doğrulanmamış bir proxy varsayılan olarak eklenmedi. Bu nedenle DNS rebinding
-**açık bir güvenlik riski** olarak kalır; belge veya test değişikliği onu
-kapatmaz.
+**Android'de bağlantı artık denetlenen IP'ye sabitleniyor (round 16).**
+Site WebView'ının trafiği, uygulama içindeki loopback CONNECT proxy'sinden
+geçer: `androidx.webkit.ProxyController` ile **tek** bir `addProxyRule`
+(`127.0.0.1:<rastgele port>`) ve `removeImplicitRules()` kurulur; `addDirect()`,
+bypass kuralı veya kural içermeyen config **yoktur** ve override hiçbir zaman
+temizlenmez — yani proxy çökerse istek başarısız olur, doğrudan bağlantıya
+düşmez. Yeni bir site WebView'ının ilk `loadUrl` çağrısı, `setProxyOverride`
+callback'i gelmeden yapılmaz (5 sn watchdog). Sağlayıcı `PROXY_OVERRIDE`
+desteklemiyorsa, proxy portu bağlanamıyorsa veya callback gelmezse site
+**açılmaz** ve kullanıcıya açık bir hata gösterilir; `ALLOW_AND_PROBE`'a geri
+düşülmez.
+
+Proxy yalnızca `CONNECT` kabul eder (düz HTTP reddedilir), hedefi katı biçimde
+ayrıştırır, adı **bir kez** çözer, dönen her adresi mevcut `IpPolicy` ile
+sınıflandırır (karışık/boş/hatalı cevap → ret) ve soketi
+`InetSocketAddress(adres, port)` ile açar — ikinci bir çözümleme yoktur — sonra
+`socket.inetAddress` değerini denetlediği adresle karşılaştırır. TLS hiçbir zaman
+sonlandırılmaz veya araya girilmez; sertifika doğrulaması WebView'da kalır ve
+sertifika hataları yutulmaz. Her yeni `CONNECT` (her redirect, her WSS/WebSocket
+isteği) yeni bir karardır.
+
+`NavigationDnsGate` / `shouldInterceptRequest` ön kontrolleri **savunma
+derinliği** olarak korunur; artık garanti olarak sunulmaz. Bu ortamda Android
+SDK, Gradle, cihaz veya emülatör bulunmadığı için proxy'nin WebView ile
+gerçekten konuştuğu, QUIC'in kapandığı, redirect/PiP/launcher davranışı
+**cihazda doğrulanmadı**; çalıştırılacak matriks
+[`docs/android-dns-pinning-device-checklist.md`](docs/android-dns-pinning-device-checklist.md)
+içinde. Bu nedenle DNS rebinding (R-01 b) **kapalı sayılmaz**: tasarım ve
+gerçek-soket testleriyle kapatılmış, cihaz doğrulaması bekleyen bir bulgu olarak
+kalır. Masaüstü aynı TOCTOU şeklini korur, çünkü orada desteklenen bir ağ kancası
+yoktur.
 
 ### ➕&nbsp; Kodsuz site ekleme
 

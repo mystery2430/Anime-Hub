@@ -58,11 +58,24 @@ pub const MULTI_PROFILE_UNSUPPORTED_MSG: &str = "Bu cihazın WebView sağlayıc�
 /// state, not a dead end.
 pub const PROFILE_QUARANTINED_MSG: &str = "Bu sitenin verileri temizlenirken çerez silme işlemi zaman aşımına uğradı ve tamamlanıp tamamlanmadığı doğrulanamadı. İşlem arka planda hâlâ sürüyor olabileceği için site, bekleyen tüm silme işlemleri sonuçlanıp temizlik doğrulanana kadar açılmadı: açılsaydı yeni oturumun çerezleri silinebilirdi. Sonradan yapılan başarılı bir temizlik, daha önce zaman aşımına uğrayan silme işlemini beklemekten vazgeçirmez. Site verilerini yeniden temizlemeyi deneyin; sonuç değişmezse siteyi kaldırıp yeniden ekleyin. Kayıtlı oturum verileriniz korunuyor.";
 
+/// User-facing explanation when Kotlin refuses to open a site because the
+/// connection-pinning proxy is not in effect (no `PROXY_OVERRIDE`, the loopback
+/// proxy could not bind, or the install callback never arrived).
+///
+/// The refusal is the point: without the proxy the WebView resolves a hostname
+/// again when it connects, so a rebinding name could reach a private address
+/// after passing every check. "Open the site anyway" would restore exactly that
+/// gap, which is why this message offers no such option and does not call the
+/// state transient — only a WebView update can change it.
+pub const PROXY_UNAVAILABLE_MSG: &str = "Bu cihazda site bağlantıları güvenli biçimde sabitlenemedi: WebView, bağlantıları denetlenen IP adresine yönlendiren yerel proxy'yi (PROXY_OVERRIDE) uygulayamadı ya da proxy başlatılamadı. Site, DNS yeniden yönlendirmesine (rebinding) karşı korunmasız açılmayacağı için açılmadı. Android System WebView veya Google Chrome'u güncelleyip tekrar deneyin. Sorun sürerse bu cihazın WebView sağlayıcısı bu özelliği desteklemiyor olabilir.";
+
 /// Map Kotlin's closed protocol sentinels to actionable errors without ever
 /// forwarding provider exception text, profile names or other bridge payloads.
 pub fn classify_site_open_error(error: animehub_android::Error) -> AppError {
     if animehub_android::is_unsupported_multi_profile(&error) {
         AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string())
+    } else if animehub_android::is_proxy_unavailable(&error) {
+        AppError::Unsupported(PROXY_UNAVAILABLE_MSG.to_string())
     } else if animehub_android::is_profile_quarantined(&error) {
         AppError::Quarantined(PROFILE_QUARANTINED_MSG.to_string())
     } else if animehub_android::is_migration_retry(&error) {
@@ -81,6 +94,9 @@ pub fn classify_site_open_error(error: animehub_android::Error) -> AppError {
 #[cfg(target_os = "android")]
 fn plugin_error_class(error: &animehub_android::Error) -> &'static str {
     if animehub_android::is_unsupported_multi_profile(error) {
+        "unsupported"
+    } else if animehub_android::is_proxy_unavailable(error) {
+        // A feature gap on this provider, not a transient failure.
         "unsupported"
     } else if animehub_android::is_profile_quarantined(error) {
         "quarantined"
@@ -777,6 +793,26 @@ mod tests {
         ));
         assert_eq!(unsupported.code(), "unsupported");
         assert_eq!(unsupported.to_string(), MULTI_PROFILE_UNSUPPORTED_MSG);
+
+        // The pinning-proxy refusal is its own message: the site is refused so
+        // it cannot run unpinned, and the text never suggests opening anyway.
+        let unpinned = classify_site_open_error(animehub_android::Error::Bridge(format!(
+            "{}",
+            animehub_android::PROXY_SENTINEL
+        )));
+        assert_eq!(unpinned.code(), "unsupported");
+        assert_eq!(unpinned.to_string(), PROXY_UNAVAILABLE_MSG);
+        assert!(!unpinned
+            .to_string()
+            .contains(animehub_android::PROXY_SENTINEL));
+        assert!(
+            unpinned.to_string().contains("rebinding"),
+            "the message must name what the refusal protects against"
+        );
+        assert!(
+            unpinned.to_string().contains("açılmadı"),
+            "the message must say the site was not opened"
+        );
 
         let quarantined = classify_site_open_error(animehub_android::Error::Bridge(format!(
             "{}: {}",

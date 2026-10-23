@@ -236,6 +236,12 @@ jobs:
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteWebViewSettingsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteWebViewSettingsTest.kt could not be copied into the test source set"; exit 1; }
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubDebugLogTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::AnimeHubDebugLogTest.kt could not be copied into the test source set"; exit 1; }
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/PipTransferFlowTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::PipTransferFlowTest.kt could not be copied into the test source set"; exit 1; }
+          # Connection pinning: the CONNECT parser, the pinned connect and the
+          # tunnel run against real loopback sockets in this suite. A missing
+          # copy would silently drop the only test that proves a rebinding
+          # answer cannot reach a private address.
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/DnsPinnedProxyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::DnsPinnedProxyTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProxyGateTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteProxyGateTest.kt could not be copied into the test source set"; exit 1; }
           # The shared navigation-policy vectors: the Kotlin suite loads this
           # file from the test classpath and the Rust suite includes the very
           # same path with include_str!. A missing copy fails here (and the test
