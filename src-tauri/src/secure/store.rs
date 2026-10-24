@@ -201,7 +201,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     let _guard = STORE_LOCK
         .lock()
         .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-    atomic_write_locked(path, bytes)
+    atomic_write_locked(path, bytes).map_err(AppError::from)
 }
 
 /// Create the temporary file of an atomic write: exclusive and owner-only.
@@ -328,12 +328,18 @@ mod tests {
         // error below. Linux and macOS report EISDIR for a file-over-directory
         // rename; on Windows the check only rules out the earlier phases.
         #[cfg(unix)]
-        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{err}");
+        {
+            let kind = err.kind();
+            let refused = kind == std::io::ErrorKind::IsADirectory;
+            let refused = refused || kind == std::io::ErrorKind::NotADirectory;
+            assert!(refused, "{err}");
+        }
+        // Windows reports ERROR_ACCESS_DENIED; the earlier phases cannot
+        // produce that kind with a writable parent and an unused temp name.
         #[cfg(not(unix))]
         {
             let kind = err.kind();
-            assert!(kind != std::io::ErrorKind::AlreadyExists, "{kind:?}");
-            assert!(kind != std::io::ErrorKind::NotFound, "{kind:?}");
+            assert_eq!(kind, std::io::ErrorKind::PermissionDenied, "{err}");
         }
 
         // The target is untouched …
