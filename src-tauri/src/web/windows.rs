@@ -271,7 +271,6 @@ fn site_proxy_requests() -> Option<usize> {
     slot.as_ref().map(|handle| handle.requests())
 }
 
-
 /// Lock the desktop session. See the `DESKTOP_SESSION_LOCK` docs for the
 /// global lock order.
 #[cfg(desktop)]
@@ -3937,7 +3936,10 @@ mod tests {
         assert_eq!(darwin_major(""), 0);
         assert!(macos_proxy_supported("23.0.0", true));
         assert!(macos_proxy_supported("24.1.0", true));
-        assert!(!macos_proxy_supported("22.6.0", true), "macOS 13 must refuse");
+        assert!(
+            !macos_proxy_supported("22.6.0", true),
+            "macOS 13 must refuse"
+        );
         assert!(
             !macos_proxy_supported("23.0.0", false),
             "a build without the proxy bridge must refuse, not open unprotected"

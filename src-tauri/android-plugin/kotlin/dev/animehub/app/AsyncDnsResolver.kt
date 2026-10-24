@@ -35,8 +35,10 @@ import android.net.DnsResolver
 import android.os.CancellationSignal
 import java.io.IOException
 import java.net.InetAddress
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -118,6 +120,11 @@ internal class PlatformDnsLookup(
 /**
  * The resolver the proxy uses: `(String) -> List<InetAddress>`, like the
  * blocking default it replaces, but with a deadline it can rely on.
+ *
+ * The coordination uses a per-flight [CountDownLatch] rather than
+ * `wait`/`notifyAll`: Kotlin's `Any` does not expose the monitor methods, and a
+ * `java.lang.Object` cast for them is exactly the pattern the Kotlin docs
+ * discourage in favour of the concurrency utilities.
  */
 internal class AsyncDnsResolver(
   private val lookup: DnsLookup,
@@ -126,6 +133,12 @@ internal class AsyncDnsResolver(
 ) : (String) -> List<InetAddress> {
   /** One lookup, shared by every caller that asked for the same host. */
   private class Flight {
+    /**
+     * Released exactly once, when the flight settles — answer, failure or
+     * cancel. The latch is also the publication edge for the three fields
+     * below: they are written under the lock before the count reaches zero.
+     */
+    val settled = CountDownLatch(1)
     var done = false
     var cancelled = false
     var answers: List<InetAddress>? = null
@@ -142,50 +155,53 @@ internal class AsyncDnsResolver(
   override fun invoke(host: String): List<InetAddress> {
     val key = host.trim().lowercase()
     if (key.isEmpty()) throw IOException("empty host")
-    val flight: Flight
-    synchronized(lock) {
-      val existing = flights[key]
-      if (existing != null) {
-        // Single-flight: a second CONNECT for a name already being resolved
-        // waits for that lookup instead of starting another one.
-        flight = existing
-      } else {
-        if (inFlight >= maxInFlight) {
-          // A refusal, never a queue: the proxy answers RESOLVE_EXHAUSTED.
-          throw IOException("resolver busy")
-        }
-        inFlight += 1
-        flight = Flight()
-        flights[key] = flight
-        // Started under the lock so a cancel racing with start cannot lose
-        // the handle that makes cancellation possible.
-        flight.handle =
-          lookup.start(key) { answers, error -> complete(key, flight, answers, error) }
-      }
-    }
+    val flight = synchronized(lock) { flightFor(key) }
     return await(key, flight)
   }
 
-  private fun await(key: String, flight: Flight): List<InetAddress> {
-    val deadlineNanos = System.nanoTime() + timeoutMs.toLong() * 1_000_000L
-    var timedOut = false
-    synchronized(lock) {
-      while (!flight.done) {
-        val remainingMs = (deadlineNanos - System.nanoTime()) / 1_000_000L
-        if (remainingMs <= 0) {
-          timedOut = true
-          break
-        }
-        try {
-          (lock as Object).wait(remainingMs)
-        } catch (_: InterruptedException) {
-          Thread.currentThread().interrupt()
-          timedOut = true
-          break
-        }
-      }
+  /**
+   * The flight for [key], starting one if nothing is in flight for it.
+   *
+   * Must be called with [lock] held.
+   */
+  private fun flightFor(key: String): Flight {
+    val existing = flights[key]
+    if (existing != null) {
+      // Single-flight: a second CONNECT for a name already being resolved
+      // waits for that lookup instead of starting another one.
+      return existing
     }
-    if (timedOut) {
+    if (inFlight >= maxInFlight) {
+      // A refusal, never a queue: the proxy answers RESOLVE_EXHAUSTED.
+      throw IOException("resolver busy")
+    }
+    inFlight += 1
+    val flight = Flight()
+    flights[key] = flight
+    try {
+      // Started under the lock so a cancel racing with start cannot lose the
+      // handle that makes cancellation possible.
+      flight.handle = lookup.start(key) { answers, error -> complete(key, flight, answers, error) }
+    } catch (t: Throwable) {
+      flights.remove(key)
+      inFlight -= 1
+      throw t
+    }
+    return flight
+  }
+
+  private fun await(key: String, flight: Flight): List<InetAddress> {
+    val settled =
+      try {
+        flight.settled.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+      } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        cancel(key, flight)
+        throw IOException("resolver interrupted", e)
+      }
+    if (!settled) {
+      // The provider is allowed to ignore the cancellation; the caller is
+      // released either way, which is what keeps the thread budget bounded.
       cancel(key, flight)
       throw IOException("resolver timed out")
     }
@@ -208,10 +224,10 @@ internal class AsyncDnsResolver(
       flight.failure = IOException("resolver cancelled")
       release(key, flight)
       handle = flight.handle
-      lock.notifyAll()
     }
     // Outside the lock: a provider is free to call back synchronously.
     handle?.cancel()
+    flight.settled.countDown()
   }
 
   /**
@@ -230,8 +246,8 @@ internal class AsyncDnsResolver(
       flight.answers = answers
       flight.failure = error
       release(key, flight)
-      lock.notifyAll()
     }
+    flight.settled.countDown()
   }
 
   /** Must be called with [lock] held. */

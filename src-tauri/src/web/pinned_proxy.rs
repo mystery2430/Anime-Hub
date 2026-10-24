@@ -756,7 +756,9 @@ mod tests {
             .expect("proxy");
         let first_port = first.port();
         first.stop();
-        let second = start_with(resolver, Policy::PUBLIC_ONLY, test_limits()).await.expect("proxy");
+        let second = start_with(resolver, Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
         assert_ne!(first_port, second.port());
         second.stop();
     }

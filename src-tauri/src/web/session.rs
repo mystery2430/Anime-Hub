@@ -1001,7 +1001,9 @@ mod tests {
         // lives in windows.rs so a refactor cannot drop it silently.
         let windows_rs = include_str!("windows.rs");
         assert!(
-            windows_rs.contains("initialization_script_for_all_frames(crate::web::session::WEBRTC_GUARD)"),
+            windows_rs.contains(
+                "initialization_script_for_all_frames(crate::web::session::WEBRTC_GUARD)"
+            ),
             "the site WebView must install the guard in every frame"
         );
     }

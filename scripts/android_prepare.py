@@ -536,6 +536,13 @@ def prepare(root: Path, gen: Path) -> list[str]:
         "PinnedConnect",
         "SiteProxyGate",
         "SiteProxyController",
+        # Round 17: the asynchronous, cancellable host lookup the proxy now
+        # uses instead of blocking `getAllByName`. Both halves live in one
+        # file (the JVM resolver + the android.net.DnsResolver adapter), and
+        # the file is REQUIRED: without it SiteProxyController cannot resolve
+        # the resolver it constructs, and the proxy would fall back to the
+        # uncancellable lookup this change removed.
+        "AsyncDnsResolver",
     ):
         aux_src = kotlin_source(root, package, aux)
         if not aux_src.is_file():
