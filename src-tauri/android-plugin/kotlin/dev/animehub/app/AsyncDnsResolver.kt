@@ -21,8 +21,14 @@
 //     it cannot be written into a stale verdict either);
 //   * per-host single-flight: concurrent CONNECTs for one name share one
 //     lookup instead of each starting their own;
-//   * a ceiling on in-flight lookups, and no queue: over the ceiling is a
-//     refusal, which the proxy maps to `RESOLVE_EXHAUSTED`.
+//   * two ceilings and no queue — one for the logical flights this class is
+//     awaiting, one for the platform queries whose callback has not arrived
+//     yet. Over either ceiling is a refusal, never a queue. The second ceiling
+//     exists because `CancellationSignal.cancel()` is "used by the caller to
+//     signal if the query should be cancelled" (the platform reference promises
+//     neither a completion callback nor that the work has stopped), so the
+//     logical ceiling alone would let a provider that never calls back start
+//     one more query per timeout, without limit.
 //
 // WHAT IT DOES NOT DO
 //
@@ -85,7 +91,12 @@ internal class PlatformDnsLookup(
     val callback =
       object : DnsResolver.Callback<MutableList<InetAddress>> {
         override fun onAnswer(answer: MutableList<InetAddress>, rcode: Int) {
-          if (settled.compareAndSet(false, true)) onResult(answer.toList(), null)
+          if (!settled.compareAndSet(false, true)) return
+          try {
+            onResult(dnsAnswerOrFailure(rcode, answer), null)
+          } catch (e: IOException) {
+            onResult(null, e)
+          }
         }
 
         override fun onError(error: DnsResolver.DnsException) {
@@ -123,6 +134,27 @@ internal class PlatformDnsLookup(
 }
 
 /**
+ * The one rule about `rcode`, in a form a JVM test can call.
+ *
+ * `DnsResolver.Callback.onAnswer` is documented as "invoked when the answer to
+ * a query was successfully parsed", and `rcode` as "the response code in the
+ * DNS response" (android.net.DnsResolver.Callback). Parsing and succeeding are
+ * not the same thing, and the reference does not promise that the address list
+ * is empty when the response code reports a failure — SERVFAIL/REFUSED answers
+ * can be parsed. Only `0` (NOERROR) means "use these addresses"; anything else
+ * is a resolution failure, which the proxy turns into a refusal. This is the
+ * fail-closed reading of an under-specified contract, and it costs nothing:
+ * ignoring a nonzero rcode could only ever *accept* an answer.
+ */
+internal fun dnsAnswerOrFailure(rcode: Int, answer: List<InetAddress>): List<InetAddress> {
+  if (rcode != DNS_RCODE_NOERROR) throw IOException("dns rcode $rcode")
+  return answer
+}
+
+/** NOERROR. The only DNS response code that means "the answer is usable". */
+internal const val DNS_RCODE_NOERROR: Int = 0
+
+/**
  * The resolver the proxy uses: `(String) -> List<InetAddress>`, like the
  * blocking default it replaces, but with a deadline it can rely on.
  *
@@ -135,13 +167,17 @@ internal class AsyncDnsResolver(
   private val lookup: DnsLookup,
   private val timeoutMs: Int = 10_000,
   private val maxInFlight: Int = 8,
+  /** How long a platform slot is held after the app stops waiting for it. */
+  private val platformGraceMs: Long = 60_000,
+  /** Clock seam for the grace period; the deadline uses the latch's own wait. */
+  private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
 ) : (String) -> List<InetAddress> {
   /** One lookup, shared by every caller that asked for the same host. */
   private class Flight {
     /**
      * Released exactly once, when the flight settles — answer, failure or
-     * cancel. The latch is also the publication edge for the three fields
-     * below: they are written under the lock before the count reaches zero.
+     * cancel. The latch is also the publication edge for the fields below:
+     * they are written under the lock before the count reaches zero.
      */
     val settled = CountDownLatch(1)
     var done = false
@@ -149,12 +185,29 @@ internal class AsyncDnsResolver(
     var answers: List<InetAddress>? = null
     var failure: Throwable? = null
     var handle: DnsLookup.Cancel? = null
+
+    /** The platform reported something (answer, error or rcode failure). */
+    var platformDone = false
+
+    /**
+     * When the platform slot may be reclaimed anyway. `Long.MAX_VALUE` while
+     * the caller is still waiting: there is nothing to reclaim yet.
+     */
+    var reclaimAtMs = Long.MAX_VALUE
   }
 
-  /** Guards the map, the counter and every [Flight] field. */
+  /** Guards the maps, the counters and every [Flight] field. */
   private val lock = Any()
 
+  /** Logical flights currently awaited, one per hostname. */
   private val flights = HashMap<String, Flight>()
+
+  /**
+   * Flights whose platform query has not reported back yet, in start order.
+   * Bounded by [maxInFlight]; a slot is reclaimed on a callback or after
+   * [platformGraceMs] past the cancel, whichever comes first.
+   */
+  private val platform = LinkedHashSet<Flight>()
   private var inFlight = 0
 
   override fun invoke(host: String): List<InetAddress> {
@@ -176,8 +229,10 @@ internal class AsyncDnsResolver(
       // waits for that lookup instead of starting another one.
       return existing
     }
-    if (inFlight >= maxInFlight) {
-      // A refusal, never a queue: the proxy answers RESOLVE_EXHAUSTED.
+    sweep(nowMs())
+    if (inFlight >= maxInFlight || platform.size >= maxInFlight) {
+      // A refusal, never a queue. The proxy reports it as RESOLVE_FAILED (502):
+      // it is an availability refusal, not a verdict about the host.
       throw IOException("resolver busy")
     }
     inFlight += 1
@@ -190,8 +245,12 @@ internal class AsyncDnsResolver(
     } catch (t: Throwable) {
       flights.remove(key)
       inFlight -= 1
+      platform.remove(flight)
       throw t
     }
+    // `start` may answer synchronously: then `complete` already ran and the
+    // slot was released before it was taken.
+    if (!flight.platformDone) platform.add(flight)
     return flight
   }
 
@@ -206,7 +265,8 @@ internal class AsyncDnsResolver(
       }
     if (!settled) {
       // The provider is allowed to ignore the cancellation; the caller is
-      // released either way, which is what keeps the thread budget bounded.
+      // released either way. The platform slot is NOT released here — see
+      // `cancel`.
       cancel(key, flight)
       throw IOException("resolver timed out")
     }
@@ -229,15 +289,22 @@ internal class AsyncDnsResolver(
       flight.failure = IOException("resolver cancelled")
       release(key, flight)
       handle = flight.handle
+      // The platform query may still be running and may never call back, so
+      // its slot is kept until a callback arrives or the grace period passes —
+      // never awaited synchronously, which would let a silent provider wedge
+      // the resolver for the life of the process.
+      if (platform.contains(flight)) flight.reclaimAtMs = nowMs() + platformGraceMs
     }
-    // Outside the lock: a provider is free to call back synchronously.
-    handle?.cancel()
+    // Outside the lock: a provider is free to call back synchronously, and a
+    // broken `Cancel` must not replace the caller's own verdict with its throw.
+    runCatching { handle?.cancel() }
     flight.settled.countDown()
   }
 
   /**
    * Platform answer. A late answer for a cancelled or already-finished flight
-   * is dropped here, so it can never turn a timeout into a success.
+   * is dropped here, so it can never turn a timeout into a success — but it
+   * still releases the platform slot it was holding.
    */
   private fun complete(
     key: String,
@@ -246,6 +313,8 @@ internal class AsyncDnsResolver(
     error: Throwable?,
   ) {
     synchronized(lock) {
+      flight.platformDone = true
+      platform.remove(flight)
       if (flight.done || flight.cancelled) return
       flight.done = true
       flight.answers = answers
@@ -263,6 +332,21 @@ internal class AsyncDnsResolver(
     }
   }
 
-  /** In-flight lookups, for the tests and the coarse debug log. */
+  /** Reclaim platform slots whose grace period has passed. Lock held. */
+  private fun sweep(now: Long) {
+    val iterator = platform.iterator()
+    while (iterator.hasNext()) {
+      if (iterator.next().reclaimAtMs <= now) iterator.remove()
+    }
+  }
+
+  /** Logical flights being awaited, for the tests and the coarse debug log. */
   internal fun inFlightCount(): Int = synchronized(lock) { inFlight }
+
+  /**
+   * Platform queries whose callback has not arrived yet. At most
+   * [maxInFlight]; a value that stays at the ceiling means the provider is not
+   * answering at all, which is exactly what the grace period bounds.
+   */
+  internal fun platformCount(): Int = synchronized(lock) { platform.size }
 }

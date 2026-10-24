@@ -122,11 +122,17 @@ class DnsPinnedProxy(
     RESOLVE_FAILED,
 
     /**
-     * Every resolver thread is stuck inside a lookup that cannot be cancelled,
-     * and no further thread may be created. This is a DNS outage for the whole
-     * process, not a property of the host that was asked for: nothing is
-     * remembered about that host, and service returns by itself only if a
-     * stuck lookup eventually returns (see [resolveThreadCap]).
+     * Every resolver worker is busy with a lookup and the worker budget is
+     * spent. This is an availability refusal for the whole process, not a
+     * property of the host that was asked for: nothing is remembered about
+     * that host and the `CONNECT` is answered with 502.
+     *
+     * How long it lasts is the injected resolver's business. With the shipped
+     * [AsyncDnsResolver] every lookup ends at its own deadline (10 s), so the
+     * workers return by themselves within that bound. With the blocking
+     * fallback a lookup that never returns owns its worker until the platform
+     * call returns (see [Limits.resolveThreadCap]). Either way nothing is
+     * cached, so service returns by itself and no host is ever marked bad.
      */
     RESOLVE_EXHAUSTED,
 
@@ -153,42 +159,52 @@ class DnsPinnedProxy(
     /**
      * How long one `CONNECT` may spend waiting for the resolver.
      *
-     * `InetAddress.getAllByName` has no timeout and cannot be cancelled, so a
-     * stuck DNS answer would otherwise block a handler thread for as long as
-     * the platform resolver takes (minutes, on a captive portal). The wait is
-     * bounded here instead. The abandoned lookup keeps its resolver thread
-     * until the platform call returns, which is why threads are counted against
-     * [resolveThreadCap] (never one thread per connection).
+     * The lookup runs on a bounded worker and the caller waits at most this
+     * long, whatever the resolver does. The shipped [AsyncDnsResolver] also
+     * owns a deadline of its own (10 s by default), so in production the two
+     * agree: the resolver settles — and cancels — its platform query itself.
+     * A lookup abandoned by this outer bound is interrupted, and its answer is
+     * dropped: no address from it is classified, cached or connected to.
      */
     val resolveMs: Int = 10_000,
     /**
-     * Resolver threads per generation. `InetAddress.getAllByName` cannot be
-     * cancelled, so a lookup that never returns owns its thread forever.
+     * Resolver workers per generation: how many lookups one pool may run at
+     * once.
      *
      * Generations are **reused**: a lookup is submitted to the current
      * generation and, if that one is full, to any older generation that still
-     * has a free thread. Only when every generation is full is another one
+     * has a free worker. Only when every generation is full is another one
      * created (see [resolveThreadCap]). A rejected submission is a refusal,
      * never a queue.
+     *
+     * The blocking fallback (`InetAddress.getAllByName`) cannot be cancelled,
+     * so one of its calls that never returns owns its worker until the
+     * platform returns — which is why workers are counted against
+     * [resolveThreadCap]. The shipped [AsyncDnsResolver] bounds its own call,
+     * so in production this is a concurrency limit, not a leak bound.
      */
     val resolveThreads: Int = 4,
     /**
-     * Hard ceiling on resolver threads for this proxy object, across every
-     * generation **and across `stop()`/`start()` cycles**, because a platform
-     * call that ignores the interrupt outlives both.
+     * Hard ceiling on resolver workers for this proxy object, across every
+     * generation **and across `stop()`/`start()` cycles**, so a call that
+     * outlives one lifecycle is still counted against the next.
      *
-     * The budget is spent on threads that can still run a lookup: `resolveThreads`
-     * per live generation plus the threads of shut-down generations that are
+     * The budget is spent on workers that can still run a lookup: `resolveThreads`
+     * per live generation plus the workers of shut-down generations that are
      * still executing an abandoned call. A shut-down generation whose calls
      * have all returned cannot run anything again, so it stops counting.
      *
      * It must leave room for at least one full spare generation (enforced in
-     * [Limits]), which is what gives the proxy its one automatic recovery.
+     * [Limits]), which is what the proxy retries with after a rotation.
      * Capacity is spent in whole generations, so a cap that is not a multiple
      * of [resolveThreads] leaves the remainder unused rather than creating a
-     * half generation. When the budget is spent, [Refusal.RESOLVE_EXHAUSTED] is
-     * the answer and DNS stays refused until the process restarts. **This is a
-     * documented availability residual, not automatic recovery.**
+     * half generation.
+     *
+     * When the budget is spent, [Refusal.RESOLVE_EXHAUSTED] is the answer. With
+     * the shipped [AsyncDnsResolver] every worker frees itself at its deadline,
+     * so that refusal cannot outlive the deadline; with the blocking fallback a
+     * wedged lookup holds its worker for the life of the process. **That case
+     * is a documented availability residual, not automatic recovery.**
      */
     val resolveThreadCap: Int = 8,
     val idleMs: Int = 180_000,
@@ -658,12 +674,17 @@ class DnsPinnedProxy(
    * Resolve [host] exactly once, with a bounded wait. IP literals are parsed,
    * never resolved.
    *
-   * A timeout is a REFUSAL, never a verdict: the abandoned lookup may still be
-   * running inside the platform resolver (there is no cancellation API), but
-   * its answer is dropped, no address is classified from it, and no socket is
-   * opened for it. A later attempt for the same name resolves again instead of
-   * reusing the failure — there is no cache here in either direction, so
-   * neither a broken answer nor a good one can become a stale public verdict.
+   * A timeout is a REFUSAL, never a verdict: the abandoned lookup's answer is
+   * dropped, no address is classified from it, and no socket is opened for it.
+   * A later attempt for the same name resolves again instead of reusing the
+   * failure — there is no cache here in either direction, so neither a broken
+   * answer nor a good one can become a stale public verdict.
+   *
+   * The resolver call itself may still be running after the refusal: the
+   * blocking fallback cannot be cancelled at all, and the shipped
+   * [AsyncDnsResolver] asks the platform to stop without waiting for it. The
+   * answer is dropped either way, and the shipped resolver bounds its own call
+   * so the worker is not held by a provider that never answers.
    */
   private fun resolveOnce(host: String): List<InetAddress> {
     literal(host)?.let { return listOf(it) }
@@ -673,9 +694,9 @@ class DnsPinnedProxy(
       future.get(limits.resolveMs.toLong(), TimeUnit.MILLISECONDS)
     } catch (_: TimeoutException) {
       // Best effort only: `cancel(true)` cannot interrupt a blocking
-      // `getAllByName`. The task keeps its (bounded) resolver thread, and its
-      // answer is dropped even if it arrives later — nothing is read from a
-      // future that already timed out.
+      // `getAllByName`, and the shipped AsyncDnsResolver is already bounded by
+      // its own deadline. The answer is dropped even if it arrives later —
+      // nothing is read from a future that already timed out.
       future.cancel(true)
       throw IOException("resolver timed out")
     } catch (e: ExecutionException) {
@@ -692,8 +713,8 @@ class DnsPinnedProxy(
   /**
    * Submit one lookup, reusing any generation that still has a free thread.
    *
-   * A generation whose threads are all owned by an uncancellable call rejects
-   * the submission (`SynchronousQueue`, so nothing queues). That rejection says
+   * A generation whose workers are all owned by unsettled lookups rejects the
+   * submission (`SynchronousQueue`, so nothing queues). That rejection says
    * nothing about the *other* generations: a wedged generation can become
    * usable again the moment one of its calls returns, and an older one may be
    * idle while the current one is full. So the lookup is offered to the current
@@ -760,10 +781,10 @@ class DnsPinnedProxy(
    *
    * A live generation is counted at its capacity: that is what it may still
    * spawn, and counting capacity rather than the current `poolSize` keeps the
-   * bound true for a thread that is being created right now. A shut-down
+   * bound true for a worker that is being created right now. A shut-down
    * generation is counted at its `activeCount` — the calls that are still
-   * running and cannot be reclaimed — because an idle worker in a shut-down
-   * pool has nothing left to execute and exits on its own.
+   * running — because an idle worker in a shut-down pool has nothing left to
+   * execute and exits on its own.
    *
    * The distinction matters across `stop()`/`start()`: the stuck call from the
    * previous lifecycle is counted, an idle thread that is merely exiting is not.
