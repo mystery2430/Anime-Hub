@@ -296,7 +296,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let existing = dir.path().join("already-there");
         std::fs::write(&existing, b"keep me").unwrap();
-        let err = create_private_exclusive(&existing).expect_err("an existing path must not be opened");
+        let opened = create_private_exclusive(&existing);
+        let err = opened.expect_err("an existing path must not be opened");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
     }

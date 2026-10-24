@@ -140,7 +140,8 @@ fn in_flight() -> &'static Mutex<HashMap<String, Arc<Pending>>> {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic in a resolver thread must not disable DNS for the process: the
     // data behind these locks is a plain map and a plain Option.
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    let guard = mutex.lock();
+    guard.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Join the running lookup for `host`, or claim the slot to start one.
@@ -400,20 +401,18 @@ mod tests {
     #[test]
     fn a_resolver_answer_is_classified_and_an_error_is_unknown() {
         let limit = Duration::from_millis(500);
-        assert_eq!(
-            lookup_with("public.test", limit, 2, |_| Ok(vec![PUBLIC])),
-            DnsClass::Answered { private: false }
-        );
-        assert_eq!(
-            lookup_with("private.test", limit, 2, |_| Ok(vec![PUBLIC, PRIVATE])),
-            DnsClass::Answered { private: true }
-        );
-        assert_eq!(
-            lookup_with("error.test", limit, 2, |_| {
-                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "nxdomain"))
-            }),
-            DnsClass::Unknown
-        );
+        let answered = lookup_with("public.test", limit, 2, |_| Ok(vec![PUBLIC]));
+        assert_eq!(answered, DnsClass::Answered { private: false });
+
+        let mixed = |_: &str| -> std::io::Result<Vec<IpAddr>> { Ok(vec![PUBLIC, PRIVATE]) };
+        let answered = lookup_with("private.test", limit, 2, mixed);
+        assert_eq!(answered, DnsClass::Answered { private: true });
+
+        let not_found = std::io::ErrorKind::NotFound;
+        let failed = lookup_with("error.test", limit, 2, move |_| {
+            Err(std::io::Error::new(not_found, "nx"))
+        });
+        assert_eq!(failed, DnsClass::Unknown);
     }
 
     #[test]
@@ -426,7 +425,8 @@ mod tests {
             .map(|_| {
                 let gate = Arc::clone(&gate);
                 std::thread::spawn(move || {
-                    lookup_with("shared.test", Duration::from_millis(200), 4, move |_| {
+                    let timeout = Duration::from_millis(200);
+                    lookup_with("shared.test", timeout, 4, move |_| {
                         gate.enter();
                         Ok(vec![PUBLIC])
                     })
@@ -436,11 +436,9 @@ mod tests {
         for caller in callers {
             assert_eq!(caller.join().unwrap(), DnsClass::Unknown);
         }
-        assert_eq!(
-            gate.entered(),
-            1,
-            "six navigations for one host must cost one lookup, not six threads"
-        );
+        // Six navigations for one host must cost one lookup, not six threads.
+        let entered = gate.entered();
+        assert_eq!(entered, 1);
         gate.release();
         assert!(wait_until(|| no_lookup("shared.test"), 2_000));
     }
@@ -456,7 +454,8 @@ mod tests {
                 let gate = Arc::clone(&gate);
                 std::thread::spawn(move || {
                     let host = format!("hung{index}.test");
-                    lookup_with(&host, Duration::from_millis(150), 2, move |_| {
+                    let timeout = Duration::from_millis(150);
+                    lookup_with(&host, timeout, 2, move |_| {
                         gate.enter();
                         Ok(vec![PUBLIC])
                     })
@@ -466,19 +465,21 @@ mod tests {
         for caller in callers {
             assert_eq!(caller.join().unwrap(), DnsClass::Unknown);
         }
-        assert_eq!(gate.entered(), 2, "the budget is a thread bound, not a hint");
+        // The budget is a thread bound, not a hint.
+        let entered = gate.entered();
+        assert_eq!(entered, 2);
 
         // Once the stuck lookups return, the slots come back: the refusal is
         // about threads that are really alive, not about a remembered verdict.
         gate.release();
-        assert!(wait_until(|| no_lookup("hung0.test") && no_lookup("hung1.test"), 2_000));
-        assert!(wait_until(
-            || {
-                lookup_with("after-release.test", Duration::from_millis(300), 2, |_| Ok(vec![PUBLIC]))
-                    == DnsClass::Answered { private: false }
-            },
-            2_000
-        ));
+        let freed = || no_lookup("hung0.test") && no_lookup("hung1.test");
+        assert!(wait_until(freed, 2_000));
+        let usable = || {
+            let timeout = Duration::from_millis(300);
+            let class = lookup_with("after-release.test", timeout, 2, |_| Ok(vec![PUBLIC]));
+            class == DnsClass::Answered { private: false }
+        };
+        assert!(wait_until(usable, 2_000));
     }
 
     #[test]
@@ -496,13 +497,12 @@ mod tests {
             first_gate.enter();
             Ok(vec![PUBLIC])
         });
-        assert_eq!(first, DnsClass::Unknown, "a timeout is a refusal, not a verdict");
+        // A timeout is a refusal, not a verdict.
+        assert_eq!(first, DnsClass::Unknown);
 
         gate.release();
-        assert!(
-            wait_until(|| no_lookup("late.test"), 2_000),
-            "the late answer must finish and free its slot"
-        );
+        let finished = || no_lookup("late.test");
+        assert!(wait_until(finished, 2_000));
 
         let second_calls = Arc::clone(&calls);
         let second = lookup_with("late.test", Duration::from_millis(500), 4, move |_| {
@@ -510,11 +510,9 @@ mod tests {
             Ok(vec![PUBLIC])
         });
         assert_eq!(second, DnsClass::Answered { private: false });
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "the second navigation must resolve again, not reuse the late answer"
-        );
+        // The second navigation must resolve again, not reuse the late answer.
+        let total = calls.load(Ordering::SeqCst);
+        assert_eq!(total, 2);
     }
 
     #[test]

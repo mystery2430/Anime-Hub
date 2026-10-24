@@ -7111,17 +7111,13 @@ mod tests {
             cookie_for_test("blank", Some("   "), None),
             cookie_for_test("expired", None, Some(now - 10)),
         ];
-        let kept: Vec<&str> = cookies_belonging_to_site(
-            &cookies,
-            "https://a.example.com/watch/1",
-            now,
-        )
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-        assert_eq!(kept, vec!["own", "parent", "exact"]);
+        let site = "https://a.example.com/watch/1";
+        let kept = cookies_belonging_to_site(&cookies, site, now);
+        let names: Vec<&str> = kept.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["own", "parent", "exact"]);
         // A jar value that cannot be attributed to a site restores nothing.
-        assert!(cookies_belonging_to_site(&cookies, "not a url", now).is_empty());
+        let unparsable = cookies_belonging_to_site(&cookies, "not a url", now);
+        assert!(unparsable.is_empty());
     }
 
     #[test]

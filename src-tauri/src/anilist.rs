@@ -1163,6 +1163,18 @@ pub struct PreparedLogin {
     pub listener: Option<LoopbackListener>,
 }
 
+/// The refusal for a loopback port this app cannot bind.
+///
+/// Deliberately does not echo the port or an OS error: the value would come
+/// from configuration, and the user only needs to know that nothing started.
+fn loopback_bind_error() -> AppError {
+    AppError::AniList(
+        "Yerel geri dönüş dinleyicisi açılamadı; bu port başka bir uygulama \
+         tarafından kullanılıyor olabilir. Giriş başlatılmadı."
+            .into(),
+    )
+}
+
 /// Bind the return path, then build the authorization URL and its state.
 ///
 /// The ordering is the security property. The listener used to be bound inside
@@ -1176,15 +1188,10 @@ pub async fn prepare_login(
     redirect: LoginRedirect,
 ) -> AppResult<PreparedLogin> {
     let listener = match redirect {
-        LoginRedirect::Loopback(port) => Some(
-            LoopbackListener::bind_port(port).await.map_err(|_| {
-                AppError::AniList(
-                    "Yerel geri dönüş dinleyicisi açılamadı; bu port başka bir uygulama \
-                     tarafından kullanılıyor olabilir. Giriş başlatılmadı."
-                        .into(),
-                )
-            })?,
-        ),
+        LoginRedirect::Loopback(port) => {
+            let bound = LoopbackListener::bind_port(port).await;
+            Some(bound.map_err(|_| loopback_bind_error())?)
+        }
         LoginRedirect::CustomScheme => None,
     };
     let state = uuid::Uuid::new_v4().to_string();
@@ -2161,14 +2168,13 @@ mod tests {
             .expect("squat a loopback port");
         let port = squatter.local_addr().unwrap().port();
 
-        let err = prepare_login(&cfg(), LoginRedirect::Loopback(port))
-            .await
-            .err()
-            .expect("a busy port must refuse the login");
-        assert!(
-            err.to_string().contains("Giriş başlatılmadı"),
-            "unexpected error: {err}"
-        );
+        let prepared = prepare_login(&cfg(), LoginRedirect::Loopback(port)).await;
+        let err = match prepared {
+            Ok(_) => panic!("a busy port must refuse the login"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(message.contains("Giriş başlatılmadı"), "{message}");
         // Nothing was taken from the squatter and no listener was left behind
         // on the port: the error path dropped whatever it had.
         assert_eq!(squatter.local_addr().unwrap().port(), port);
@@ -2178,19 +2184,19 @@ mod tests {
     /// URL is the one the caller has to remember.
     #[tokio::test]
     async fn prepare_login_binds_the_return_path_before_building_the_url() {
-        let p = prepare_login(&cfg(), LoginRedirect::Loopback(0))
-            .await
-            .expect("prepare a loopback login");
-        assert!(p.listener.is_some(), "loopback needs a bound listener");
-        assert!(p.url.contains(&format!("state={}", p.state)), "{}", p.url);
+        let prepared = prepare_login(&cfg(), LoginRedirect::Loopback(0)).await;
+        let p = prepared.expect("prepare a loopback login");
+        assert!(p.listener.is_some());
+        let expected = format!("state={}", p.state);
+        assert!(p.url.contains(&expected), "{}", p.url);
 
         // A custom-scheme redirect is delivered by the OS, so it binds nothing.
-        let c = prepare_login(&cfg(), LoginRedirect::CustomScheme)
-            .await
-            .expect("prepare a custom-scheme login");
+        let scheme = prepare_login(&cfg(), LoginRedirect::CustomScheme).await;
+        let c = scheme.expect("prepare a custom-scheme login");
         assert!(c.listener.is_none());
-        assert!(c.url.contains(&format!("state={}", c.state)), "{}", c.url);
-        assert_ne!(c.state, p.state, "each attempt needs a fresh state");
+        let expected = format!("state={}", c.state);
+        assert!(c.url.contains(&expected), "{}", c.url);
+        assert_ne!(c.state, p.state);
     }
 
     /// Exercises the real socket path: bind, accept one request, answer, and
