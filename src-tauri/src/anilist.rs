@@ -1177,16 +1177,23 @@ fn loopback_bind_error() -> AppError {
 
 /// Bind the return path, then build the authorization URL and its state.
 ///
-/// The ordering is the security property. The listener used to be bound inside
-/// a background task, i.e. after the command had already returned the URL to
-/// the UI and the browser may have been opened: a local process holding
-/// `127.0.0.1:<port>` then made the bind fail *after* the user had been sent to
-/// AniList, and the redirect — which carries both `code` and `state` — landed in
-/// that process. Here a failed bind returns `Err` and no URL is produced.
-pub async fn prepare_login(
-    cfg: &AniListConfig,
-    redirect: LoginRedirect,
-) -> AppResult<PreparedLogin> {
+/// The redirect is **derived from `cfg.redirect_uri`**, never passed in. The
+/// address the listener binds and the `redirect_uri` the authorization URL
+/// carries are therefore the same value by construction: a caller cannot bind
+/// one address and ask AniList to redirect somewhere else. The previous
+/// signature took a `LoginRedirect`, and the test around it paired
+/// `Loopback(0)` — an ephemeral port — with a configuration that named the
+/// fixed port 17395, so it never proved that the two agreed.
+///
+/// The ordering is the security property: validate the URI, bind it, build the
+/// URL and the state. The listener used to be bound inside a background task,
+/// i.e. after the command had already returned the URL to the UI and the
+/// browser may have been opened: a local process holding `127.0.0.1:<port>`
+/// then made the bind fail *after* the user had been sent to AniList, and the
+/// redirect — which carries both `code` and `state` — landed in that process.
+/// Here a refused URI or a failed bind returns `Err` and no URL is produced.
+pub async fn prepare_login(cfg: &AniListConfig) -> AppResult<PreparedLogin> {
+    let redirect = validate_redirect_uri(&cfg.redirect_uri, cfg!(desktop))?;
     let listener = match redirect {
         LoginRedirect::Loopback(port) => {
             let bound = LoopbackListener::bind_port(port).await;
@@ -2157,18 +2164,95 @@ mod tests {
         assert_eq!(c.config().client_id, "1234");
     }
 
+    /// A config with a chosen redirect URI; `cfg()` keeps the default.
+    fn cfg_with(redirect_uri: &str) -> AniListConfig {
+        AniListConfig {
+            client_id: "1234".into(),
+            client_secret: String::new(),
+            redirect_uri: redirect_uri.into(),
+        }
+    }
+
+    /// A loopback port nothing is listening on (bound once, then released).
+    fn free_port() -> u16 {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("probe");
+        probe.local_addr().unwrap().port()
+    }
+
+    /// The listener binds the port the configured redirect names, and the
+    /// authorization URL carries that same redirect — not a second value that
+    /// merely happens to look similar.
+    #[tokio::test]
+    async fn prepare_login_binds_the_port_the_redirect_names() {
+        // The port is probed, released and immediately bound again, so another
+        // process can win the race; retry with a new port instead of flaking.
+        let mut attempt = 0;
+        let (cfg, prepared) = loop {
+            attempt += 1;
+            let port = free_port();
+            let candidate = cfg_with(&format!("http://127.0.0.1:{port}/callback"));
+            match prepare_login(&candidate).await {
+                Ok(prepared) => break (candidate, prepared),
+                Err(e) if attempt < 5 => eprintln!("port {port} was taken: {e}"),
+                Err(e) => panic!("prepare_login failed five times: {e}"),
+            }
+        };
+        let listener = prepared.listener.expect("loopback binds a listener");
+        assert_eq!(listener.redirect_uri(), cfg.redirect_uri);
+
+        let url = url::Url::parse(&prepared.url).expect("authorization url");
+        let mut redirect = None;
+        let mut state = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "redirect_uri" => redirect = Some(value.into_owned()),
+                "state" => state = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        assert_eq!(redirect.as_deref(), Some(listener.redirect_uri()));
+        assert_eq!(state.as_deref(), Some(prepared.state.as_str()));
+    }
+
+    /// An unsupported redirect is refused by the URI validation, not by the
+    /// bind: the port below is squatted on purpose, so an implementation that
+    /// bound first would answer with the bind refusal instead.
+    #[tokio::test]
+    async fn prepare_login_rejects_an_unsupported_redirect_before_binding() {
+        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await;
+        let squatter = squatter.expect("squat a loopback port");
+        let port = squatter.local_addr().unwrap().port();
+
+        let candidates = [
+            format!("http://127.0.0.1:{port}/cb"),
+            format!("http://127.0.0.1:{port}/callback?x=1"),
+            "http://127.0.0.1/callback".to_string(),
+            "https://example.com/callback".to_string(),
+        ];
+        for redirect in candidates {
+            let prepared = prepare_login(&cfg_with(&redirect)).await;
+            let err = match prepared {
+                Ok(_) => panic!("{redirect} must be refused"),
+                Err(e) => e,
+            };
+            let message = err.to_string();
+            assert!(message.contains("desteklenmiyor"), "{redirect}: {message}");
+            assert!(!message.contains("Giriş başlatılmadı"), "{redirect}: {message}");
+        }
+    }
+
     /// A login must not produce an authorization URL when the loopback port is
     /// already taken. The redirect carries both `code` and `state`, so a login
     /// that is started and then fails to bind hands the authorization to
     /// whoever holds the port.
     #[tokio::test]
     async fn prepare_login_refuses_a_busy_loopback_port() {
-        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("squat a loopback port");
+        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await;
+        let squatter = squatter.expect("squat a loopback port");
         let port = squatter.local_addr().unwrap().port();
+        let cfg = cfg_with(&format!("http://127.0.0.1:{port}/callback"));
 
-        let prepared = prepare_login(&cfg(), LoginRedirect::Loopback(port)).await;
+        let prepared = prepare_login(&cfg).await;
         let err = match prepared {
             Ok(_) => panic!("a busy port must refuse the login"),
             Err(e) => e,
@@ -2178,25 +2262,6 @@ mod tests {
         // Nothing was taken from the squatter and no listener was left behind
         // on the port: the error path dropped whatever it had.
         assert_eq!(squatter.local_addr().unwrap().port(), port);
-    }
-
-    /// The listener is bound before the URL exists, and the state inside the
-    /// URL is the one the caller has to remember.
-    #[tokio::test]
-    async fn prepare_login_binds_the_return_path_before_building_the_url() {
-        let prepared = prepare_login(&cfg(), LoginRedirect::Loopback(0)).await;
-        let p = prepared.expect("prepare a loopback login");
-        assert!(p.listener.is_some());
-        let expected = format!("state={}", p.state);
-        assert!(p.url.contains(&expected), "{}", p.url);
-
-        // A custom-scheme redirect is delivered by the OS, so it binds nothing.
-        let scheme = prepare_login(&cfg(), LoginRedirect::CustomScheme).await;
-        let c = scheme.expect("prepare a custom-scheme login");
-        assert!(c.listener.is_none());
-        let expected = format!("state={}", c.state);
-        assert!(c.url.contains(&expected), "{}", c.url);
-        assert_ne!(c.state, p.state);
     }
 
     /// Exercises the real socket path: bind, accept one request, answer, and

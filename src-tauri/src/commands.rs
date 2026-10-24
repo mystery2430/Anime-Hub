@@ -1283,17 +1283,14 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
         ));
     }
 
-    // Validate the redirect BEFORE any pending state exists. Writing state
-    // first meant an unusable URI (a path or port the listener never serves)
-    // still armed the flow, so the browser round-trip could only fail after
-    // the user had already granted access.
-    let redirect = anilist::validate_redirect_uri(&cfg.redirect_uri, cfg!(desktop))?;
-
-    // Bind the loopback listener BEFORE an authorization URL exists or a
-    // pending state is armed; `prepare_login` owns that ordering. A port held
-    // by another process is then a plain refusal instead of a login the app
-    // starts and can never complete.
-    let prepared = anilist::prepare_login(&cfg, redirect).await?;
+    // Validate the redirect, bind it, and only then build the authorization
+    // URL and its state — `prepare_login` owns that ordering, and it derives
+    // the redirect from the configured URI so the bound address and the
+    // `redirect_uri` in the URL cannot disagree. An unusable URI or a port held
+    // by another process is a plain refusal: no URL, no armed state, no
+    // browser. Writing state first meant such a flow armed anyway, and the
+    // round-trip could only fail after the user had already granted access.
+    let prepared = anilist::prepare_login(&cfg).await?;
     let listener = prepared.listener;
 
     // Kept for the loopback task below: if that task cannot complete the
