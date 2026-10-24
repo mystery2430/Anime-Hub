@@ -8,6 +8,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (rel) => readFileSync(join(root, rel), "utf8");
 
 const commandsRs = read("src-tauri/src/commands.rs");
+const anilistRs = read("src-tauri/src/anilist.rs");
 const libRs = read("src-tauri/src/lib.rs");
 const mainJs = read("src/main.js");
 const bridgeJs = read("src/logic/bridge.js");
@@ -110,13 +111,30 @@ test("blocklist sync is fail-closed for opens, settings and reset", () => {
 test("OAuth login validates the redirect before writing pending state", () => {
   const loginStart = commandsRs.slice(commandsRs.indexOf("pub async fn anilist_login_start"));
   const validatorAt = loginStart.indexOf("validate_redirect_uri");
-  const stateAt = loginStart.indexOf("*s = Some(state_value)");
+  const prepareAt = loginStart.indexOf("anilist::prepare_login");
+  const stateAt = loginStart.indexOf("*s = Some(prepared.state)");
   assert.ok(validatorAt > 0, "login start must validate the redirect URI");
+  assert.ok(prepareAt > 0, "login start must bind the return path via prepare_login");
   assert.ok(stateAt > 0, "login start still writes pending state");
-  assert.ok(validatorAt < stateAt, "validation must happen before pending state");
-  // The listener is only started for the port the URI actually names.
-  assert.match(loginStart, /LoginRedirect::Loopback\(port\)/);
+  assert.ok(
+    validatorAt < stateAt,
+    "validation must happen before pending state",
+  );
+  assert.ok(
+    prepareAt < stateAt,
+    "the listener is bound before a pending state exists",
+  );
+  // The listener is only started for the port the URI actually names, and the
+  // command never binds one itself: prepare_login owns that ordering.
+  assert.equal(/bind_port\(/.test(loginStart), false);
   assert.equal(/loopback_port\(&cfg\.redirect_uri\)/.test(loginStart), false);
+
+  const prep = anilistRs.slice(anilistRs.indexOf("pub async fn prepare_login"));
+  const bindAt = prep.indexOf("LoopbackListener::bind_port(port)");
+  const urlAt = prep.indexOf("authorize_url(");
+  assert.ok(bindAt > 0, "prepare_login must bind the loopback listener");
+  assert.ok(urlAt > bindAt, "the port must be bound before the URL exists");
+  assert.match(prep, /LoginRedirect::Loopback\(port\)/);
 });
 
 test("top-level navigation consults the DNS gate and the gate is shipped", () => {
@@ -297,11 +315,12 @@ test("R-05 and the 'Not closed' list agree about Android OAuth", () => {
   );
   const refuseAt = loginStart.indexOf("mobile_native_login_allowed");
   const validateAt = loginStart.indexOf("validate_redirect_uri");
-  const stateWriteAt = loginStart.indexOf("*s = Some(state_value)");
+  const prepareAt = loginStart.indexOf("anilist::prepare_login");
+  const stateWriteAt = loginStart.indexOf("*s = Some(prepared.state)");
   assert.ok(refuseAt > 0, "the Android custom-scheme refusal must exist");
   assert.ok(
-    validateAt > refuseAt && stateWriteAt > validateAt,
-    "refusal and redirect validation must both precede the pending-state write",
+    validateAt > refuseAt && prepareAt > validateAt && stateWriteAt > prepareAt,
+    "refusal, redirect validation and the bind must all precede the state write",
   );
   assert.match(
     loginStart.slice(validateAt, validateAt + 120),
