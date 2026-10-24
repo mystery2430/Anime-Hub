@@ -970,6 +970,25 @@ pub fn cookie_belongs_to_site(stored: &crate::web::session::StoredCookie, site_u
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+/// The live cookies of `jar` that this site may hold.
+///
+/// One definition for every import path: [`cookie_belongs_to_site`] is the
+/// ownership rule, and a cookie that fails it is dropped before anything writes
+/// it. The Android profile migration always used this rule; the iOS import path
+/// (round 16.4) did not, and restored every live cookie in the jar into the
+/// *shared* WebView — including third-party and foreign-domain cookies that the
+/// next site then inherited.
+pub fn cookies_belonging_to_site<'a>(
+    cookies: &'a [crate::web::session::StoredCookie],
+    site_url: &str,
+    now: i64,
+) -> Vec<&'a crate::web::session::StoredCookie> {
+    cookies
+        .iter()
+        .filter(|cookie| cookie.is_live(now) && cookie_belongs_to_site(cookie, site_url))
+        .collect()
+}
+
 /// The persisted generation for `site_id` (0 when never bumped).
 ///
 /// A corrupt value is recovered from the pending-delete queue instead of
@@ -1494,11 +1513,7 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
             // Third-party jar entries are skipped BEFORE the provider sees
             // them: setCookie(site_url, …) rejects a foreign Domain, and a
             // single rejection used to retire the profile and retry forever.
-            for stored in jar
-                .cookies
-                .iter()
-                .filter(|c| c.is_live(now) && cookie_belongs_to_site(c, url))
-            {
+            for stored in cookies_belonging_to_site(&jar.cookies, url, now) {
                 if let Some(cookie) = crate::web::session::restore(stored) {
                     cookie_headers.push(cookie.to_string());
                 }
@@ -3362,15 +3377,17 @@ fn export_cookies_from(
 fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> AppResult<()> {
     let app = window.app_handle().clone();
     let state = app.state::<AppState>();
-    let _ = url;
     let stored = state.provider.get_secret(&format!("cookies-{site_id}"))?;
     let jar: CookieJar = match stored {
         Some(bytes) => serde_json::from_slice(&bytes)?,
         None => return Ok(()),
     };
 
+    // Only the cookies this site owns. The jar is captured from the shared
+    // WebView, so it also holds third-party and other-origin cookies; putting
+    // those back would hand them to whichever site is opened next.
     let now = crate::anilist::now_unix();
-    for stored in jar.cookies.iter().filter(|c| c.is_live(now)) {
+    for stored in cookies_belonging_to_site(&jar.cookies, url.as_str(), now) {
         if let Some(cookie) = restore(stored) {
             if window.set_cookie(cookie).is_err() {
                 log::debug!("site cookie restore did not complete");
@@ -7076,6 +7093,35 @@ mod tests {
         }
         assert!(!cookie_belongs_to_site(&host_only, "not a url"));
         assert!(!cookie_belongs_to_site(&host_only, "file:///tmp/x"));
+    }
+
+    #[test]
+    fn the_shared_webview_import_only_restores_the_sites_own_cookies() {
+        // The iOS import path used to replay every live cookie in the jar into
+        // the shared WebView. The jar is captured from that same WebView, so it
+        // also carries third-party and other-origin cookies — which the next
+        // site then inherited. Both import paths now go through one selector.
+        let now = crate::anilist::now_unix();
+        let cookies = vec![
+            cookie_for_test("own", None, None),
+            cookie_for_test("parent", Some(".example.com"), None),
+            cookie_for_test("exact", Some("a.example.com"), None),
+            cookie_for_test("cdn", Some(".player-cdn.example"), None),
+            cookie_for_test("ad", Some(".ads.example.net"), None),
+            cookie_for_test("blank", Some("   "), None),
+            cookie_for_test("expired", None, Some(now - 10)),
+        ];
+        let kept: Vec<&str> = cookies_belonging_to_site(
+            &cookies,
+            "https://a.example.com/watch/1",
+            now,
+        )
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+        assert_eq!(kept, vec!["own", "parent", "exact"]);
+        // A jar value that cannot be attributed to a site restores nothing.
+        assert!(cookies_belonging_to_site(&cookies, "not a url", now).is_empty());
     }
 
     #[test]
