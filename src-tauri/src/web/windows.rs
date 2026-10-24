@@ -42,7 +42,7 @@ use crate::commands::{lock_recover, AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
-use crate::web::dns::{classify_host, DnsClass};
+use crate::web::dns::classify_host;
 // `CookieJar` backs the iOS jar swap and the one-time Android profile
 // migration; `restore` is used only by the iOS import path (`import_cookies`),
 // so it carries exactly that gate — Android's host-compiled migration
@@ -54,7 +54,7 @@ use crate::web::dns::{classify_host, DnsClass};
 #[cfg(all(mobile, not(target_os = "android")))]
 use crate::web::session::restore;
 #[cfg(desktop)]
-use crate::web::session::{decide_navigation, NavDecision, DNS_REBIND_BLOCK};
+use crate::web::session::{decide_navigation, dns_decision, NavDecision};
 use crate::web::session::{profile_dir_name, CookieJar};
 use tauri::{AppHandle, Emitter, Manager};
 #[cfg(desktop)]
@@ -492,14 +492,16 @@ fn open_in_main_window_inner(
                 decide_navigation(target, &nav_host, &bl)
             };
             let decision = if preliminary == NavDecision::Allow {
-                let dns = target
-                    .host_str()
-                    .map(classify_host)
-                    .unwrap_or(DnsClass::Unknown);
-                if matches!(dns, DnsClass::Answered { private: true }) {
-                    NavDecision::Block(DNS_REBIND_BLOCK)
-                } else {
-                    NavDecision::Allow
+                match (target.scheme(), target.host_str()) {
+                    // Only an `https` URL with a host carries a name the
+                    // WebView will resolve itself. `blob:` (the MSE player's
+                    // object URLs) and `about:blank` pass the string policy
+                    // and have no name of their own; demanding a DNS answer
+                    // for them would break playback or a player popup without
+                    // closing anything — they inherit a document that already
+                    // went through this check.
+                    ("https", Some(host)) => dns_decision(classify_host(host)),
+                    _ => NavDecision::Allow,
                 }
             } else {
                 preliminary

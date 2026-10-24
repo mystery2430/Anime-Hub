@@ -391,3 +391,39 @@ test("R-05 and the 'Not closed' list agree about Android OAuth", () => {
     "the desktop-only acceptance of the custom scheme must be gone",
   );
 });
+
+test("the desktop DNS gate refuses an unanswered lookup, and only for top-level https", () => {
+  const sessionRs = read("src-tauri/src/web/session.rs");
+  const windowsRs = read("src-tauri/src/web/windows.rs");
+
+  // Source-string pins, not a WebView behaviour test: this fixes *which*
+  // branch runs, not that a provider honours it. A real desktop WebView run is
+  // still missing (`docs/security-residual-risks.md`, round 21).
+  assert.match(
+    sessionRs,
+    /pub const DNS_UNKNOWN_BLOCK: &str =\s*\n?\s*"Alan adı doğrulanamadı/,
+    "an unanswered lookup needs its own notice, not the rebinding one",
+  );
+  assert.match(
+    sessionRs,
+    /DnsClass::Unknown => NavDecision::Block\(DNS_UNKNOWN_BLOCK\)/,
+    "Unknown must be a refusal, not a pass-through",
+  );
+
+  // The open path refuses it on desktop only: Android's site WebView resolves
+  // again inside DnsPinnedProxy, so refusing there would be a pure regression.
+  assert.match(
+    commandsRs,
+    /if cfg!\(desktop\) && matches!\(dns, crate::web::dns::DnsClass::Unknown\)/,
+    "the open path must refuse an unanswered lookup on desktop",
+  );
+
+  // A navigation with no name of its own is not sent to DNS: `blob:` (MSE
+  // playback) and `about:blank` pass the string policy and inherit a document
+  // that was already checked.
+  assert.match(
+    windowsRs,
+    /\("https", Some\(host\)\) => dns_decision\(classify_host\(host\)\)/,
+    "only https navigations with a host are classified",
+  );
+});

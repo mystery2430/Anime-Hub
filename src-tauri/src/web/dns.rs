@@ -48,9 +48,10 @@ pub enum DnsClass {
     /// The resolver answered. `private` is true when **any** address is
     /// non-public, or when the answer was empty (no routable address to pin).
     Answered { private: bool },
-    /// Timeout, NXDOMAIN, or a resolver error. Callers must fall back to the
-    /// string policy rather than failing closed: a DNS outage must not make
-    /// every site unopenable.
+    /// Timeout, NXDOMAIN, a resolver error, or every lookup slot busy. It says
+    /// nothing about the name, so it must never be read as "public": the
+    /// desktop top-level gate refuses it ([`crate::web::session::dns_decision`],
+    /// round 21) and it is never cached.
     Unknown,
 }
 
@@ -148,8 +149,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// `None` means every lookup thread is busy: the caller gets [`DnsClass::Unknown`]
 /// immediately instead of queueing another thread. That is the same answer a
-/// timeout produces, so it is not a new bypass — the static string policy has
-/// already run and it never needs DNS.
+/// timeout produces and the caller must treat it as "no answer" — since round
+/// 21 the desktop gate refuses it. Before that it was a way to *skip* the DNS
+/// check: a page only had to keep four lookups in flight.
 fn join_in_flight(host: &str, budget: usize) -> Option<(Arc<Pending>, bool)> {
     let mut map = lock(in_flight());
     if let Some(existing) = map.get(host) {

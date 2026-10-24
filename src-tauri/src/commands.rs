@@ -629,9 +629,17 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
 
     // DNS rebinding: a stored name can look public and still resolve to the
     // user's router or a cloud metadata address. The lookup is blocking, so
-    // it runs off the async runtime. A resolver failure is not fatal — the
-    // string policy already passed, and failing closed would make every site
-    // unopenable during a DNS outage.
+    // it runs off the async runtime.
+    //
+    // An *unanswered* lookup (`DnsClass::Unknown`: timeout, NXDOMAIN, resolver
+    // error, or every lookup slot busy) is refused on desktop and allowed on
+    // Android, and the difference is deliberate. Desktop has no proven
+    // connect-time pin for the first request (P1), so an unanswered check was
+    // the last gate before the WebView resolved the name itself — that
+    // fail-open is closed here (round 21). Android's site WebView resolves the
+    // name again inside `DnsPinnedProxy`, which refuses a private target, so a
+    // resolver hiccup is not an open hole there and refusing the open would be
+    // a pure usability regression.
     let host = safe.host().to_string();
     let dns_result =
         tauri::async_runtime::spawn_blocking(move || crate::web::dns::classify_host(&host)).await;
@@ -653,6 +661,21 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         );
         AppError::Other("adres çözümlenemedi".into())
     })?;
+    if cfg!(desktop) && matches!(dns, crate::web::dns::DnsClass::Unknown) {
+        crate::diagnostics::record_current(
+            "open",
+            "resolve",
+            "rejected",
+            None,
+            None,
+            Some("unknown"),
+            None,
+            None,
+        );
+        return Err(AppError::Network(
+            crate::web::session::DNS_UNKNOWN_BLOCK.to_string(),
+        ));
+    }
     if matches!(dns, crate::web::dns::DnsClass::Answered { private: true }) {
         crate::diagnostics::record_current(
             "open",

@@ -215,31 +215,70 @@ pub enum NavDecision {
 /// Shown when a public-looking name resolves to a private address.
 pub const DNS_REBIND_BLOCK: &str = "Alan adı özel/ağ içi bir adrese çözümlendi.";
 
-/// Decide whether a WebView navigation may proceed.
+/// Shown when the resolver did not answer at all: timeout, NXDOMAIN, resolver
+/// error, or every lookup slot busy.
+///
+/// Deliberately **not** [`DNS_REBIND_BLOCK`]: nothing was proven about the
+/// name, so the notice must not claim a rebinding was detected.
+pub const DNS_UNKNOWN_BLOCK: &str =
+    "Alan adı doğrulanamadı (DNS yanıtı alınamadı); sayfa açılmadı, tekrar deneyin.";
+
+/// Decide whether a WebView navigation may proceed, using the string policy
+/// only.
 ///
 /// `site_host` is the site the session was opened for; it is unused by the
 /// current rules but keeps the signature honest for future same-site rules.
 ///
-/// This is the string policy only. Production call sites that can block the
-/// WebView thread pass a [`DnsClass`] from [`decide_navigation_dns`] so a
-/// name that *looks* public but resolves to a router or a metadata address
-/// is refused too.
+/// This has no DNS facts, so it cannot judge a name. Callers that can resolve
+/// use [`decide_navigation_dns`] or [`dns_decision`]; `web/windows.rs` runs
+/// both halves, so a host that *looks* public but resolves to a router or a
+/// metadata address is refused too.
 pub fn decide_navigation(url: &Url, site_host: &str, blocklist: &Blocklist) -> NavDecision {
-    decide_navigation_dns(url, site_host, blocklist, DnsClass::Unknown)
+    string_policy(url, site_host, blocklist)
 }
 
 /// [`decide_navigation`] plus the result of a DNS lookup.
 ///
-/// `DnsClass::Unknown` (timeout, NXDOMAIN, resolver error) does **not** block:
-/// a DNS outage must not make every site unopenable. A successful answer that
-/// contains any non-public address does block. The string policy still runs
-/// first, so literal private hosts keep their existing message.
+/// The string policy runs first, so a literal private host keeps its existing
+/// message and a blocklisted host stays silent. [`dns_decision`] then decides
+/// the name: a private answer blocks, and so does [`DnsClass::Unknown`].
 pub fn decide_navigation_dns(
     url: &Url,
     site_host: &str,
     blocklist: &Blocklist,
     dns: DnsClass,
 ) -> NavDecision {
+    match string_policy(url, site_host, blocklist) {
+        NavDecision::Allow => dns_decision(dns),
+        refused => refused,
+    }
+}
+
+/// The DNS half of the top-level policy, shared by the WebView callback and
+/// the site-open path so the two cannot drift.
+///
+/// **`Unknown` is a refusal (round 21).** It used to fall through, on the
+/// argument that a DNS outage must not make every site unopenable. That
+/// argument was wrong for this call site: `Unknown` is not only an outage —
+/// `dns.rs` also returns it *immediately* when every lookup slot is busy, and
+/// a hostile page can cause that — and the allowed navigation was then
+/// resolved again by the WebView's own stack, which is exactly the rebinding
+/// window this check exists to close. The cost is availability: a slow or
+/// broken resolver now refuses the navigation. Nothing is cached for a
+/// timeout, so a retry resolves again.
+///
+/// Scope: top-level navigations only. `fetch`, XHR, iframes and other
+/// subresources never pass through this function.
+pub fn dns_decision(dns: DnsClass) -> NavDecision {
+    match dns {
+        DnsClass::Answered { private: true } => NavDecision::Block(DNS_REBIND_BLOCK),
+        DnsClass::Unknown => NavDecision::Block(DNS_UNKNOWN_BLOCK),
+        DnsClass::Answered { private: false } => NavDecision::Allow,
+    }
+}
+
+/// Scheme, host and blocklist rules. No DNS, no cache, no I/O.
+fn string_policy(url: &Url, site_host: &str, blocklist: &Blocklist) -> NavDecision {
     let _ = site_host;
     if !navigation_allowed(url) {
         return NavDecision::Block(match url.scheme() {
@@ -257,12 +296,6 @@ pub fn decide_navigation_dns(
         if blocklist.is_blocked(h) {
             return NavDecision::BlockedHost;
         }
-    }
-    // After the string policy. A blocklisted host is already refused, so we
-    // never replace that silent decision with a toast just because DNS also
-    // happened to return a private address.
-    if matches!(dns, DnsClass::Answered { private: true }) {
-        return NavDecision::Block(DNS_REBIND_BLOCK);
     }
     NavDecision::Allow
 }
@@ -749,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_blocks_public_name_that_resolves_private() {
+    fn navigation_blocks_a_private_answer_and_an_unanswered_lookup() {
         let bl = Blocklist::default();
         let url = Url::parse("https://rebind.example/latest/meta-data/").unwrap();
         assert_eq!(
@@ -761,11 +794,18 @@ mod tests {
             ),
             NavDecision::Block(DNS_REBIND_BLOCK)
         );
-        // A resolver miss must not fail closed: the string policy already
-        // accepted this host, and a DNS outage is not an attack.
+        // Round 21: an unanswered lookup is refused, not waved through. The
+        // lookup budget alone can produce `Unknown`, so this used to be a way
+        // to skip the check entirely (four hung lookups, then navigate).
         assert_eq!(
             decide_navigation_dns(&url, "openani.me", &bl, DnsClass::Unknown),
-            NavDecision::Allow
+            NavDecision::Block(DNS_UNKNOWN_BLOCK)
+        );
+        // ... and the notice must not claim a rebinding that was never seen.
+        assert_ne!(DNS_UNKNOWN_BLOCK, DNS_REBIND_BLOCK);
+        assert!(
+            !DNS_UNKNOWN_BLOCK.contains("çözümlendi"),
+            "an unanswered lookup resolved nothing"
         );
         assert_eq!(
             decide_navigation_dns(
@@ -775,6 +815,39 @@ mod tests {
                 DnsClass::Answered { private: false }
             ),
             NavDecision::Allow
+        );
+    }
+
+    #[test]
+    fn a_rejected_url_is_not_rescued_by_a_public_dns_answer() {
+        let bl = Blocklist::default();
+        let public = DnsClass::Answered { private: false };
+        let http = Url::parse("http://openani.me/").unwrap();
+        let literal = Url::parse("https://127.0.0.1/x").unwrap();
+        let listed = Url::parse("https://ad.doubleclick.net/x").unwrap();
+        // Scheme policy runs first, whatever the resolver said.
+        assert_eq!(
+            decide_navigation_dns(&http, "openani.me", &bl, public),
+            NavDecision::Block("Güvensiz (HTTP) yönlendirme engellendi.")
+        );
+        // A private literal is judged by the string policy, not by DNS: no
+        // answer can turn it into an allowed navigation.
+        let literal_public = decide_navigation_dns(&literal, "openani.me", &bl, public);
+        assert_ne!(literal_public, NavDecision::Allow);
+        assert_eq!(
+            literal_public,
+            decide_navigation_dns(&literal, "openani.me", &bl, DnsClass::Unknown)
+        );
+        // A blocklist hit stays silent even when the name resolves public.
+        assert_eq!(
+            decide_navigation_dns(&listed, "openani.me", &bl, public),
+            NavDecision::BlockedHost
+        );
+        // The same holds for the unanswered class: it cannot rescue a URL the
+        // string policy already refuses.
+        assert_eq!(
+            decide_navigation_dns(&listed, "openani.me", &bl, DnsClass::Unknown),
+            NavDecision::BlockedHost
         );
     }
 
