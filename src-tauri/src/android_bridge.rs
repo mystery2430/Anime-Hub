@@ -69,6 +69,16 @@ pub const PROFILE_QUARANTINED_MSG: &str = "Bu sitenin verileri temizlenirken çe
 /// state transient — only a WebView update can change it.
 pub const PROXY_UNAVAILABLE_MSG: &str = "Bu cihazda site bağlantıları güvenli biçimde sabitlenemedi: WebView, bağlantıları denetlenen IP adresine yönlendiren yerel proxy'yi (PROXY_OVERRIDE) uygulayamadı ya da proxy başlatılamadı. Site, DNS yeniden yönlendirmesine (rebinding) karşı korunmasız açılmayacağı için açılmadı. Android System WebView veya Google Chrome'u güncelleyip tekrar deneyin. Sorun sürerse bu cihazın WebView sağlayıcısı bu özelliği desteklemiyor olabilir.";
 
+/// User-facing explanation when Kotlin refuses to open a site because the
+/// WebView provider cannot run the document-start script.
+///
+/// The security-relevant part is WebRTC: the pinning proxy is an HTTP CONNECT
+/// proxy and never carries ICE/UDP, so the only control is removing the API
+/// before page script runs. A provider without `DOCUMENT_START_SCRIPT` can only
+/// inject from `onPageStarted`, which can lose that race — so the site is not
+/// opened at all rather than opened with a guard that may arrive too late.
+pub const DOCUMENT_START_UNSUPPORTED_MSG: &str = "Bu cihazdaki WebView, sayfa betikleri çalışmadan önce güvenlik betiğini (WebRTC devre dışı bırakma) kuramıyor. WebRTC trafiği IP sabitleme proxy'sinden geçmediği için site bu sağlayıcıda korumasız açılmayacak. Android System WebView veya Google Chrome'u güncelleyip tekrar deneyin.";
+
 /// Map Kotlin's closed protocol sentinels to actionable errors without ever
 /// forwarding provider exception text, profile names or other bridge payloads.
 pub fn classify_site_open_error(error: animehub_android::Error) -> AppError {
@@ -76,6 +86,8 @@ pub fn classify_site_open_error(error: animehub_android::Error) -> AppError {
         AppError::Unsupported(MULTI_PROFILE_UNSUPPORTED_MSG.to_string())
     } else if animehub_android::is_proxy_unavailable(&error) {
         AppError::Unsupported(PROXY_UNAVAILABLE_MSG.to_string())
+    } else if animehub_android::is_document_start_unsupported(&error) {
+        AppError::Unsupported(DOCUMENT_START_UNSUPPORTED_MSG.to_string())
     } else if animehub_android::is_profile_quarantined(&error) {
         AppError::Quarantined(PROFILE_QUARANTINED_MSG.to_string())
     } else if animehub_android::is_migration_retry(&error) {

@@ -68,7 +68,6 @@
 package dev.animehub.app
 
 import android.app.Activity
-import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -122,6 +121,14 @@ object AnimeHubSiteController {
 
   /** Another site WebView is already attached (Rust serialises opens). */
   const val ERR_ACTIVE_SITE = "active-site-open"
+
+  /**
+   * Rejected-open sentinel: the provider cannot run a script before the page's
+   * own (`DOCUMENT_START_SCRIPT` missing). The WebRTC override is the reason
+   * this is a refusal and not a warning — a late injection is not a guarantee.
+   * Exact literal shared with `android_plugin::DOCUMENT_START_SENTINEL`.
+   */
+  const val ERR_DOCUMENT_START_UNSUPPORTED = "unsupported-document-start"
 
   /**
    * Profile names are produced by Rust (`android_profile_name`): a SHA-256
@@ -347,6 +354,21 @@ object AnimeHubSiteController {
       onResult(quarantined)
       return
     }
+    // DOCUMENT-START GATE. The pinning proxy carries TCP only; WebRTC's
+    // ICE/UDP never reaches it, so the WebRTC API is removed by a
+    // document-start script. A provider without `DOCUMENT_START_SCRIPT` can
+    // only inject from `onPageStarted`, which can lose the race with an inline
+    // `<script>`. That is not a weaker version of the control, it is the
+    // absence of it: refuse the open instead of calling the site protected.
+    if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+      AnimeHubDebugLog.record(
+        "open", "document_start", "unsupported", operationId, errorClass = "unsupported",
+      )
+      onResult(ERR_DOCUMENT_START_UNSUPPORTED)
+      return
+    }
+    AnimeHubDebugLog.record("open", "document_start", "supported", operationId)
+
     // CONNECTION PINNING GATE (see SiteProxyController). Every request this
     // view makes must travel through the loopback proxy that classifies a
     // hostname once and connects to that exact address; a WebView created
@@ -485,11 +507,13 @@ object AnimeHubSiteController {
       // casts to RustWebView). The DNS gate inside it is now a SECOND line:
       // the actual connection for this view is pinned by the process-wide
       // loopback proxy (SiteProxyController), which is what decides the IP.
-      val evalOnPageStart = !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+      // The feature is guaranteed by the gate in `open()`, so there is no
+      // late path left: the script is registered before the view is attached
+      // and before the first navigation.
       // Drop any guard left over from a previous view before replacing it, so
       // the previous resolver thread cannot outlive its WebView.
       releaseNavigationGuard()
-      val guard = SiteNavigationGuard(SiteWebViewClient(initScript, evalOnPageStart))
+      val guard = SiteNavigationGuard(SiteWebViewClient())
       webView.webViewClient = guard
       navigationGuard = guard
       webView.webChromeClient =
@@ -532,9 +556,7 @@ object AnimeHubSiteController {
       //    origin's data. Verified by unit tests on the injected text
       //    (Rust session.rs, tests/init_script.test.js, tests/pip_controller
       //    .test.js) - NOT on a physical device.
-      if (!evalOnPageStart) {
-        WebViewCompat.addDocumentStartJavaScript(webView, initScript, setOf("*"))
-      }
+      WebViewCompat.addDocumentStartJavaScript(webView, initScript, setOf("*"))
 
       // (6) Attach above the launcher; never remove the launcher — closing
       // this view reveals it again.
@@ -1512,26 +1534,15 @@ object AnimeHubSiteController {
 
   /**
    * Base client for the site WebView: forwards everything (the
-   * [SiteNavigationGuard] wrapper owns policy) and only adds the init-script
-   * fallback for providers without `DOCUMENT_START_SCRIPT`. Deliberately NOT
-   * wry's `RustWebViewClient`: that class casts to `RustWebView` and talks to
-   * the launcher's IPC/asset machinery, none of which a site may reach.
+   * [SiteNavigationGuard] wrapper owns policy). It deliberately has no
+   * init-script path any more — `DOCUMENT_START_SCRIPT` is required to open a
+   * site, so a late `onPageStarted` injection would only duplicate work the
+   * document-start registration already did before any page script ran.
+   * Deliberately NOT wry's `RustWebViewClient`: that class casts to
+   * `RustWebView` and talks to the launcher's IPC/asset machinery, none of
+   * which a site may reach.
    */
-  private class SiteWebViewClient(
-    private val initScript: String,
-    private val evalOnPageStart: Boolean,
-  ) : WebViewClient() {
-    override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-      if (evalOnPageStart) {
-        try {
-          view.evaluateJavascript(initScript, null)
-        } catch (_: Exception) {
-          // Page-start callbacks are high-volume; do not emit per-navigation logs.
-        }
-      }
-      super.onPageStarted(view, url, favicon)
-    }
-  }
+  private class SiteWebViewClient : WebViewClient()
 
   private const val LOG_TAG = "AnimeHubSite"
 }

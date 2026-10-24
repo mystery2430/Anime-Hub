@@ -157,6 +157,16 @@ pub const QUARANTINE_SENTINEL: &str = "profile-quarantined";
 /// never open the site on the unpinned stack.
 pub const PROXY_SENTINEL: &str = "proxy-unavailable";
 
+/// Kotlin's `AnimeHubSiteController.ERR_DOCUMENT_START_UNSUPPORTED`. A bridge
+/// error containing this string means the site was NOT opened because the
+/// WebView provider cannot run a script before the page's own: without
+/// `DOCUMENT_START_SCRIPT` the WebRTC override (and the popup/cosmetic rules)
+/// can only be injected from `onPageStarted`, i.e. after an inline `<script>`
+/// may already have opened a peer connection. A late injection is not a
+/// security guarantee, so the open is refused instead of being called
+/// protected.
+pub const DOCUMENT_START_SENTINEL: &str = "unsupported-document-start";
+
 /// Alias under which the Kotlin side is registered.
 pub const PLUGIN_ALIAS: &str = "animehub-android";
 
@@ -329,6 +339,17 @@ pub fn is_profile_quarantined(error: &Error) -> bool {
 pub fn is_proxy_unavailable(error: &Error) -> bool {
     match error {
         Error::Bridge(message) => message.contains(PROXY_SENTINEL),
+        _ => false,
+    }
+}
+
+/// See [`DOCUMENT_START_SENTINEL`]: the site was refused because the provider
+/// cannot install the document-start script, which is the only point at which
+/// the WebRTC override runs before page script. Disjoint from the other
+/// sentinels.
+pub fn is_document_start_unsupported(error: &Error) -> bool {
+    match error {
+        Error::Bridge(message) => message.contains(DOCUMENT_START_SENTINEL),
         _ => false,
     }
 }
@@ -906,6 +927,16 @@ mod tests {
         assert_eq!(MIGRATION_RETRY_SENTINEL, "migration-partial");
         assert_eq!(QUARANTINE_SENTINEL, "profile-quarantined");
         assert_eq!(PROXY_SENTINEL, "proxy-unavailable");
+        assert_eq!(DOCUMENT_START_SENTINEL, "unsupported-document-start");
+        assert!(is_document_start_unsupported(&Error::Bridge(
+            "unsupported-document-start".into()
+        )));
+        assert!(!is_document_start_unsupported(&Error::Bridge(
+            "proxy-unavailable".into()
+        )));
+        assert!(!is_proxy_unavailable(&Error::Bridge(
+            "unsupported-document-start".into()
+        )));
         assert!(is_proxy_unavailable(&Error::Bridge(
             "proxy-unavailable".into()
         )));
@@ -1197,6 +1228,25 @@ mod tests {
         // refusal is the sentinel above.
         assert!(controller.contains("SiteProxyController.ensureReady(operationId)"));
         assert!(controller.contains("onResult(SiteProxyController.ERR_PROXY_UNAVAILABLE)"));
+        // The document-start gate: same literal, and no late-injection path
+        // left behind it. A `evaluateJavascript(initScript` fallback would mean
+        // the WebRTC guard can arrive after page script — the exact race the
+        // refusal exists for.
+        assert!(
+            controller.contains(&format!(
+                "const val ERR_DOCUMENT_START_UNSUPPORTED = \"{DOCUMENT_START_SENTINEL}\""
+            )),
+            "the document-start sentinel must match the Kotlin constant"
+        );
+        assert!(controller.contains("onResult(ERR_DOCUMENT_START_UNSUPPORTED)"));
+        assert!(
+            !controller.contains("evaluateJavascript(initScript"),
+            "no page-start fallback may remain"
+        );
+        assert!(
+            controller.contains("WebViewCompat.addDocumentStartJavaScript(webView, initScript"),
+            "the script is registered before the first navigation"
+        );
         assert!(controller.contains("if (!SiteProxyController.isPinned())"));
     }
 

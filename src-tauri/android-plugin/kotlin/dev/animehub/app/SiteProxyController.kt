@@ -123,7 +123,12 @@ object SiteProxyController {
     }
 
     val startedPort = try {
-      val bound = DnsPinnedProxy()
+      // The lookup is asynchronous and cancellable (`DnsResolver.query`), not
+      // the blocking `getAllByName` default: a platform resolver that never
+      // returns must not be able to own a proxy thread forever. The deadline
+      // here is the mirror of `Limits.resolveThreads`/`resolveThreadCap` — the
+      // budget bounds the leak, this bounds the wait.
+      val bound = DnsPinnedProxy(resolver = AsyncDnsResolver(PlatformDnsLookup()))
       bound.start()
       proxy = bound
       bound.port ?: error("proxy bound no port")

@@ -274,6 +274,11 @@ jobs:
           # answer cannot reach a private address.
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/DnsPinnedProxyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::DnsPinnedProxyTest.kt could not be copied into the test source set"; exit 1; }
           cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProxyGateTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteProxyGateTest.kt could not be copied into the test source set"; exit 1; }
+          # The asynchronous resolver: cancellation, single-flight, the
+          # in-flight ceiling and the "late answer cannot win" rule. Without
+          # this class the proxy could regress to a blocking, uncancellable
+          # lookup without any test noticing.
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/AsyncDnsResolverTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::AsyncDnsResolverTest.kt could not be copied into the test source set"; exit 1; }
           # The shared navigation-policy vectors: the Kotlin suite loads this
           # file from the test classpath and the Rust suite includes the very
           # same path with include_str!. A missing copy fails here (and the test
@@ -410,7 +415,7 @@ jobs:
           # require a results file per class. Printed counts make the evidence
           # visible in the log; a missing file fails the step.
           if [ $status -eq 0 ]; then
-            for cls in SiteProfileOpsTest SiteNavigationPolicyTest SiteWebViewSettingsTest DnsPinnedProxyTest SiteProxyGateTest; do
+            for cls in SiteProfileOpsTest SiteNavigationPolicyTest SiteWebViewSettingsTest DnsPinnedProxyTest SiteProxyGateTest AsyncDnsResolverTest; do
               xml=$(find . -type f -name "TEST-*${cls}.xml" | head -n 1)
               if [ -n "$xml" ]; then
                 echo "OK ${cls}: $(grep -o 'tests=\"[0-9]*\"' "$xml" | head -n 1) $(grep -o 'failures=\"[0-9]*\"' "$xml" | head -n 1) ($xml)"

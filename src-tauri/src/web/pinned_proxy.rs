@@ -171,7 +171,12 @@ impl Drop for ProxyHandle {
 
 /// Start the production proxy on an ephemeral loopback port.
 pub async fn start() -> std::io::Result<ProxyHandle> {
-    start_with(Arc::new(SystemResolver), Policy::PUBLIC_ONLY, Limits::DEFAULT).await
+    start_with(
+        Arc::new(SystemResolver),
+        Policy::PUBLIC_ONLY,
+        Limits::DEFAULT,
+    )
+    .await
 }
 
 async fn start_with(
@@ -359,9 +364,8 @@ fn status_text(status: u16) -> &'static str {
 }
 
 async fn reply(stream: &mut TcpStream, status: u16, reason: &str) -> std::io::Result<()> {
-    let body = format!(
-        "HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-    );
+    let body =
+        format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     stream.write_all(body.as_bytes()).await?;
     stream.flush().await
 }
@@ -480,14 +484,20 @@ mod tests {
         (port, task)
     }
 
+    /// Connect to the proxy itself.
+    async fn dial(port: u16) -> TcpStream {
+        TcpStream::connect(("127.0.0.1", port)).await.unwrap()
+    }
+
     /// Send one CONNECT and return the status line.
     async fn connect_via(proxy_port: u16, authority: &str) -> String {
-        let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        let mut stream = dial(proxy_port).await;
         let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut buf = vec![0u8; 256];
         let n = stream.read(&mut buf).await.unwrap();
-        String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        text.lines().next().unwrap_or("").to_string()
     }
 
     /// Production bounds, shortened so a refusal is observable immediately.
@@ -516,7 +526,7 @@ mod tests {
             .await
             .expect("proxy");
 
-        let mut stream = TcpStream::connect(("127.0.0.1", proxy.port())).await.unwrap();
+        let mut stream = dial(proxy.port()).await;
         let authority = format!("allowed.test:{origin_port}");
         let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -557,12 +567,19 @@ mod tests {
         // First request gets the public answer; it may or may not connect (the
         // address is TEST-NET and not routable here), which is irrelevant.
         let first = connect_via(proxy.port(), &format!("rebind.test:{catcher_port}")).await;
-        assert!(!first.contains(" 200 "), "public TEST-NET must not tunnel: {first}");
+        assert!(
+            !first.contains(" 200 "),
+            "public TEST-NET must not tunnel: {first}"
+        );
 
         // Second request re-resolves and gets the private address: refused.
         let second = connect_via(proxy.port(), &format!("rebind.test:{catcher_port}")).await;
         assert!(second.starts_with("HTTP/1.1 403"), "{second}");
-        assert_eq!(resolver.calls(), 2, "each CONNECT resolves once, never cached");
+        assert_eq!(
+            resolver.calls(),
+            2,
+            "each CONNECT resolves once, never cached"
+        );
 
         // The private address was never dialled: the catcher accepts nothing.
         let accepted = tokio::time::timeout(Duration::from_millis(300), catcher.accept()).await;
@@ -624,7 +641,11 @@ mod tests {
             let status = connect_via(proxy.port(), authority).await;
             assert!(status.starts_with("HTTP/1.1 403"), "{authority}: {status}");
         }
-        assert_eq!(resolver.calls(), 0, "literals and local names skip the resolver");
+        assert_eq!(
+            resolver.calls(),
+            0,
+            "literals and local names skip the resolver"
+        );
         proxy.stop();
     }
 
@@ -634,7 +655,7 @@ mod tests {
         let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
             .await
             .expect("proxy");
-        let mut stream = TcpStream::connect(("127.0.0.1", proxy.port())).await.unwrap();
+        let mut stream = dial(proxy.port()).await;
         stream
             .write_all(b"GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n")
             .await
@@ -653,7 +674,7 @@ mod tests {
         let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
             .await
             .expect("proxy");
-        let mut stream = TcpStream::connect(("127.0.0.1", proxy.port())).await.unwrap();
+        let mut stream = dial(proxy.port()).await;
         let mut request = String::from("CONNECT example.test:443 HTTP/1.1\r\n");
         while request.len() < MAX_HEAD_BYTES + 64 {
             request.push_str("X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
@@ -692,7 +713,7 @@ mod tests {
             .expect("proxy");
         let port = proxy.port();
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut stream = dial(port).await;
         let authority = format!("allowed.test:{origin_port}");
         let request = format!("CONNECT {authority} HTTP/1.1\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -709,7 +730,8 @@ mod tests {
 
         // The port no longer accepts.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+        let closed = TcpStream::connect(("127.0.0.1", port)).await;
+        assert!(closed.is_err(), "the stopped listener must not accept");
     }
 
     #[tokio::test]

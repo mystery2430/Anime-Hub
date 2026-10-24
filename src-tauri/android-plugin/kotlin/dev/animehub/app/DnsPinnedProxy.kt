@@ -63,7 +63,9 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * @param limits timeouts, buffer size and the connection ceiling.
  * @param resolver the ONLY place a hostname is turned into addresses. Called
- *   exactly once per connection, and never for an IP literal.
+ *   exactly once per connection, and never for an IP literal. Production
+ *   passes [AsyncDnsResolver] (`DnsResolver.query` + a deadline); the
+ *   blocking default below stays for the tests and as a readable fallback.
  * @param connector opens a TCP socket to a numeric [InetAddress]. Production is
  *   [PinnedConnect]: it uses `InetSocketAddress(address, port)`, which cannot
  *   re-resolve, and then verifies the socket's own remote address.
