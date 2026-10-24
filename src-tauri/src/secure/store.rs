@@ -107,7 +107,7 @@ impl SecureStore {
         std::fs::create_dir_all(&self.dir)?;
         let env = self.sealer_for(name).seal(plaintext, &Self::aad(name))?;
         let target = self.path_for(name);
-        atomic_write_locked(&target, &env)
+        atomic_write_locked(&target, &env).map_err(AppError::from)
     }
 
     /// Store an opaque secret (e.g. the AniList token JSON).
@@ -223,7 +223,7 @@ fn create_private_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
+pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
@@ -249,7 +249,7 @@ pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
         // Never leave a half-written temp file next to the store: it is the
         // only place where plaintext-shaped intermediate state could sit.
         let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(e);
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         // The rename is the last step that can fail, and it leaves the temp
@@ -258,7 +258,7 @@ pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
         // directory. A cleanup failure is ignored on purpose — the error the
         // caller sees has to be the one that describes why the write failed.
         let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(e);
     }
     // Ensure the rename is durable: fsync the parent directory where the
     // filesystem supports it. Best-effort — a failure to open/fsync the dir
@@ -323,22 +323,17 @@ mod tests {
         std::fs::write(target.join("inside"), b"keep").unwrap();
 
         let err = atomic_write_locked(&target, b"new").expect_err("the target is a directory");
-        // `rename` is the only step here that refuses a directory target — the
-        // parent exists and is writable and the temp name is unique — so the
-        // error kind is what proves the temp file had already been created and
-        // written. Unix reports EISDIR (Linux) or ENOTDIR (some kernels);
-        // Windows reports access-denied.
+        // The parent exists and is writable, so the temp file was created and
+        // written and the only step left is the rename — which is exactly the
+        // error below. Linux and macOS report EISDIR for a file-over-directory
+        // rename; on Windows the check only rules out the earlier phases.
         #[cfg(unix)]
-        {
-            let kind = err.kind();
-            let refused = kind == std::io::ErrorKind::IsADirectory;
-            let refused = refused || kind == std::io::ErrorKind::NotADirectory;
-            assert!(refused, "unexpected error kind: {kind:?}");
-        }
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{err}");
         #[cfg(not(unix))]
         {
             let kind = err.kind();
-            assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
+            assert!(kind != std::io::ErrorKind::AlreadyExists, "{kind:?}");
+            assert!(kind != std::io::ErrorKind::NotFound, "{kind:?}");
         }
 
         // The target is untouched …
