@@ -275,9 +275,17 @@ kendi 10 saniyelik son tarihinde serbest kalır; geç gelen veya yinelenen bir y
 uçuşu değiştiremez, yalnızca platform yuvasını bırakır; aynı host için tek uçuş
 (single-flight) vardır. **İki ayrı tavan** vardır ve ikisi de 8'dir: bekleyen
 mantıksal uçuşlar ve platformun henüz geri çağrımadığı sorgular — ikisinde de
-fazlası kuyruğa alınmaz, reddedilir. İptal edilen bir sorgunun yuvası, yanıtı
-gelirse onunla, gelmezse iptalden 60 s sonra geri alınır. `rcode` 0 (NOERROR)
-değilse yanıt adres listesi olarak **kullanılmaz**; çözümleme hatası sayılır.
+fazlası kuyruğa alınmaz, reddedilir. İptal edilen bir sorgunun yuvası platform
+**rapor verirse** onunla hemen kapanır (geç gelen rapor sonucu değiştiremez ama
+muhasebeyi tamamlar); hiç rapor gelmezse yalnızca **bizim takip kümemizden**
+iptalden 60 s sonra düşer. Bu 60 s bir **watchdog**'dur, platformun durduğunun
+kanıtı değildir: genel API tamamlanma sinyali vermez, AOSP uygulaması fd'yi
+kapatıp dinleyiciyi kaldırsa bile kuyruğa alınmış bir callback yine teslim
+edilebilir. Bu yüzden "en fazla 8 çalışan platform sorgusu" **denmez**; en fazla
+8 **izlenen** sorgu denir. Bir rapor, kapanmış uçuşu asla diriltmez ve hiçbir
+adres kullanılmaz — kalan maliyet erişilebilirlik, güvenlik değil. `rcode` 0
+(NOERROR) değilse yanıt adres listesi olarak **kullanılmaz**; çözümleme hatası
+sayılır.
 Bu çözümleyici yine sınırlı bir havuzda çalışır (`resolveMs = 10 s`, nesil
 başına `resolveThreads = 4`) ve toplam iş parçacığı `resolveThreadCap = 8` ile
 sınırlıdır; bu bütçe `stop()`/`start()` arasında da korunur. Tavan, tam bir
@@ -290,7 +298,7 @@ yoktur. **Cihazda
 kanıtlanmayan:** gerçek sağlayıcının `CancellationSignal.cancel()` çağrısına
 uyup uymadığı ve iptalden sonra geri çağrım yapıp yapmadığı — Android referansı
 bunun için bir söz vermez; `AsyncDnsResolverTest` bunu fake bir lookup ile
-JVM'de ölçer, cihazı değil (madde 36–38, 41; round 18).
+JVM'de ölçer, cihazı değil (madde 36–39 ve 42; round 19).
 Ayrıca `127.0.0.1`'e bağlanmak **yalnızca dış ağ arayüzlerini** kapatır; aynı
 cihazdaki başka uygulamalar bu portu bulup kullanabilir (kimlik doğrulama
 `ProxyConfig` ile mümkün değildir, açık kalan risk).

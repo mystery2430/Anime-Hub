@@ -8,7 +8,128 @@ each one describes the state at the end of its round, including status lines
 that a later round made obsolete. The next section is the only one that
 describes the branch as it stands now.
 
-## Round 18 — current state of the branch
+## Round 19 — current state of the branch
+
+Round 19 found a real defect in the Android resolver adapter — the shipped code
+did not do what its own tests and documents said it did — and settled, with
+source evidence, how far the platform-slot accounting can be trusted. It also
+answers the desktop first-request question per platform. No architecture
+changed; nothing here is device evidence.
+
+### 1. The defect: a post-cancel platform report was swallowed
+
+`PlatformDnsLookup.start()` used one `AtomicBoolean("settled")` for two
+different things: "the platform has reported" and "the caller asked to cancel".
+`Cancel` set that flag before calling `CancellationSignal.cancel()`, so a
+report that arrived afterwards was dropped by the callback. Consequences:
+
+* `AsyncDnsResolver.complete()` never ran for a cancelled query, so
+  `platform.remove(...)` never happened and the slot was reclaimed only by the
+  **60 s watchdog** — for a query that had actually finished;
+* the resolver's own comment ("a late answer … still releases the platform
+  slot") was true of the resolver and false of the adapter in front of it;
+* the JVM tests could not see it: `ManualLookup` forwarded every callback,
+  i.e. the fake was *more permissive* than production. A test that models a
+  different contract than the shipped code is worse than no test.
+
+**Fix.** The delivery rule is now a separate, pure-JVM class,
+`DnsAnswerDelivery`, used by `PlatformDnsLookup` and driven directly by the
+tests. It has exactly one job: hand the platform's **first** report to the
+resolver, whatever the cancellation state (`onAnswer` then `onError`, or a
+duplicate answer, still deliver once). Cancellation is now only "ask the
+platform to stop" and never clears the delivery latch, so a report that
+arrives after the caller gave up still reaches `complete()`, which refuses to
+settle the finished flight but does release the slot. The tests gained an
+`AdapterLikeLookup` that routes its reports through that same class, so the
+two "late report frees the slot" tests exercise the production rule rather
+than a lookalike.
+
+### 2. What the 60 s number actually is: a watchdog, not proof
+
+Round 18 presented the two ceilings as "logical flights" and "platform queries
+whose callback has not arrived", which reads like a hard bound on platform
+work. The evidence does not support that.
+
+**Public contract** (developer.android.com, fetched 2026-10-24):
+
+* `DnsResolver.query(..., CancellationSignal, ...)`: the signal is "used by
+  the caller to signal if the query should be cancelled. May be null." There
+  is no statement about what happens to the callback afterwards.
+* `CancellationSignal.cancel()`: "Cancels the operation and signals the
+  cancellation listener. If the operation has not yet started, then it will
+  be canceled as soon as it does."
+* `CancellationSignal.setOnCancelListener()`: "This method is intended to be
+  used by the recipient of a cancellation signal such as a database or a
+  content provider to handle cancellation requests while performing a
+  long-running operation. This method is not intended to be used by
+  applications themselves." — that is a statement of intent about the API's
+  audience, **not** a prohibition; `DnsResolver` is the intended recipient and
+  installs the listener itself, while an application calling `cancel()` is the
+  normal use of the signal.
+* `DnsResolver.query` (API 29 overload): "If at least one query succeeded with
+  valid answer, rcode will be 0" — the basis for treating any non-zero `rcode`
+  as a failure (round 18's `dnsAnswerOrFailure`, unchanged).
+
+**AOSP implementation** (API 30 SDK sources, `android/net/DnsResolver.java`,
+fetched 2026-10-24):
+
+* `cancelQuery(fd)` removes the fd event listener from the main looper's queue
+  and calls `resNetworkCancel(queryfd)`, whose comment is "Closes fd, marks it
+  invalid."
+* the fd listener's executor task re-checks `cancellationSignal.isCanceled()`
+  under the query lock and returns **without** calling the callback if the
+  signal fired;
+* therefore, in that implementation, cancel usually ends the query with no
+  callback — but a task that already passed the `isCanceled()` check can still
+  call `onAnswer`, and nothing in the API tells the caller which happened.
+
+**Conclusion (design choice B).** A callback always finishes the accounting at
+once; the 60 s value is only the fallback for a query that never reports, and
+it removes *our bookkeeping*, not platform work. The honest statement is:
+
+> At most 8 queries are **tracked** as unfinished. A report frees its slot
+> immediately; a query that never reports is no longer tracked 60 s after the
+> cancel. Nothing in the public API proves the platform stopped working on it,
+> so "at most 8 running platform queries" is **not** claimed.
+
+This is an availability residual, never a security one: a report that arrives
+after the flight settled cannot be used (the same `complete()` refuses it),
+no address from an untracked query is classified, and nothing is cached.
+
+### 3. Desktop first request, per platform (round 19 answer)
+
+Question: is there a **supported** API, available to this app, that prevents
+the first network request from leaving when the proxy setting was not applied?
+
+| Platform | Supported pre-request veto? | Evidence |
+| --- | --- | --- |
+| Windows / WebView2 | **Partly, and not through our stack.** `WebResourceRequested` + a resource filter runs before the request is sent and can answer it from the host. But `AddWebResourceRequestedFilter` is documented as deprecated and as not behaving "as expected for iframes"; the newer `AddWebResourceRequestedFilterWithRequestSourceKinds` does not fix WebSocket handshakes, which have no interception event. wry 0.55.1 does not expose either; it would need `with_webview` + raw COM per view. | Microsoft Learn, `ICoreWebView2::AddWebResourceRequestedFilter` (deprecation + iframe note), `add_WebResourceRequested` |
+| Linux / WebKitGTK | **Yes for resource loads, but out of reach of this stack.** `WebKitWebPage::send-request` is emitted "when request is about to be sent to the server" and returning `TRUE` cancels the load. It belongs to the **web-process extension** API (a separate `.so` loaded by the web process, registered on the context); wry sets up its own context and exposes no hook for it, and the signal does not cover WebSocket handshakes. | webkitgtk.org `WebKitWebPage` reference, `send-request`; WebKit bug 83681 (API added for the injected bundle) |
+| macOS / WKWebView | **No.** `WKNavigationDelegate` covers navigations (top frame and iframes), not `fetch`/XHR/subresources; `WKURLSchemeHandler` only serves custom schemes; `WKContentRuleList` blocks by URL pattern, cannot ask "did the proxy apply?", and is not a network veto. | Apple WebKit API surface (no subresource interception delegate) |
+
+None of these is implemented in this round, and none of them would be a
+"comment fix": each is a new native component with its own gaps (WebSocket,
+iframes, per-view wiring). The proxy binding and the post-load zero-CONNECT
+check are what this branch has; they are **not** a first-request guarantee, and
+the residual stays **Open** (P1: *Implemented; device verification pending*).
+
+### 4. Status after round 19
+
+| Item | Status | Change this round |
+| --- | --- | --- |
+| Android DNS cancellation (P2) | **Implemented; device verification pending** | The adapter now forwards the first platform report after a cancel, so a real completion frees its slot; 22 JVM tests (7 new) drive `DnsAnswerDelivery` and an adapter-shaped fake. The platform-query ceiling is documented as a watchdog, not a bound on platform work. |
+| Desktop proxy / first request (P1) | **Implemented; device verification pending**; first-request residual **Open** | Per-platform answer above; no new mechanism. |
+| Loopback proxy auth (P3) | **Open; product decision** | Unchanged; no 407 code. |
+| WebRTC/UDP (P4) | **Partially fixed**; UDP/QUIC **Open; technical limitation** | Unchanged. |
+| AniList OAuth (P5) | **Implementation fixed; AniList registration/E2E pending** | Unchanged. |
+
+**What is still not proven:** whether a real provider honours the cancel, and
+whether it ever reports afterwards (checklist items 36–39 and 42 remain NOT
+YET RUN); a real WebView2/WebKitGTK/WKWebView run for P1; an AniList login; and the
+independent human review. R-01(b) stays open. The Action pins (R-09) still live
+only on this branch.
+
+## Round 18 — state at the end of round 18 (history; corrected by round 19)
 
 Round 18 is a verification round: it closed what the source could prove, and
 narrowed every claim it could not. No re-architecture, no new mechanism, and no
@@ -18,9 +139,9 @@ item declared closed by a test or a comment alone.
 | --- | --- | --- | --- | --- |
 | Desktop proxy (P1) | **Implemented; device verification pending** | Windows: `additional_browser_args` carries wry 0.55.1's own default string plus `--proxy-server=http://127.0.0.1:{port}` and `--proxy-bypass-list=<-loopback>`; it is `cfg`-exclusive with `proxy_url` (setting both would make wry drop the proxy). Linux: wry sets the proxy on the `WebContext` website-data-manager **before** the first `WebView` is created. macOS: wry sets `proxyConfigurations` on the `WKWebsiteDataStore` **before** the webview is initialised, behind the `macos-proxy` default feature; the app's Darwin ≥ 23 (macOS 14) gate matches wry's `custom_data_store_available`. | `tests/desktop_proxy_wiring.test.js` (8 source-string pins), `pinned_proxy.rs` 12 tests, three desktop CI jobs. | A real WebView2 / WebKitGTK / WKWebView. **Scope is not per-view:** the Linux proxy belongs to the `WebContext` and the macOS one to the data store, so every view sharing them uses it. |
 | Desktop fail-closed check (P1) | **Implemented; post-load only** | `site_proxy_requests() == Some(0)` runs inside `PageLoadEvent::Finished`: a page that finished loading with zero proxy CONNECTs closes the site and tells the UI. | `windows.rs` comment + the `Finished`-guard pin in `tests/desktop_proxy_wiring.test.js`. | **It is not a first-request guarantee.** The check can only run after the load, so a provider that ignores the setting has already fetched the document. No pre-request veto exists in wry 0.55.1 or in the three WebView APIs reviewed; the residual stays **Open**. |
-| Android DNS cancellation (P2) | **Implemented in code; device verification pending** | The lookup runs on `DnsResolver.query` with a caller-owned deadline; the caller is released at that deadline whatever the provider does. A late or duplicate answer can free its slot but can never settle a finished call. Per-host single-flight. **Two independent ceilings of 8** — logical flights being awaited, and platform queries whose callback has not arrived — both refuse instead of queueing. A cancelled query's platform slot is released by its callback or, failing that, 60 s after the cancel (swept on the next CONNECT). `rcode != 0` is a resolution failure, never an address list. | `AsyncDnsResolverTest` (15 JVM tests, fake lookup: before/at/after the deadline, throwing cancel, stale answer for the same host, grace-period reclaim, rcode, ceilings) and `DnsPinnedProxyTest`, in the Android CI job. | Whether a real provider honours `CancellationSignal` and whether it ever calls back. The reference promises neither, gives no post-cancel ordering, and forbids apps from using `setOnCancelListener`; `PlatformDnsLookup` itself has never run on a device. Checklist items 36–38 remain **NOT YET RUN**. |
+| Android DNS cancellation (P2) | **Implemented in code; device verification pending** | The lookup runs on `DnsResolver.query` with a caller-owned deadline; the caller is released at that deadline whatever the provider does. A late or duplicate answer can free its slot but can never settle a finished call. Per-host single-flight. **Two independent ceilings of 8** — logical flights being awaited, and platform queries whose callback has not arrived — both refuse instead of queueing. A cancelled query's platform slot is released by its callback or, failing that, 60 s after the cancel (swept on the next CONNECT). `rcode != 0` is a resolution failure, never an address list. | `AsyncDnsResolverTest` (15 JVM tests, fake lookup: before/at/after the deadline, throwing cancel, stale answer for the same host, grace-period reclaim, rcode, ceilings) and `DnsPinnedProxyTest`, in the Android CI job. | Whether a real provider honours `CancellationSignal` and whether it ever calls back. The reference promises neither and gives no post-cancel ordering, and it says the listener is "not intended to be used by applications themselves" — a statement about the API's audience, not a prohibition (round 19 §2 corrects the earlier "forbids" wording); `PlatformDnsLookup` itself has never run on a device. The 60 s figure is bookkeeping, not proof that the platform stopped (round 19 §2). Checklist items 36–39 remain **NOT YET RUN**. |
 | Loopback proxy authentication (P3) | **Open; product decision** | The listener is loopback-only, ephemeral, public-destination-only and never cleared, but unauthenticated: `ProxyConfig.Builder` offers no credentials, and no `Proxy-Authorization` can be attached to the WebView's own `CONNECT`. | `docs/security-residual-risks.md` §4 (another app can reach and use it). | Any real-WebView evidence that a `407` challenge would be answered. Credentials would have to be random, native-only and unlogged. Smallest next step: a device probe that points a WebView at a loopback proxy answering `407` and records whether the `CONNECT` completes. Until then: no 407 code. |
-| WebRTC / UDP (P4) | **Partially fixed**; UDP **Open; technical limitation** | Only the JS API is restricted (`WEBRTC_GUARD` at document start on Android, all frames on desktop), and a provider without document-start support refuses the open. There is **no OS-level UDP/QUIC block**; `VpnService`/TUN is out of scope without a product decision. | Source pins for the guard; the refusal path is covered by the sentinel tests. | The iframe case, `RTCPeerConnection` delete/redefine, and a UDP-443 capture (checklist items 39–40, not run). "UDP is pinned/proxied" is never claimed. |
+| WebRTC / UDP (P4) | **Partially fixed**; UDP **Open; technical limitation** | Only the JS API is restricted (`WEBRTC_GUARD` at document start on Android, all frames on desktop), and a provider without document-start support refuses the open. There is **no OS-level UDP/QUIC block**; `VpnService`/TUN is out of scope without a product decision. | Source pins for the guard; the refusal path is covered by the sentinel tests. | The iframe case, `RTCPeerConnection` delete/redefine, and a UDP-443 capture (checklist items 40–41 after the round-19 renumbering, not run). "UDP is pinned/proxied" is never claimed. |
 | AniList OAuth (P5) | **Implementation fixed; AniList registration/E2E pending** | Both platforms accept only `http://127.0.0.1:<port>/callback`: `prepare_login` calls `validate_redirect_uri(&cfg.redirect_uri, false)` and the loopback listener is bound before the authorization URL is built; a custom scheme is refused first. The old build-manifest `animehub` intent filter is still generated by `scripts/android_prepare.py` and remains inert for OAuth — it was **not** "deleted". | `prepare_login_refuses_the_custom_scheme_on_every_platform`, `tests/command_wiring.test.js`. | A real AniList application registered with the exact redirect URI and a full login run. The client id is not in the repository, so no E2E login has happened. |
 
 **What round 18 changed in the source** (each one is a narrow, reviewable commit):
@@ -48,7 +169,7 @@ desktop and the `Unknown` fail-open path (GO-02/03); R-09's `main` aspect (the
 pins live on this branch only); fixed-port OAuth squatting (GO-06); R-01(b) and
 the independent human review; checklist items 26–40.
 
-## Round 17 — state at the end of round 17 (history; superseded by round 18)
+## Round 17 — state at the end of round 17 (history; superseded by round 18/19)
 
 This table described the branch at the end of round 17. It is kept as history:
 the round-18 section above it is the current state. Everything after this point

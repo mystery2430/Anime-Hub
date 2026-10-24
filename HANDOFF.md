@@ -101,6 +101,24 @@ macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TC
 `CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
 `HANDOFF` bölüm 6.D'de.
 
+**Round 19 — adapter hatası düzeltildi ve watchdog sınırı adlandırıldı.** Üretim
+adapter'ı (`PlatformDnsLookup`) iptal ile "platform rapor verdi" durumunu **aynı**
+bayrakta tutuyordu: `Cancel` bayrağı önce `true` yapıyordu, dolayısıyla iptalden
+sonra gelen `onAnswer`/`onError` aşağıya iletilmiyor, `AsyncDnsResolver.complete()`
+hiç çalışmıyor ve gerçekten bitmiş bir sorgunun yuvası ancak 60 s'lik watchdog ile
+düşüyordu. JVM testleri fake lookup her callback'i ilettiği için bunu göremiyordu.
+Düzeltme: teslim kuralı ayrı ve saf-JVM `DnsAnswerDelivery` sınıfına taşındı
+(ilk rapor **her zaman** iletilir; iptal teslim mandalını temizlemez), testlerdeki
+`AdapterLikeLookup` üretimdeki aynı sınıfı sürer. **60 s nedir:** platformun
+durduğunun kanıtı değil, yalnızca bizim muhasebemizin watchdog'u — genel API
+tamamlanma sinyali vermez; AOSP (API 30 kaynakları) `cancelQuery` içinde fd
+dinleyicisini kaldırıp fd'yi kapatır, ama kuyruğa alınmış bir callback yine
+çalışabilir. Bu yüzden "en fazla 8 çalışan platform sorgusu" denmez, "en fazla 8
+**izlenen** sorgu" denir. Masaüstü ilk istek sorusunun platform bazlı yanıtı
+`docs/security-residual-risks.md` round 19 §3'te; hiçbir platformda bu uygulamanın
+kullanabileceği, tüm trafiği kapsayan destekli bir ön-istek vetosu yok — risk
+**açık** kalır. Cihaz doğrulaması hâlâ yapılmadı.
+
 **Round 18 (doğrulama turu) — durum, etiketli.** D1 masaüstü vekili
 **uygulandı, cihaz doğrulaması bekliyor**: Windows'ta wry 0.55.1'in kendi
 varsayılan argüman dizisine `--proxy-server=http://127.0.0.1:<port>` +
