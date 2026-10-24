@@ -341,6 +341,17 @@ mod tests {
         lock(in_flight()).get(host).is_none()
     }
 
+    /// `in_flight` and its budget are process-global, which is what production
+    /// needs and what makes these tests interfere: two of them would spend the
+    /// same budget and each would see the other's lookups. So the tests that
+    /// touch it take this lock and run one at a time (cargo runs test threads
+    /// in parallel by default).
+    static DNS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn exclusive() -> MutexGuard<'static, ()> {
+        lock(&DNS_TEST_LOCK)
+    }
+
     #[test]
     fn empty_answer_is_private() {
         assert!(answers_are_private(&[]));
@@ -400,6 +411,7 @@ mod tests {
 
     #[test]
     fn a_resolver_answer_is_classified_and_an_error_is_unknown() {
+        let _exclusive = exclusive();
         let limit = Duration::from_millis(500);
         let answered = lookup_with("public.test", limit, 2, |_| Ok(vec![PUBLIC]));
         assert_eq!(answered, DnsClass::Answered { private: false });
@@ -417,6 +429,7 @@ mod tests {
 
     #[test]
     fn concurrent_callers_for_one_host_share_a_single_lookup() {
+        let _exclusive = exclusive();
         // The old code spawned one detached thread per call, and the comment
         // claimed the cache lock de-duplicated them. It never did: the lock is
         // only held for the map access, not across the lookup.
@@ -448,6 +461,7 @@ mod tests {
 
     #[test]
     fn hung_hosts_cannot_exceed_the_lookup_budget() {
+        let _exclusive = exclusive();
         // Four distinct names whose resolver never returns must cost at most
         // `budget` threads; everything after that is refused immediately rather
         // than queued behind them.
@@ -489,6 +503,7 @@ mod tests {
 
     #[test]
     fn a_timed_out_lookup_never_classifies_its_late_answer() {
+        let _exclusive = exclusive();
         // The caller times out, THEN the resolver answers with a public address.
         // That answer must not reach the caller (it timed out) and must not be
         // cached: the next navigation has to resolve again.
@@ -522,6 +537,7 @@ mod tests {
 
     #[test]
     fn a_lookup_never_writes_the_answer_cache_itself() {
+        let _exclusive = exclusive();
         // `classify_host` caches answers, never `Unknown` (see its match), and
         // the lookup below writes nothing at all. Caching a timeout would turn
         // one slow lookup into a permanent verdict about a host, which a
