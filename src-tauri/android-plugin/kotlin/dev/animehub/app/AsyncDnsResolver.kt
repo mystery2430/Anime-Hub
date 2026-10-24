@@ -77,10 +77,15 @@ internal class PlatformDnsLookup(
   override fun start(host: String, onResult: (List<InetAddress>?, Throwable?) -> Unit): DnsLookup.Cancel {
     val signal = CancellationSignal()
     val settled = AtomicBoolean(false)
+    // `DnsResolver.Callback<T>` is `onAnswer(answer: T, rcode: Int)` plus
+    // `onError(error: DnsException)` — both parameters matter: a one-argument
+    // `onAnswer` overrides nothing. The answer list arrives as a `MutableList`
+    // (Java's `List` in a parameter position), so it is copied into the
+    // read-only list this file returns.
     val callback =
-      object : DnsResolver.Callback<List<InetAddress>> {
-        override fun onAnswer(answer: List<InetAddress>) {
-          if (settled.compareAndSet(false, true)) onResult(answer, null)
+      object : DnsResolver.Callback<MutableList<InetAddress>> {
+        override fun onAnswer(answer: MutableList<InetAddress>, rcode: Int) {
+          if (settled.compareAndSet(false, true)) onResult(answer.toList(), null)
         }
 
         override fun onError(error: DnsResolver.DnsException) {
