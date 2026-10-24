@@ -3,6 +3,28 @@
 This document records what this branch fixes and what it deliberately does
 **not** claim to fix.
 
+## Round 16.4 — active workflow Actions are SHA-pinned
+
+**R-09's mutable-tag issue is implemented on this branch; CI validation is pending.**
+The four active workflows under `.github/workflows/` now pin all 36 external
+Action references to reviewed 40-character commit SHAs, with the former version
+tag retained as a comment. The two local reusable-workflow references in
+`publish-release.yml` remain `uses: ./.github/workflows/...` because they name
+repository files rather than third-party Actions.
+
+Only those 36 `uses:` reference lines changed. Workflow triggers, permissions,
+release-gate conditions, signing environment, secrets wiring, build commands
+and artifact handling were left unchanged. `tests/gaps.test.js` and
+`tests/command_wiring.test.js` now scan the **active** workflow set and check
+the complete reference count and reviewed SHA mapping; the CI run for this
+commit is still the final syntax/integration check.
+
+The former token-scope blocker was not bypassed by changing credentials: these
+edits were accepted on the PR branch, and `main`, tags and releases were not
+modified. The hardened files in `ci-fixes/` remain reference copies, not the
+workflows GitHub executes.
+
+
 ## Fixed
 
 ### Android OAuth callback interception (R-05)
@@ -70,15 +92,13 @@ persisted state is re-read for on startup.
 
 ### Supply chain
 
-The hardened workflows in `ci-fixes/` pin every external Action to a commit
-SHA, and a test rejects mutable tags in those files. The **active** workflows
-still use mutable tags: the branch token has no `workflow` permission and the
-push was refused again this round — see
-[Actions pinning — explicit blocker](#actions-pinning--explicit-blocker) for the
-verified SHA table and the exact change a maintainer has to make.
-`android_prepare.py` fails unless each Gradle pin appears exactly once. The
-`ci-fixes/` proposal to also assert the **resolved** Gradle graph in CI is
-deliberately unapplied: it cannot be exercised in this environment.
+All 36 external Action references in the four **active** workflows are now
+pinned to the reviewed commit SHAs documented below and guarded by tests over
+the active files. The `ci-fixes/` copies are retained as references; they are
+not the executable workflow source. The separate proposal to assert the
+**resolved** Gradle dependency graph in CI remains unapplied because that
+extra step has not been exercised in this environment. `android_prepare.py`
+continues to require each Gradle dependency pin exactly once.
 
 ## Round 16 — DNS rebinding is decided where the connection is made
 
@@ -822,36 +842,13 @@ bounds replacements; after that the worker **refuses** new submissions
 of creating more threads. Real provider latency and kill paths remain device
 work (R-04).
 
-### Actions pinning — explicit blocker
+### Actions pinning — verified SHA table (applied in Round 16.4)
 
-The hardened, **SHA-pinned** workflows live only in `ci-fixes/*.yml`; the
-**active** `.github/workflows/*.yml` still reference mutable tags. This was
-re-attempted in the current round — the pinned files were committed on top of
-the branch and pushed — and GitHub rejected the push again with:
+This table records the reviewed references that are now used by the active
+workflows. Earlier rounds below describe the state at those points in time;
+they are historical and are superseded by the Round 16.4 status at the top.
 
-```
-refusing to allow a Personal Access Token to create or update workflow
-`.github/workflows/ci.yml` without `workflow` scope
-```
-
-The rejection is a hard server-side rule, not a transient failure: the token
-authenticates (`GET /user` → `mystery2430`) and the repository reports
-`push`/`admin` for it, and a commit that touches **no** workflow file was
-accepted on the same branch in the same round. Only `.github/workflows/` content
-is refused, which is exactly the fine-grained-PAT `Workflows` permission.
-
-The permission was not worked around, no credential was changed, nothing was
-pushed to `main`, and no tag or release was created. The rejected commit was
-rolled back locally so the branch never carried workflow edits the token cannot
-land, and the tree therefore still matches the docs. The item stays **blocked**,
-not fixed.
-
-Every SHA below was resolved from its tag through
-`GET /repos/<owner>/<repo>/commits/<tag>` during this round, so a maintainer
-does not have to re-derive them. They match the `ci-fixes/` proposals exactly —
-the proposals were **verified**, not assumed correct:
-
-| Action | Verified commit SHA | tag |
+| Action | Verified commit SHA | former tag |
 | --- | --- | --- |
 | `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | v7 |
 | `dtolnay/rust-toolchain` | `b725eda525362e7cf34af9a7243cac1e3f01a7ec` | stable |
@@ -863,58 +860,15 @@ the proposals were **verified**, not assumed correct:
 | `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 |
 | `tauri-apps/tauri-action` | `1deb371b0cd8bd54025b384f1cd735e725c4060f` | v1 |
 
-36 `uses:` references across `ci.yml` (19), `release-android.yml` (7),
-`release-desktop.yml` (6) and `publish-release.yml` (4 external; its two
-`uses: ./.github/workflows/...` are in-repo reusable workflows and are not
-pinnable). `tests/command_wiring.test.js` asserts this table, so the values are
-in a tested location even while the workflows themselves cannot be changed.
+There are 36 external `uses:` references: 19 in `ci.yml`, 7 in
+`release-android.yml`, 6 in `release-desktop.yml`, and 4 in
+`publish-release.yml`. The latter file's two local reusable-workflow
+references are deliberately left as relative paths. The changes replace only
+the action reference on each of the 36 lines; all workflow logic stays the same.
 
-Note on `dtolnay/rust-toolchain@stable`: pinning freezes the *installer* action
-at a commit, not the Rust toolchain — the job still installs whatever `stable`
-is that day. That is the correct reading of the pin, not a reproducibility
-claim.
-
-**The exact change a maintainer with `workflow` scope has to make** — replace
-each `owner/action@tag` with `owner/action@<sha> # tag` in the four ACTIVE
-files, and nothing else:
-
-```
-actions/checkout@v7                  -> actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-dtolnay/rust-toolchain@stable        -> dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-Swatinem/rust-cache@v2               -> Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-actions/setup-node@v7                -> actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-actions/setup-java@v6                -> actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
-android-actions/setup-android@v4     -> android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
-actions/upload-artifact@v7           -> actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-actions/download-artifact@v8         -> actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-tauri-apps/tauri-action@v1           -> tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
-```
-
-Verified property of that change: `git diff -U0 -- .github/workflows/` touches
-72 lines and **every one of them is a `uses:` line**, so triggers,
-`permissions:`, the `publish-release` gate conditions
-(`head_branch == 'main'`,
-`head_repository.full_name == github.repository`), `environment: keystore` and
-every artifact step stay byte-identical.
-
-Two things a maintainer should know before choosing how to apply it:
-
-* `ci-fixes/apply.sh` copies the whole proposal files, which is **not** the same
-  as the minimal change above. `ci-fixes/ci.yml` additionally inserts a
-  `Verify resolved Android pins` Gradle step asserting the resolved graph holds
-  exactly `androidx.webkit:webkit:1.16.0` and `kotlin-gradle-plugin:2.1.20`.
-  Those are the versions `scripts/android_prepare.py` pins, so the step is
-  plausible — but it was **deliberately not applied** here, because no
-  Gradle/JVM/Android SDK exists in this environment and a strict assertion
-  nobody could run is an unverified change to the Android CI job. Land it
-  separately, after one real run.
-* After the pinning lands, two tests must move with it: `tests/gaps.test.js`
-  (`assert.match(yml, /actions\/upload-artifact@v7/)`, and the pinning scan that
-  currently only walks `ci-fixes/`) and the
-  `"Actions pinning is reported as a blocker, not claimed as fixed"` case in
-  `tests/command_wiring.test.js`, which asserts the active `ci.yml` is *not*
-  pinned. Both say so in their own failure messages.
-
+Pinning `dtolnay/rust-toolchain` fixes the installer **Action code** at a
+commit, not the Rust toolchain installed by its `stable` input. That is not a
+claim of bit-for-bit reproducible Rust toolchains.
 
 ## Partially mitigated / residual
 
