@@ -139,29 +139,19 @@ test("flush worker replacement is bounded and can refuse work", () => {
   assert.match(worker, /flush worker exhausted/);
 });
 
-test("Actions pinning is reported as a blocker, not claimed as fixed", () => {
-  // R-09 / item 5: the hardened, SHA-pinned workflows live in ci-fixes/ and
-  // the ACTIVE workflows still use mutable tags, because this branch's token
-  // is refused ("without `workflow` scope"). Bypassing that was explicitly out
-  // of scope, so the honest state is: proposals pinned, active files not, and
-  // the limit written down. This test fails if the docs start claiming
-  // otherwise.
+test("all active GitHub Actions workflows use the reviewed SHA pins", () => {
   const docs = read("docs/security-residual-risks.md");
-  assert.match(docs, /workflow` scope/);
-  assert.match(docs, /Actions pinning/);
-  const active = read(".github/workflows/ci.yml");
-  assert.equal(
-    /uses:\s*actions\/checkout@[0-9a-f]{40}/.test(active),
-    false,
-    "if the active workflow ever gets pinned, update the blocker docs and this test",
-  );
-  const proposal = read("ci-fixes/ci.yml");
-  assert.match(proposal, /uses:\s*actions\/checkout@[0-9a-f]{40} # v7/);
+  const status = read("docs/audit-item-status.md");
+  assert.match(docs, /Round 16\.4 — active workflow Actions are SHA-pinned/);
+  assert.match(status, /\|\s*\*\*R-09\*\*.*\*\*fixed\*\*/);
 
-  // The verification half of R-09 IS done: every tag was resolved to a commit
-  // SHA through GET /repos/<owner>/<repo>/commits/<tag>. Those values are
-  // recorded in the blocker doc so a maintainer does not have to re-derive
-  // them, and they are asserted here so they cannot rot silently.
+  const paths = [
+    ".github/workflows/ci.yml",
+    ".github/workflows/release-android.yml",
+    ".github/workflows/release-desktop.yml",
+    ".github/workflows/publish-release.yml",
+  ];
+  const allActive = paths.map(read).join("\n");
   const verified = {
     "actions/checkout": ["3d3c42e5aac5ba805825da76410c181273ba90b1", "v7"],
     "dtolnay/rust-toolchain": ["b725eda525362e7cf34af9a7243cac1e3f01a7ec", "stable"],
@@ -173,27 +163,33 @@ test("Actions pinning is reported as a blocker, not claimed as fixed", () => {
     "actions/download-artifact": ["9000827ccba6bdab643e8b6fd33ac0654aef8333", "v8"],
     "tauri-apps/tauri-action": ["1deb371b0cd8bd54025b384f1cd735e725c4060f", "v1"],
   };
-  for (const [action, [sha, tag]] of Object.entries(verified)) {
-    assert.match(sha, /^[0-9a-f]{40}$/, `${action}: not a full commit SHA`);
-    assert.match(
-      docs,
-      new RegExp(`\`${action.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\` \\| \`${sha}\` \\| ${tag} \\|`),
-      `${action}@${tag} -> ${sha} must stay documented for the maintainer`,
-    );
-    // And the documented SHA must be the one the reviewed proposal uses.
-    const found = new Set(
-      [...proposal.matchAll(new RegExp(`uses:\\s*${action.replace(/\//g, "\\/")}@([0-9a-f]{40})`, "g"))].map(
-        (m) => m[1],
-      ),
-    );
-    if (found.size > 0) {
-      assert.deepEqual([...found], [sha], `${action}: ci-fixes/ disagrees with the verified SHA`);
+  let external = 0;
+  for (const path of paths) {
+    const src = read(path);
+    for (const line of src.split("\n")) {
+      const match = line.match(/^\s*(?:-\s*)?uses:\s*(\S+)/);
+      if (!match || match[1].startsWith("./")) continue;
+      external += 1;
+      const [action, sha] = match[1].split("@");
+      assert.match(sha || "", /^[0-9a-f]{40}$/, `${path}: ${action} must use a full commit SHA`);
+      assert.match(line, /#\s*(?:v?\d|stable\b)/, `${path}: missing Action version comment`);
     }
   }
-  // The doc must tell the maintainer exactly what to change, and must not
-  // pretend ci-fixes/apply.sh is that minimal change.
-  assert.match(docs, /uses:` line/);
-  assert.match(docs, /Verify resolved Android pins/);
+  assert.equal(external, 36, `expected 36 pinned external Actions, found ${external}`);
+
+  for (const [action, [sha, tag]] of Object.entries(verified)) {
+    assert.match(sha, /^[0-9a-f]{40}$/, `${action}: not a full commit SHA`);
+    const escapedAction = action.replace(/\//g, "\\/");
+    assert.match(
+      allActive,
+      new RegExp(`uses:\\s*${escapedAction}@${sha}\\s+#\\s*${tag}`),
+      `${action}@${tag} SHA must remain present in active workflows`,
+    );
+    assert.ok(docs.includes(sha) && docs.includes(action), `${action}@${tag} SHA should remain documented`);
+  }
+
+  // The ci-fixes copy is a reference; active workflows are validated above.
+  assert.match(read("ci-fixes/ci.yml"), /actions\\/checkout@[0-9a-f]{40} # v7/);
 });
 
 test("blocklist transfers are serialized and generation-guarded (PR #27 follow-up)", () => {
