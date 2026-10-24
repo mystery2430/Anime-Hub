@@ -7,6 +7,14 @@
 // navigation, and that a failure never ends in an open site. Those are
 // ordering properties of `web/windows.rs`, so they are pinned here against the
 // shipped source, next to the behavioural tests in `pinned_proxy.rs`.
+//
+// WHAT THESE TESTS ARE: source-string pins. Every assertion below reads the
+// text of a file and checks the order of statements or the presence of a
+// literal. They prove that the code says what the review agreed on; they do
+// NOT prove that a WebView provider honours `proxy_url`, that macOS applies the
+// data-store proxy, or that the `PageLoadEvent::Finished` check runs after a
+// real un-pinned request. Only a run on each desktop WebView can show that, and
+// none has happened (docs/security-residual-risks.md, round 18).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -64,7 +72,8 @@ test("the inner open installs that proxy before any WebView and cannot start its
   assert.ok(builder > 0 && addChild > builder, "the WebView is built and then attached");
   assert.ok(
     install < builder,
-    "the proxy must be running before the builder is constructed, so the first navigation is covered",
+    "the proxy must be listening before the WebView is created (ordering only: " +
+      "whether the provider applies it is a device question)",
   );
   // The already-open early return happens before the install: the freshly
   // bound listener is dropped there instead of leaking a port.
@@ -117,7 +126,14 @@ test("the Windows argument string keeps the proxy and removes the loopback bypas
   assert.match(fn, /String::from\(WRY_DEFAULT_BROWSER_ARGS\)/);
 });
 
-test("a WebView that ignores the proxy closes the site instead of running un-pinned", () => {
+test("a page load with zero proxy CONNECTs closes the site afterwards", () => {
+  // The check can only run once the page has finished loading, so it closes a
+  // session that already made its requests; it is not a pre-request veto.
+  assert.match(
+    OPEN_PATH,
+    /if !matches!\(payload\.event\(\), tauri::webview::PageLoadEvent::Finished\) \{\s*return;/,
+    "the zero-CONNECT check must live inside the Finished branch",
+  );
   const check = OPEN_PATH.indexOf("site_proxy_requests() == Some(0)");
   assert.ok(check > 0, "the load handler must verify the proxy was used");
   // Scope to the fail-closed branch itself: `navigation-blocked` and

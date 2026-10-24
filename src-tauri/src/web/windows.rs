@@ -275,7 +275,8 @@ fn stop_site_proxy() {
 ///
 /// `None` means no proxy is running. `Some(0)` after a page has finished
 /// loading means the WebView never talked to it, i.e. the proxy setting was
-/// ignored by the provider — the case that must never pass silently.
+/// ignored by the provider — the case that must never pass silently. The check
+/// is necessarily post-load: the counter can only be read after the fact.
 #[cfg(desktop)]
 fn site_proxy_requests() -> Option<usize> {
     let slot = lock_recover(&SITE_PROXY);
@@ -424,10 +425,13 @@ fn open_in_main_window_inner(
     close_current_child_locked(app)?;
 
     // Pin every request this session makes. The handle was bound BEFORE this
-    // function ran (and before the lock), and it is installed before the
-    // WebView exists, so the very first navigation is already covered. There
-    // is no branch that opens a site without the proxy: a failed bind returned
-    // `Err` from `open_in_main_window` before reaching this point.
+    // function ran (and before the lock) and it is installed before the WebView
+    // is created, so every navigation this view starts is meant to go through
+    // the proxy. Whether the provider actually applies the setting cannot be
+    // known from here: `on_page_load` closes the session when the proxy saw no
+    // CONNECT at all, and that check can only run once the load has finished.
+    // There is no branch that opens a site without a bound proxy: a failed bind
+    // returned `Err` from `open_in_main_window` before reaching this point.
     let proxy_port = install_site_proxy(proxy);
 
     // Per-site profile directory: WebKitGTK's data directory on Linux, and on
@@ -522,10 +526,15 @@ fn open_in_main_window_inner(
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 return;
             }
-            // A page that finished loading without the proxy ever seeing a
-            // CONNECT did not use it — the provider ignored the setting. That
-            // is the fail-open case, and it must not end as a quietly
-            // un-pinned site: close it and tell the UI.
+            // Post-load fail-closed check, NOT a first-request guard. This
+            // runs only at `PageLoadEvent::Finished`, i.e. after the document
+            // has loaded (and after any request the page already made). If the
+            // proxy saw no CONNECT at all, the provider ignored the setting:
+            // close the site instead of leaving it open un-pinned and tell the
+            // UI. What this bounds is how long an ignored setting survives,
+            // not whether an un-pinned request ever happened: neither wry
+            // 0.55.1 nor WebView2/WebKitGTK/WKWebView offers a pre-request
+            // veto (see the risk table in docs/security-residual-risks.md).
             if site_proxy_requests() == Some(0) {
                 log::error!("site görünümü proxy'yi kullanmadı");
                 let app = webview.app_handle().clone();
