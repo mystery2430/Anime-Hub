@@ -739,13 +739,13 @@ clears the slot **only if it still holds this attempt's value** — a login
 started in the meantime keeps its state. Regression test:
 `abandoning_a_pending_state_clears_only_its_own_attempt`.
 
-### Actions pinning (R-09) is still blocked, not fixed
+### Actions pinning (R-09) — state at Round 7, superseded by Round 16.4
 
-The active workflows still use mutable tags. `workflow_dispatch` is also
-refused for this token (`HTTP 403: Resource not accessible by integration`), so
-CI can only be triggered by a pull request. Nothing in this round changed a
-`.github/workflows/` file; see
-[Actions pinning — explicit blocker](#actions-pinning--explicit-blocker).
+At the time of Round 7, the active workflows still used mutable tags and
+`workflow_dispatch` was refused for the available token
+(`HTTP 403: Resource not accessible by integration`), so CI could only be
+triggered by a pull request. The SHA-pinning status changed in Round 16.4; see
+[Actions pinning — verified SHA table](#actions-pinning--verified-sha-table-applied-in-round-164).
 
 ## Round 6 — what is fixed and what is still blocked
 
