@@ -320,8 +320,11 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
         ""
     };
 
-    // Same rule as the popup guard: omitted, never emitted-and-disabled, so the
-    // shipped text for desktop does not contain the override at all.
+    // Same rule as the popup guard: omitted, never emitted-and-disabled. On
+    // Android the guard is part of this document-start script (which the
+    // provider applies to every frame). On desktop it is registered
+    // separately with `initialization_script_for_all_frames`, so it is not
+    // duplicated here — see [`WEBRTC_GUARD`].
     let webrtc_guard = if cfg.webrtc_guard {
         include_str!("webrtc_guard.js")
     } else {
@@ -351,6 +354,12 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
 {popup_guard}{webrtc_guard}{cosmetic}{pip_controller}}})();"#
     )
 }
+
+/// The WebRTC override as shipped, for the desktop all-frames registration.
+///
+/// Kept in one place: the file is the single source of truth for both the
+/// Android document-start script and the desktop `initialization_script_for_all_frames`.
+pub const WEBRTC_GUARD: &str = include_str!("webrtc_guard.js");
 
 /// Serialise a value for embedding inside an inline `<script>` block.
 ///
@@ -972,14 +981,29 @@ mod tests {
         }
     }
 
+    /// Both platforms with a pinned path ship the guard, but they install it
+    /// through different channels: Android composes it into the document-start
+    /// script (every frame), desktop registers [`WEBRTC_GUARD`] separately with
+    /// `initialization_script_for_all_frames`. Neither composes it twice.
     #[test]
-    fn the_webrtc_guard_is_android_only() {
-        let desktop = build_init_script(&InjectedConfig::default());
+    fn the_webrtc_guard_is_installed_once_per_platform() {
+        let composed = build_init_script(&InjectedConfig::default());
         assert!(
-            !desktop.contains("RTCPeerConnection"),
-            "desktop has no pinned path to protect, so the API stays"
+            !composed.contains("RTCPeerConnection"),
+            "the composed script never carries the guard on its own"
         );
-        assert!(!desktop.contains("NotSupportedError"));
+        assert!(!composed.contains("NotSupportedError"));
+        assert!(
+            WEBRTC_GUARD.contains("RTCPeerConnection") && WEBRTC_GUARD.contains("defineProperty"),
+            "the shared guard text is the shipped override"
+        );
+        // The desktop WebView registers that text for every frame; the pin
+        // lives in windows.rs so a refactor cannot drop it silently.
+        let windows_rs = include_str!("windows.rs");
+        assert!(
+            windows_rs.contains("initialization_script_for_all_frames(crate::web::session::WEBRTC_GUARD)"),
+            "the site WebView must install the guard in every frame"
+        );
     }
 
     /// AH-P2: the document-start channel cannot be scoped to the top frame, so

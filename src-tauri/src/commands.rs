@@ -679,8 +679,11 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         // drives with `evaluateJavascript` right before entering PiP. Desktop
         // has no PiP window for a site WebView, so it stays out.
         pip_controller: cfg!(target_os = "android"),
-        // Android only: the pinning proxy covers HTTP(S)/WSS (TCP CONNECT),
-        // not WebRTC's UDP. Desktop has no pinned path, so nothing to guard.
+        // Android composes the guard here. Desktop has a pinned path too
+        // (the Rust CONNECT proxy), but installs the same guard through
+        // `initialization_script_for_all_frames` in `web/windows.rs`, so it is
+        // not duplicated into this top-frame script. Neither transport is
+        // covered for UDP/WebRTC by the proxy itself.
         webrtc_guard: cfg!(target_os = "android"),
     };
     let init_script = build_init_script(&injected);
@@ -692,6 +695,7 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         &init_script,
         settings.fullscreen_sites,
     )
+    .await
     .map(|label| OpenedSite {
         label,
         mobile: cfg!(any(target_os = "android", target_os = "ios")),

@@ -38,6 +38,7 @@ const SESSION_RS = read("src-tauri/src/web/session.rs");
 const POPUP_GUARD = read("src-tauri/src/web/popup_guard.js");
 const PIP_CONTROLLER = read("src-tauri/src/web/pip_controller.js");
 const WEBRTC_GUARD = read("src-tauri/src/web/webrtc_guard.js");
+const WINDOWS_RS = read("src-tauri/src/web/windows.rs");
 const COMMANDS_RS = read("src-tauri/src/commands.rs");
 
 const CFG = { blockPopups: true, hideSelectors: [".ad-container", "#popup"], pipController: true };
@@ -171,7 +172,7 @@ test("the WebRTC guard removes the API and cannot be undone by the page", () => 
   assert.equal(constructed, 0, "the native constructor never ran");
 });
 
-test("the WebRTC guard is omitted, not merely disabled, where there is no pin", () => {
+test("the WebRTC guard is composed once per platform, never twice", () => {
   const dom = createFakeDom({ width: 360, height: 800 });
   const NativePeerConnection = function NativePeerConnection() {};
   dom.window.RTCPeerConnection = NativePeerConnection;
@@ -179,18 +180,28 @@ test("the WebRTC guard is omitted, not merely disabled, where there is no pin", 
   assert.equal(
     dom.window.RTCPeerConnection,
     NativePeerConnection,
-    "desktop keeps the platform API",
+    "the composed script alone never overrides the API",
   );
   assert.ok(WEBRTC_GUARD.includes("RTCPeerConnection"), "the shipped file is the override");
-  // The composition is the only thing that decides: the shipped text exists in
-  // session.rs exactly once, behind the Android-only flag.
+  // The composition is the only thing that decides, and it does so behind a
+  // native-side flag: Android sets it and gets the guard inside the
+  // document-start script (which its provider applies to every frame).
   const production = SESSION_RS.split("mod tests")[0];
   assert.match(production, /include_str!\("webrtc_guard\.js"\)/);
   assert.match(production, /if cfg\.webrtc_guard/);
   assert.match(
     COMMANDS_RS,
     /webrtc_guard: cfg!\(target_os = "android"\)/,
-    "the Android open path turns the guard on",
+    "the Android open path composes the guard into the document-start script",
+  );
+  // Desktop has a pinned path too (the Rust CONNECT proxy) and installs the
+  // same shipped file for every frame instead of duplicating it into the
+  // top-frame script. If this pin ever loses the registration, desktop would
+  // silently keep `RTCPeerConnection` while the proxy pins only TCP.
+  assert.match(
+    WINDOWS_RS,
+    /\.initialization_script_for_all_frames\(crate::web::session::WEBRTC_GUARD\)/,
+    "the desktop site WebView must install the guard in every frame",
   );
 });
 

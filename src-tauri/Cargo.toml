@@ -97,6 +97,15 @@ tempfile = "3"
 # Emitted by `tauri build`; enables the custom protocol / dev server plumbing.
 custom-protocol = ["tauri/custom-protocol"]
 
+# WKWebView has no public per-WebView proxy setting; wry's only bridge is the
+# Network.framework `nw_proxy_config_*` path plus an undocumented
+# `WKWebsiteDataStore` key, which is gated behind this feature and only exists
+# on macOS 14+. Turning it on is what lets a site WebView be pinned on macOS;
+# without it the runtime refuses to open a site instead of opening it
+# unproxied (see `web/windows.rs::start_site_proxy`). Inert off macOS.
+default = ["macos-proxy"]
+macos-proxy = ["tauri/macos-proxy"]
+
 # Release profile for distribution builds.
 #
 # `lto = true` + `codegen-units = 1` produces the smallest binary, but it

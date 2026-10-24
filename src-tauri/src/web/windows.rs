@@ -122,6 +122,156 @@ pub fn lock_android_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
 #[cfg(desktop)]
 static DESKTOP_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The pinning proxy of the site that is open right now.
+///
+/// One site is hosted at a time and every open/close runs under
+/// [`DESKTOP_SESSION_LOCK`], so a single slot is the whole lifecycle. Starting
+/// a session always stops whatever is there first: a port or handle from an
+/// earlier session must never serve a new one.
+#[cfg(desktop)]
+static SITE_PROXY: std::sync::Mutex<Option<crate::web::pinned_proxy::ProxyHandle>> =
+    std::sync::Mutex::new(None);
+
+/// Minimum Darwin kernel major for macOS 14 (Darwin 23). The WKWebView proxy
+/// bridge in wry goes through Network.framework's `nw_proxy_config_*` and an
+/// undocumented `WKWebsiteDataStore` key; neither exists before macOS 14, and
+/// a silently ignored proxy is exactly the fail-open this feature must avoid.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_14_DARWIN_MAJOR: u32 = 23;
+
+/// Map a Darwin release string ("23.6.0") to its major version.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_major(release: &str) -> u32 {
+    release
+        .split('.')
+        .next()
+        .and_then(|major| major.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether this build can put the site WebView behind a proxy at all.
+///
+/// `false` means the site must not be opened: the alternative would be a site
+/// with un-pinned egress while the UI claims otherwise.
+#[cfg(any(target_os = "macos", test))]
+fn macos_proxy_supported(release: &str, feature_enabled: bool) -> bool {
+    feature_enabled && darwin_major(release) >= MACOS_14_DARWIN_MAJOR
+}
+
+#[cfg(target_os = "macos")]
+fn current_darwin_release() -> String {
+    // `KERN_OSRELEASE` (2) under `CTL_KERN` (1) from <sys/sysctl.h>.
+    let mut buf = [0u8; 128];
+    let mut len = buf.len();
+    let mut name = [1i32, 2i32];
+    let ok = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            name.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf[..len])
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+/// Wry's own default argument string for the WebView2 environment
+/// (`wry 0.55.1`, `src/webview2/mod.rs::create_environment`). The API takes a
+/// single string and the app-supplied value REPLACES it, so everything the
+/// default carries has to be repeated here. `--autoplay-policy` is part of the
+/// wry default whenever `autoplay` is on, which is wry's default and what this
+/// app relies on for its players.
+#[cfg(any(windows, test))]
+const WRY_DEFAULT_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
+
+/// Full WebView2 argument string for a pinned session.
+///
+/// Why not `proxy_url` on Windows: wry appends `--proxy-server` only in the
+/// branch where the app did *not* set its own arguments, so combining the two
+/// would silently drop the proxy. Both flags therefore live here, together
+/// with the defaults that would otherwise be lost.
+///
+/// `--proxy-bypass-list=<-loopback>` subtracts Chromium's implicit
+/// "loopback destinations never use the proxy" rules. Without it a page could
+/// reach `127.0.0.1:<port>` (or `localhost`, `[::1]`) directly and the proxy
+/// would never see the request.
+#[cfg(any(windows, test))]
+fn windows_browser_args(port: u16) -> String {
+    let mut args = String::from(WRY_DEFAULT_BROWSER_ARGS);
+    // The port this session actually bound, never a constant.
+    args.push_str(&format!(" --proxy-server=http://127.0.0.1:{port}"));
+    args.push_str(" --proxy-bypass-list=<-loopback>");
+    args
+}
+
+/// The proxy URL handed to wry on the platforms where it takes one
+/// (`ProxyConfig::Http` → HTTP CONNECT; TLS stays between the WebView and the
+/// origin).
+#[cfg(all(desktop, not(windows)))]
+fn site_proxy_url(port: u16) -> AppResult<url::Url> {
+    url::Url::parse(&format!("http://127.0.0.1:{port}"))
+        .map_err(|_| AppError::Other("proxy adresi geçersiz".into()))
+}
+
+/// Start the proxy for the session that is about to open.
+///
+/// Failure is fatal for the open: there is no code path here that creates the
+/// WebView without a working pinned path.
+#[cfg(desktop)]
+async fn start_site_proxy() -> AppResult<u16> {
+    stop_site_proxy();
+
+    #[cfg(target_os = "macos")]
+    {
+        let release = current_darwin_release();
+        if !macos_proxy_supported(&release, cfg!(feature = "macos-proxy")) {
+            log::warn!("macOS sürümü proxy köprüsünü desteklemiyor");
+            return Err(AppError::Unsupported(
+                "Bu macOS sürümünde güvenli site proxy'si kullanılamıyor; site korumasız açılmadı."
+                    .into(),
+            ));
+        }
+    }
+
+    let handle = crate::web::pinned_proxy::start().await.map_err(|_| {
+        log::error!("site proxy'si başlatılamadı");
+        AppError::Network("site proxy'si başlatılamadı; site açılmadı".into())
+    })?;
+    let port = handle.port();
+    let mut slot = lock_recover(&SITE_PROXY);
+    *slot = Some(handle);
+    Ok(port)
+}
+
+/// Stop the proxy and drop every tunnel of the current session.
+#[cfg(desktop)]
+fn stop_site_proxy() {
+    let mut slot = lock_recover(&SITE_PROXY);
+    if let Some(handle) = slot.take() {
+        handle.stop();
+    }
+}
+
+/// How many CONNECT requests the live proxy has parsed.
+///
+/// `None` means no proxy is running. `Some(0)` after a page has finished
+/// loading means the WebView never talked to it, i.e. the proxy setting was
+/// ignored by the provider — the case that must never pass silently.
+#[cfg(desktop)]
+fn site_proxy_requests() -> Option<usize> {
+    let slot = lock_recover(&SITE_PROXY);
+    slot.as_ref().map(|handle| handle.requests())
+}
+
+
 /// Lock the desktop session. See the `DESKTOP_SESSION_LOCK` docs for the
 /// global lock order.
 #[cfg(desktop)]
@@ -156,7 +306,7 @@ pub fn label_for(site_id: &str) -> String {
 /// builds, so even a `cfg!()`-guarded branch would fail to compile on
 /// Android.
 #[cfg(mobile)]
-pub fn open_site_window(
+pub async fn open_site_window(
     app: AppHandle,
     site: &Site,
     url: &Url,
@@ -169,14 +319,14 @@ pub fn open_site_window(
 /// Desktop variant: a child WebView inside the main window, per-site profile
 /// kept.
 #[cfg(desktop)]
-pub fn open_site_window(
+pub async fn open_site_window(
     app: AppHandle,
     site: &Site,
     url: &Url,
     init_script: &str,
     fullscreen: bool,
 ) -> AppResult<String> {
-    open_in_main_window(&app, site, url, init_script, fullscreen)
+    open_in_main_window(&app, site, url, init_script, fullscreen).await
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +334,7 @@ pub fn open_site_window(
 // ---------------------------------------------------------------------------
 
 #[cfg(desktop)]
-fn open_in_main_window(
+async fn open_in_main_window(
     app: &AppHandle,
     site: &Site,
     url: &Url,
@@ -195,11 +345,11 @@ fn open_in_main_window(
     // the lock is held so a concurrent `clear_site_data` cannot delete the
     // profile directory we are about to create.
     let _guard = lock_desktop_session()?;
-    open_in_main_window_inner(app, site, url, init_script, fullscreen)
+    open_in_main_window_inner(app, site, url, init_script, fullscreen).await
 }
 
 #[cfg(desktop)]
-fn open_in_main_window_inner(
+async fn open_in_main_window_inner(
     app: &AppHandle,
     site: &Site,
     url: &Url,
@@ -245,7 +395,14 @@ fn open_in_main_window_inner(
     // One site at a time inside the single window: close a previous session
     // (saving its jar) before opening the next. Use the `_locked` variant
     // because we already hold `DESKTOP_SESSION_LOCK` so we must not relock.
+    // The close also stops that session's pinning proxy, so the port below is
+    // never a leftover from the previous site.
     close_current_child_locked(app)?;
+
+    // Pin every request this session makes. Started BEFORE the WebView exists,
+    // so the very first navigation is already covered, and a failure returns
+    // here — there is no branch that opens a site without the proxy.
+    let proxy_port = start_site_proxy().await?;
 
     // Per-site profile directory: WebKitGTK's data directory on Linux, and on
     // Windows the WebView2 user-data folder. This is what makes cookies,
@@ -275,6 +432,10 @@ fn open_in_main_window_inner(
         // launcher's. See the module docs for the isolation contract.
         .data_directory(data_dir)
         .initialization_script(init_script)
+        // WebRTC is removed in EVERY frame at document start: an iframe can
+        // open a peer connection just as the top document can, and its ICE
+        // traffic is UDP that a CONNECT proxy never carries.
+        .initialization_script_for_all_frames(crate::web::session::WEBRTC_GUARD)
         .focused(true)
         .on_navigation(move |target: &Url| {
             // The injected "back" affordance navigates to this pseudo-URL.
@@ -335,8 +496,36 @@ fn open_in_main_window_inner(
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 return;
             }
+            // A page that finished loading without the proxy ever seeing a
+            // CONNECT did not use it — the provider ignored the setting. That
+            // is the fail-open case, and it must not end as a quietly
+            // un-pinned site: close it and tell the UI.
+            if site_proxy_requests() == Some(0) {
+                log::error!("site görünümü proxy'yi kullanmadı");
+                let app = webview.app_handle().clone();
+                let label = webview.label().to_string();
+                let _ = app.emit(
+                    "animehub://navigation-blocked",
+                    "Site proxy'si kullanılmadı; site korumasız açılmadı.",
+                );
+                tauri::async_runtime::spawn(async move {
+                    if close_site_window(&app, &label).is_err() {
+                        log::error!("korumasız site oturumu kapatılamadı");
+                    }
+                });
+                return;
+            }
             let _ = webview.eval(crate::web::session::OVERLAY_SNIPPET);
         });
+
+    // Point the WebView at the proxy. Windows takes it as a WebView2 argument
+    // (the only way to also override the implicit loopback bypass); the other
+    // desktop targets use wry's proxy setting, which is what WebKitGTK's
+    // `WebsiteDataManager` and WKWebView's proxy configuration consume.
+    #[cfg(windows)]
+    let builder = builder.additional_browser_args(&windows_browser_args(proxy_port));
+    #[cfg(all(desktop, not(windows)))]
+    let builder = builder.proxy_url(site_proxy_url(proxy_port)?);
 
     // `add_child` lives on the bare `Window`, not on `WebviewWindow`; same
     // window, different handle type.
@@ -351,6 +540,7 @@ fn open_in_main_window_inner(
         )
         .map_err(|_| {
             log::error!("WebView pencereye eklenemedi");
+            stop_site_proxy();
             AppError::Other("WebView pencereye eklenemedi".into())
         })?;
 
@@ -3518,6 +3708,10 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     if let Some(site_id) = closed_site {
         let _ = app.emit("animehub://site-closed", site_id);
     }
+    // The session is over: its tunnels must not outlive it. Doing this before
+    // the caller wipes the profile also guarantees no in-flight request can
+    // write into a directory that is being deleted.
+    stop_site_proxy();
     Ok(())
 }
 
@@ -3664,6 +3858,9 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
     if let Some(site_id) = closed_site {
         let _ = app.emit("animehub://site-closed", site_id);
     }
+    // Down with the session: no tunnel survives its WebView, and the next
+    // open starts its own proxy (see `start_site_proxy`).
+    stop_site_proxy();
     Ok(())
 }
 
@@ -3697,6 +3894,67 @@ mod tests {
     use crate::secure::SecretProvider;
     use crate::sites::blocklist::Blocklist;
     use std::sync::{Arc, Mutex};
+
+    /// The WebView2 argument string must keep wry's own defaults, add the
+    /// proxy, and subtract Chromium's implicit loopback bypass. This is a
+    /// string-level check on purpose: it pins the composition, not the
+    /// browser's behaviour (that needs a real WebView2).
+    #[test]
+    fn the_windows_browser_args_keep_the_proxy_and_the_loopback_override() {
+        let args = windows_browser_args(43210);
+        assert!(
+            args.contains("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"),
+            "wry's default features flag would be lost: {args}"
+        );
+        assert!(
+            args.contains("--autoplay-policy=no-user-gesture-required"),
+            "wry's autoplay default would be lost: {args}"
+        );
+        assert!(
+            args.contains("--proxy-server=http://127.0.0.1:43210"),
+            "the proxy must be spelled out: {args}"
+        );
+        assert!(
+            args.contains("--proxy-bypass-list=<-loopback>"),
+            "the implicit loopback bypass must be removed: {args}"
+        );
+        // Every token is a switch; a stray value would make WebView2 reject
+        // the call and start without a proxy.
+        for token in args.split(' ').filter(|t| !t.is_empty()) {
+            assert!(token.starts_with("--"), "not a switch: {token}");
+        }
+        // The port is the one this session bound, never a hard-coded one.
+        assert!(!args.contains("17395"));
+        assert_ne!(windows_browser_args(1), windows_browser_args(2));
+    }
+
+    #[test]
+    fn macos_14_is_the_first_supported_release() {
+        assert_eq!(darwin_major("23.6.0"), 23);
+        assert_eq!(darwin_major("22.6.0"), 22);
+        assert_eq!(darwin_major("24.0.0"), 24);
+        assert_eq!(darwin_major("not-a-release"), 0);
+        assert_eq!(darwin_major(""), 0);
+        assert!(macos_proxy_supported("23.0.0", true));
+        assert!(macos_proxy_supported("24.1.0", true));
+        assert!(!macos_proxy_supported("22.6.0", true), "macOS 13 must refuse");
+        assert!(
+            !macos_proxy_supported("23.0.0", false),
+            "a build without the proxy bridge must refuse, not open unprotected"
+        );
+        assert!(!macos_proxy_supported("", true));
+    }
+
+    /// No proxy is running outside a session, so the page-load check cannot
+    /// mistake "not started" for "the provider ignored it" — and a stopped
+    /// slot never hands a stale handle to the next open.
+    #[test]
+    fn the_proxy_slot_is_empty_between_sessions() {
+        stop_site_proxy();
+        assert!(site_proxy_requests().is_none());
+        stop_site_proxy();
+        assert!(site_proxy_requests().is_none());
+    }
 
     #[test]
     fn labels_are_unique_per_site_and_filesystem_safe() {
