@@ -437,6 +437,9 @@ mod tests {
             assert_eq!(caller.join().unwrap(), DnsClass::Unknown);
         }
         // Six navigations for one host must cost one lookup, not six threads.
+        // A slow runner can take a moment to schedule the resolver thread, so
+        // wait for the lookup to be entered before counting it.
+        assert!(wait_until(|| gate.entered() == 1, 2_000));
         let entered = gate.entered();
         assert_eq!(entered, 1);
         gate.release();
@@ -465,7 +468,9 @@ mod tests {
         for caller in callers {
             assert_eq!(caller.join().unwrap(), DnsClass::Unknown);
         }
-        // The budget is a thread bound, not a hint.
+        // The budget is a thread bound, not a hint: two lookups may be inside
+        // the resolver (never more), and the other six were refused without one.
+        assert!(wait_until(|| gate.entered() == 2, 2_000));
         let entered = gate.entered();
         assert_eq!(entered, 2);
 
