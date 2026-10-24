@@ -5,29 +5,37 @@
 // a fake DnsLookup, so no Android runtime is involved — the platform half
 // (PlatformDnsLookup) can only be exercised on a device, and that is stated in
 // docs/security-residual-risks.md.
+//
+// JUnit 4, like every other test in this source set: the generated Android
+// project puts `junit:junit` on the unit-test classpath and nothing else, so
+// `kotlin.test` (which the first version of this file used) does not resolve.
 package dev.animehub.app
 
 import java.io.IOException
 import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertSame
-import kotlin.test.assertTrue
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Test
 
 class AsyncDnsResolverTest {
   /** A lookup the test completes by hand. */
   private class ManualLookup : DnsLookup {
     val started = AtomicInteger()
     val cancelled = AtomicInteger()
-    private val callbacks = java.util.concurrent.ConcurrentHashMap<String, (List<InetAddress>?, Throwable?) -> Unit>()
+    private val callbacks =
+      ConcurrentHashMap<String, (List<InetAddress>?, Throwable?) -> Unit>()
     private val startedLatch = CountDownLatch(1)
 
-    override fun start(host: String, onResult: (List<InetAddress>?, Throwable?) -> Unit): DnsLookup.Cancel {
+    override fun start(
+      host: String,
+      onResult: (List<InetAddress>?, Throwable?) -> Unit,
+    ): DnsLookup.Cancel {
       callbacks[host] = onResult
       started.incrementAndGet()
       startedLatch.countDown()
@@ -35,12 +43,22 @@ class AsyncDnsResolverTest {
     }
 
     fun awaitStarted() {
-      assertTrue(startedLatch.await(2, TimeUnit.SECONDS), "the lookup never started")
+      assertTrue("the lookup never started", startedLatch.await(2, TimeUnit.SECONDS))
     }
 
     fun answer(host: String, addresses: List<InetAddress>, error: Throwable? = null) {
       callbacks[host]?.invoke(addresses, error)
     }
+  }
+
+  /** `assertThrows` without depending on a JUnit minor version. */
+  private fun expectIOException(block: () -> Unit): IOException {
+    try {
+      block()
+    } catch (e: IOException) {
+      return e
+    }
+    throw AssertionError("an IOException was expected")
   }
 
   private fun loopback() = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
@@ -53,20 +71,21 @@ class AsyncDnsResolverTest {
     val worker = Thread { resolver("example.test") }
     var result: List<InetAddress>? = null
     val done = CountDownLatch(1)
-    val waiter = Thread {
-      result = resolver("example.test")
-      done.countDown()
-    }
+    val waiter =
+      Thread {
+        result = resolver("example.test")
+        done.countDown()
+      }
     // Start one lookup, then let a second caller join it.
     worker.start()
     lookup.awaitStarted()
     waiter.start()
     lookup.answer("example.test", listOf(loopback()))
-    assertTrue(done.await(2, TimeUnit.SECONDS), "the joined caller never returned")
-    assertEquals(1, lookup.started.get(), "both callers must share one lookup")
+    assertTrue("the joined caller never returned", done.await(2, TimeUnit.SECONDS))
+    assertEquals("both callers must share one lookup", 1, lookup.started.get())
     worker.join(2_000)
     assertEquals(listOf(loopback()), result)
-    assertEquals(0, resolver.inFlightCount(), "a completed flight must be released")
+    assertEquals("a completed flight must be released", 0, resolver.inFlightCount())
   }
 
   @Test
@@ -75,10 +94,13 @@ class AsyncDnsResolverTest {
     val resolver = AsyncDnsResolver(lookup, timeoutMs = 120)
 
     val started = System.nanoTime()
-    assertFailsWith<IOException> { resolver("slow.test") }
+    expectIOException { resolver("slow.test") }
     val elapsedMs = (System.nanoTime() - started) / 1_000_000L
-    assertTrue(elapsedMs < 2_000, "the caller must not wait for the platform: ${elapsedMs}ms")
-    assertEquals(1, lookup.cancelled.get(), "the platform lookup must be cancelled")
+    assertTrue(
+      "the caller must not wait for the platform: ${elapsedMs}ms",
+      elapsedMs < 2_000,
+    )
+    assertEquals("the platform lookup must be cancelled", 1, lookup.cancelled.get())
     assertEquals(0, resolver.inFlightCount())
   }
 
@@ -86,15 +108,15 @@ class AsyncDnsResolverTest {
   fun `a late answer cannot turn a timed-out lookup into a success`() {
     val lookup = ManualLookup()
     val resolver = AsyncDnsResolver(lookup, timeoutMs = 80)
-    assertFailsWith<IOException> { resolver("late.test") }
+    expectIOException { resolver("late.test") }
     // The provider ignored cancellation and answers afterwards.
     lookup.answer("late.test", listOf(loopback()))
-    assertEquals(0, resolver.inFlightCount(), "a dropped answer must not reopen a flight")
+    assertEquals("a dropped answer must not reopen a flight", 0, resolver.inFlightCount())
     // The next call starts a NEW lookup instead of reusing the old answer.
     val thread = Thread { runCatching { resolver("late.test") } }
     thread.start()
     thread.join(2_000)
-    assertTrue(lookup.started.get() >= 2, "nothing is cached across calls")
+    assertTrue("nothing is cached across calls", lookup.started.get() >= 2)
   }
 
   @Test
@@ -102,12 +124,13 @@ class AsyncDnsResolverTest {
     val lookup = ManualLookup()
     val resolver = AsyncDnsResolver(lookup, timeoutMs = 2_000)
     val failure = IllegalArgumentException("NXDOMAIN")
-    val worker = Thread { resolver("nx.test") }
+    val worker = Thread { runCatching { resolver("nx.test") } }
     worker.start()
     lookup.awaitStarted()
     lookup.answer("nx.test", emptyList(), failure)
     worker.join(2_000)
-    assertTrue(!worker.isAlive, "the caller must be released")
+    assertTrue("the caller must be released", !worker.isAlive)
+    assertEquals(0, resolver.inFlightCount())
   }
 
   @Test
@@ -126,11 +149,12 @@ class AsyncDnsResolverTest {
       }
     threads.forEach { it.start() }
     Thread.sleep(200)
-    assertEquals(2, lookup.started.get(), "two names must not share one lookup")
+    assertEquals("two names must not share one lookup", 2, lookup.started.get())
     lookup.answer("a.test", listOf(loopback()))
     lookup.answer("b.test", listOf(loopback()))
     threads.forEach { it.join(2_000) }
     assertEquals(2, results.size)
+    assertEquals(0, resolver.inFlightCount())
   }
 
   @Test
@@ -140,8 +164,8 @@ class AsyncDnsResolverTest {
     val worker = Thread { runCatching { resolver("first.test") } }
     worker.start()
     lookup.awaitStarted()
-    assertFailsWith<IOException> { resolver("second.test") }
-    assertEquals(1, lookup.started.get(), "the refused call must not start a lookup")
+    expectIOException { resolver("second.test") }
+    assertEquals("the refused call must not start a lookup", 1, lookup.started.get())
     lookup.answer("first.test", listOf(loopback()))
     worker.join(2_000)
     assertEquals(0, resolver.inFlightCount())
