@@ -260,23 +260,33 @@ claims are tested here, and only the first one is a guarantee:
 
 ---
 
-## 7. Round 17 additions — unexecuted
+## 7. Round 17–18 additions — NOT YET RUN
 
-None of these has been run. They are new because round 17 changed the resolver
-and made the WebRTC document-start guard fail-closed, so the older items no
-longer describe every path.
+None of these has been run. They are new because rounds 17–18 changed the
+resolver (asynchronous platform lookup with a deadline), made the WebRTC
+document-start guard fail-closed, and added a failed-response-code rule, so the
+older items no longer describe every path.
 
 36. **Asynchronous resolver deadline.** With DNS blackholed, open a site.
-    Expected: the refusal arrives in roughly ten seconds (`RESOLVE_EXHAUSTED`
-    after the deadline), not "never", and `logcat` shows the platform lookup
-    cancelled. A thread dump must show no growing `AnimeHubDns` population —
-    the deadline releases the waiting thread whether or not the provider honours
-    `CancellationSignal.cancel()`.
+    Expected: the `CONNECT` is refused with **502** in roughly ten seconds. That
+    refusal is `RESOLVE_FAILED` (deadline or resolver error), *not*
+    `RESOLVE_EXHAUSTED` — exhaustion means every resolver worker is busy, which
+    is a different, process-wide condition. Nothing is logged about the host or
+    the query, so do **not** expect a `logcat` line for the cancellation; the
+    verdict has to come from timing and from the thread dump, which must show no
+    growing `AnimeHubDns` population and at most 8 `AnimeHubProxyResolve`
+    workers. The deadline releases the waiting thread whether or not the
+    provider honours `CancellationSignal.cancel()`.
 37. **Late answer cannot win.** Keep one lookup pending past its deadline, then
     restore DNS. Expected: the timed-out attempt stays failed, nothing is
-    cached, and a *new* open resolves again. (JVM test
-    `a late answer cannot turn a timed-out lookup into a success`; the device is
-    what decides whether a provider delivers the callback at all.)
+    cached, and a *new* open resolves again. If the provider delivers the late
+    answer it only frees the platform slot; if it never does, the slot is
+    reclaimed 60 s after the cancel, which shows up indirectly as later opens
+    still working. JVM tests:
+    `a late answer cannot turn a timed-out lookup into a success`,
+    `a stale answer cannot change the result of a new call for the same host`,
+    `a provider that never answers loses its slot after the grace period`. The
+    device is what decides whether a provider delivers a callback at all.
 38. **Concurrent same-host lookups.** Open the same site twice in quick
     succession. Expected: the provider is asked once per name while the first
     lookup is in flight (single-flight), and the second caller is answered by
@@ -293,6 +303,12 @@ longer describe every path.
     residual — if UDP 443 still leaves the device, the claim stays
     "HTTP(S)/WSS is pinned" and the guard is defence in depth only. Only an
     OS-level filter (`VpnService`/TUN, a product decision) could change that.
+41. **Failed DNS response code is refused.** Point the proxy at a name whose
+    resolver answers SERVFAIL/REFUSED (or use a captive portal that does), and
+    open a site. Expected: the `CONNECT` is refused with **502** and no socket
+    is opened — a parsed answer with a non-zero `rcode` must never be used as an
+    address list. JVM test: `a nonzero dns rcode is a failure, never an
+    allow-list`.
 
 Items 33–35 describe the resolver the proxy used *before* round 17 (blocking
 lookups with a thread budget). Keep them as history: the budget still exists and

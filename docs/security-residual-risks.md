@@ -8,19 +8,51 @@ each one describes the state at the end of its round, including status lines
 that a later round made obsolete. The next section is the only one that
 describes the branch as it stands now.
 
-## Round 17 — current state of the branch
+## Round 18 — current state of the branch
 
-This is the summary to read first. Everything after it is a round log.
+Round 18 is a verification round: it closed what the source could prove, and
+narrowed every claim it could not. No re-architecture, no new mechanism, and no
+item declared closed by a test or a comment alone.
+
+| Item | Status | What is true now | Evidence | What is still not proven |
+| --- | --- | --- | --- | --- |
+| Desktop proxy (P1) | **Implemented; device verification pending** | Windows: `additional_browser_args` carries wry 0.55.1's own default string plus `--proxy-server=http://127.0.0.1:{port}` and `--proxy-bypass-list=<-loopback>`; it is `cfg`-exclusive with `proxy_url` (setting both would make wry drop the proxy). Linux: wry sets the proxy on the `WebContext` website-data-manager **before** the first `WebView` is created. macOS: wry sets `proxyConfigurations` on the `WKWebsiteDataStore` **before** the webview is initialised, behind the `macos-proxy` default feature; the app's Darwin ≥ 23 (macOS 14) gate matches wry's `custom_data_store_available`. | `tests/desktop_proxy_wiring.test.js` (8 source-string pins), `pinned_proxy.rs` 12 tests, three desktop CI jobs. | A real WebView2 / WebKitGTK / WKWebView. **Scope is not per-view:** the Linux proxy belongs to the `WebContext` and the macOS one to the data store, so every view sharing them uses it. |
+| Desktop fail-closed check (P1) | **Implemented; post-load only** | `site_proxy_requests() == Some(0)` runs inside `PageLoadEvent::Finished`: a page that finished loading with zero proxy CONNECTs closes the site and tells the UI. | `windows.rs` comment + the `Finished`-guard pin in `tests/desktop_proxy_wiring.test.js`. | **It is not a first-request guarantee.** The check can only run after the load, so a provider that ignores the setting has already fetched the document. No pre-request veto exists in wry 0.55.1 or in the three WebView APIs reviewed; the residual stays **Open**. |
+| Android DNS cancellation (P2) | **Implemented in code; device verification pending** | The lookup runs on `DnsResolver.query` with a caller-owned deadline; the caller is released at that deadline whatever the provider does. A late or duplicate answer can free its slot but can never settle a finished call. Per-host single-flight. **Two independent ceilings of 8** — logical flights being awaited, and platform queries whose callback has not arrived — both refuse instead of queueing. A cancelled query's platform slot is released by its callback or, failing that, 60 s after the cancel (swept on the next CONNECT). `rcode != 0` is a resolution failure, never an address list. | `AsyncDnsResolverTest` (15 JVM tests, fake lookup: before/at/after the deadline, throwing cancel, stale answer for the same host, grace-period reclaim, rcode, ceilings) and `DnsPinnedProxyTest`, in the Android CI job. | Whether a real provider honours `CancellationSignal` and whether it ever calls back. The reference promises neither, gives no post-cancel ordering, and forbids apps from using `setOnCancelListener`; `PlatformDnsLookup` itself has never run on a device. Checklist items 36–38 remain **NOT YET RUN**. |
+| Loopback proxy authentication (P3) | **Open; product decision** | The listener is loopback-only, ephemeral, public-destination-only and never cleared, but unauthenticated: `ProxyConfig.Builder` offers no credentials, and no `Proxy-Authorization` can be attached to the WebView's own `CONNECT`. | `docs/security-residual-risks.md` §4 (another app can reach and use it). | Any real-WebView evidence that a `407` challenge would be answered. Credentials would have to be random, native-only and unlogged. Smallest next step: a device probe that points a WebView at a loopback proxy answering `407` and records whether the `CONNECT` completes. Until then: no 407 code. |
+| WebRTC / UDP (P4) | **Partially fixed**; UDP **Open; technical limitation** | Only the JS API is restricted (`WEBRTC_GUARD` at document start on Android, all frames on desktop), and a provider without document-start support refuses the open. There is **no OS-level UDP/QUIC block**; `VpnService`/TUN is out of scope without a product decision. | Source pins for the guard; the refusal path is covered by the sentinel tests. | The iframe case, `RTCPeerConnection` delete/redefine, and a UDP-443 capture (checklist items 39–40, not run). "UDP is pinned/proxied" is never claimed. |
+| AniList OAuth (P5) | **Implementation fixed; AniList registration/E2E pending** | Both platforms accept only `http://127.0.0.1:<port>/callback`: `prepare_login` calls `validate_redirect_uri(&cfg.redirect_uri, false)` and the loopback listener is bound before the authorization URL is built; a custom scheme is refused first. The old build-manifest `animehub` intent filter is still generated by `scripts/android_prepare.py` and remains inert for OAuth — it was **not** "deleted". | `prepare_login_refuses_the_custom_scheme_on_every_platform`, `tests/command_wiring.test.js`. | A real AniList application registered with the exact redirect URI and a full login run. The client id is not in the repository, so no E2E login has happened. |
+
+**What round 18 changed in the source** (each one is a narrow, reviewable commit):
+the Android resolver's cancellation and `rcode` handling
+(`AsyncDnsResolver.kt`), its JVM tests, the stale resolver KDocs in
+`DnsPinnedProxy.kt`, the post-load wording of the desktop zero-CONNECT check and
+its pins. P3–P5 were documentation-only corrections: no code changed for them,
+because there is no verified mechanism to add. Nothing here changed the proxy's
+decision logic, the IP classification, or the loopback bind.
+
+**Still open after round 18, stated narrowly:** a real desktop WebView and a real
+Android provider run (every "Implemented" above is device-verification-pending);
+loopback reachability by other apps (GO-01); WebRTC/UDP (GO-04); DNS rebinding on
+desktop and the `Unknown` fail-open path (GO-02/03); R-09's `main` aspect (the
+pins live on this branch only); fixed-port OAuth squatting (GO-06); R-01(b) and
+the independent human review; checklist items 26–40.
+
+## Round 17 — state at the end of round 17 (history; superseded by round 18)
+
+This table described the branch at the end of round 17. It is kept as history:
+the round-18 section above it is the current state. Everything after this point
+is a round log.
 
 **What is implemented and exercised by automated tests on every push**
 
 | Area | What exists now | Evidence | What is still not proven |
 | --- | --- | --- | --- |
-| Desktop DNS pinning | A Rust CONNECT-only proxy (`src-tauri/src/web/pinned_proxy.rs`) bound on an ephemeral `127.0.0.1` port **before** the child WebView exists, installed per session (Windows/Linux through `WebviewBuilder::proxy_url`, macOS through the `macos-proxy` feature) with `--proxy-bypass-list=<-loopback>` on Windows. Fail-closed: the open returns an error if the bind fails, and a load that never touched the proxy closes the site. | 15 real-socket Rust tests (public tunnels, rebinding refused, mixed answer refused whole, private/empty/NXDOMAIN refused, literals never resolved, >8 KiB head refused, unreachable destination refused, `stop()` kills the tunnel, two starts use different ports, one resolution per CONNECT); `tests/desktop_proxy_wiring.test.js`; the three desktop CI jobs. | A real WebView2 / WebKitGTK / WKWebView run. A JVM/Rust test and a green CI job are not that. |
-| Android DNS pinning | `SiteProxyController` installs a process-wide `PROXY_OVERRIDE`; `DnsPinnedProxy` resolves once per CONNECT, classifies every answer and connects to the classified `InetAddress`; `AsyncDnsResolver` moves the lookup onto `DnsResolver.query` with a 10 s deadline that cancels the `CancellationSignal`, drops late answers, and refuses instead of queueing above 8 in-flight lookups. | `DnsPinnedProxyTest`, `SiteProxyGateTest`, `AsyncDnsResolverTest` (host JVM, real sockets where the proxy is involved) run in the Android CI job. | Whether the provider honours `PROXY_OVERRIDE` at all, and whether cancelling actually frees the platform thread. Device matrix unchanged: [`android-dns-pinning-device-checklist.md`](./android-dns-pinning-device-checklist.md). |
+| Desktop DNS pinning | A Rust CONNECT-only proxy (`src-tauri/src/web/pinned_proxy.rs`) bound on an ephemeral `127.0.0.1` port **before** the child WebView exists, installed per session through wry 0.55.1 (`additional_browser_args` with `--proxy-server` + `--proxy-bypass-list=<-loopback>` on Windows, `WebviewBuilder::proxy_url` on Linux, the `macos-proxy` feature on macOS). Fail-closed: the open returns an error if the bind fails, and a load that **finished** without the proxy seeing a single CONNECT closes the site (`PageLoadEvent::Finished`, i.e. after the fact — not a first-request guard). | 12 Rust tests in `pinned_proxy.rs` — 11 real-socket tests (public tunnels, rebinding refused, mixed answer refused whole, private/empty/NXDOMAIN refused, literals never resolved, >8 KiB head refused, unreachable destination refused, `stop()` kills the tunnel, two starts use different ports, one resolution per CONNECT) plus 1 parser test — `tests/desktop_proxy_wiring.test.js` (source-string pins only); the three desktop CI jobs. | A real WebView2 / WebKitGTK / WKWebView run. A JVM/Rust test and a green CI job are not that. |
+| Android DNS pinning | `SiteProxyController` installs a process-wide `PROXY_OVERRIDE`; `DnsPinnedProxy` resolves once per CONNECT, classifies every answer and connects to the classified `InetAddress`; `AsyncDnsResolver` moves the lookup onto `DnsResolver.query` with a 10 s caller-owned deadline, drops late answers and refuses instead of queueing above its in-flight ceilings (round 18 rewrote this path; see the round-18 section for the current guarantees). | `DnsPinnedProxyTest`, `SiteProxyGateTest`, `AsyncDnsResolverTest` (host JVM, real sockets where the proxy is involved) run in the Android CI job. | Whether the provider honours `PROXY_OVERRIDE` at all, and whether cancelling actually frees the platform thread. Device matrix unchanged: [`android-dns-pinning-device-checklist.md`](./android-dns-pinning-device-checklist.md). |
 | WebRTC / UDP | Android: `WEBRTC_GUARD` is installed with `addDocumentStartJavaScript` (the round-16 `onPageStarted` fallback, which ran after the page could already open a peer connection, is gone). Desktop: `initialization_script_for_all_frames`. | Source pins in `src-tauri/android-plugin/src/lib.rs` and `session.rs`. | Every part of it. The guard is page JavaScript, not OS-level UDP filtering; QUIC/UDP needs a packet capture; the Android provider must support the document-start API or the open is refused (fail-closed, see below). |
 | OAuth return path | Loopback only, on **every** platform: `prepare_login` calls `validate_redirect_uri(&cfg.redirect_uri, false)`, so `animehub://anilist/callback` is refused before a listener, a state value or an authorization URL exists. | `prepare_login_refuses_the_custom_scheme_on_every_platform`, `tests/command_wiring.test.js`. | Nothing on this side; the login still needs a manual run against AniList because the client id is not in the repo. |
-| Actions pinning (R-09) | All 36 external `uses:` references in the active workflows are pinned to reviewed 40-character SHAs; `ci-fixes/` remains a reference copy that GitHub does not execute. | `tests/gaps.test.js`, `tests/command_wiring.test.js`; the six-job matrix has been green on this branch (first: **40108690774 @ `7948e8f`**), and PR #30 carries the run for the current head. | `main` is untouched: the pins live on this PR branch until it is merged. |
+| Actions pinning (R-09) | All 36 external `uses:` references in the active workflows are pinned to reviewed 40-character SHAs; `ci-fixes/` remains a reference copy that GitHub does not execute. | `tests/gaps.test.js`, `tests/command_wiring.test.js`; the six-job matrix has been green on this branch (first: **40108690774 @ `7948e8f`**, latest before round 18: **40120340164 @ `87ba782`**), and PR #30 carries the run for the round-18 head. | `main` is untouched: the pins live on this PR branch until it is merged. |
 
 **What a green CI run does not mean.** The six jobs are `Tests` on
 ubuntu-24.04 / macos-latest / windows-latest, `Release profile (LTO)`,
@@ -901,7 +933,8 @@ matrix that has to run before any of it can be shipped. That network layer was
 **not** part of this PR at the time of writing — *superseded*: round 16 built it
 for Android (`SiteProxyController` + `DnsPinnedProxy`, `PROXY_OVERRIDE`) and
 round 17 built it for desktop (`web/pinned_proxy.rs`, installed through wry's
-`proxy_url` / `macos-proxy`). Neither half is device-verified; the table at the
+`proxy_url` on Linux, `additional_browser_args` on Windows and `macos-proxy` on
+macOS). Neither half is device-verified; the table at the
 top of this document is the current state. **R-01 (b) stays open.** No comment,
 test or doc change closes it.
 

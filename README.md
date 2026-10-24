@@ -268,20 +268,29 @@ WebRTC/UDP sabitlenmiş sayılmaz. Gerçek çözüm kullanıcı onayı gerektire
 senaryosu: `docs/security-residual-risks.md` (round 16.1) ve
 `docs/android-dns-pinning-device-checklist.md`.
 
-**Çözümleyici (DNS) sınırı:** `InetAddress.getAllByName` ne zaman aşımı ne de
-iptal sunar, bu yüzden çözümleme sınırlı bir havuzda yapılır (`resolveMs = 10 s`,
-nesil başına `resolveThreads = 4`). Bir lookup önce güncel nesneye, dolduysa
-**daha eski ama hâlâ boş thread'i olan nesneye** verilir; yeni nesil ancak hepsi
-dolduğunda ve en fazla bir kez açılır. Toplam iş parçacığı
-`resolveThreadCap = 8` ile sınırlıdır ve bu bütçe `stop()`/`start()` arasında da
-korunur (iptali yok sayan bir çağrının thread'i `stop()` ile geri kazanılamaz).
-Tavan, tam bir yedek nesneye izin vermek zorundadır (`>= 2 × resolveThreads`;
-`4/5` gibi bir değer kurulumda reddedilir). Bütçe tükendiğinde istek
-`RESOLVE_EXHAUSTED` (502) ile hemen reddedilir; bütçe doluysa `start()` hiç
-bağlanmaz ve site `proxy-unavailable` ile açılmaz. Bu **kapasite**, kurtarma
-değildir: platform çağrısı hiç dönmezse süreç yeniden başlatılana kadar DNS
-kapalı kalır — belgelenmiş erişilebilirlik riski
-(`docs/security-residual-risks.md`, round 16.3; cihaz maddesi 35).
+**Çözümleyici (DNS) sınırı:** Android'de (API 29+, uygulamanın
+`minSdkVersion`'ı) çözümleme `DnsResolver.query` + `CancellationSignal` ile
+**asenkron** yapılır (`AsyncDnsResolver`): çağıran, sağlayıcı ne yaparsa yapsın
+kendi 10 saniyelik son tarihinde serbest kalır; geç gelen veya yinelenen bir yanıt
+uçuşu değiştiremez, yalnızca platform yuvasını bırakır; aynı host için tek uçuş
+(single-flight) vardır. **İki ayrı tavan** vardır ve ikisi de 8'dir: bekleyen
+mantıksal uçuşlar ve platformun henüz geri çağrımadığı sorgular — ikisinde de
+fazlası kuyruğa alınmaz, reddedilir. İptal edilen bir sorgunun yuvası, yanıtı
+gelirse onunla, gelmezse iptalden 60 s sonra geri alınır. `rcode` 0 (NOERROR)
+değilse yanıt adres listesi olarak **kullanılmaz**; çözümleme hatası sayılır.
+Bu çözümleyici yine sınırlı bir havuzda çalışır (`resolveMs = 10 s`, nesil
+başına `resolveThreads = 4`) ve toplam iş parçacığı `resolveThreadCap = 8` ile
+sınırlıdır; bu bütçe `stop()`/`start()` arasında da korunur. Tavan, tam bir
+yedek nesneye izin vermek zorundadır (`>= 2 × resolveThreads`). Bütçe
+tükendiğinde istek `RESOLVE_EXHAUSTED` (502) ile hemen reddedilir; bu, host
+hakkında bir yargı değil **kapasite** reddidir ve `AsyncDnsResolver` ile her
+işçi kendi son tarihinde boşaldığı için o son tarihten uzun sürmez. Proxy bağlanamaz veya
+kuramazsa site hiç açılmaz (`proxy-unavailable`); doğrudan bağlantıya düşen bir yol
+yoktur. **Cihazda
+kanıtlanmayan:** gerçek sağlayıcının `CancellationSignal.cancel()` çağrısına
+uyup uymadığı ve iptalden sonra geri çağrım yapıp yapmadığı — Android referansı
+bunun için bir söz vermez; `AsyncDnsResolverTest` bunu fake bir lookup ile
+JVM'de ölçer, cihazı değil (madde 36–38, 41; round 18).
 Ayrıca `127.0.0.1`'e bağlanmak **yalnızca dış ağ arayüzlerini** kapatır; aynı
 cihazdaki başka uygulamalar bu portu bulup kullanabilir (kimlik doğrulama
 `ProxyConfig` ile mümkün değildir, açık kalan risk).

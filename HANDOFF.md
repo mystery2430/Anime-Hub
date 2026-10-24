@@ -101,6 +101,24 @@ macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TC
 `CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
 `HANDOFF` bölüm 6.D'de.
 
+**Round 18 (doğrulama turu) — durum, etiketli.** D1 masaüstü vekili
+**uygulandı, cihaz doğrulaması bekliyor**: Windows'ta wry 0.55.1'in kendi
+varsayılan argüman dizisine `--proxy-server=http://127.0.0.1:<port>` +
+`--proxy-bypass-list=<-loopback>` eklenir (ikisi birlikte; `proxy_url` ile
+cfg-dışlayıcı). Linux'ta vekil `WebContext`'in website-data-manager'ına,
+macOS'ta `WKWebsiteDataStore`'a **ilk gezinmeden önce** kurulur; ikisi de
+görünüm başına değil, context/data-store kapsamlıdır ve macOS 14 (Darwin 23)
+gerektirir. "Sıfır CONNECT" kontrolü **yalnızca `PageLoadEvent::Finished`'da**
+çalışır: yüklenmiş bir sayfayı kapatır, ilk isteği engellemez — bu yüzden
+ilk-istek garantisi olarak sunulmaz, risk **açık** kalır. D2 Android çözümleyici
+**uygulandı, cihaz doğrulaması bekliyor**: `DnsResolver.query` +
+`CancellationSignal`, çağıran kendi 10 s son tarihinde serbest, geç yinelenen
+yanıt kazanamaz, iki ayrı 8'lik tavan (mantıksal uçuşlar / platform sorguları),
+`rcode != 0` ret; kanıt **yalnızca JVM** (fake lookup), gerçek sağlayıcının
+iptali cihazda doğrulanmadı. D3 döngü vekili kimlik doğrulaması **açık, ürün
+kararı** (407 yok). D4 WebRTC/UDP: yalnızca JS API'si kısıtlı, UDP/QUIC
+**açık**. D5 OAuth: **uygulama düzeltildi, AniList kaydı/E2E bekliyor**.
+
 ---
 
 ## 4. Denetimde test edilip **sağlam çıkan** şeyler
