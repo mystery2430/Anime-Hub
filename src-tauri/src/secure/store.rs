@@ -224,11 +224,19 @@ fn create_private_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    // Unique temp name so two concurrent writes to the same target never share
-    // the same `.tmp` file: `<name>.tmp.<pid>-<rand>`.
+    let tmp = temp_path_for(path);
+    atomic_write_via(path, &tmp, bytes)
+}
+
+/// The temp path a write will use: `<name>.tmp.<pid>-<rand>`.
+///
+/// Unique so two concurrent writes to the same target never share a `.tmp`
+/// file. Kept as its own function so a test can name the path up front and
+/// collide with it on purpose; the writer itself always passes this value to
+/// [`atomic_write_via`].
+fn temp_path_for(path: &Path) -> PathBuf {
     let unique = {
         use rand::RngCore as _;
         let mut b = [0u8; 8];
@@ -238,26 +246,38 @@ pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> std::io::Result<
     // `with_extension` replaces only the final extension, so
     // `secret.foo.bin` -> `secret.foo.tmp.<unique>`; uniqueness is what
     // matters, not the exact stem.
-    let tmp = path.with_extension(format!("tmp.{unique}"));
-    let written = (|| -> std::io::Result<()> {
-        let mut f = create_private_exclusive(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(())
-    })();
+    path.with_extension(format!("tmp.{unique}"))
+}
+
+/// Write `bytes` to `path` atomically, through the temp path `tmp`.
+///
+/// Creation is handled apart from the write on purpose. `create_new` fails on
+/// an existing path exactly so a write never clobbers a file it does not own;
+/// deleting that path on the error branch would undo the guarantee, because a
+/// failed open means this call never created it. Only after `create_new`
+/// succeeded does `tmp` belong to this call, and only then does a later
+/// failure clean it up.
+fn atomic_write_via(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = create_private_exclusive(tmp)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    // Close the handle before anything else touches the path: Windows refuses
+    // to unlink an open file, and the cleanup below must not be a no-op there.
+    drop(file);
     if let Err(e) = written {
-        // Never leave a half-written temp file next to the store: it is the
-        // only place where plaintext-shaped intermediate state could sit.
-        let _ = std::fs::remove_file(&tmp);
+        // The temp file is ours: never leave a half-written one next to the
+        // store. A cleanup failure is ignored so the write error survives.
+        let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = std::fs::rename(tmp, path) {
         // The rename is the last step that can fail, and it leaves the temp
         // file behind. Remove it: the next read must not find a stray copy of
         // the store next to it, and a retry has to start from a clean
         // directory. A cleanup failure is ignored on purpose — the error the
         // caller sees has to be the one that describes why the write failed.
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
     // Ensure the rename is durable: fsync the parent directory where the
@@ -306,6 +326,27 @@ mod tests {
         let err = opened.expect_err("an existing path must not be opened");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+    }
+
+    /// A temp path the write did not create is never the write's to delete.
+    ///
+    /// The test picks the path through the same helper the writer uses, then
+    /// creates it, so `create_new` refuses with `AlreadyExists` before the
+    /// write starts. The previous code ran `remove_file(&tmp)` on every
+    /// failure, which deleted this file even though the open had failed.
+    #[test]
+    fn a_temp_collision_is_not_deleted_by_the_write_that_found_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("store.json");
+        std::fs::write(&target, b"old").unwrap();
+        let tmp = temp_path_for(&target);
+        std::fs::write(&tmp, b"not ours").unwrap();
+
+        let err = atomic_write_via(&target, &tmp, b"new").expect_err("the temp path is taken");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"not ours");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
     }
 
     /// The temp file really exists and has been written when `rename` fails.
