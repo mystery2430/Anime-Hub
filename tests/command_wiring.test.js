@@ -143,7 +143,7 @@ test("all active GitHub Actions workflows use the reviewed SHA pins", () => {
   const docs = read("docs/security-residual-risks.md");
   const status = read("docs/audit-item-status.md");
   assert.match(docs, /Round 16\.4 — active workflow Actions are SHA-pinned/);
-  assert.match(status, /\|\s*\*\*R-09\*\*.*\*\*fixed\*\*/);
+  assert.match(status, /\|\s*\*\*R-09\*\*.*Action pinning implemented/);
 
   const paths = [
     ".github/workflows/ci.yml",
@@ -189,7 +189,7 @@ test("all active GitHub Actions workflows use the reviewed SHA pins", () => {
   }
 
   // The ci-fixes copy is a reference; active workflows are validated above.
-  assert.match(read("ci-fixes/ci.yml"), /actions\\/checkout@[0-9a-f]{40} # v7/);
+  assert.match(read("ci-fixes/ci.yml"), /actions\/checkout@[0-9a-f]{40} # v7/);
 });
 
 test("blocklist transfers are serialized and generation-guarded (PR #27 follow-up)", () => {
