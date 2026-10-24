@@ -24,7 +24,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -72,6 +75,75 @@ class AsyncDnsResolverTest {
     /** Answer the oldest, still-unanswered query for [host]. */
     fun answerOldest(host: String, addresses: List<InetAddress>, error: Throwable? = null) {
       callbacks[host]?.firstOrNull()?.invoke(addresses, error)
+    }
+  }
+
+  /**
+   * A lookup that mirrors `PlatformDnsLookup`'s delivery rule instead of a
+   * convenient lookalike: every report goes through the shipped
+   * [DnsAnswerDelivery], and `Cancel` only asks the platform to stop when no
+   * report has been delivered yet. The fake platform deliberately keeps
+   * answering after a cancel — that is what the real one can still do, because
+   * an answer already queued on the callback executor is delivered even though
+   * the file descriptor was closed.
+   *
+   * The regression this models: round 17's adapter let `Cancel` set the same
+   * flag the callback used, so a post-cancel report was swallowed, the
+   * resolver never saw it, and the slot was only freed by the 60 s watchdog.
+   */
+  private class AdapterLikeLookup : DnsLookup {
+    val started = AtomicInteger()
+    val cancelRequested = AtomicInteger()
+    private val deliveries =
+      ConcurrentHashMap<String, CopyOnWriteArrayList<DnsAnswerDelivery>>()
+    private val startedLatch = CountDownLatch(1)
+
+    override fun start(
+      host: String,
+      onResult: (List<InetAddress>?, Throwable?) -> Unit,
+    ): DnsLookup.Cancel {
+      val delivery = DnsAnswerDelivery(onResult)
+      deliveries.getOrPut(host) { CopyOnWriteArrayList() }.add(delivery)
+      started.incrementAndGet()
+      startedLatch.countDown()
+      return DnsLookup.Cancel {
+        // What PlatformDnsLookup does: best effort, and only while no report
+        // has been delivered. It never clears the delivery state itself.
+        if (delivery.isPending()) cancelRequested.incrementAndGet()
+      }
+    }
+
+    fun awaitStarted() {
+      assertTrue("the lookup never started", startedLatch.await(2, TimeUnit.SECONDS))
+    }
+
+    /** The platform reports an answer, even after a cancel. */
+    fun answer(host: String, addresses: List<InetAddress>, rcode: Int = 0) {
+      deliveries[host]?.lastOrNull()?.answer(addresses, rcode)
+    }
+
+    /** The platform reports an error, even after a cancel. */
+    fun error(host: String, error: Throwable) {
+      deliveries[host]?.lastOrNull()?.error(error)
+    }
+
+    /** Report on the oldest, already-cancelled query for [host]. */
+    fun answerOldest(host: String, addresses: List<InetAddress>, rcode: Int = 0) {
+      deliveries[host]?.firstOrNull()?.answer(addresses, rcode)
+    }
+  }
+
+  /** A lookup that answers synchronously, before `start` returns. */
+  private class SyncLookup(private val addresses: List<InetAddress>) : DnsLookup {
+    override fun start(
+      host: String,
+      onResult: (List<InetAddress>?, Throwable?) -> Unit,
+    ): DnsLookup.Cancel {
+      val delivery = DnsAnswerDelivery(onResult)
+      delivery.answer(addresses, 0)
+      return DnsLookup.Cancel {
+        if (delivery.isPending()) throw AssertionError("a delivered query must not be cancelled")
+      }
     }
   }
 
@@ -330,7 +402,7 @@ class AsyncDnsResolverTest {
   }
 
   @Test
-  fun `a provider that never answers loses its slot after the grace period`() {
+  fun `a provider that never answers loses its slot after the watchdog period`() {
     val lookup = ManualLookup()
     val clock = longArrayOf(0L)
     val resolver =
@@ -338,7 +410,7 @@ class AsyncDnsResolverTest {
         lookup,
         timeoutMs = 2_000,
         maxInFlight = 1,
-        platformGraceMs = 100,
+        platformWatchdogMs = 100,
         nowMs = { clock[0] },
       )
 
@@ -402,5 +474,138 @@ class AsyncDnsResolverTest {
     // The proxy classifies the empty list as a refusal; the resolver must not
     // hide it behind an exception or a made-up address.
     assertEquals(emptyList<InetAddress>(), answers)
+  }
+  // ---------------------------------------------------------------------
+  // The production delivery rule (DnsAnswerDelivery), which the fake lookup
+  // above the next comment does NOT model — it forwards everything on purpose.
+  // These tests exist because the round-17 adapter dropped post-cancel reports.
+  // ---------------------------------------------------------------------
+
+  @Test
+  fun `the delivery rule forwards only the first platform report`() {
+    val seen = mutableListOf<Pair<List<InetAddress>?, Throwable?>>()
+    val delivery = DnsAnswerDelivery { answers, error -> seen.add(answers to error) }
+    assertTrue("nothing has been delivered yet", delivery.isPending())
+
+    delivery.answer(listOf(loopback()), 0)
+    assertFalse("a report ends the pending state", delivery.isPending())
+    delivery.answer(listOf(other()), 0) // duplicate
+    delivery.error(IOException("later")) // out of order
+
+    assertEquals("exactly one report must reach the resolver", 1, seen.size)
+    assertEquals(listOf(loopback()), seen[0].first)
+    assertNull(seen[0].second)
+  }
+
+  @Test
+  fun `a nonzero rcode is delivered as a failure exactly once`() {
+    val seen = mutableListOf<Pair<List<InetAddress>?, Throwable?>>()
+    val delivery = DnsAnswerDelivery { answers, error -> seen.add(answers to error) }
+    // The platform parsed an answer, but the response code says it failed.
+    delivery.answer(listOf(loopback()), 3)
+    // A second, "better" report must not replace the first verdict.
+    delivery.answer(listOf(other()), 0)
+
+    assertEquals(1, seen.size)
+    assertNull("no address list may be published for a failed rcode", seen[0].first)
+    val error = seen[0].second
+    assertTrue("expected an IOException, got $error", error is IOException)
+    assertTrue("the rcode must be named", error!!.message!!.contains("3"))
+  }
+
+  @Test
+  fun `a late platform report frees the slot through the production delivery rule`() {
+    val lookup = AdapterLikeLookup()
+    val resolver = AsyncDnsResolver(lookup, timeoutMs = 80)
+    // The caller gives up and the adapter asks the platform to cancel.
+    expectIOException { resolver("late.test") }
+    assertEquals("the cancel must have been attempted", 1, lookup.cancelRequested.get())
+    assertEquals("the query is still counted", 1, resolver.platformCount())
+
+    // The platform reports anyway, as the AOSP callback executor still can.
+    lookup.answer("late.test", listOf(loopback()))
+
+    // The late answer must not win (the call already failed) but it must end
+    // the accounting at once, not after 60 s of watchdog.
+    assertEquals("a real report is completion evidence", 0, resolver.platformCount())
+    assertEquals(0, resolver.inFlightCount())
+  }
+
+  @Test
+  fun `a late platform failure also completes the accounting`() {
+    val lookup = AdapterLikeLookup()
+    val resolver = AsyncDnsResolver(lookup, timeoutMs = 80)
+    expectIOException { resolver("late-error.test") }
+    assertEquals(1, resolver.platformCount())
+
+    lookup.error("late-error.test", IOException("platform gave up"))
+
+    assertEquals(0, resolver.platformCount())
+    assertEquals(0, resolver.inFlightCount())
+  }
+
+  @Test
+  fun `a stale report cannot settle a newer flight through the delivery rule`() {
+    val lookup = AdapterLikeLookup()
+    val resolver = AsyncDnsResolver(lookup, timeoutMs = 1_000)
+    expectIOException { resolver("stale.test") }
+
+    var result: List<InetAddress>? = null
+    val worker = Thread { result = resolver("stale.test") }
+    worker.start()
+    while (lookup.started.get() < 2 && worker.isAlive) Thread.sleep(5)
+
+    lookup.answerOldest("stale.test", listOf(other()))
+    Thread.sleep(100)
+    assertTrue("the stale report must not settle the new call", worker.isAlive)
+    assertEquals("only the abandoned query's slot is freed", 1, resolver.platformCount())
+
+    lookup.answer("stale.test", listOf(loopback()))
+    worker.join(2_000)
+    assertEquals("the new call must get its own answer", listOf(loopback()), result)
+    assertEquals(0, resolver.inFlightCount())
+    assertEquals(0, resolver.platformCount())
+  }
+
+  @Test
+  fun `a report racing the cancel leaks no slot and double-counts nothing`() {
+    repeat(20) { attempt ->
+      val lookup = AdapterLikeLookup()
+      // A different deadline per attempt so the report and the deadline land on
+      // both sides of each other over the loop; every iteration must still end
+      // with the same clean state.
+      val resolver = AsyncDnsResolver(lookup, timeoutMs = 10 + attempt, maxInFlight = 8)
+      val outcome = AtomicReference<Result<List<InetAddress>>?>()
+      val worker = Thread { outcome.set(runCatching { resolver("race.test") }) }
+      worker.start()
+      lookup.awaitStarted()
+      val answerer = Thread { lookup.answer("race.test", listOf(loopback())) }
+      answerer.start()
+      worker.join(2_000)
+      answerer.join(2_000)
+
+      val value = outcome.get()
+      assertTrue("the caller must settle", value != null)
+      val settled = value!!
+      assertTrue(
+        "the caller must see the answer or a closed failure, saw $settled",
+        settled.isSuccess || settled.exceptionOrNull() is IOException,
+      )
+      assertEquals("no logical flight may leak", 0, resolver.inFlightCount())
+      assertEquals(
+        "the delivered report must free the slot exactly once",
+        0,
+        resolver.platformCount(),
+      )
+      assertTrue(resolver.inFlightCount() >= 0 && resolver.platformCount() >= 0)
+    }
+  }
+
+  @Test
+  fun `a synchronous report during start leaves no platform slot`() {
+    val resolver = AsyncDnsResolver(SyncLookup(listOf(loopback())), timeoutMs = 1_000)
+    assertEquals(listOf(loopback()), resolver("sync.test"))
+    assertEquals(0, resolver.inFlightCount())
+    assertEquals("a report before start returned must not leave a slot", 0, resolver.platformCount())
   }
 }

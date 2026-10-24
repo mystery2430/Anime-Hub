@@ -19,16 +19,24 @@
 //   * a settled flag, so a callback that arrives after the deadline cannot
 //     flip a cancelled request into a success (and nothing is ever cached, so
 //     it cannot be written into a stale verdict either);
+//   * accounting that a real callback completes even after the caller gave
+//     up: a late answer cannot win, but it does prove the platform query is
+//     over, so the slot it held is released at once. Only a query that never
+//     reports anything falls back to the watchdog (see `platformWatchdogMs`);
 //   * per-host single-flight: concurrent CONNECTs for one name share one
 //     lookup instead of each starting their own;
 //   * two ceilings and no queue — one for the logical flights this class is
-//     awaiting, one for the platform queries whose callback has not arrived
-//     yet. Over either ceiling is a refusal, never a queue. The second ceiling
-//     exists because `CancellationSignal.cancel()` is "used by the caller to
-//     signal if the query should be cancelled" (the platform reference promises
-//     neither a completion callback nor that the work has stopped), so the
-//     logical ceiling alone would let a provider that never calls back start
-//     one more query per timeout, without limit.
+//     awaiting, one for the platform queries whose result has not been
+//     observed yet. Over either ceiling is a refusal, never a queue. The
+//     second one is a watchdog over what this class can observe, NOT proof
+//     that the platform stopped: `CancellationSignal.cancel()` is documented
+//     as "used by the caller to signal if the query should be cancelled" and
+//     the reference promises neither a completion callback nor that the work
+//     has stopped. The AOSP implementation (API 30 sources) removes the file
+//     descriptor listener and calls `resNetworkCancel`, which closes the
+//     descriptor — but it can still deliver an answer that was already queued
+//     on the callback executor, and no public API reports that cancellation
+//     finished.
 //
 // WHAT IT DOES NOT DO
 //
@@ -67,8 +75,67 @@ internal interface DnsLookup {
    * Implementations must not call it synchronously before returning when they
    * can avoid it (the resolver tolerates both, but a re-entrant call would run
    * on the caller's thread).
+   *
+   * A cancelled lookup MUST still report if the platform reports: this class
+   * is what decides that a late answer cannot win, and it needs the report to
+   * finish its own accounting. An implementation that drops the report after
+   * `Cancel.cancel()` makes a real platform completion indistinguishable from
+   * a provider that never answers — that was a defect in round 17's adapter
+   * and is what [DnsAnswerDelivery] now prevents.
    */
   fun start(host: String, onResult: (List<InetAddress>?, Throwable?) -> Unit): Cancel
+}
+
+/**
+ * The adapter's one-shot delivery rule, kept out of [PlatformDnsLookup] so the
+ * JVM tests can drive the code that actually ships.
+ *
+ * Two states that used to share one flag are separate here:
+ *
+ *   * **delivered** — the platform has reported a result, and the first report
+ *     was handed to the resolver. This is the only thing that suppresses a
+ *     second report (`onAnswer` then `onError`, or a duplicate answer).
+ *   * **cancelled** — the caller asked the platform to stop. It is NOT a
+ *     reason to drop a report, and it is not proof that the query is over.
+ *
+ * The round-17 adapter cancelled by setting the same flag its callback used,
+ * so a cancelled query's late answer was swallowed, `AsyncDnsResolver` never
+ * saw it, and the platform slot could only be reclaimed by the 60 s watchdog.
+ * The JVM tests could not see that, because the fake lookup forwarded every
+ * callback. Now the swallowing decision lives here, in one place the tests
+ * call directly, and the rule is: deliver the platform's first report
+ * whatever the cancellation state; let the resolver decide what it means.
+ */
+internal class DnsAnswerDelivery(
+  private val onResult: (List<InetAddress>?, Throwable?) -> Unit,
+) {
+  private val delivered = AtomicBoolean(false)
+
+  /** The platform answered. Only the first report reaches [onResult]. */
+  fun answer(answer: List<InetAddress>, rcode: Int) {
+    if (!delivered.compareAndSet(false, true)) return
+    val settled =
+      try {
+        dnsAnswerOrFailure(rcode, answer)
+      } catch (e: IOException) {
+        onResult(null, e)
+        return
+      }
+    onResult(settled, null)
+  }
+
+  /** The platform failed. Only the first report reaches [onResult]. */
+  fun error(error: Throwable) {
+    if (delivered.compareAndSet(false, true)) onResult(null, error)
+  }
+
+  /**
+   * True while the platform has not reported yet, i.e. while asking it to
+   * cancel can still change something. `false` means "a result was delivered";
+   * it never means "the platform query is finished" — a query whose caller
+   * cancelled and which never reports stays pending forever.
+   */
+  fun isPending(): Boolean = !delivered.get()
 }
 
 /**
@@ -82,7 +149,9 @@ internal class PlatformDnsLookup(
 ) : DnsLookup {
   override fun start(host: String, onResult: (List<InetAddress>?, Throwable?) -> Unit): DnsLookup.Cancel {
     val signal = CancellationSignal()
-    val settled = AtomicBoolean(false)
+    // The production delivery rule; see [DnsAnswerDelivery] for why it is not
+    // shared with the cancellation flag any more.
+    val delivery = DnsAnswerDelivery(onResult)
     // `DnsResolver.Callback<T>` is `onAnswer(answer: T, rcode: Int)` plus
     // `onError(error: DnsException)` — both parameters matter: a one-argument
     // `onAnswer` overrides nothing. The answer list arrives as a `MutableList`
@@ -91,16 +160,11 @@ internal class PlatformDnsLookup(
     val callback =
       object : DnsResolver.Callback<MutableList<InetAddress>> {
         override fun onAnswer(answer: MutableList<InetAddress>, rcode: Int) {
-          if (!settled.compareAndSet(false, true)) return
-          try {
-            onResult(dnsAnswerOrFailure(rcode, answer), null)
-          } catch (e: IOException) {
-            onResult(null, e)
-          }
+          delivery.answer(answer, rcode)
         }
 
         override fun onError(error: DnsResolver.DnsException) {
-          if (settled.compareAndSet(false, true)) onResult(null, error)
+          delivery.error(error)
         }
       }
     try {
@@ -110,16 +174,23 @@ internal class PlatformDnsLookup(
       DnsResolver.getInstance()
         .query(null as android.net.Network?, host, DnsResolver.FLAG_EMPTY, executor, signal, callback)
     } catch (t: Throwable) {
-      if (settled.compareAndSet(false, true)) onResult(null, t)
+      delivery.error(t)
       return DnsLookup.Cancel { }
     }
     return DnsLookup.Cancel {
-      if (settled.compareAndSet(false, true)) {
+      // Best effort, and deliberately NOT a completion signal. `cancel()` only
+      // "signals" the query (CancellationSignal.cancel); the AOSP client-side
+      // implementation removes the fd listener and closes the fd, but an
+      // answer already queued on the executor can still be delivered, and it
+      // is forwarded by `delivery` because cancellation never clears the
+      // delivery latch. A provider that refuses the cancel is handled by the
+      // resolver's own deadline and watchdog.
+      if (delivery.isPending()) {
         try {
           signal.cancel()
         } catch (_: Throwable) {
-          // A provider that refuses the cancel is exactly the case the
-          // resolver's own deadline handles.
+          // Swallowed on purpose: a broken cancel must not replace the
+          // caller's own verdict with this throw.
         }
       }
     }
@@ -167,9 +238,20 @@ internal class AsyncDnsResolver(
   private val lookup: DnsLookup,
   private val timeoutMs: Int = 10_000,
   private val maxInFlight: Int = 8,
-  /** How long a platform slot is held after the app stops waiting for it. */
-  private val platformGraceMs: Long = 60_000,
-  /** Clock seam for the grace period; the deadline uses the latch's own wait. */
+  /**
+   * How long a platform query stays counted after the app stops waiting for
+   * it, when no report ever arrives.
+   *
+   * This is a **watchdog over what this class can observe**, not a measurement
+   * of the platform. It is only the fallback for a query whose callback never
+   * comes; a query that does report — even after the caller timed out — is
+   * released by that report immediately (see [complete]). What the number does
+   * NOT mean is documented on [platform]: after it passes, the query is no
+   * longer counted here, and nothing in the public Android API proves that the
+   * platform stopped working on it.
+   */
+  private val platformWatchdogMs: Long = 60_000,
+  /** Clock seam for the watchdog; the deadline uses the latch's own wait. */
   private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
 ) : (String) -> List<InetAddress> {
   /** One lookup, shared by every caller that asked for the same host. */
@@ -190,10 +272,11 @@ internal class AsyncDnsResolver(
     var platformDone = false
 
     /**
-     * When the platform slot may be reclaimed anyway. `Long.MAX_VALUE` while
-     * the caller is still waiting: there is nothing to reclaim yet.
+     * When this class stops counting the query even though nothing reported.
+     * `Long.MAX_VALUE` while the caller is still waiting: there is nothing to
+     * watch yet.
      */
-    var reclaimAtMs = Long.MAX_VALUE
+    var watchdogAtMs = Long.MAX_VALUE
   }
 
   /** Guards the maps, the counters and every [Flight] field. */
@@ -203,9 +286,28 @@ internal class AsyncDnsResolver(
   private val flights = HashMap<String, Flight>()
 
   /**
-   * Flights whose platform query has not reported back yet, in start order.
-   * Bounded by [maxInFlight]; a slot is reclaimed on a callback or after
-   * [platformGraceMs] past the cancel, whichever comes first.
+   * Flights whose platform result has not been observed yet, in start order.
+   *
+   * A slot leaves this set when the adapter reports (answer, failure or rcode
+   * refusal) — whether or not the caller is still waiting — or when
+   * [platformWatchdogMs] passes since the cancel.
+   *
+   * **What the ceiling does and does not mean.** It bounds the queries this
+   * class is still waiting on, so it bounds the callbacks it may yet receive.
+   * It does NOT prove that at most [maxInFlight] platform queries exist: the
+   * watchdog only removes our own bookkeeping. The public `DnsResolver`/
+   * `CancellationSignal` contract gives no completion signal, and no API
+   * reports that a cancelled query has stopped, so a provider that ignores the
+   * cancel and never calls back can leave work behind that this class can no
+   * longer see. The AOSP client implementation (API 30 sources) closes the
+   * query's file descriptor in `cancelQuery` and drops the fd listener, which
+   * makes that unlikely, but it is implementation detail, not a contract —
+   * and even there an answer already queued on the callback executor can still
+   * be delivered. The residual is documented in
+   * docs/security-residual-risks.md (round 19) and item 36–38 of the device
+   * checklist; it is an availability cost, not a security decision: no address
+   * from an untracked query can be used, because a report that arrives after
+   * the flight settled is refused by [complete].
    */
   private val platform = LinkedHashSet<Flight>()
   private var inFlight = 0
@@ -290,10 +392,11 @@ internal class AsyncDnsResolver(
       release(key, flight)
       handle = flight.handle
       // The platform query may still be running and may never call back, so
-      // its slot is kept until a callback arrives or the grace period passes —
-      // never awaited synchronously, which would let a silent provider wedge
-      // the resolver for the life of the process.
-      if (platform.contains(flight)) flight.reclaimAtMs = nowMs() + platformGraceMs
+      // its slot is kept until a report arrives (which [complete] handles for
+      // cancelled flights too) or the watchdog passes — never awaited
+      // synchronously, which would let a silent provider wedge the resolver
+      // for the life of the process. The watchdog is bookkeeping, not proof.
+      if (platform.contains(flight)) flight.watchdogAtMs = nowMs() + platformWatchdogMs
     }
     // Outside the lock: a provider is free to call back synchronously, and a
     // broken `Cancel` must not replace the caller's own verdict with its throw.
@@ -302,9 +405,15 @@ internal class AsyncDnsResolver(
   }
 
   /**
-   * Platform answer. A late answer for a cancelled or already-finished flight
-   * is dropped here, so it can never turn a timeout into a success — but it
-   * still releases the platform slot it was holding.
+   * The adapter reported. A late answer for a cancelled or already-finished
+   * flight is dropped here, so it can never turn a timeout into a success —
+   * but it still releases the platform slot it was holding, because a report
+   * is the only evidence this class has that the platform query is over.
+   *
+   * The adapter guarantees it calls this for the FIRST platform report even
+   * after the caller cancelled (`DnsAnswerDelivery`): swallowing a post-cancel
+   * report there would make a completed query indistinguishable from a silent
+   * one and push every cancelled lookup onto the watchdog.
    */
   private fun complete(
     key: String,
@@ -332,11 +441,11 @@ internal class AsyncDnsResolver(
     }
   }
 
-  /** Reclaim platform slots whose grace period has passed. Lock held. */
+  /** Stop counting queries whose watchdog has passed. Lock held. */
   private fun sweep(now: Long) {
     val iterator = platform.iterator()
     while (iterator.hasNext()) {
-      if (iterator.next().reclaimAtMs <= now) iterator.remove()
+      if (iterator.next().watchdogAtMs <= now) iterator.remove()
     }
   }
 
@@ -344,9 +453,10 @@ internal class AsyncDnsResolver(
   internal fun inFlightCount(): Int = synchronized(lock) { inFlight }
 
   /**
-   * Platform queries whose callback has not arrived yet. At most
-   * [maxInFlight]; a value that stays at the ceiling means the provider is not
-   * answering at all, which is exactly what the grace period bounds.
+   * Queries whose result has not been observed yet — the watchdog set. At most
+   * [maxInFlight]; a value that stays at the ceiling means reports are not
+   * arriving at all, which is what [platformWatchdogMs] bounds in *our*
+   * bookkeeping. It is not a measurement of platform-side work.
    */
   internal fun platformCount(): Int = synchronized(lock) { platform.size }
 }
