@@ -204,6 +204,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     atomic_write_locked(path, bytes)
 }
 
+/// Create the temporary file of an atomic write: exclusive and owner-only.
+///
+/// `File::create` leaves the process umask in charge, so on Unix the temp file
+/// was typically `0644` — readable by every local user, even though the payload
+/// is encrypted. `create_new` also means an existing path is never truncated:
+/// the unique name makes a collision practically impossible, and if it does
+/// happen the safe outcome is an error, not a clobbered file. Windows has no
+/// mode bits to set here and keeps its ACL default from `OpenOptions`.
+fn create_private_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
     use std::io::Write as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -220,10 +239,17 @@ pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
     // `secret.foo.bin` -> `secret.foo.tmp.<unique>`; uniqueness is what
     // matters, not the exact stem.
     let tmp = path.with_extension(format!("tmp.{unique}"));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
+    let written = (|| -> std::io::Result<()> {
+        let mut f = create_private_exclusive(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        // Never leave a half-written temp file next to the store: it is the
+        // only place where plaintext-shaped intermediate state could sit.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
     }
     std::fs::rename(&tmp, path)?;
     // Ensure the rename is durable: fsync the parent directory where the
@@ -248,6 +274,43 @@ mod tests {
     fn store_with_dir(dir: &Path) -> SecureStore {
         let key = crate::secure::master_key::load_master_key(dir).expect("key");
         SecureStore::new(&key, dir).expect("store")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_file_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        atomic_write_locked(&path, b"encrypted-bytes").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the store (and its temp file) must not be readable by other local users"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"encrypted-bytes");
+    }
+
+    #[test]
+    fn the_temp_file_is_created_exclusively_and_never_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("already-there");
+        std::fs::write(&existing, b"keep me").unwrap();
+        let err = create_private_exclusive(&existing).expect_err("an existing path must not be opened");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_existing_target_untouched() {
+        // The parent is a regular file, so `create_dir_all` fails before the
+        // temp file exists. Nothing about the existing target may change.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"original").unwrap();
+        let target = blocker.join("store.json");
+        assert!(atomic_write_locked(&target, b"new").is_err());
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"original");
     }
 
     #[test]
