@@ -1603,6 +1603,53 @@ test("connection pinning is wired from the proxy to the refusal", () => {
   assert.match(proxyTestKt, /fun a_restart_cannot_spend_the_resolver_budget_twice\(\)/);
   assert.match(proxyTestKt, /fun the_cap_must_leave_room_for_a_full_spare_generation\(\)/);
 
+  // Round 16.4: start() is all-or-nothing. The validation runs before any
+  // socket exists, the phases are injectable so each one is covered by a real
+  // rollback test, and the rollback must put the published fields back —
+  // otherwise a failed start leaves `port` set and the controller would install
+  // a proxy that is not accepting.
+  assert.match(proxyKt, /internal fun validate\(\)/);
+  assert.match(proxyKt, /limits\.validate\(\)\n\n    \/\/ 2\./);
+  assert.match(proxyKt, /require\(maxConnections > 0\)/);
+  assert.match(proxyKt, /require\(headerBytes in 1\.\.MAX_HEADER_BYTES\)/);
+  assert.match(proxyKt, /require\(bufferBytes in 1\.\.MAX_BUFFER_BYTES\)/);
+  assert.match(proxyKt, /require\(resolveThreads <= Int\.MAX_VALUE \/ 2\)/);
+  assert.match(proxyKt, /fun interface StartHook/);
+  assert.match(proxyKt, /enum class StartPhase/);
+  assert.match(proxyKt, /releaseUnusedGeneration\(generation\)/);
+  // Every published field is reset in the rollback.
+  for (const [field, value] of [
+    ["running", "false"],
+    ["server", "null"],
+    ["handlerPool", "null"],
+    ["pumpPool", "null"],
+    ["resolvePool", "null"],
+    ["acceptThread", "null"],
+    ["boundPort", "null"],
+  ]) {
+    assert.match(
+      proxyKt,
+      new RegExp(`\\n[ \\t]+${field} = ${value}[ \\t]*\\n`),
+      `${field} must be reset when start() rolls back`,
+    );
+  }
+  assert.match(proxyKt, /internal fun resolverGenerationCount\(\)/);
+  assert.match(proxyTestKt, /fun an_invalid_limits_value_cannot_even_be_constructed\(\)/);
+  assert.match(proxyTestKt, /fun a_failed_start_leaves_nothing_behind_and_can_be_retried\(\)/);
+  assert.match(proxyTestKt, /fun a_failed_start_returns_its_resolver_generation_to_the_budget\(\)/);
+  // A failed start is a refusal, never a ready proxy: the controller stops the
+  // half-started instance and marks the gate failed, and only the install
+  // callback may mark it ready.
+  assert.match(
+    adapterKt,
+    /catch \(e: Exception\) \{[\s\S]{0,900}?stopQuietly\(\)\n      gate\.markFailed\(\)\n      return\n    \}/,
+  );
+  assert.equal(
+    adapterKt.match(/gate\.markReady\(\)/g).length,
+    1,
+    "only the setProxyOverride callback may mark the gate ready",
+  );
+
   // The ONLY configuration: one loopback rule, implicit bypass removed, and no
   // bypass/DIRECT/clear call that would restore a direct path.
   assert.match(gateKt, /const val LOOPBACK_HOST: String = "127\.0\.0\.1"/);

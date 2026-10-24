@@ -76,7 +76,38 @@ class DnsPinnedProxy(
   private val connector: (InetAddress, Int, Int) -> Socket = { address, port, timeoutMs ->
     PinnedConnect.connect(address, port, timeoutMs)
   },
+  /**
+   * Test seam for [start]: [before] runs immediately before each phase, and a
+   * test can make that one phase fail. Production passes the no-op default, so
+   * the phases themselves stay exactly what they are — what the tests measure is
+   * the rollback `start()` performs when a phase throws, not a mock of `start()`.
+   */
+  private val startHook: StartHook = StartHook { },
 ) {
+  /** The phases of [start], in order, that a [StartHook] can interrupt. */
+  enum class StartPhase {
+    /** Before the `ServerSocket` is created and bound. */
+    BIND,
+
+    /** Before the handler pool is created. */
+    HANDLER_POOL,
+
+    /** Before the tunnel (pump) pool is created. */
+    PUMP_POOL,
+
+    /**
+     * Before the accept thread is started. Every field has been published by
+     * then, so a failure here has to put the whole object back: this is the
+     * phase that proves the rollback, not just the cleanup.
+     */
+    ACCEPT_THREAD,
+  }
+
+  /** Test seam: `before` is called with the phase about to run; throwing aborts. */
+  fun interface StartHook {
+    fun before(phase: StartPhase)
+  }
+
   /** Why a connection was refused. Never sent to the client, never logged with a host. */
   enum class Refusal {
     /** Anything other than `CONNECT`, e.g. a cleartext HTTP request through the proxy. */
@@ -165,7 +196,51 @@ class DnsPinnedProxy(
     val backlog: Int = 16,
   ) {
     init {
+      validate()
+    }
+
+    companion object {
+      /**
+       * Largest accepted `CONNECT` head, and the largest tunnel copy buffer.
+       *
+       * These are not policy knobs: they bound an allocation that would
+       * otherwise follow a configuration value straight into `ByteArray(...)`.
+       */
+      const val MAX_HEADER_BYTES: Int = 64 * 1024
+      const val MAX_BUFFER_BYTES: Int = 1024 * 1024
+    }
+
+    /**
+     * Reject a configuration that cannot work, **before** anything is created.
+     *
+     * Every value here ends up as a socket option, a pool size or an array
+     * length. A zero/negative timeout or pool size either makes the proxy
+     * useless or throws from inside `start()` after a socket already exists, and
+     * an absurd size is an allocation an attacker-chosen default could turn into
+     * an OOM. The checks are `init`-time so a bad `Limits` cannot even be
+     * constructed (including through `copy()`); `start()` calls this again as a
+     * cheap invariant assertion.
+     */
+    internal fun validate() {
+      require(handshakeMs > 0) { "handshakeMs must be positive" }
+      require(connectMs > 0) { "connectMs must be positive" }
+      require(resolveMs > 0) { "resolveMs must be positive" }
+      require(idleMs > 0) { "idleMs must be positive" }
+      require(maxConnections > 0) { "maxConnections must be positive" }
+      require(backlog > 0) { "backlog must be positive" }
+      require(headerBytes in 1..MAX_HEADER_BYTES) {
+        "headerBytes must be in 1..$MAX_HEADER_BYTES"
+      }
+      require(bufferBytes in 1..MAX_BUFFER_BYTES) {
+        "bufferBytes must be in 1..$MAX_BUFFER_BYTES"
+      }
       require(resolveThreads > 0) { "resolveThreads must be positive" }
+      // `2 * resolveThreads` is the spare-generation requirement below; past
+      // Int.MAX_VALUE / 2 it would overflow to a negative number and let a cap
+      // that cannot fit two generations pass.
+      require(resolveThreads <= Int.MAX_VALUE / 2) {
+        "resolveThreads must be at most ${Int.MAX_VALUE / 2}"
+      }
       // The one automatic recovery this design has is the spare generation, and
       // a cap that cannot fit it would read as a bound while behaving as
       // "one stuck generation and DNS is gone". Reject the combination instead
@@ -174,6 +249,11 @@ class DnsPinnedProxy(
         "resolveThreadCap must leave room for one spare generation " +
           "(${2 * resolveThreads} threads with resolveThreads = $resolveThreads)"
       }
+      // Capacity is spent in whole generations, so a cap that is not a multiple
+      // of resolveThreads cannot be honoured exactly. The remainder stays
+      // unused: 4/10 runs two generations (8 threads) and never a half one.
+      // Nothing is reserved, so nothing is lost — the docs say the remainder is
+      // unused rather than pretending the bound is 10.
     }
   }
 
@@ -248,6 +328,14 @@ class DnsPinnedProxy(
    * and `docs/security-residual-risks.md` (round 16.1 §2) states the same
    * thing; do not describe the loopback bind as app isolation.
    *
+   * ALL-OR-NOTHING: either this returns the port the listener is accepting on,
+   * or it throws and the object is exactly as it was before the call — no
+   * listener, no pool, no accept thread, `port == null`, and the resolver
+   * generation back on the budget. The configuration is validated first, so a
+   * bad `Limits` cannot reach a socket at all, and every subsequent phase
+   * (bind, handler pool, tunnel pool, accept thread) unwinds through the same
+   * rollback, including on an `Error`.
+   *
    * @throws IOException when the loopback listener cannot be bound **or** when
    *   no resolver generation can be created because the threads of an earlier
    *   lifecycle are still owned by calls that ignored the interrupt. Both are
@@ -257,43 +345,103 @@ class DnsPinnedProxy(
    */
   fun start(): Int = synchronized(lock) {
     boundPort?.let { return it }
-    // The resolver budget is checked BEFORE the listener exists. A call from an
-    // earlier lifecycle that ignores the interrupt still owns its thread, so a
-    // start that cannot get a generation must not bind and must not look ready:
-    // throwing here surfaces as `proxy-unavailable`, which refuses to open the
-    // site instead of opening it onto a proxy that can only answer 502.
+    // 1. Validate the configuration before a socket, a thread or a resolver
+    //    generation exists. `Limits` already validates itself; this is the
+    //    invariant asserted at the point of use, so a `Limits` built by any
+    //    other route cannot reach `ThreadPoolExecutor(0, 0, ...)` or a negative
+    //    backlog after the listener is up.
+    limits.validate()
+
+    // 2. Take the resolver generation first. A call from an earlier lifecycle
+    //    that ignores the interrupt still owns its thread, so a start that
+    //    cannot get a generation must not bind and must not look ready: throwing
+    //    here surfaces as `proxy-unavailable`, which refuses to open the site
+    //    instead of opening it onto a proxy that can only answer 502.
     val generation = try {
       newResolverGeneration()
     } catch (e: ResolverExhausted) {
       throw IOException(e.message)
     }
+
+    // 3. Bind the listener. A failure here releases the generation and nothing
+    //    else exists yet.
     val socket = ServerSocket()
     try {
+      startHook.before(StartPhase.BIND)
       socket.reuseAddress = true
       socket.bind(InetSocketAddress(InetAddress.getByName(LOOPBACK), 0), limits.backlog)
-    } catch (e: IOException) {
+    } catch (e: Exception) {
       closeQuietly(socket)
-      // Nothing will ever use this generation; shutting it down lets its pool
-      // terminate and drop out of the budget instead of holding it forever.
-      generation.shutdownNow()
-      discardTerminatedGenerations()
+      releaseUnusedGeneration(generation)
       throw e
     }
-    server = socket
-    boundPort = socket.localPort
-    running = true
-    handlerPool = pool("AnimeHubProxy", limits.maxConnections)
-    pumpPool = pool("AnimeHubProxyTunnel", limits.maxConnections)
-    // Small and fixed per generation: a resolver call that never returns
-    // strands at most `resolveThreads` threads here, a further concurrent
-    // lookup goes to another generation or is refused rather than queued
-    // behind the stuck ones, and the total is capped by `resolveThreadCap`.
-    resolvePool = generation
-    acceptThread = Thread({ acceptLoop(socket) }, "AnimeHubProxyAccept").apply {
-      isDaemon = true
-      start()
+
+    // 4. Everything that can still fail, with a rollback that puts the object
+    //    back into "not started": no listener, no pool, no accept thread, no
+    //    bound port, and the resolver generation back on the budget. A start
+    //    that throws must leave nothing behind that the next start could leak
+    //    or that would make the instance look ready.
+    var handler: ThreadPoolExecutor? = null
+    var pump: ThreadPoolExecutor? = null
+    var accept: Thread? = null
+    var started = false
+    try {
+      startHook.before(StartPhase.HANDLER_POOL)
+      handler = pool("AnimeHubProxy", limits.maxConnections)
+      startHook.before(StartPhase.PUMP_POOL)
+      pump = pool("AnimeHubProxyTunnel", limits.maxConnections)
+      accept = Thread({ acceptLoop(socket) }, "AnimeHubProxyAccept").apply { isDaemon = true }
+
+      // Publish only once every piece exists, so a concurrent `handle()` can
+      // never observe a half-built proxy.
+      server = socket
+      handlerPool = handler
+      pumpPool = pump
+      resolvePool = generation
+      boundPort = socket.localPort
+      running = true
+      acceptThread = accept
+      // Last chance to fail: everything above is already visible on the object,
+      // so the rollback below is what makes the failed start look untouched.
+      startHook.before(StartPhase.ACCEPT_THREAD)
+      accept.start()
+      started = true
+      return socket.localPort
+    } finally {
+      // `finally`, not `catch (Exception)`: an Error thrown by a phase (an OOM
+      // while creating a pool, for instance) must unwind through the same
+      // rollback, or the listener and the generation would leak.
+      if (!started) {
+        running = false
+        server = null
+        handlerPool = null
+        pumpPool = null
+        resolvePool = null
+        acceptThread = null
+        boundPort = null
+        closeQuietly(socket)
+        handler?.shutdownNow()
+        pump?.shutdownNow()
+        // An accept thread that was created but never started owns nothing; one
+        // that did start is stopped by the listener close above plus `running`.
+        accept?.interrupt()
+        releaseUnusedGeneration(generation)
+      }
     }
-    return socket.localPort
+  }
+
+  /**
+   * Put a generation that never served a lookup back on the budget.
+   *
+   * Shutting it down is enough to make it terminate (it has no workers yet), and
+   * discarding terminated generations is what returns the threads to the cap.
+   * A generation that somehow still has a lookup inside it is *not* discarded:
+   * [liveResolverThreads] keeps counting its `activeCount`, because that call
+   * cannot be reclaimed. Nothing here pretends a stuck platform call is gone.
+   */
+  private fun releaseUnusedGeneration(generation: ThreadPoolExecutor) {
+    generation.shutdownNow()
+    discardTerminatedGenerations()
   }
 
   /**
@@ -365,6 +513,16 @@ class DnsPinnedProxy(
   fun resolutionCount(): Long = resolutions.get()
 
   fun refusalCount(reason: Refusal): Long = refusals[reason.ordinal].get()
+
+  /**
+   * Diagnostics and tests: generations still tracked by this object.
+   *
+   * It includes shut-down generations whose calls are still running (they are
+   * part of the thread budget) and drops the ones that really terminated. A
+   * failed `start()` must leave this at zero.
+   */
+  internal fun resolverGenerationCount(): Int =
+    synchronized(resolveGenerations) { resolveGenerations.size }
 
   // -------------------------------------------------------------------------
   // Accept loop

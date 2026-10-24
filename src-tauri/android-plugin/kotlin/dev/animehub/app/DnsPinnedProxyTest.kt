@@ -813,6 +813,18 @@ class DnsPinnedProxyTest {
       .map { it.name }
 
   /**
+   * Live threads with exactly this name.
+   *
+   * The pools are named `AnimeHubProxy`, `AnimeHubProxyTunnel`,
+   * `AnimeHubProxyAccept` and `AnimeHubProxyResolve`, and several tests create
+   * proxies, so a `startsWith` count mixes instances that are still winding
+   * down. An exact name is what "when a phase fails, no accept/handler/tunnel
+   * thread was left behind" can be asserted against.
+   */
+  private fun threadsNamed(name: String): Int =
+    Thread.getAllStackTraces().keys.count { it.isAlive && it.name == name }
+
+  /**
    * Resolver threads that are *inside a lookup right now*.
    *
    * Unlike the global thread count this cannot be confused by idle pool threads
@@ -871,6 +883,207 @@ class DnsPinnedProxyTest {
       client.close()
     } finally {
       proxy.stop()
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // start(): all-or-nothing
+  // ---------------------------------------------------------------------
+
+  @Test
+  fun an_invalid_limits_value_cannot_even_be_constructed() {
+    // Every one of these ends up as a socket option, a pool size or an array
+    // length. A zero/negative value would make the proxy useless or throw from
+    // inside start() with the listener already bound, and an oversized one is an
+    // allocation: the proxy therefore rejects them at construction, before a
+    // socket or a thread can exist.
+    val invalid = listOf<() -> DnsPinnedProxy.Limits>(
+      { DnsPinnedProxy.Limits(handshakeMs = 0) },
+      { DnsPinnedProxy.Limits(handshakeMs = -1) },
+      { DnsPinnedProxy.Limits(connectMs = 0) },
+      { DnsPinnedProxy.Limits(resolveMs = 0) },
+      { DnsPinnedProxy.Limits(idleMs = 0) },
+      { DnsPinnedProxy.Limits(maxConnections = 0) },
+      { DnsPinnedProxy.Limits(maxConnections = -4) },
+      { DnsPinnedProxy.Limits(backlog = 0) },
+      { DnsPinnedProxy.Limits(headerBytes = 0) },
+      { DnsPinnedProxy.Limits(headerBytes = DnsPinnedProxy.Limits.MAX_HEADER_BYTES + 1) },
+      { DnsPinnedProxy.Limits(bufferBytes = 0) },
+      { DnsPinnedProxy.Limits(bufferBytes = DnsPinnedProxy.Limits.MAX_BUFFER_BYTES + 1) },
+      { DnsPinnedProxy.Limits(resolveThreads = 0) },
+      // `2 * resolveThreads` must not overflow into a negative bound.
+      { DnsPinnedProxy.Limits(resolveThreads = Int.MAX_VALUE / 2 + 1, resolveThreadCap = -1) },
+    )
+    for ((index, build) in invalid.withIndex()) {
+      var threw = false
+      try {
+        build()
+      } catch (_: IllegalArgumentException) {
+        threw = true
+      }
+      assertTrue("invalid Limits #$index must be rejected", threw)
+      // `copy()` re-runs the same validation, so a valid value cannot be edited
+      // into an invalid one either.
+      var copyThrew = false
+      try {
+        DnsPinnedProxy.Limits().copy(maxConnections = 0)
+      } catch (_: IllegalArgumentException) {
+        copyThrew = true
+      }
+      if (index == 0) assertTrue("copy() must validate too", copyThrew)
+    }
+  }
+
+  @Test
+  fun a_failed_start_leaves_nothing_behind_and_can_be_retried() {
+    // Each phase of start() is made to fail once, in order. After every failure
+    // the object must be exactly as it was before: no port, no listener, no
+    // pool thread, no resolver generation spent. The same object must then be
+    // able to start cleanly.
+    for (phase in DnsPinnedProxy.StartPhase.entries) {
+      // The previous iteration's stop() is asynchronous for its accept thread.
+      assertTrue(
+        "the previous proxy must be gone before the next phase",
+        awaitCondition { threadsNamed("AnimeHubProxyAccept") == 0 },
+      )
+      var fail = true
+      val proxy = DnsPinnedProxy(
+        limits = DnsPinnedProxy.Limits(resolveThreads = 1, resolveThreadCap = 2),
+        resolver = { listOf(publicA) },
+        connector = { _, _, _ -> throw java.io.IOException("must not be called") },
+        startHook = { failingPhase ->
+          if (fail && failingPhase == phase) throw java.io.IOException("phase $phase failed")
+        },
+      )
+      try {
+        var failure: Exception? = null
+        try {
+          proxy.start()
+        } catch (e: Exception) {
+          failure = e
+        }
+        assertTrue("$phase: a failing start must throw, got $failure", failure is java.io.IOException)
+        assertNull("$phase: a failed start must not leave a port", proxy.port)
+        assertEquals(
+          "$phase: a failed start must return its resolver generation",
+          0,
+          proxy.resolverGenerationCount(),
+        )
+        // No accept, handler or tunnel thread: the pools never ran a task and
+        // the accept thread must not have been started.
+        assertEquals("$phase: no accept thread may survive", 0, threadsNamed("AnimeHubProxyAccept"))
+        assertEquals("$phase: no handler thread may survive", 0, threadsNamed("AnimeHubProxy"))
+        assertEquals("$phase: no tunnel thread may survive", 0, threadsNamed("AnimeHubProxyTunnel"))
+
+        // The object is still usable, and it starts cleanly on the second
+        // attempt: nothing from the failed attempt is remembered or leaked.
+        fail = false
+        val port = proxy.start()
+        assertTrue("$phase: the retry must bind, got $port", port > 0)
+        assertEquals("$phase: exactly one generation per lifecycle", 1, proxy.resolverGenerationCount())
+        assertEquals("$phase: the retry must publish one port", port, proxy.port)
+        assertEquals("$phase: start() is idempotent", port, proxy.start())
+
+        // A real CONNECT still works after the failed attempt: the resolver
+        // generation that was released was replaced, not exhausted.
+        val client = Socket("127.0.0.1", port)
+        client.soTimeout = 3_000
+        send(client, "CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+        assertEquals("$phase: the proxy must work after the retry", "HTTP/1.1 502 Bad Gateway", statusLine(client))
+        assertEquals("$phase: the retry must have resolved", 1L, proxy.resolutionCount())
+        client.close()
+      } finally {
+        proxy.stop()
+        assertNull("$phase: stop() must clear the port", proxy.port)
+        assertTrue(
+          "$phase: stop() must end the accept thread, saw ${proxyThreads()}",
+          awaitCondition { threadsNamed("AnimeHubProxyAccept") == 0 },
+        )
+      }
+    }
+  }
+
+  @Test
+  fun a_failed_start_returns_its_resolver_generation_to_the_budget() {
+    // The generation is taken before the listener exists, so a failed start has
+    // to put it back — otherwise every failed attempt would consume one unit of
+    // a cap that is only two generations wide, and a start that failed twice
+    // would leave the object unable to start at all.
+    var fail = true
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(resolveThreads = 1, resolveThreadCap = 2),
+      resolver = { listOf(publicA) },
+      connector = { _, _, _ -> throw java.io.IOException("must not be called") },
+      startHook = { phase -> if (fail && phase == DnsPinnedProxy.StartPhase.PUMP_POOL) throw java.io.IOException("no pump") },
+    )
+    try {
+      // Four failures in a row: a leaked generation would exhaust the budget at
+      // the third one, because the cap only fits two generations.
+      repeat(4) {
+        var threw = false
+        try {
+          proxy.start()
+        } catch (_: java.io.IOException) {
+          threw = true
+        }
+        assertTrue("failure #$it must be reported", threw)
+        assertNull("failure #$it must not leave a port", proxy.port)
+      }
+      fail = false
+      val port = proxy.start()
+      assertTrue("a clean start must still be possible, got $port", port > 0)
+    } finally {
+      proxy.stop()
+    }
+  }
+
+  @Test
+  fun a_head_of_exactly_header_bytes_is_accepted_and_one_more_byte_is_not() {
+    // The read loop tests `out.size() < headerBytes` BEFORE reading, so it can
+    // never store more than headerBytes bytes: the audit's "reads
+    // headerBytes + 1" claim is wrong. This pins the boundary from both sides.
+    val limit = 128
+    val base = "CONNECT example.com:443 HTTP/1.1\r\n"
+    fun head(total: Int): String {
+      val pad = total - base.length - 2 - 2 // trailing CRLF + blank line
+      return base + "X-Pad: " + "a".repeat(pad - 7) + "\r\n" + "\r\n"
+    }
+    val exact = head(limit)
+    assertEquals("the fixture must be exactly the limit", limit, exact.length)
+
+    for ((label, payload, expected) in listOf(
+      Triple("exactly headerBytes", exact, "HTTP/1.1 502 Bad Gateway"),
+      Triple("headerBytes + 1", head(limit + 1), "HTTP/1.1 403 Forbidden"),
+    )) {
+      val proxy = DnsPinnedProxy(
+        limits = DnsPinnedProxy.Limits(headerBytes = limit),
+        resolver = { listOf(publicA) },
+        connector = { _, _, _ -> throw java.io.IOException("must not be called") },
+      )
+      val port = proxy.start()
+      try {
+        val client = Socket("127.0.0.1", port)
+        client.soTimeout = 3_000
+        send(client, payload)
+        assertEquals("$label must be classified, not truncated", expected, statusLine(client))
+        client.close()
+        if (label.startsWith("exactly")) {
+          assertEquals(
+            "a head of exactly headerBytes must reach the resolver",
+            1L,
+            proxy.resolutionCount(),
+          )
+        } else {
+          assertEquals(
+            "one byte more must be refused before resolution",
+            0L,
+            proxy.resolutionCount(),
+          )
+          assertEquals(1L, proxy.refusalCount(DnsPinnedProxy.Refusal.HANDSHAKE))
+        }
+      } finally {
+        proxy.stop()
+      }
     }
   }
 
