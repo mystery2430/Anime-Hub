@@ -601,9 +601,30 @@ jobs:
       - name: cargo build --release
         # One codegen unit plus LTO is the memory spike. Don't also fan the
         # rustc jobs out across both cores while linking.
+        #
+        # The failing step's log is not readable from this repository's API
+        # (artifact download returns a storage error), so a failed build is
+        # re-published as an annotation: check-run annotations ARE readable and
+        # carry the actual cargo/rustc message instead of a bare exit code.
         env:
           CARGO_BUILD_JOBS: "1"
-        run: cargo build --release --locked
+        run: |
+          set +e
+          cargo build --release --locked 2>&1 | tee "$RUNNER_TEMP/release.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "disk:"
+              df -h / /home/runner 2>/dev/null | tail -n +2
+              echo "memory:"
+              free -m | head -n 2
+              echo "cargo:"
+              tail -n 30 "$RUNNER_TEMP/release.log"
+            } > "$RUNNER_TEMP/release-report.txt"
+            message="$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/' "$RUNNER_TEMP/release-report.txt" | tr -d '\n' | cut -c1-50000)"
+            echo "::error title=Release build failed::$message"
+          fi
+          exit "$status"
         working-directory: src-tauri
 
   # ------------------------------------------------- secret / hygiene audit
