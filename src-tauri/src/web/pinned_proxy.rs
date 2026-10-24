@@ -136,7 +136,7 @@ struct Context {
 /// A running proxy. Dropping or stopping it closes the listener and every
 /// tunnel; the port is never reused by this process afterwards.
 pub struct ProxyHandle {
-    port: u16,
+    addr: SocketAddr,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
     requests: Arc<AtomicUsize>,
@@ -145,7 +145,14 @@ pub struct ProxyHandle {
 impl ProxyHandle {
     /// The loopback port the WebView must be pointed at.
     pub fn port(&self) -> u16 {
-        self.port
+        self.addr.port()
+    }
+
+    /// The exact address the listener bound. Test-only: the open path needs
+    /// the port, and the address is what makes "loopback only" checkable.
+    #[cfg(test)]
+    pub fn bind_addr(&self) -> SocketAddr {
+        self.addr
     }
 
     /// How many CONNECT requests have been parsed since this proxy started.
@@ -185,7 +192,7 @@ async fn start_with(
     limits: Limits,
 ) -> std::io::Result<ProxyHandle> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
+    let addr = listener.local_addr()?;
     let (stop_tx, stop_rx) = watch::channel(false);
     let connections = Arc::new(Semaphore::new(limits.max_connections));
     let requests = Arc::new(AtomicUsize::new(0));
@@ -198,7 +205,7 @@ async fn start_with(
     });
     let task = tokio::spawn(accept_loop(listener, context, connections, stop_rx));
     Ok(ProxyHandle {
-        port,
+        addr,
         stop: stop_tx,
         task,
         requests,
@@ -761,6 +768,45 @@ mod tests {
             .expect("proxy");
         assert_ne!(first_port, second.port());
         second.stop();
+    }
+
+    #[tokio::test]
+    async fn the_listener_binds_loopback_only() {
+        let resolver = ScriptedResolver::new(vec![]);
+        let proxy = start_with(resolver, Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
+        let addr = proxy.bind_addr();
+        // `start_with` binds ("127.0.0.1", 0): the OS picks the port and the
+        // address is loopback, so nothing outside this machine can dial it.
+        // That is the whole of the network-side boundary (P3): it is not a
+        // client authentication.
+        assert!(addr.ip().is_loopback(), "bound {addr}");
+        assert_ne!(addr.port(), 0);
+        proxy.stop();
+    }
+
+    /// P3, pinning an **open** residual: the listener has no notion of a
+    /// trusted client.
+    ///
+    /// Any process on the machine can dial it and ask for a tunnel; only the
+    /// destination policy bounds where that tunnel may go. The test exists so
+    /// that adding client authentication later has to change this pin and the
+    /// risk document together, instead of silently contradicting them.
+    #[tokio::test]
+    async fn a_local_client_is_served_without_authentication() {
+        let (origin_port, origin_task) = origin().await;
+        let resolver = ScriptedResolver::new(vec![Ok(vec![IpAddr::from([127, 0, 0, 1])])]);
+        let proxy = start_with(resolver, Policy::LOOPBACK_FOR_TESTS, test_limits())
+            .await
+            .expect("proxy");
+        // A bare TCP client — no WebView, no credentials, no handshake beyond
+        // the CONNECT line — is tunnelled exactly like the site WebView would
+        // be. Nothing in the request identifies the caller.
+        let status = connect_via(proxy.port(), &format!("allowed.test:{origin_port}")).await;
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        proxy.stop();
+        let _ = origin_task.await;
     }
 
     #[test]
