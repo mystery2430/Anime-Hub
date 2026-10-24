@@ -4192,20 +4192,38 @@ mod tests {
         // the main test thread tries to acquire the same lock for a wipe.
         // The wipe must wait, not deadlock, and must see the session as no
         // longer current after the wipe's `current_site` is cleared.
+        //
+        // The sync thread starts its 80ms hold only after the wipe has said it
+        // is about to ask for the lock (`wipe_ready`). Without that handshake
+        // the assertion measured "how much of the 80ms was left when this
+        // thread woke up from its poll", so a descheduled runner could leave
+        // 40ms and fail a lock that had worked perfectly (observed on the macOS
+        // CI runner).
         #[cfg(desktop)]
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             let state = Arc::new(state_with_current_site(Some("s1")));
             let sync_started = Arc::new(AtomicBool::new(false));
             let sync_done = Arc::new(AtomicBool::new(false));
+            let wipe_ready = Arc::new(AtomicBool::new(false));
             let state_clone = state.clone();
             let started_clone = sync_started.clone();
             let done_clone = sync_done.clone();
+            let ready_clone = wipe_ready.clone();
             let handle = std::thread::spawn(move || {
                 let _guard = lock_desktop_session();
                 started_clone.store(true, Ordering::SeqCst);
                 // Simulate sync's ownership check + export under the lock.
                 assert!(session_is_current(&state_clone, "s1"));
+                // Hold the lock only once the wipe is committed to contending
+                // for it. The loop is bounded so a panicked test cannot wedge
+                // this thread forever.
+                for _ in 0..5_000 {
+                    if ready_clone.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 std::thread::sleep(std::time::Duration::from_millis(80));
                 done_clone.store(true, Ordering::SeqCst);
             });
@@ -4216,6 +4234,7 @@ mod tests {
             // Wipe thread (main) tries to acquire the same lock — must block,
             // not deadlock, until sync releases.
             let wipe_start = std::time::Instant::now();
+            wipe_ready.store(true, Ordering::SeqCst);
             {
                 let _guard = lock_desktop_session();
                 let elapsed = wipe_start.elapsed();
