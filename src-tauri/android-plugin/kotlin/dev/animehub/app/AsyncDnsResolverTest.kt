@@ -68,23 +68,19 @@ class AsyncDnsResolverTest {
     val lookup = ManualLookup()
     val resolver = AsyncDnsResolver(lookup, timeoutMs = 2_000)
 
-    val worker = Thread { resolver("example.test") }
+    // One caller, one lookup, one answer. The "two callers share one flight"
+    // case is the next-but-one test, which is deterministic about the join;
+    // running both here made the assertion race against the answer landing
+    // before the second thread had entered the resolver (it failed exactly
+    // that way in CI).
     var result: List<InetAddress>? = null
-    val done = CountDownLatch(1)
-    val waiter =
-      Thread {
-        result = resolver("example.test")
-        done.countDown()
-      }
-    // Start one lookup, then let a second caller join it.
+    val worker = Thread { result = resolver("example.test") }
     worker.start()
     lookup.awaitStarted()
-    waiter.start()
     lookup.answer("example.test", listOf(loopback()))
-    assertTrue("the joined caller never returned", done.await(2, TimeUnit.SECONDS))
-    assertEquals("both callers must share one lookup", 1, lookup.started.get())
     worker.join(2_000)
     assertEquals(listOf(loopback()), result)
+    assertEquals("one answer must not mean two lookups", 1, lookup.started.get())
     assertEquals("a completed flight must be released", 0, resolver.inFlightCount())
   }
 
