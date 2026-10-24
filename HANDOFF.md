@@ -34,7 +34,11 @@ Tauri 2 (Rust + native WebView) ile yazılmış bir **başlatıcı**: ikon ızga
 site masaüstünde kendi WebView profiliyle açılır; Android tek WebView kullanır
 ve sağlayıcı çerez kavanozlarını değiştirir. Android'de aynı kaynaklı
 `localStorage`/IndexedDB için gerçek sağlayıcı yalıtımı henüz çözülmedi.
-Android birincil, Windows/Linux ikincil hedef; macOS/iOS kapsam dışı.
+Android birincil, Windows/Linux ikincil hedef. **macOS (round 17):** masaüstü
+hedefi artık macOS'u da kapsar — site vekili `macos-proxy` özelliğiyle
+bağlanır ve 14 (Darwin 23) altındaki sürümlerde site **korunmasız açılmaz**,
+açıkça reddedilir. iOS kapsam dışı. macOS üzerinde paket/notarization ve
+gerçek WKWebView doğrulaması yapılmadı.
 
 Paket kimliği `dev.animehub.app`. GPLv3 lisanslı Dantotsu'dan **hiç kod
 taşınmadı** (temiz oda); ayrıntı `NOTICES.md` içinde.
@@ -90,7 +94,12 @@ gezinti ve site açılışı artık alan adını kısa bir zaman aşımıyla ç�
 zaman aşımına uğrarsa metin politikası geçerli kalır (DNS kesintisi siteleri
 kapatmasın diye). Sayfa yüklendikten sonra WebView'ın kendi çözümleyicisiyle
 giden alt istekler (`fetch` / XHR) hâlâ bu kontrolden geçmez — onu kapatmak
-filtreleyen bir vekil ister, v1'de yok. Karar `HANDOFF` bölüm 6.D'de.
+filtreleyen bir vekil ister. **Round 17 güncellemesi:** o vekil artık var —
+Android'de `SiteProxyController` + `DnsPinnedProxy` (round 16), masaüstünde
+`src-tauri/src/web/pinned_proxy.rs` (round 17, Windows/Linux `proxy_url`,
+macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TCP
+`CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
+`HANDOFF` bölüm 6.D'de.
 
 ---
 
@@ -135,12 +144,12 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **Android localStorage/IndexedDB** | Dışa/içe aktarma köprüleri ve şifreli anlık görüntüler bulunur; bunlar gerçek sağlayıcı yalıtımı sağlamaz. Android tek WebView'ı yeniden kullandığı için aynı kaynaklı `localStorage`/IndexedDB izolasyonu çözülmemiştir ve güvenlik sınırı olarak sunulmamalıdır. IndexedDB aktarımı en iyi çabadır (ikincil indeks/key path/Blob kaybı mümkündür) |
 | **Kotlin köprüsü** | v0.3.2 release workflow'u Activity/WebView yaşam döngüsü kontrolleri ve asenkron cookie kalıcılaştırması içeren köprüyü üç Android ABI'sinde derleyip imzaladı. Yerelde Android SDK/Gradle yok; asenkron kalıcılaştırmanın gerçek cihaz performansı doğrulanmadı |
 | **PiP duraklatma** | 6f28b13'teki 2 saniyelik otomatik oynatma yeniden denemesi kaldırıldı (`c4a260b`). Sayfanın gördüğü bir duraklatma geri alınmaz. Kullanıcı ile WebView duraklatması ayırt edilemediğinden, PiP sırasındaki oynatma sürekliliği **cihazda doğrulanmadı** ve bir sınır olarak kalıyor |
-| **Android site gezinme koruması** | `SiteNavigationGuard` (`470e7b8`) yalnızca üst düzey gezinmeleri denetler: düz `http`, https dışı şemalar, yerel/özel hostlar. Blocklist, DNS rebinding, alt çerçeveler ve uygulamanın `loadUrl` çağrıları kapsam dışı. Kotlin derlenmedi, cihazda denenmedi. Ayrıntı: `docs/android-navigation.md` |
+| **Android site gezinme koruması** | `SiteNavigationGuard` (`470e7b8`) yalnızca üst düzey gezinmeleri denetler: düz `http`, https dışı şemalar, yerel/özel hostlar. **Round 16/17 güncellemesi:** blocklist aktarımı fail-closed, `NavigationDnsGate` üst düzey + `shouldInterceptRequest` kontrolleri, ve bağlantı zamanında pinleme (`SiteProxyController` `PROXY_OVERRIDE` + `DnsPinnedProxy`, asenkron `AsyncDnsResolver`) eklendi. Kotlin **CI'da derleniyor ve JVM testleri koşuyor**; buna karşın gerçek sağlayıcı davranışı (proxy override'ın uygulanması, iptalin platform iş parçacığını bırakması, WebRTC belge-başı betiği) **cihazda denenmedi** — `docs/android-dns-pinning-device-checklist.md`. Alt çerçeveler ve WebRTC/UDP hâlâ kapsam dışı. Ayrıntı: `docs/android-navigation.md` |
 | **Android `ipc` kısıtı** | wry'nin her sayfaya açtığı `ipc` nesnesi kaldırıldı; launcher origin'lerine ana çerçevede yalnızca `WebMessageListener` verildi (`a864bad`). Kurulamazsa hata loglanır ve IPC kapalı kalır (fail closed). CI Android derlemesi (`5ef743f`, run 38047701321) geçti. **Cihazda doğrulanmadı**: launcher IPC'si çalışmalı, bir site sayfasında `typeof window.ipc` `"undefined"` olmalı |
 | **Linux anahtar kaynağı (keyring)** | Anahtar kaynağı `key-source` kaydında tutulur (`e001705`). Kilitli/erişilemeyen keyring'de yeni anahtar oluşturulmaz, kayıtlı keyring anahtarı varken dosya anahtarına geçilmez. CI `cargo test --all` Linux, Windows ve macOS'ta geçti (`a21b0ec`, run 38045901411). Gerçek Secret Service ile test edilmedi |
 | **PiP çalışma zamanı (gerçek cihaz)** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; bu ortamda cihaz yok. Kontrollü zincir testlerden geçti ve PR #19'un CI koşusunda (`6f28b13` için run 37985547812, tüm işler yeşil) Android aarch64 **derlendi, debug APK üretildi** (`animehub-android-aarch64-debug`). Bu tarihten sonraki commit'ler için CI sonucu ayrıca kontrol edilmelidir. Yani "derleniyor" doğrulandı, "cihazda çalışıyor" **doğrulanmadı**: PiP geçişi, oynatıcı seçimi, geri yükleme ve API seviyesi farkları hâlâ cihazda denenmeli (`docs/android-pip.md` §12'deki 15 maddelik liste) |
 | **Windows NSIS** | v0.3.2 Release Desktop workflow'u Windows üzerinde geçti ve `AnimeHub_0.3.2_x64-setup.exe` üretti. Windows imzalama sırrı tanımlı olmadığı için paket imzasız; README'de uyarısı var |
-| **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
+| **macOS** | **Round 17: hedef kapsamına alındı** (site vekili `macos-proxy` + Darwin ≥ 23 kapısı; alt sürümlerde açılış reddedilir). CI'da `Tests (macos-latest)` işi derleyip test ediyor; **gerçek WKWebView üzerinde proxy/pin davranışı ve notarization doğrulanmadı**. Anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
 | **İmzalı yayın APK** | ✅ Keystore secret'ları (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) repository secrets'a eklendi; workflow imzalı üretiyor |
 | **`.deb` / AppImage / rpm** | v0.3.2 Release Desktop Ubuntu işi geçti ve üç Linux paketini yayımladı (`.deb`, `.rpm`, AppImage) |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
@@ -214,8 +223,12 @@ Seçenek (1), eşzamanlı tutularak: `on_navigation` ve `open_site` alan adını
 1200 ms zaman aşımıyla çözer; herhangi bir cevap özel/yerelse keser.
 Zaman aşımı / NXDOMAIN seçenek (3) gibi metin politikasına düşer — aksi halde
 DNS kesintisi bütün siteleri kapatır. Seçenek (2) (bağlantı katmanında vekil)
-yapılmadı: WebView alt isteklerini kendi çözer, vekil olmadan TOCTOU kapanmaz,
-ve vekil burada doğrulanamazdı. Kalan sınır README'de ve bölüm 3'te yazılı.
+o tarihte yapılmadı: WebView alt isteklerini kendi çözer, vekil olmadan TOCTOU
+kapanmaz, ve vekil burada doğrulanamazdı. **Round 17: bu karar iki parça
+hâlinde uygulandı** — Android `PROXY_OVERRIDE` (round 16) ve masaüstü Rust
+`CONNECT` vekili (round 17). TOCTOU, sınıflandırılan IP'ye bağlanıldığı ve
+soket eşinin doğrulandığı için kapanıyor; ama **gerçek WebView'da denenmedi**
+ve WebRTC/UDP hâlâ pinlenmiyor. Kalan sınır README'de ve bölüm 3'te yazılı.
 
 ### E. Depoyu yayınlarken — yapıldı
 

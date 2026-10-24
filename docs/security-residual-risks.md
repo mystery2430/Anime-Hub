@@ -3,12 +3,53 @@
 This document records what this branch fixes and what it deliberately does
 **not** claim to fix.
 
+Sections below are kept in the order they were written, and they are **history**:
+each one describes the state at the end of its round, including status lines
+that a later round made obsolete. The next section is the only one that
+describes the branch as it stands now.
+
+## Round 17 — current state of the branch
+
+This is the summary to read first. Everything after it is a round log.
+
+**What is implemented and exercised by automated tests on every push**
+
+| Area | What exists now | Evidence | What is still not proven |
+| --- | --- | --- | --- |
+| Desktop DNS pinning | A Rust CONNECT-only proxy (`src-tauri/src/web/pinned_proxy.rs`) bound on an ephemeral `127.0.0.1` port **before** the child WebView exists, installed per session (Windows/Linux through `WebviewBuilder::proxy_url`, macOS through the `macos-proxy` feature) with `--proxy-bypass-list=<-loopback>` on Windows. Fail-closed: the open returns an error if the bind fails, and a load that never touched the proxy closes the site. | 15 real-socket Rust tests (public tunnels, rebinding refused, mixed answer refused whole, private/empty/NXDOMAIN refused, literals never resolved, >8 KiB head refused, unreachable destination refused, `stop()` kills the tunnel, two starts use different ports, one resolution per CONNECT); `tests/desktop_proxy_wiring.test.js`; the three desktop CI jobs. | A real WebView2 / WebKitGTK / WKWebView run. A JVM/Rust test and a green CI job are not that. |
+| Android DNS pinning | `SiteProxyController` installs a process-wide `PROXY_OVERRIDE`; `DnsPinnedProxy` resolves once per CONNECT, classifies every answer and connects to the classified `InetAddress`; `AsyncDnsResolver` moves the lookup onto `DnsResolver.query` with a 10 s deadline that cancels the `CancellationSignal`, drops late answers, and refuses instead of queueing above 8 in-flight lookups. | `DnsPinnedProxyTest`, `SiteProxyGateTest`, `AsyncDnsResolverTest` (host JVM, real sockets where the proxy is involved) run in the Android CI job. | Whether the provider honours `PROXY_OVERRIDE` at all, and whether cancelling actually frees the platform thread. Device matrix unchanged: [`android-dns-pinning-device-checklist.md`](./android-dns-pinning-device-checklist.md). |
+| WebRTC / UDP | Android: `WEBRTC_GUARD` is installed with `addDocumentStartJavaScript` (the round-16 `onPageStarted` fallback, which ran after the page could already open a peer connection, is gone). Desktop: `initialization_script_for_all_frames`. | Source pins in `src-tauri/android-plugin/src/lib.rs` and `session.rs`. | Every part of it. The guard is page JavaScript, not OS-level UDP filtering; QUIC/UDP needs a packet capture; the Android provider must support the document-start API or the open is refused (fail-closed, see below). |
+| OAuth return path | Loopback only, on **every** platform: `prepare_login` calls `validate_redirect_uri(&cfg.redirect_uri, false)`, so `animehub://anilist/callback` is refused before a listener, a state value or an authorization URL exists. | `prepare_login_refuses_the_custom_scheme_on_every_platform`, `tests/command_wiring.test.js`. | Nothing on this side; the login still needs a manual run against AniList because the client id is not in the repo. |
+| Actions pinning (R-09) | All 36 external `uses:` references in the active workflows are pinned to reviewed 40-character SHAs; `ci-fixes/` remains a reference copy that GitHub does not execute. | `tests/gaps.test.js`, `tests/command_wiring.test.js`; last fully green six-job run **40108690774 @ `7948e8f`**. | `main` is untouched: the pins live on this PR branch until it is merged. |
+
+**What a green CI run does not mean.** The six jobs are `Tests` on
+ubuntu-24.04 / macos-latest / windows-latest, `Release profile (LTO)`,
+`Android compile (aarch64)` and `Dependency and secret audit`. None of them runs
+a WebView, a device, an emulator or an AniList login. A green run proves the
+code compiles, the host-side suites pass and the profile links — it is not
+evidence about provider behaviour.
+
+**Still open, by kind**
+
+* **Open; technical limitation** — WebRTC/ICE/STUN/TURN/UDP are outside the
+  pin. The document-start guard is defence in depth inside the page; the only
+  layer that could actually filter that traffic is the OS (`VpnService`/TUN),
+  which is a product decision, not a fix.
+* **Open; product decision** — loopback proxy authentication, and whether to
+  ship `VpnService`/TUN for UDP.
+* **Open; independent review needed** — everything marked "device verification
+  pending" above, and the review itself (R-12's exclusion stands).
+* **Open** — other applications on the same machine can reach the loopback
+  proxy port: an ephemeral port is not authentication, and the `407` prototype
+  in `docs/security-residual-risks.md` is not shipped.
+
 ## Round 16.4 — active workflow Actions are SHA-pinned
 
-**R-09's mutable-tag issue is implemented on this branch; CI validation is pending.**
+**R-09's mutable-tag issue is implemented on this branch and was validated by CI (run 40108690774, six jobs green, at `7948e8f`).**
 The four active workflows under `.github/workflows/` now pin all 36 external
 Action references to reviewed 40-character commit SHAs, with the former version
-tag retained as a comment. The two local reusable-workflow references in
+tag retained as a comment. The "still the final check" sentence below is
+history: that check passed, and the pins are unchanged since. The two local reusable-workflow references in
 `publish-release.yml` remain `uses: ./.github/workflows/...` because they name
 repository files rather than third-party Actions.
 
@@ -17,7 +58,7 @@ release-gate conditions, signing environment, secrets wiring, build commands
 and artifact handling were left unchanged. `tests/gaps.test.js` and
 `tests/command_wiring.test.js` now scan the **active** workflow set and check
 the complete reference count and reviewed SHA mapping; the CI run for this
-commit is still the final syntax/integration check.
+commit was still the final syntax/integration check at the time of writing.
 
 The former token-scope blocker was not bypassed by changing credentials: these
 edits were accepted on the PR branch, and `main`, tags and releases were not
@@ -856,9 +897,13 @@ the connected address would be needed; the options that were actually evaluated
 (`androidx.webkit.ProxyController` / `PROXY_OVERRIDE` and the rejected
 alternatives) are written up under
 [DNS rebinding on Android](#dns-rebinding-on-android), together with the device
-matrix that has to run before any of it can be shipped. That network layer is
-**not** part of this PR. **R-01 (b) stays open.** No comment, test or doc change
-closes it.
+matrix that has to run before any of it can be shipped. That network layer was
+**not** part of this PR at the time of writing — *superseded*: round 16 built it
+for Android (`SiteProxyController` + `DnsPinnedProxy`, `PROXY_OVERRIDE`) and
+round 17 built it for desktop (`web/pinned_proxy.rs`, installed through wry's
+`proxy_url` / `macos-proxy`). Neither half is device-verified; the table at the
+top of this document is the current state. **R-01 (b) stays open.** No comment,
+test or doc change closes it.
 
 ### OAuth loopback redirect must be exactly the served endpoint
 

@@ -260,6 +260,47 @@ claims are tested here, and only the first one is a guarantee:
 
 ---
 
+## 7. Round 17 additions — unexecuted
+
+None of these has been run. They are new because round 17 changed the resolver
+and made the WebRTC document-start guard fail-closed, so the older items no
+longer describe every path.
+
+36. **Asynchronous resolver deadline.** With DNS blackholed, open a site.
+    Expected: the refusal arrives in roughly ten seconds (`RESOLVE_EXHAUSTED`
+    after the deadline), not "never", and `logcat` shows the platform lookup
+    cancelled. A thread dump must show no growing `AnimeHubDns` population —
+    the deadline releases the waiting thread whether or not the provider honours
+    `CancellationSignal.cancel()`.
+37. **Late answer cannot win.** Keep one lookup pending past its deadline, then
+    restore DNS. Expected: the timed-out attempt stays failed, nothing is
+    cached, and a *new* open resolves again. (JVM test
+    `a late answer cannot turn a timed-out lookup into a success`; the device is
+    what decides whether a provider delivers the callback at all.)
+38. **Concurrent same-host lookups.** Open the same site twice in quick
+    succession. Expected: the provider is asked once per name while the first
+    lookup is in flight (single-flight), and the second caller is answered by
+    the same flight rather than starting another. If a provider cannot be
+    observed this way, record "not observable", not PASS.
+39. **Document-start WebRTC guard.** On a real provider: in the page devtools
+    (top frame *and* an iframe) check `typeof RTCPeerConnection`, then try to
+    redefine and to delete it, and confirm a peer connection cannot be created.
+    Separately confirm a provider without `DOCUMENT_START_SCRIPT` support
+    **refuses the open** (`unsupported-document-start`) instead of falling back
+    to a late `onPageStarted` script — the round-16 fallback is gone.
+40. **UDP/QUIC capture.** With the guard active, capture device traffic while a
+    video site plays. Expected: this is the item that decides the wording of the
+    residual — if UDP 443 still leaves the device, the claim stays
+    "HTTP(S)/WSS is pinned" and the guard is defence in depth only. Only an
+    OS-level filter (`VpnService`/TUN, a product decision) could change that.
+
+Items 33–35 describe the resolver the proxy used *before* round 17 (blocking
+lookups with a thread budget). Keep them as history: the budget still exists and
+is still a ceiling rather than a cure, but the deadline in item 36 is now the
+first line of defence.
+
+---
+
 ## What would count as proof, and what would not
 
 * **Proof:** capture showing the only outbound TCP connection for a hostname is
