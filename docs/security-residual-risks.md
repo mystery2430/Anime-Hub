@@ -70,8 +70,10 @@ work. The evidence does not support that.
   valid answer, rcode will be 0" — the basis for treating any non-zero `rcode`
   as a failure (round 18's `dnsAnswerOrFailure`, unchanged).
 
-**AOSP implementation** (API 30 SDK sources, `android/net/DnsResolver.java`,
-fetched 2026-10-24):
+**AOSP implementation** (API 30 SDK sources —
+`AndroidSDKSources/android-sdk-sources-for-api-level-30`, file
+`android/net/DnsResolver.java`, fetched 2026-10-24; one implementation, not a
+contract — OEM builds and later releases may differ):
 
 * `cancelQuery(fd)` removes the fd event listener from the main looper's queue
   and calls `resNetworkCancel(queryfd)`, whose comment is "Closes fd, marks it
@@ -104,7 +106,7 @@ the first network request from leaving when the proxy setting was not applied?
 | Platform | Supported pre-request veto? | Evidence |
 | --- | --- | --- |
 | Windows / WebView2 | **Partly, and not through our stack.** `WebResourceRequested` + a resource filter runs before the request is sent and can answer it from the host. But `AddWebResourceRequestedFilter` is documented as deprecated and as not behaving "as expected for iframes"; the newer `AddWebResourceRequestedFilterWithRequestSourceKinds` does not fix WebSocket handshakes, which have no interception event. wry 0.55.1 does not expose either; it would need `with_webview` + raw COM per view. | Microsoft Learn, `ICoreWebView2::AddWebResourceRequestedFilter` (deprecation + iframe note), `add_WebResourceRequested` |
-| Linux / WebKitGTK | **Yes for resource loads, but out of reach of this stack.** `WebKitWebPage::send-request` is emitted "when request is about to be sent to the server" and returning `TRUE` cancels the load. It belongs to the **web-process extension** API (a separate `.so` loaded by the web process, registered on the context); wry sets up its own context and exposes no hook for it, and the signal does not cover WebSocket handshakes. | webkitgtk.org `WebKitWebPage` reference, `send-request`; WebKit bug 83681 (API added for the injected bundle) |
+| Linux / WebKitGTK | **Yes for resource loads, but out of reach of this stack.** `WebKitWebPage::send-request` is emitted "when request is about to be sent to the server" and returning `TRUE` cancels the load. It belongs to the **web-process extension** API: a separate `.so` loaded into the web process from a directory registered on the context. wry 0.55.1 can pass one such directory (`WebViewBuilder::with_extension_path` → `set_web_extensions_directory`), but **the Tauri 2.11.6 layer this app uses does not expose it** (`extension_path` appears nowhere in tauri's `webview/mod.rs` or in tauri-runtime-wry), so it would need a custom web-process extension plus a way around Tauri's builder. The signal also does not cover WebSocket handshakes. | webkitgtk.org `WebKitWebPage` reference, `send-request`; WebKit bug 83681 (API added for the injected bundle); wry 0.55.1 `webkitgtk/mod.rs` (`set_web_extensions_directory`), tauri 2.11.6 source (no `extension_path`) |
 | macOS / WKWebView | **No.** `WKNavigationDelegate` covers navigations (top frame and iframes), not `fetch`/XHR/subresources; `WKURLSchemeHandler` only serves custom schemes; `WKContentRuleList` blocks by URL pattern, cannot ask "did the proxy apply?", and is not a network veto. | Apple WebKit API surface (no subresource interception delegate) |
 
 None of these is implemented in this round, and none of them would be a
