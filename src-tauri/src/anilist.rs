@@ -2237,7 +2237,10 @@ mod tests {
             };
             let message = err.to_string();
             assert!(message.contains("desteklenmiyor"), "{redirect}: {message}");
-            assert!(!message.contains("Giriş başlatılmadı"), "{redirect}: {message}");
+            assert!(
+                !message.contains("Giriş başlatılmadı"),
+                "{redirect}: {message}"
+            );
         }
     }
 
