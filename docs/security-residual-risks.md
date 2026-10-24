@@ -199,6 +199,69 @@ proxy were misconfigured.
   a new process starts unpinned and refuses to open a site until it installs
   the override again. That is the intended fail-closed path, not a gap.
 
+## Round 16.3 — reusing resolver generations, and a cap that survives `stop()`
+
+Round 16.2 added a spare generation but only ever submitted to the newest one,
+and it cleared the generation list in `stop()`. Both were measured as broken:
+
+* **An idle generation was never used.** With `resolveThreads = 1`,
+  `resolveThreadCap = 2`, generation 1 wedged, generation 2 wedged, then
+  generation 1's call returned: the next `CONNECT` was still refused with
+  `RESOLVE_EXHAUSTED`, because the cap was spent and only generation 2 — still
+  full — was ever tried. A usable thread sat idle while DNS was declared down.
+* **A restart could spend the budget twice.** `stop()` shut the generations down
+  and cleared the list. A call that ignores the interrupt keeps running, so
+  `start()` then saw an empty list, created a fresh generation, and the object
+  ended up with more resolver threads than its declared cap. The list was
+  bookkeeping; the threads were real.
+
+### What changed (all of it measured on the JVM, none of it on a device)
+
+| Behaviour | Now |
+| --- | --- |
+| Where a lookup is submitted | The current generation first, then every older generation of the same lifecycle that is not shut down. Only when none can take it is another generation created, and at most one per call. |
+| What the cap counts | `resolveThreads` per live generation **plus** `activeCount` of shut-down generations — the calls that are still running and cannot be reclaimed. It spans `stop()`/`start()` on the same object. |
+| `stop()` | Shuts the generations down but **keeps tracking them**. Their threads still exist; forgetting them is what let a restart overspend. A generation that really terminated is dropped on the next accounting pass. |
+| `start()` when the budget is spent | Throws. The listener is checked before it is bound, so a proxy that cannot resolve never looks ready; `SiteProxyController` maps it to `proxy-unavailable` and the site is not opened. |
+| `Limits` | The cap must allow a **full** spare generation (`>= 2 × resolveThreads`); `4/5` — accepted in 16.2 and unable to form one — is now rejected at construction. Capacity is spent in whole generations, so a cap that is not a multiple of `resolveThreads` leaves the remainder unused rather than creating a half generation. Defaults stay `4/8`. |
+
+One more defect surfaced while running this suite repeatedly on JDK 25:
+`stop()` closed the live sockets from a `live.toList()` snapshot, and that
+iteration throws `NoSuchElementException` when a handler removes its own socket
+between `hasNext()` and `next()` (observed as an intermittent failure of
+`a_cleartext_request_through_the_proxy_is_refused`). A `stop()` that throws there
+leaves descriptors open, so the sweep now iterates the set directly and skips a
+vanished entry. It is a pre-existing bug, not one introduced here.
+
+Tests that fail without these changes (each mutation was run and reverted):
+`an_older_generation_is_reused_once_its_lookup_returns` (only-current
+submission → 502 instead of 200), `a_restart_cannot_spend_the_resolver_budget_twice`
+(clearing the list in `stop()` → the third `start()` succeeds),
+`the_cap_must_leave_room_for_a_full_spare_generation`,
+`a_cap_that_is_not_a_whole_number_of_generations_leaves_the_remainder_unused`.
+
+### What is still not fixed
+
+* **The platform call is still uncancellable.** Everything above bounds threads
+  and reuses what is reusable; none of it can make `InetAddress.getAllByName`
+  return. If every thread the budget allows is owned by a call that never
+  returns, DNS stays refused until the process restarts. Reuse makes that far
+  less likely to be permanent — a generation becomes usable again the moment one
+  of its calls returns — but it is not recovery, and the docs do not call it
+  that.
+* **The refusal is per proxy object.** The budget is enforced by the object that
+  owns the generations. The app installs one override per process and the gate
+  permits a single install, so one object is the normal case; a second object
+  would come from an install attempt that failed first.
+* **A failed `start()` latches the gate.** `SiteProxyGate` refuses after a
+  failed install and a later success cannot flip it, so a budget-spent start
+  means the process refuses to open sites until it restarts. That is the same
+  fail-closed path as a bind failure and is stated here rather than papered
+  over.
+* **Nothing here changes the DNS-rebinding verification status** — still OPEN
+  until the device capture in checklist items 1–19 exists — or the loopback
+  reachability residual, or the Action SHA-pinning blocker (R-09).
+
 ## Round 16.2 — resolver generations, and two claims corrected
 
 ### 1. The `start()` comment claimed app isolation from a loopback bind
@@ -226,7 +289,7 @@ stuck platform call does. Measured on the JVM (not on a device):
 | --- | --- |
 | One lookup never returns | `CONNECT` is refused `502` after `resolveMs`; the handler slot is released; the lookup keeps its thread. |
 | Every thread of the current generation is stuck | The next `CONNECT` **rotates to one spare generation** (4 more threads, 8 total) and is resolved there. No restart is needed for this case. |
-| The spare generation is stuck too | `Refusal.RESOLVE_EXHAUSTED` (`502`) immediately, for **every** host, because the shortage is in this process, not in that host's answer. Nothing is queued and nothing is dialled. |
+| The spare generation is stuck too | `Refusal.RESOLVE_EXHAUSTED` (`502`) immediately, for **every** host, because the shortage is in this process, not in that host's answer — but only once **every** generation is full: from round 16.3 an older generation with a free thread is reused first (see [round 16.3](#round-163--reusing-resolver-generations-and-a-cap-that-survives-stop)). Nothing is queued and nothing is dialled. |
 | A stuck lookup finally returns | Capacity comes back by itself, the next `CONNECT` resolves again, and no failure was cached. |
 | The lookups never return | DNS stays refused until the proxy/process is restarted. **This is the residual.** |
 | `stop()` while lookups are stuck | Every generation is shut down and the listener closes, but a call that ignores the interrupt keeps its thread until the platform returns — `stop()` cannot end it. |
@@ -388,7 +451,7 @@ pivot into the device or the user's LAN — see
 bounded concurrency and handshake deadlines, and no logging of hosts or URLs, so
 another app's use of the port leaves no data behind for this app to leak.
 
-### 3. Resolver timeout and socket lifecycle (round 16.1; the pool was revised in 16.2)
+### 3. Resolver timeout and socket lifecycle (round 16.1; the pool was revised in 16.2 and 16.3)
 
 `InetAddress.getAllByName` has **no timeout and no cancellation** — with a
 captive portal or a blackholed DNS server a single `CONNECT` could hold a
@@ -404,6 +467,10 @@ handler thread, and 16 of those would wedge every site request. What changed:
   a wedged generation is replaced once, and past the ceiling the answer is
   `Refusal.RESOLVE_EXHAUSTED` — still a `502`, still fail-closed. This is
   capacity, not recovery: see [round 16.2 §3](#3-resolver-generations-what-recoverability-this-actually-buys).
+  Round 16.3 corrects two defects of that design — a lookup now also goes to an
+  older generation that became usable again, and the ceiling counts the threads
+  of a previous `stop()`/`start()` cycle instead of being reset by `stop()` (see
+  [round 16.3](#round-163--reusing-resolver-generations-and-a-cap-that-survives-stop)).
 * A timeout, a resolver exception and an empty answer are all `502` refusals and
   **no address is classified from them**; nothing is cached in either
   direction, so a failure cannot become a public verdict

@@ -123,27 +123,39 @@ class DnsPinnedProxy(
      * `InetAddress.getAllByName` has no timeout and cannot be cancelled, so a
      * stuck DNS answer would otherwise block a handler thread for as long as
      * the platform resolver takes (minutes, on a captive portal). The wait is
-     * bounded here instead, and the abandoned lookup keeps its own thread —
-     * [resolveThreads] at most, never one per connection.
+     * bounded here instead. The abandoned lookup keeps its resolver thread
+     * until the platform call returns, which is why threads are counted against
+     * [resolveThreadCap] (never one thread per connection).
      */
     val resolveMs: Int = 10_000,
     /**
      * Resolver threads per generation. `InetAddress.getAllByName` cannot be
-     * cancelled, so a lookup that never returns owns its thread forever; when
-     * all threads of the current generation are owned that way, a new
-     * generation may be created (see [resolveThreadCap]) instead of the proxy
-     * staying DNS-dead for the rest of the process.
+     * cancelled, so a lookup that never returns owns its thread forever.
      *
-     * A rejected submission is a refusal, not a queue.
+     * Generations are **reused**: a lookup is submitted to the current
+     * generation and, if that one is full, to any older generation that still
+     * has a free thread. Only when every generation is full is another one
+     * created (see [resolveThreadCap]). A rejected submission is a refusal,
+     * never a queue.
      */
     val resolveThreads: Int = 4,
     /**
-     * Hard ceiling on resolver threads per proxy instance, across every
-     * generation. It is what keeps an uncancellable platform call from turning
-     * into unbounded thread growth: with the defaults, one spare generation of
-     * four threads exists, and when those are stuck too DNS is refused until
-     * the proxy (or the process) is restarted. **This is a documented
-     * availability residual, not automatic recovery.**
+     * Hard ceiling on resolver threads for this proxy object, across every
+     * generation **and across `stop()`/`start()` cycles**, because a platform
+     * call that ignores the interrupt outlives both.
+     *
+     * The budget is spent on threads that can still run a lookup: `resolveThreads`
+     * per live generation plus the threads of shut-down generations that are
+     * still executing an abandoned call. A shut-down generation whose calls
+     * have all returned cannot run anything again, so it stops counting.
+     *
+     * It must leave room for at least one full spare generation (enforced in
+     * [Limits]), which is what gives the proxy its one automatic recovery.
+     * Capacity is spent in whole generations, so a cap that is not a multiple
+     * of [resolveThreads] leaves the remainder unused rather than creating a
+     * half generation. When the budget is spent, [Refusal.RESOLVE_EXHAUSTED] is
+     * the answer and DNS stays refused until the process restarts. **This is a
+     * documented availability residual, not automatic recovery.**
      */
     val resolveThreadCap: Int = 8,
     val idleMs: Int = 180_000,
@@ -153,10 +165,15 @@ class DnsPinnedProxy(
     val backlog: Int = 16,
   ) {
     init {
-      // A cap below one generation would make every lookup fail as soon as the
-      // first one is slow, so the two knobs have to agree.
       require(resolveThreads > 0) { "resolveThreads must be positive" }
-      require(resolveThreadCap >= resolveThreads) { "resolveThreadCap must allow one generation" }
+      // The one automatic recovery this design has is the spare generation, and
+      // a cap that cannot fit it would read as a bound while behaving as
+      // "one stuck generation and DNS is gone". Reject the combination instead
+      // of shipping a cap that silently disables the recovery path.
+      require(resolveThreadCap >= 2 * resolveThreads) {
+        "resolveThreadCap must leave room for one spare generation " +
+          "(${2 * resolveThreads} threads with resolveThreads = $resolveThreads)"
+      }
     }
   }
 
@@ -170,13 +187,20 @@ class DnsPinnedProxy(
   private var pumpPool: ThreadPoolExecutor? = null
 
   /**
-   * The generation currently used for lookups. Replaced (never mutated) when
-   * every thread of it is stuck; see [rotateResolver].
+   * The generation created for the current `start()`/`stop()` cycle. It is the
+   * first one a lookup is offered to, but never the only one: older generations
+   * are reused while they still have a free thread (see [submitLookup]).
    */
   @Volatile
   private var resolvePool: ThreadPoolExecutor? = null
 
-  /** Every generation this instance created, including abandoned ones. */
+  /**
+   * Every generation this object created, in creation order, **including the
+   * ones from earlier `start()`/`stop()` cycles**. The list is not cleared by
+   * [stop]: a call that ignores the interrupt keeps running, so clearing the
+   * list would let the next [start] spend the thread budget again on threads
+   * that still exist. Generations that have terminated are dropped here.
+   */
   private val resolveGenerations: MutableList<ThreadPoolExecutor> =
     Collections.synchronizedList(mutableListOf<ThreadPoolExecutor>())
 
@@ -223,15 +247,36 @@ class DnsPinnedProxy(
    * queue — never authenticated. `ProxyController` points the WebViews at it,
    * and `docs/security-residual-risks.md` (round 16.1 §2) states the same
    * thing; do not describe the loopback bind as app isolation.
+   *
+   * @throws IOException when the loopback listener cannot be bound **or** when
+   *   no resolver generation can be created because the threads of an earlier
+   *   lifecycle are still owned by calls that ignored the interrupt. Both are
+   *   refusals: a proxy that cannot resolve anything must not look ready. The
+   *   caller (`SiteProxyController`) maps it to `proxy-unavailable`, so the
+   *   site is not opened instead of opening onto a proxy that can only fail.
    */
   fun start(): Int = synchronized(lock) {
     boundPort?.let { return it }
+    // The resolver budget is checked BEFORE the listener exists. A call from an
+    // earlier lifecycle that ignores the interrupt still owns its thread, so a
+    // start that cannot get a generation must not bind and must not look ready:
+    // throwing here surfaces as `proxy-unavailable`, which refuses to open the
+    // site instead of opening it onto a proxy that can only answer 502.
+    val generation = try {
+      newResolverGeneration()
+    } catch (e: ResolverExhausted) {
+      throw IOException(e.message)
+    }
     val socket = ServerSocket()
     try {
       socket.reuseAddress = true
       socket.bind(InetSocketAddress(InetAddress.getByName(LOOPBACK), 0), limits.backlog)
     } catch (e: IOException) {
       closeQuietly(socket)
+      // Nothing will ever use this generation; shutting it down lets its pool
+      // terminate and drop out of the budget instead of holding it forever.
+      generation.shutdownNow()
+      discardTerminatedGenerations()
       throw e
     }
     server = socket
@@ -241,9 +286,9 @@ class DnsPinnedProxy(
     pumpPool = pool("AnimeHubProxyTunnel", limits.maxConnections)
     // Small and fixed per generation: a resolver call that never returns
     // strands at most `resolveThreads` threads here, a further concurrent
-    // lookup is refused rather than queued behind the stuck ones, and the
-    // total across generations is capped by `resolveThreadCap`.
-    resolvePool = newResolverGeneration()
+    // lookup goes to another generation or is refused rather than queued
+    // behind the stuck ones, and the total is capped by `resolveThreadCap`.
+    resolvePool = generation
     acceptThread = Thread({ acceptLoop(socket) }, "AnimeHubProxyAccept").apply {
       isDaemon = true
       start()
@@ -275,15 +320,30 @@ class DnsPinnedProxy(
     // Every generation, including the abandoned ones: a stuck lookup keeps its
     // thread until the platform call returns, and interrupting is the only
     // thing that can be done about it. The rotation lock is held so a handler
-    // that is rotating right now cannot add a generation after the list was
-    // drained — it re-reads `running` (already false) and refuses instead.
+    // that is rotating right now cannot add a generation after this loop — it
+    // re-reads `running` (already false) and refuses instead.
+    //
+    // The list is deliberately NOT cleared: those threads still exist, so a
+    // following [start] has to see them in the budget. A generation that has
+    // really terminated is dropped on the next accounting pass.
     synchronized(resolveRotation) {
       synchronized(resolveGenerations) {
         for (generation in resolveGenerations) generation.shutdownNow()
-        resolveGenerations.clear()
       }
     }
-    for (socket in live.toList()) {
+    // Snapshot-free iteration on purpose: `live.toList()` walks the key set of
+    // a ConcurrentHashMap, and `next()` there can throw when a handler removes
+    // its own socket between `hasNext()` and `next()`. A stop must close every
+    // descriptor it can, so a vanished entry is skipped instead of aborting the
+    // loop halfway (the handler that removed it already closed it).
+    val sockets = live.iterator()
+    while (true) {
+      val socket = try {
+        if (!sockets.hasNext()) break
+        sockets.next()
+      } catch (_: java.util.NoSuchElementException) {
+        continue
+      }
       closeQuietly(socket)
     }
     live.clear()
@@ -470,52 +530,116 @@ class DnsPinnedProxy(
   }
 
   /**
-   * Submit one lookup, rotating to a fresh generation at most once.
+   * Submit one lookup, reusing any generation that still has a free thread.
    *
-   * The rejection of a submission means every thread of the current generation
-   * is owned by a call that cannot be interrupted. Refusing there would leave
-   * the whole process without DNS until it is restarted — which is what
-   * happens when a captive portal or a VPN switch strands four lookups and the
-   * network is healthy again a minute later. So one extra generation is
-   * created, subject to [Limits.resolveThreadCap]; the abandoned lookups keep
-   * their threads, their answers are never read, and no verdict about a host is
-   * carried over. When the cap is reached, [Refusal.RESOLVE_EXHAUSTED] is the
-   * answer, and the residual is a documented availability risk rather than
-   * something this file pretends to heal.
+   * A generation whose threads are all owned by an uncancellable call rejects
+   * the submission (`SynchronousQueue`, so nothing queues). That rejection says
+   * nothing about the *other* generations: a wedged generation can become
+   * usable again the moment one of its calls returns, and an older one may be
+   * idle while the current one is full. So the lookup is offered to the current
+   * generation first and then to every older generation, and a new generation
+   * is created only when all of them are full — at most once per call, and only
+   * while [Limits.resolveThreadCap] allows it.
+   *
+   * Reuse changes nothing about the guarantee: each submission gets its OWN
+   * future, its answer is read only by the caller that submitted it, a timed-out
+   * future is cancelled and never read again, and no answer is cached. When no
+   * generation can take the lookup, [ResolverExhausted] is thrown and the
+   * caller refuses the connection.
    */
   private fun submitLookup(host: String): java.util.concurrent.Future<List<InetAddress>> {
+    var rotated = false
     while (true) {
-      val pool = resolvePool ?: throw IOException("proxy not started")
-      try {
-        return pool.submit(Callable { resolver(host) })
-      } catch (_: RejectedExecutionException) {
-        if (!rotateResolver(pool)) throw ResolverExhausted()
+      val current = resolvePool ?: throw IOException("proxy not started")
+      for (generation in generationOrder(current)) {
+        if (generation.isShutdown) continue
+        try {
+          return generation.submit(Callable { resolver(host) })
+        } catch (_: RejectedExecutionException) {
+          // This generation is at its thread limit; try the next one.
+        }
       }
+      if (rotated || !rotateResolver(current)) throw ResolverExhausted()
+      rotated = true
     }
   }
 
+  /**
+   * The current generation first, then every older one in creation order.
+   *
+   * `stop()` leaves the list in place for accounting, so shut-down generations
+   * can still be in it; they are filtered by the caller.
+   */
+  private fun generationOrder(current: ThreadPoolExecutor): List<ThreadPoolExecutor> =
+    synchronized(resolveGenerations) {
+      val ordered = ArrayList<ThreadPoolExecutor>(resolveGenerations.size + 1)
+      ordered.add(current)
+      for (generation in resolveGenerations) {
+        if (generation !== current) ordered.add(generation)
+      }
+      ordered
+    }
+
   /** True when [stuck] was replaced by a fresh generation, so the caller retries. */
   private fun rotateResolver(stuck: ThreadPoolExecutor): Boolean = synchronized(resolveRotation) {
-    // Another handler may already have rotated while this one was rejected.
+    // Another handler may already have rotated while this one was rejected; the
+    // retry then re-reads the generation order instead of creating a second one.
     if (resolvePool !== stuck) return true
     if (!running) return false
-    if (!mayCreateResolverGeneration()) return false
-    resolvePool = newResolverGeneration()
+    val generation = try {
+      newResolverGeneration()
+    } catch (_: ResolverExhausted) {
+      return false
+    }
+    resolvePool = generation
     return true
   }
 
-  private fun mayCreateResolverGeneration(): Boolean = synchronized(resolveGenerations) {
-    (resolveGenerations.size + 1) * limits.resolveThreads <= limits.resolveThreadCap
+  /**
+   * Threads that can still be running a lookup.
+   *
+   * A live generation is counted at its capacity: that is what it may still
+   * spawn, and counting capacity rather than the current `poolSize` keeps the
+   * bound true for a thread that is being created right now. A shut-down
+   * generation is counted at its `activeCount` — the calls that are still
+   * running and cannot be reclaimed — because an idle worker in a shut-down
+   * pool has nothing left to execute and exits on its own.
+   *
+   * The distinction matters across `stop()`/`start()`: the stuck call from the
+   * previous lifecycle is counted, an idle thread that is merely exiting is not.
+   */
+  private fun liveResolverThreads(): Int = synchronized(resolveGenerations) {
+    var live = 0
+    for (generation in resolveGenerations) {
+      live += if (generation.isShutdown) generation.activeCount else limits.resolveThreads
+    }
+    live
   }
 
-  private fun newResolverGeneration(): ThreadPoolExecutor {
+  private fun discardTerminatedGenerations() {
+    synchronized(resolveGenerations) {
+      resolveGenerations.removeAll { it.isTerminated }
+    }
+  }
+
+  /**
+   * Create a generation if the budget allows it, otherwise [ResolverExhausted].
+   *
+   * Callers hold [resolveRotation] when this is a rotation; `start()` calls it
+   * for the first generation of a lifecycle.
+   */
+  private fun newResolverGeneration(): ThreadPoolExecutor = synchronized(resolveRotation) {
+    discardTerminatedGenerations()
+    if (liveResolverThreads() + limits.resolveThreads > limits.resolveThreadCap) {
+      throw ResolverExhausted()
+    }
     val generation = pool("AnimeHubProxyResolve", limits.resolveThreads)
     resolveGenerations.add(generation)
-    return generation
+    generation
   }
 
-  /** Internal signal: every generation is stuck, nothing may be spawned. */
-  private class ResolverExhausted : IOException("resolver exhausted")
+  /** Internal signal: no generation can take a lookup and none may be created. */
+  private class ResolverExhausted : IOException("resolver thread budget exhausted")
 
   // -------------------------------------------------------------------------
   // Tunnel

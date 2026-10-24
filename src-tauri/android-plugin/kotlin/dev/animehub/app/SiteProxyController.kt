@@ -129,8 +129,11 @@ object SiteProxyController {
       bound.port ?: error("proxy bound no port")
     } catch (e: Exception) {
       // A half-started proxy is stopped again: the gate refuses from here on,
-      // so nothing is using the port and holding it would only leak.
-      logCoarse("proxy could not bind loopback")
+      // so nothing is using the port and holding it would only leak. `start()`
+      // refuses before binding when no resolver generation fits the budget, so
+      // this is a bind failure OR a resolver-budget failure; both mean the
+      // proxy would not be able to resolve and must not be installed.
+      logCoarse("proxy could not start (bind or resolver budget)")
       stopQuietly()
       gate.markFailed()
       return

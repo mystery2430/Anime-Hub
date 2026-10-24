@@ -169,6 +169,52 @@ test("the declared MSRV is one value, and CI actually builds with it", () => {
   assert.ok(!ci.includes('"-D warnings" --all-targets > "$RUNNER_TEMP/clippy.log" 2>&1 || true'));
 });
 
+test("the resolver budget is documented as capacity, not recovery", () => {
+  // Round 16.3 changed what `resolveThreadCap` means: it now spans
+  // `stop()`/`start()` on the same object and a lookup may be submitted to an
+  // older generation. Docs that still describe the 16.2 model would be wrong in
+  // exactly the direction that matters — they would read as a recovery claim.
+  const risks = read("docs/security-residual-risks.md");
+  assert.match(risks, /## Round 16\.3 — /);
+  assert.ok(
+    risks.includes("round 16.3"),
+    "the older resolver section must point at the round that revised it",
+  );
+  const section = risks.slice(risks.indexOf("## Round 16.3 — "));
+  assert.ok(
+    section.includes("`stop()`/`start()`") && section.includes("still not fixed"),
+    "the 16.3 section must state that the cap spans lifecycles and what is still open",
+  );
+  assert.ok(
+    !/automatically recover|recycles the thread|thread recovery/i.test(section),
+    "the 16.3 section must not describe the pool as recovering itself",
+  );
+  // The device checklist is where an operator decides whether persistent
+  // exhaustion is a bug: it must say that restarting the proxy does not buy
+  // threads, because the budget is per object.
+  const checklist = read("docs/android-dns-pinning-device-checklist.md");
+  assert.match(
+    checklist,
+    /does\s+\*\*not\*\* buy more\s+threads/,
+    "checklist item 35 must say a proxy restart does not reset the budget",
+  );
+  // The README is the user-facing copy of the same facts.
+  const readme = read("README.md");
+  assert.ok(
+    readme.includes("2 × resolveThreads"),
+    "the README must state that the cap has to allow a full spare generation",
+  );
+  assert.ok(
+    readme.includes("`stop()`/`start()` arasında da") ||
+      readme.includes("`stop()`/`start()` arasında"),
+    "the README must state that the budget survives stop()/start()",
+  );
+  assert.ok(
+    readme.includes("`RESOLVE_EXHAUSTED`") && readme.includes("proxy-unavailable"),
+    "the README must keep both refusal paths named",
+  );
+});
+
 test("every external GitHub Action is pinned to a commit SHA, not a mutable tag", () => {
   // The hardened copies live in ci-fixes/ because the branch token has no
   // workflow scope; apply.sh installs them. Validate the proposed files here.

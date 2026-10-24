@@ -270,12 +270,18 @@ senaryosu: `docs/security-residual-risks.md` (round 16.1) ve
 
 **Çözümleyici (DNS) sınırı:** `InetAddress.getAllByName` ne zaman aşımı ne de
 iptal sunar, bu yüzden çözümleme sınırlı bir havuzda yapılır (`resolveMs = 10 s`,
-nesil başına `resolveThreads = 4`). Takılı kalan bir nesnenin yerine **tek bir
-yedek nesil** açılabilir; toplam iş parçacığı `resolveThreadCap = 8` ile
-sınırlıdır ve bu tavan aşıldığında istek `RESOLVE_EXHAUSTED` (502) ile hemen
-reddedilir. Bu **kapasite**, kurtarma değildir: platform çağrısı hiç dönmezse
-süreç yeniden başlatılana kadar DNS kapalı kalır — belgelenmiş erişilebilirlik
-riski (`docs/security-residual-risks.md`, round 16.2 §3; cihaz maddesi 35).
+nesil başına `resolveThreads = 4`). Bir lookup önce güncel nesneye, dolduysa
+**daha eski ama hâlâ boş thread'i olan nesneye** verilir; yeni nesil ancak hepsi
+dolduğunda ve en fazla bir kez açılır. Toplam iş parçacığı
+`resolveThreadCap = 8` ile sınırlıdır ve bu bütçe `stop()`/`start()` arasında da
+korunur (iptali yok sayan bir çağrının thread'i `stop()` ile geri kazanılamaz).
+Tavan, tam bir yedek nesneye izin vermek zorundadır (`>= 2 × resolveThreads`;
+`4/5` gibi bir değer kurulumda reddedilir). Bütçe tükendiğinde istek
+`RESOLVE_EXHAUSTED` (502) ile hemen reddedilir; bütçe doluysa `start()` hiç
+bağlanmaz ve site `proxy-unavailable` ile açılmaz. Bu **kapasite**, kurtarma
+değildir: platform çağrısı hiç dönmezse süreç yeniden başlatılana kadar DNS
+kapalı kalır — belgelenmiş erişilebilirlik riski
+(`docs/security-residual-risks.md`, round 16.3; cihaz maddesi 35).
 Ayrıca `127.0.0.1`'e bağlanmak **yalnızca dış ağ arayüzlerini** kapatır; aynı
 cihazdaki başka uygulamalar bu portu bulup kullanabilir (kimlik doğrulama
 `ProxyConfig` ile mümkün değildir, açık kalan risk).

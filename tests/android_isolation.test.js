@@ -1566,10 +1566,42 @@ test("connection pinning is wired from the proxy to the refusal", () => {
   assert.match(proxyKt, /Refusal\.RESOLVE_EXHAUSTED/);
   assert.match(proxyKt, /newResolverGeneration\(\)/);
   assert.match(proxyKt, /resolveGenerations/);
-  assert.match(proxyKt, /require\(resolveThreadCap >= resolveThreads\)/);
+  // The cap must leave room for a whole spare generation: 4/5 used to be
+  // accepted and then could never form one.
+  assert.match(proxyKt, /require\(resolveThreadCap >= 2 \* resolveThreads\)/);
+  // Round 16.3: an older generation with a free thread is reused instead of
+  // refusing because the cap is already spent, and `stop()` must NOT forget the
+  // generations whose calls are still running (that is how a restart spent the
+  // same budget twice).
+  assert.match(proxyKt, /private fun generationOrder\(current: ThreadPoolExecutor\)/);
+  assert.match(proxyKt, /for \(generation in generationOrder\(current\)\)/);
+  assert.match(proxyKt, /private fun liveResolverThreads\(\)/);
+  assert.doesNotMatch(
+    proxyCode,
+    /resolveGenerations\.clear\(\)/,
+    "stop() must keep tracking generations: their threads still exist",
+  );
+  // The budget is enforced before the listener exists, so a start without a
+  // resolver thread cannot bind and cannot look ready.
+  assert.match(proxyKt, /val generation = try \{\s*\n\s*newResolverGeneration\(\)/);
+  // stop() must count what a shut-down generation is still running, and must
+  // not snapshot the live-socket set with `toList()`: that iteration can throw
+  // NoSuchElementException when a handler removes its own socket mid-sweep, and
+  // a stop that throws there leaves descriptors open.
+  assert.match(proxyKt, /if \(generation.isShutdown\) generation.activeCount/);
+  assert.doesNotMatch(
+    proxyCode,
+    /live\.toList\(\)/,
+    "stop() must sweep the socket set without a toList() snapshot",
+  );
+  assert.match(proxyKt, /catch \(_: java\.util\.NoSuchElementException\)/);
   // The tests must model an UNCANCELLABLE lookup: an interruptible fake made
   // the round-16.1 "stuck" suite pass while proving the opposite case.
-  assert.match(read(`${KOTLIN}/DnsPinnedProxyTest.kt`), /class UninterruptibleResolver/);
+  const proxyTestKt = read(`${KOTLIN}/DnsPinnedProxyTest.kt`);
+  assert.match(proxyTestKt, /class UninterruptibleResolver/);
+  assert.match(proxyTestKt, /fun an_older_generation_is_reused_once_its_lookup_returns\(\)/);
+  assert.match(proxyTestKt, /fun a_restart_cannot_spend_the_resolver_budget_twice\(\)/);
+  assert.match(proxyTestKt, /fun the_cap_must_leave_room_for_a_full_spare_generation\(\)/);
 
   // The ONLY configuration: one loopback rule, implicit bypass removed, and no
   // bypass/DIRECT/clear call that would restore a direct path.

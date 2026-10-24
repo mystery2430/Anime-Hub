@@ -232,17 +232,19 @@ claims are tested here, and only the first one is a guarantee:
     (`AnimeHubProxyResolve`), not one per attempt.
 34. Restore DNS and retry. Expected: the site opens — nothing about the failed
     lookup is remembered. If four lookups were still stuck when DNS came back,
-    the first retry should be served by the **spare generation** without
-    restarting the app (JVM behaviour; on-device this is what item 34 confirms
-    or refutes).
-35. Leave DNS blackholed long enough to wedge both generations (8 stuck
-    lookups: keep opening sites for a few minutes), then restore DNS. Expected:
-    requests keep being refused (`502`) immediately, because the threads are
-    gone and `stop()` cannot reclaim a call that ignores the interrupt. The
-    documented recovery is to restart the app, which is a **known availability
-    residual, not a bug you are hunting**. Record it as observed behaviour, and
-    capture a thread dump showing that the resolver thread count never exceeds
-    8 and does not grow with each attempt.
+    the retry is served by the **spare generation**, or by the wedged generation
+    itself once one of its calls returns (both are JVM-verified in round 16.3;
+    this is what item 34 confirms or refutes on a device).
+35. Leave DNS blackholed long enough to fill every generation (8 stuck lookups:
+    keep opening sites for a few minutes), then restore DNS. Expected: requests
+    keep being refused (`502`) immediately until those calls return on their
+    own; `stop()` cannot reclaim a call that ignores the interrupt, and the
+    budget spans `stop()`/`start()`, so restarting the proxy inside the app does
+    **not** buy more threads. The documented recovery is to restart the app,
+    which is a **known availability residual, not a bug you are hunting**.
+    Record it as observed behaviour and capture a thread dump showing that the
+    resolver thread count never exceeds 8, does not grow with each attempt, and
+    does not grow when the proxy is stopped and started again.
 
 ## 6. Isolation, unchanged by this work (regression check)
 
