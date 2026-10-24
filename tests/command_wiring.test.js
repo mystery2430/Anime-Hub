@@ -137,6 +137,49 @@ test("OAuth login validates the redirect before writing pending state", () => {
   assert.match(prep, /LoginRedirect::Loopback\(port\)/);
 });
 
+test("OAuth redirect docs match the shipped configuration", () => {
+  // Android accepts a loopback redirect only, so every doc that tells a user to
+  // register `animehub://anilist/callback` for Android describes a login the app
+  // then refuses. These are source pins, like the rest of this file: they fail
+  // when the prose drifts away from the configuration again.
+  const conf = JSON.parse(read("src-tauri/tauri.conf.json"));
+  assert.deepEqual(conf.plugins["deep-link"].mobile, []);
+  assert.ok(conf.plugins["deep-link"].desktop.schemes.includes("animehub"));
+
+  const env = read(".env.example");
+  assert.match(env, /127\.0\.0\.1:17395\/callback/);
+  assert.equal(
+    /on Android register the custom scheme/i.test(env),
+    false,
+    "Android cannot complete a custom-scheme redirect; that guidance is stale",
+  );
+  assert.match(env, /desktop-only/i);
+
+  // The scheme is registered on desktop at startup, not from `mobile` (which is
+  // empty), so the "must stay equal to plugins.deep-link.mobile" claim is false.
+  const libRs = read("src-tauri/src/lib.rs");
+  assert.equal(
+    /must stay equal to `plugins\.deep-link\.mobile`/.test(libRs),
+    false,
+    "plugins.deep-link.mobile is [], so nothing can be equal to it",
+  );
+  assert.match(libRs, /plugins\.deep-link\.desktop/);
+
+  // The manifest note has to describe the filter that really ships: declared
+  // (scripts/android_prepare.py) but inert for OAuth.
+  const notes = read("src-tauri/android-plugin/AndroidManifest.notes.md");
+  assert.match(notes, /loopback-only|loopback redirect/i);
+  assert.match(notes, /`plugins\.deep-link\.mobile` is `\[\]`/);
+
+  const audit = read("docs/audit-item-status.md");
+  assert.equal(
+    /The Android intent filter is gone/.test(audit),
+    false,
+    "scripts/android_prepare.py still injects the filter; say so",
+  );
+  assert.match(audit, /scripts\/android_prepare\.py` injects it/);
+});
+
 test("top-level navigation consults the DNS gate and the gate is shipped", () => {
   const guard = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt");
   const gate = read("src-tauri/android-plugin/kotlin/dev/animehub/app/NavigationDnsGate.kt");

@@ -29,11 +29,21 @@ workflows GitHub executes.
 
 ### Android OAuth callback interception (R-05)
 
-The Android intent filter for `animehub://anilist/callback` is **removed**
-(`plugins.deep-link.mobile` is empty). Native AniList login on Android accepts
-only a loopback redirect, the same mechanism desktop uses. A login started with
-a custom scheme is refused before any pending state is written. Another app can
-still register the scheme, but there is no OAuth intent for it to receive.
+Native AniList login on Android accepts only a loopback redirect, the same
+mechanism desktop uses, and a login started with a custom scheme is refused
+before any pending state is written or an authorization URL exists.
+
+One correction to the earlier wording ("the intent filter is removed"): the
+built Android manifest still declares the `animehub://anilist` filter, because
+`scripts/android_prepare.py` injects it into every generated manifest and
+`tests/gaps.test.js` pins that it is added exactly once. `plugins.deep-link.mobile`
+being `[]` only means the Tauri plugin does not add one. The filter is inert for
+OAuth: nothing ever sends a redirect to that scheme, and an unsolicited
+`animehub://anilist/callback` intent is parsed against the configured (loopback)
+redirect and rejected. What makes R-05 fixed is the refusal, not the absence of
+a filter — another app can still register the scheme, but there is no OAuth intent for it to receive.
+Removing the dead filter is a manifest change that needs an Android build and
+device check, so it is left as a residual.
 
 ### Third-party cookie migration lockout
 
@@ -220,36 +230,6 @@ proxy were misconfigured.
   the override again. That is the intended fail-closed path, not a gap.
 
 ## Round 16.4 — `start()` is all-or-nothing, and what that does not buy
-
-`start()` used to build the proxy step by step: take a resolver generation,
-create and bind the listener, publish the fields, create two pools, start the
-accept thread. Every failure after the bind left something behind — most
-importantly the resolver generation, which is budgeted (round 16.3), so a failed
-start could consume part of a ceiling meant to survive for the whole process.
-The failure could also be observed in an inconsistent order: `boundPort` was set
-before the accept thread existed, so a start that threw could still report a
-port.
-
-What changed:
-
-| Step | Now |
-| --- | --- |
-| Configuration | `Limits.validate()` runs first and is also enforced by `Limits`' `init` (so `copy()` cannot produce a bad one). Zero/negative timeouts, `maxConnections`, `backlog`, `headerBytes`/`bufferBytes` bounds and the resolver numbers (including an overflow-safe `2 * resolveThreads`) are rejected **before** any socket, thread or generation exists. |
-| Listener | Created and bound; a failure closes the socket and returns the generation to the budget. |
-| Pools / accept thread | Created inside one `try`; any failure resets every published field (`running`, `server`, `handlerPool`, `pumpPool`, `resolvePool`, `acceptThread`, `boundPort`), closes the listener, shuts the pools down and returns the generation. |
-| "Is it started?" | `port` is only set immediately before the accept thread is started, and is the same value `start()` returns. A throw leaves `port == null`, so `SiteProxyController` cannot install a proxy that is not accepting. |
-
-The phases are injectable (`StartHook` + `StartPhase`, default no-op) so each one
-is covered by a test that makes the *real* code path fail at that point and then
-checks the rollback and a clean retry — not by a mock of `start()`.
-
-**What this does not buy.** A failed start is still a refusal, never a fallback:
-`SiteProxyController` stops the half-built instance, marks the gate failed and
-only the `setProxyOverride` callback may mark it ready, so nothing opens without
-a confirmed proxy. And `SiteProxyGate` is terminal by design: one failed install
-means the process refuses to open sites until it restarts. These tests say
-nothing about a real device or emulator — the WebView install path is unchanged
-and still unverified on hardware (checklist items 20–35).
 
 ## Round 16.3 — reusing resolver generations, and a cap that survives `stop()`
 

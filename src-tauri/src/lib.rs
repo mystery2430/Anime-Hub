@@ -347,8 +347,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Route the OAuth redirect into the login command on every platform.
     //
     // On desktop the scheme is not registered by the OS installer, so do it
-    // at startup from the `plugins.deep-link` config; on Android the
-    // intent-filter in AndroidManifest.xml handles it instead.
+    // at startup from the `plugins.deep-link.desktop` config. Android builds
+    // declare the same filter (injected by `scripts/android_prepare.py`), but
+    // no OAuth redirect is ever sent to it there: native login is loopback-only.
     #[cfg(desktop)]
     if app.deep_link().register_all().is_err() {
         log::warn!("deep-link şeması kaydedilemedi");
@@ -552,18 +553,28 @@ fn build_provider(config_dir: &std::path::Path) -> AppResult<Box<dyn SecretProvi
     }
 }
 
-/// Full callback URL for the mobile OAuth redirect.
+/// Full callback URL for the custom-scheme (desktop) OAuth redirect.
 pub fn mobile_callback_url(query: &str) -> String {
     format!("{}?{query}", mobile_redirect_uri())
 }
 
-/// The exact redirect URI the mobile deep link is registered for.
+/// The exact `animehub://anilist/callback` redirect URI.
+///
+/// This is the **desktop** custom-scheme redirect, despite the historical
+/// `mobile_` name: the scheme is registered at startup by `register_all()` from
+/// `plugins.deep-link.desktop` (`schemes: ["animehub"]`), and a login only uses
+/// it when `ANIMEHUB_ANILIST_REDIRECT_URI` is set to it. Android never sends an
+/// OAuth redirect here — `plugins.deep-link.mobile` is `[]` and
+/// `anilist::mobile_native_login_allowed()` refuses anything that is not
+/// loopback, both before a pending state exists. The built Android manifest
+/// still declares the same intent filter (injected by
+/// `scripts/android_prepare.py`); it is inert, because nothing ever sends an
+/// OAuth redirect to that scheme, and an unsolicited intent is parsed against
+/// the loopback redirect and rejected.
 ///
 /// Built from the same constants that build the callback URL, so the value the
-/// OAuth parser compares against and the value the OS intent filter matches
-/// cannot drift apart. It must stay equal to `plugins.deep-link.mobile` in
-/// `tauri.conf.json` (`scheme: animehub`, `host: anilist`,
-/// `pathPrefix: /callback`) — `tests/security.test.js` pins that.
+/// OAuth parser compares against and the value the OS registration matches
+/// cannot drift apart.
 pub fn mobile_redirect_uri() -> String {
     format!("{OAUTH_SCHEME}://{OAUTH_CALLBACK_PATH}")
 }

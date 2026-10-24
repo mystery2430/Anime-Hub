@@ -67,9 +67,16 @@ impl AniListConfig {
 /// another installed app: the OS delivers the intent — including both `code`
 /// and `state` — to that app, so single-use state validation cannot help. Until
 /// AniList offers a verified App Link/PKCE flow, Android therefore uses the
-/// same loopback listener as desktop. A custom-scheme redirect is refused
-/// BEFORE a login is started, and the mobile deep-link registration is gone, so
-/// a hostile app has no intent to intercept.
+/// same loopback listener as desktop, and a custom-scheme redirect is refused
+/// BEFORE a login is started: no pending state, no authorization URL, and
+/// therefore no OAuth intent for another app to receive.
+///
+/// `plugins.deep-link.mobile` is `[]`, but that is not the whole story: the
+/// built Android manifest still declares the `animehub` filter, because
+/// `scripts/android_prepare.py` injects it into every generated manifest. It is
+/// inert for OAuth — nothing sends a redirect to it, and an unsolicited intent
+/// is parsed against the configured (loopback) redirect and rejected — so it
+/// must not be described as "the filter is gone".
 pub fn mobile_native_login_allowed(redirect_uri: &str) -> bool {
     loopback_port(redirect_uri).is_some()
 }
@@ -1432,8 +1439,9 @@ mod tests {
     /// The desktop loopback redirect the deep-link/loopback flow starts with
     /// (`DEFAULT_REDIRECT_URI`).
     const LOOPBACK: &str = "http://127.0.0.1:17395/callback";
-    /// The registered Android custom-scheme redirect (tauri.conf.json
-    /// `plugins.deep-link.mobile`).
+    /// The custom-scheme redirect as the desktop build registers it
+    /// (`plugins.deep-link.desktop`). Android accepts loopback only, and this
+    /// value is kept here to prove the refusal.
     const SCHEME: &str = "animehub://anilist/callback";
 
     #[test]
