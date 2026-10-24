@@ -1141,6 +1141,54 @@ pub enum LoginRedirect {
     CustomScheme,
 }
 
+/// Everything a login needs before the browser is opened.
+///
+/// Produced by [`prepare_login`], which binds the return path *first*: the
+/// listener is already accepting on the port the redirect will hit before an
+/// authorization URL exists, so a port squatter turns into a refusal instead of
+/// a redirect the app cannot receive.
+pub struct PreparedLogin {
+    /// The AniList authorization URL the UI opens.
+    pub url: String,
+    /// The `state` this attempt carries; the callback must echo it.
+    pub state: String,
+    /// Already bound when the redirect is loopback.
+    pub listener: Option<LoopbackListener>,
+}
+
+/// Bind the return path, then build the authorization URL and its state.
+///
+/// The ordering is the security property. The listener used to be bound inside
+/// a background task, i.e. after the command had already returned the URL to
+/// the UI and the browser may have been opened: a local process holding
+/// `127.0.0.1:<port>` then made the bind fail *after* the user had been sent to
+/// AniList, and the redirect — which carries both `code` and `state` — landed in
+/// that process. Here a failed bind returns `Err` and no URL is produced.
+pub async fn prepare_login(
+    cfg: &AniListConfig,
+    redirect: LoginRedirect,
+) -> AppResult<PreparedLogin> {
+    let listener = match redirect {
+        LoginRedirect::Loopback(port) => Some(
+            LoopbackListener::bind_port(port).await.map_err(|_| {
+                AppError::AniList(
+                    "Yerel geri dönüş dinleyicisi açılamadı; bu port başka bir uygulama \
+                     tarafından kullanılıyor olabilir. Giriş başlatılmadı."
+                        .into(),
+                )
+            })?,
+        ),
+        LoginRedirect::CustomScheme => None,
+    };
+    let state = uuid::Uuid::new_v4().to_string();
+    let url = authorize_url(cfg, &state)?;
+    Ok(PreparedLogin {
+        url,
+        state,
+        listener,
+    })
+}
+
 /// Validate the configured redirect URI BEFORE a pending OAuth state exists.
 ///
 /// Both this and the callback parser ([`parse_callback`]) must agree exactly:
@@ -2092,6 +2140,49 @@ mod tests {
     fn client_builder_is_https_only() {
         let c = AniListClient::new(cfg());
         assert_eq!(c.config().client_id, "1234");
+    }
+
+    /// A login must not produce an authorization URL when the loopback port is
+    /// already taken. The redirect carries both `code` and `state`, so a login
+    /// that is started and then fails to bind hands the authorization to
+    /// whoever holds the port.
+    #[tokio::test]
+    async fn prepare_login_refuses_a_busy_loopback_port() {
+        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("squat a loopback port");
+        let port = squatter.local_addr().unwrap().port();
+
+        let err = prepare_login(&cfg(), LoginRedirect::Loopback(port))
+            .await
+            .err()
+            .expect("a busy port must refuse the login");
+        assert!(
+            err.to_string().contains("Giriş başlatılmadı"),
+            "unexpected error: {err}"
+        );
+        // Nothing was taken from the squatter and no listener was left behind
+        // on the port: the error path dropped whatever it had.
+        assert_eq!(squatter.local_addr().unwrap().port(), port);
+    }
+
+    /// The listener is bound before the URL exists, and the state inside the
+    /// URL is the one the caller has to remember.
+    #[tokio::test]
+    async fn prepare_login_binds_the_return_path_before_building_the_url() {
+        let p = prepare_login(&cfg(), LoginRedirect::Loopback(0))
+            .await
+            .expect("prepare a loopback login");
+        assert!(p.listener.is_some(), "loopback needs a bound listener");
+        assert!(p.url.contains(&format!("state={}", p.state)), "{}", p.url);
+
+        // A custom-scheme redirect is delivered by the OS, so it binds nothing.
+        let c = prepare_login(&cfg(), LoginRedirect::CustomScheme)
+            .await
+            .expect("prepare a custom-scheme login");
+        assert!(c.listener.is_none());
+        assert!(c.url.contains(&format!("state={}", c.state)), "{}", c.url);
+        assert_ne!(c.state, p.state, "each attempt needs a fresh state");
     }
 
     /// Exercises the real socket path: bind, accept one request, answer, and

@@ -1289,34 +1289,39 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
     // the user had already granted access.
     let redirect = anilist::validate_redirect_uri(&cfg.redirect_uri, cfg!(desktop))?;
 
-    // A fresh, unpredictable state value; the callback must echo it.
-    let state_value = uuid::Uuid::new_v4().to_string();
+    // Bind the loopback listener BEFORE an authorization URL exists or a
+    // pending state is armed; `prepare_login` owns that ordering. A port held
+    // by another process is then a plain refusal instead of a login the app
+    // starts and can never complete.
+    let prepared = anilist::prepare_login(&cfg, redirect).await?;
+    let listener = prepared.listener;
+
     // Kept for the loopback task below: if that task cannot complete the
-    // attempt (bind failure, or no callback inside the listener's window), it
-    // has to disarm an armed login instead of leaving the state pending.
-    let attempt_state = state_value.clone();
-    let url = anilist::authorize_url(&cfg, &state_value)?;
+    // attempt (no callback inside the listener's window, or a failed exchange),
+    // it has to disarm an armed login instead of leaving the state pending.
+    let attempt_state = prepared.state.clone();
     {
         let mut s = state
             .oauth_state
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        *s = Some(state_value);
+        *s = Some(prepared.state);
     }
+    let url = prepared.url;
 
     // Desktop loopback flow: when the redirect URI points at a local HTTP
     // address (the built-in default does, http://127.0.0.1:17395), nothing
     // else would receive the OAuth redirect — the browser would land on a
-    // dead port and the login would silently hang. Serve the single request
-    // in the background and finish the login through the same events the
-    // deep-link handler already uses. A custom-scheme redirect skips this:
-    // the OS delivers it to the deep-link handler in lib.rs instead.
-    if let anilist::LoginRedirect::Loopback(port) = redirect {
+    // dead port and the login would silently hang. The listener for it is
+    // already bound above; this task only waits for the request and finishes
+    // the login through the same events the deep-link handler uses. A
+    // custom-scheme redirect skips this: the OS delivers it to the deep-link
+    // handler in lib.rs instead.
+    if let Some(listener) = listener {
         let handle = app.clone();
         let redirect_uri = cfg.redirect_uri.clone();
         tauri::async_runtime::spawn(async move {
             let flow: AppResult<AniListUser> = async {
-                let listener = anilist::LoopbackListener::bind_port(port).await?;
                 let target = listener
                     .wait_for_callback(std::time::Duration::from_secs(300))
                     .await?;
