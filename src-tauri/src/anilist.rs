@@ -84,7 +84,7 @@ pub fn mobile_native_login_allowed(redirect_uri: &str) -> bool {
 /// User-facing refusal for an unsafe Android redirect. Never contains the
 /// redirect value itself (it may carry a hostile host or credentials).
 pub const ANDROID_CUSTOM_SCHEME_OAUTH_REFUSED: &str =
-    "Android'de güvenli AniList girişi yalnızca yerel geri dönüş adresiyle \
+    "Güvenli AniList girişi yalnızca yerel geri dönüş adresiyle \
      (http://127.0.0.1:PORT/callback) desteklenir. Özel şema (animehub://) \
      başka uygulamalar tarafından ele geçirilebildiği için kapatıldı.";
 
@@ -1145,6 +1145,10 @@ pub enum LoginRedirect {
     /// A local listener on this port receives the redirect.
     Loopback(u16),
     /// The OS delivers `animehub://anilist/callback` to the deep-link handler.
+    ///
+    /// No shipped login path produces this any more ([`prepare_login`] accepts
+    /// loopback only); the callback parser still understands a flow that was
+    /// already in flight when the app was updated.
     CustomScheme,
 }
 
@@ -1193,7 +1197,15 @@ fn loopback_bind_error() -> AppError {
 /// redirect — which carries both `code` and `state` — landed in that process.
 /// Here a refused URI or a failed bind returns `Err` and no URL is produced.
 pub async fn prepare_login(cfg: &AniListConfig) -> AppResult<PreparedLogin> {
-    let redirect = validate_redirect_uri(&cfg.redirect_uri, cfg!(desktop))?;
+    // Loopback is the only return path on every platform, including desktop.
+    // The custom scheme used to be accepted on desktop; it is refused now for
+    // the same reason Android never accepted it: `animehub://` is registered
+    // per user, and any local application can claim the scheme and receive the
+    // redirect — both `code` and `state`. Single-use state cannot undo that
+    // delivery. Nothing is lost functionally: the loopback listener works on
+    // Windows, Linux and macOS, and the refusal names the URI to register at
+    // AniList instead of quietly changing the flow.
+    let redirect = validate_redirect_uri(&cfg.redirect_uri, false)?;
     let listener = match redirect {
         LoginRedirect::Loopback(port) => {
             let bound = LoopbackListener::bind_port(port).await;
@@ -1217,12 +1229,19 @@ pub async fn prepare_login(cfg: &AniListConfig) -> AppResult<PreparedLogin> {
 /// rejects produces a login that burns a state value and can never finish.
 /// * loopback form → [`LoginRedirect::Loopback`], served by
 ///   [`LoopbackListener::bind_port`];
-/// * `animehub://anilist/callback` → [`LoginRedirect::CustomScheme`], allowed
-///   on desktop only (another app could register the scheme on Android, which
-///   is why `allow_custom_scheme` is false there);
+/// * `animehub://anilist/callback` → [`LoginRedirect::CustomScheme`], returned
+///   only when `allow_custom_scheme` is true. No shipped login path passes
+///   true: [`prepare_login`] passes false on every platform, because any local
+///   application can register the scheme and receive the redirect — which
+///   carries both `code` and `state`;
 /// * anything else (`https://`, a remote host, a missing port, another path,
 ///   a query, a fragment, userinfo) → error, and the caller must not write
 ///   `pending state` or build an authorization URL.
+///
+/// `allow_custom_scheme` stays a parameter rather than being removed: the
+/// callback parser and the refusal text are shared, and a caller that only
+/// classifies a URI the app already issued (never one it is about to hand to
+/// AniList) still needs the distinction.
 pub fn validate_redirect_uri(
     redirect_uri: &str,
     allow_custom_scheme: bool,
@@ -2212,6 +2231,17 @@ mod tests {
         }
         assert_eq!(redirect.as_deref(), Some(listener.redirect_uri()));
         assert_eq!(state.as_deref(), Some(prepared.state.as_str()));
+    }
+
+    /// Desktop used to accept the custom scheme; it no longer does, and the
+    /// refusal happens before any listener, URL or state exists.
+    #[tokio::test]
+    async fn prepare_login_refuses_the_custom_scheme_on_every_platform() {
+        let prepared = prepare_login(&cfg_with("animehub://anilist/callback")).await;
+        let err = prepared.expect_err("the custom scheme must be refused");
+        assert_eq!(err.code(), "anilist");
+        assert!(err.to_string().contains("127.0.0.1"));
+        assert!(!err.to_string().contains("animehub://anilist/callback"));
     }
 
     /// An unsupported redirect is refused by the URI validation, not by the

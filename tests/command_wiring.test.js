@@ -369,10 +369,17 @@ test("R-05 and the 'Not closed' list agree about Android OAuth", () => {
     "the Android refusal and the bind must both precede the state write",
   );
   // The redirect is validated inside prepare_login, from the configuration,
-  // with allow_custom_scheme tied to the platform.
+  // and the custom scheme is refused on every platform: a locally registered
+  // scheme can be claimed by another application, which receives both code and
+  // state. Loopback is the only accepted return path.
   assert.match(
     anilistRs,
-    /validate_redirect_uri\(&cfg\.redirect_uri, cfg!\(desktop\)\)/,
-    "allow_custom_scheme is desktop-only, so Android refuses the scheme",
+    /let redirect = validate_redirect_uri\(&cfg\.redirect_uri, false\)\?;/,
+    "ALLOW_CUSTOM_SCHEME must be false so no platform accepts the custom scheme",
+  );
+  assert.equal(
+    /validate_redirect_uri\(&cfg\.redirect_uri, cfg!\(desktop\)\)/.test(anilistRs),
+    false,
+    "the desktop-only acceptance of the custom scheme must be gone",
   );
 });
