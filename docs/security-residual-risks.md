@@ -231,6 +231,62 @@ proxy were misconfigured.
 
 ## Round 16.4 — `start()` is all-or-nothing, and what that does not buy
 
+### Same round: three defects fixed outside the Android proxy
+
+| Finding | What was wrong | Now | Tests |
+| --- | --- | --- | --- |
+| iOS cookie import (GD-01) | `windows.rs::import_cookies()` replayed **every** live cookie in the store into the shared `WKWebView`, including cookies recorded for other sites, expired ones and cookies with no host; the `url` argument it was given was dropped. | Both import paths filter through `cookies_belonging_to_site()`: only cookies whose domain is the site or a parent of it, still live at `now`, reach the WebView. A foreign cookie is skipped, never an error. Android's migration already used the same rule and keeps it. | `the_shared_webview_import_only_restores_the_sites_own_cookies` (Rust). The iOS build itself is unverified here — it is a macOS-only path. |
+| Resolver threads (GD-02) | `dns.rs::lookup_with_timeout()` spawned one detached thread per cache miss and forgot it at the timeout, so a burst of slow names could pile up unbounded OS threads, each holding a resolver call the platform will not cancel. | `lookup_with()` keeps a per-host in-flight entry that concurrent callers join, and resolves at most `MAX_LOOKUP_THREADS = 4` distinct hosts at once. A caller over the cap or past its deadline gets `DnsClass::Unknown` immediately instead of a queued thread. A timeout still only stops **waiting**: the platform call is not cancellable, a late answer never reaches the caller that timed out and is never cached, and `Unknown` is never cached. | `a_resolver_answer_is_classified_and_an_error_is_unknown`, `concurrent_callers_for_one_host_share_a_single_lookup`, `hung_hosts_cannot_exceed_the_lookup_budget`, `a_timed_out_lookup_never_classifies_its_late_answer`, `a_lookup_never_writes_the_answer_cache_itself` |
+| Store temp file (GD-05) | `secure/store.rs::atomic_write_locked()` created its temp file with plain create+truncate and the process umask, so while it held the store's plaintext it could be group/world readable, and a same-directory squatter was silently truncated. | The temp is created with `create_new` and mode `0600` on Unix; the Windows ACL is unchanged (there is no chmod equivalent to tighten). A failed write or fsync removes the temp and leaves the existing target untouched; rename/fsync/cleanup are as before. | `the_store_file_is_private_to_its_owner`, `the_temp_file_is_created_exclusively_and_never_truncates`, `a_failed_write_leaves_the_existing_target_untouched` |
+
+### Login ordering: bind before the browser is opened (desktop fixed port)
+
+`anilist_login_start()` used to arm a pending state, return the authorization
+URL and only *then* let the background task bind `127.0.0.1:<port>`. A local
+process holding the fixed default port (17395) turned that into a late bind
+failure: the user had already been sent to AniList, and the redirect — which
+carries both `code` and `state` — landed in the process that held the port
+while this app had nothing listening. There is no PKCE and no dynamic port in
+this code, so a leaked `code` is only protected by the client secret at the
+token endpoint.
+
+`anilist::prepare_login()` now binds first and builds the URL and its state
+afterwards, so a busy port is a plain refusal with no URL and no armed state
+(`prepare_login_refuses_a_busy_loopback_port`,
+`prepare_login_binds_the_return_path_before_building_the_url`). The residual is
+availability, not secrecy: the port is still fixed, so a squatter can deny
+desktop login — it now fails cleanly instead of losing the authorization.
+
+`start()` used to build the proxy step by step: take a resolver generation,
+create and bind the listener, publish the fields, create two pools, start the
+accept thread. Every failure after the bind left something behind — most
+importantly the resolver generation, which is budgeted (round 16.3), so a failed
+start could consume part of a ceiling meant to survive for the whole process.
+The failure could also be observed in an inconsistent order: `boundPort` was set
+before the accept thread existed, so a start that threw could still report a
+port.
+
+What changed:
+
+| Step | Now |
+| --- | --- |
+| Configuration | `Limits.validate()` runs first and is also enforced by `Limits`' `init` (so `copy()` cannot produce a bad one). Zero/negative timeouts, `maxConnections`, `backlog`, `headerBytes`/`bufferBytes` bounds and the resolver numbers (including an overflow-safe `2 * resolveThreads`) are rejected **before** any socket, thread or generation exists. |
+| Listener | Created and bound; a failure closes the socket and returns the generation to the budget. |
+| Pools / accept thread | Created inside one `try`; any failure resets every published field (`running`, `server`, `handlerPool`, `pumpPool`, `resolvePool`, `acceptThread`, `boundPort`), closes the listener, shuts the pools down and returns the generation. |
+| "Is it started?" | `port` is only set immediately before the accept thread is started, and is the same value `start()` returns. A throw leaves `port == null`, so `SiteProxyController` cannot install a proxy that is not accepting. |
+
+The phases are injectable (`StartHook` + `StartPhase`, default no-op) so each one
+is covered by a test that makes the *real* code path fail at that point and then
+checks the rollback and a clean retry — not by a mock of `start()`.
+
+**What this does not buy.** A failed start is still a refusal, never a fallback:
+`SiteProxyController` stops the half-built instance, marks the gate failed and
+only the `setProxyOverride` callback may mark it ready, so nothing opens without
+a confirmed proxy. And `SiteProxyGate` is terminal by design: one failed install
+means the process refuses to open sites until it restarts. These tests say
+nothing about a real device or emulator — the WebView install path is unchanged
+and still unverified on hardware (checklist items 20–35).
+
 ## Round 16.3 — reusing resolver generations, and a cap that survives `stop()`
 
 Round 16.2 added a spare generation but only ever submitted to the newest one,
