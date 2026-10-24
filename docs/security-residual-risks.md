@@ -31,6 +31,13 @@ its pins. P3–P5 were documentation-only corrections: no code changed for them,
 because there is no verified mechanism to add. Nothing here changed the proxy's
 decision logic, the IP classification, or the loopback bind.
 
+**CI on the round-18 head:** run **40123086415 @ `728b129`** — all six jobs
+(`Tests` on ubuntu-24.04 / macos-latest / windows-latest, `Release profile
+(LTO)`, `Android compile (aarch64)`, `Dependency and secret audit`) completed
+successfully. That proves compilation and the host suites; it is not device
+evidence, and the Android job's JVM suite uses a fake lookup for the
+resolver, so it cannot show provider behaviour either.
+
 **Still open after round 18, stated narrowly:** a real desktop WebView and a real
 Android provider run (every "Implemented" above is device-verification-pending);
 loopback reachability by other apps (GO-01); WebRTC/UDP (GO-04); DNS rebinding on
@@ -52,7 +59,7 @@ is a round log.
 | Android DNS pinning | `SiteProxyController` installs a process-wide `PROXY_OVERRIDE`; `DnsPinnedProxy` resolves once per CONNECT, classifies every answer and connects to the classified `InetAddress`; `AsyncDnsResolver` moves the lookup onto `DnsResolver.query` with a 10 s caller-owned deadline, drops late answers and refuses instead of queueing above its in-flight ceilings (round 18 rewrote this path; see the round-18 section for the current guarantees). | `DnsPinnedProxyTest`, `SiteProxyGateTest`, `AsyncDnsResolverTest` (host JVM, real sockets where the proxy is involved) run in the Android CI job. | Whether the provider honours `PROXY_OVERRIDE` at all, and whether cancelling actually frees the platform thread. Device matrix unchanged: [`android-dns-pinning-device-checklist.md`](./android-dns-pinning-device-checklist.md). |
 | WebRTC / UDP | Android: `WEBRTC_GUARD` is installed with `addDocumentStartJavaScript` (the round-16 `onPageStarted` fallback, which ran after the page could already open a peer connection, is gone). Desktop: `initialization_script_for_all_frames`. | Source pins in `src-tauri/android-plugin/src/lib.rs` and `session.rs`. | Every part of it. The guard is page JavaScript, not OS-level UDP filtering; QUIC/UDP needs a packet capture; the Android provider must support the document-start API or the open is refused (fail-closed, see below). |
 | OAuth return path | Loopback only, on **every** platform: `prepare_login` calls `validate_redirect_uri(&cfg.redirect_uri, false)`, so `animehub://anilist/callback` is refused before a listener, a state value or an authorization URL exists. | `prepare_login_refuses_the_custom_scheme_on_every_platform`, `tests/command_wiring.test.js`. | Nothing on this side; the login still needs a manual run against AniList because the client id is not in the repo. |
-| Actions pinning (R-09) | All 36 external `uses:` references in the active workflows are pinned to reviewed 40-character SHAs; `ci-fixes/` remains a reference copy that GitHub does not execute. | `tests/gaps.test.js`, `tests/command_wiring.test.js`; the six-job matrix has been green on this branch (first: **40108690774 @ `7948e8f`**, latest before round 18: **40120340164 @ `87ba782`**), and PR #30 carries the run for the round-18 head. | `main` is untouched: the pins live on this PR branch until it is merged. |
+| Actions pinning (R-09) | All 36 external `uses:` references in the active workflows are pinned to reviewed 40-character SHAs; `ci-fixes/` remains a reference copy that GitHub does not execute. | `tests/gaps.test.js`, `tests/command_wiring.test.js`; the six-job matrix has been green on this branch (first: **40108690774 @ `7948e8f`**, latest before round 18: **40120340164 @ `87ba782`**), and PR #30 carries the run for the round-18 head (**40123086415 @ `728b129`**, 6/6). | `main` is untouched: the pins live on this PR branch until it is merged. |
 
 **What a green CI run does not mean.** The six jobs are `Tests` on
 ubuntu-24.04 / macos-latest / windows-latest, `Release profile (LTO)`,
