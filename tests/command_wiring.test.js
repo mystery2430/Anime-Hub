@@ -157,7 +157,15 @@ test("OAuth redirect docs match the shipped configuration", () => {
     false,
     "Android cannot complete a custom-scheme redirect; that guidance is stale",
   );
-  assert.match(env, /desktop-only/i);
+  // Round 17: the custom scheme is refused on every platform, including
+  // desktop, so the old "DESKTOP-only" wording is stale and must not return.
+  assert.equal(
+    /desktop-only/i.test(env),
+    false,
+    "no platform accepts the custom-scheme redirect any more",
+  );
+  assert.match(env, /not a supported return\s*#?\s*path on ANY platform|not a supported return path on ANY platform/i);
+  assert.match(env, /prepare_login/, "the refusal must name the function that enforces it");
 
   // The scheme is registered on desktop at startup, not from `mobile` (which is
   // empty), so the "must stay equal to plugins.deep-link.mobile" claim is false.

@@ -24,10 +24,11 @@ Consequences, stated rather than papered over:
   contradiction. It is resolved in favour of the code, because R-05's verdict
   does not actually depend on the lost wording: `tauri.conf.json` ships
   `plugins.deep-link.mobile: []`, and `commands::anilist_login_start` refuses a
-  custom-scheme redirect on Android (`mobile_native_login_allowed`, then
-  `validate_redirect_uri(uri, cfg!(desktop))`) **before** any pending state is
-  written. R-05 stays **fixed** for Android; see "Not closed" #2 for the narrow
-  fact that remains true.
+  custom-scheme redirect on Android (`mobile_native_login_allowed`) **before**
+  any pending state is written, while `anilist::prepare_login` now refuses it on
+  every platform (round 17: `validate_redirect_uri(&cfg.redirect_uri, false)`).
+  R-05 stays **fixed**; see "Not closed" #2 for the narrow fact that remains
+  true.
 * `AH-01…AH-16`, `AH-P*` and `AH-G*` belong to those lost reports and are kept
   as separate identities. They are referenced here only where this branch's own
   code and tests already cite them (`AH-04 / R-07` in `web/windows.rs`,
@@ -72,16 +73,18 @@ Consequences, stated rather than papered over:
   change it; (ii) this app no longer *uses* that scheme on Android, so there is
   no OAuth intent, code or `state` for a hijacker to receive. What (i) leaves
   open is only scheme squatting against a URI this app never sends to.
-  **Desktop is different and is not covered by this row:**
-  `plugins.deep-link.desktop.schemes` still contains `animehub`, and
-  `validate_redirect_uri` is called with `cfg!(desktop)`, i.e.
-  `allow_custom_scheme = true` there. The desktop exact-host/path check
-  (`animehub://anilist/callback`, no other host or path) is unchanged and is a
-  separate, lower-severity surface. |
+  **Desktop used to be different, and round 17 removed that difference:**
+  `plugins.deep-link.desktop.schemes` still contains `animehub` (it carries the
+  in-app `animehub://close-site` pseudo-navigation), but `validate_redirect_uri`
+  is no longer called with `cfg!(desktop)`: `prepare_login` passes `false` on
+  every platform, so `animehub://anilist/callback` is refused on Windows, Linux
+  and macOS exactly as on Android — before a listener, a state value or an
+  authorization URL exists. `LoginRedirect::CustomScheme` survives only as a
+  parser for a flow that was in flight when the app updated. |
 | **R-06** | Is the Android HTTP-cache / Service-Worker limit shown to the user? | **fixed** | Shown in the UI, not only in docs: `src/logic/storage_scope.js:43` and `:48` build the clear-result message ("Android'de HTTP önbelleği ve servis çalışanları profil bazında silinemiyor; site önbellekten içerik gösterebilir."), imported by `src/main.js:39` and pinned by `tests/storage_scope.test.js:49` and `:66`. `docs/android-storage-isolation.md:237` states the same limit next to `cacheMode = LOAD_DEFAULT`. |
 | **R-07** | Profile deletion: the tombstone was lifted without securing the generation counter | **fixed** (this round, host-tested) | Order is now tombstone → provider delete → **secure the generation** → forget → retire, in both paths: `web/windows.rs:1503` `secure_tombstone_generation` and `:1555` `run_pending_delete_drain` (startup), plus `run_mobile_delete_protocol`; `lib.rs:332` `drain_pending_profile_deletes` is a thin adapter over them. `:974` `generation_past_name` is monotone, idempotent, re-derives the profile name to prove ownership (never trusts parsed digits) and refuses at `u32::MAX` while keeping the durable tombstone; `:1025` `match_queued_name_to_site` requires exactly one owner, and an unmatchable tombstone is **kept**, logged and reported (`DrainReport::kept_unmatched`) instead of being dropped. Queue entries carry their owner (`PendingOwner::{Site,Orphan,Unknown}`) with legacy string-list queues and corrupt-queue salvage preserved. Behavioural tests drive the real protocol against fakes at every kill point (`windows.rs` test module, 17 added cases, incl. "every kill point leaves the next open with a different name", a failing generation write, and repeated drains not consuming a second generation); `tests/android_isolation.test.js:400` and `:561` pin the order from the JS side; `docs/android-storage-isolation.md:554` and `:569` describe it. **What a host test cannot prove** — when a real provider finishes `deleteProfile` — is still device work (R-04). |
 | **R-08** | File/content access and popup/permission decisions must be explicit | **fixed** | Every decision is data in one tested plan: `SiteWebViewSettings.kt:43-95` — `allowFileAccess=false`, `allowContentAccess=false`, `allowFileAccessFromFileURLs=false`, `allowUniversalAccessFromFileURLs=false`, `mixedContentMode=NEVER_ALLOW` (the constant is pinned against the platform value), `geolocationEnabled=false` (no consent flow exists, so it is denied explicitly rather than left to a provider default), `supportMultipleWindows=false` with `javaScriptCanOpenWindowsAutomatically=true` — i.e. a popup becomes an ordinary same-view navigation that `SiteNavigationPolicy` judges — and `safeBrowsingEnabled=true`. `applySiteSettings(WebSettingsSink(...))` is the only code touching the platform object; `SiteWebViewSettingsTest` asserts the plan and that the adapter writes exactly these fields. |
-| **R-09** | CI token scope and Action pinning | **partially fixed — Action pinning implemented; CI pending** | All four active `.github/workflows/*.yml` files now pin 36 external Action references to the verified 40-character commit SHAs in `docs/security-residual-risks.md`; each keeps a human-readable former-tag comment. The two in-repo reusable workflow references remain relative paths. The changes touch only these 36 `uses:` lines, preserving triggers, permissions, signing environment, release gates and artifact steps. `tests/gaps.test.js` and `tests/command_wiring.test.js` now validate active workflows rather than only `ci-fixes/`. The old missing-`workflow`-scope push failure is no longer blocking this PR-branch edit; no credentials or permissions were changed and `main`, tags and releases were not touched. CI must pass before merge. The separate inability to trigger `workflow_dispatch` from the integration remains a tooling limitation, not the action-pinning vulnerability. |
+| **R-09** | CI token scope and Action pinning | **partially fixed — Action pinning implemented and CI-validated on this branch; `main` untouched** | All four active `.github/workflows/*.yml` files now pin 36 external Action references to the verified 40-character commit SHAs in `docs/security-residual-risks.md`; each keeps a human-readable former-tag comment. The two in-repo reusable workflow references remain relative paths. The changes touch only these 36 `uses:` lines, preserving triggers, permissions, signing environment, release gates and artifact steps. `tests/gaps.test.js` and `tests/command_wiring.test.js` now validate active workflows rather than only `ci-fixes/`. The old missing-`workflow`-scope push failure is no longer blocking this PR-branch edit; no credentials or permissions were changed and `main`, tags and releases were not touched. CI must pass before merge. The separate inability to trigger `workflow_dispatch` from the integration remains a tooling limitation, not the action-pinning vulnerability. |
 | **R-10** | Do both policy suites really use the same fixture? | **fixed** | One file, two loaders, and the wiring is pinned: Rust reads it at compile time (`sites/url_policy.rs:908`, `include_str!("../../../tests/fixtures/navigation-policy.tsv")`); CI copies the *same* path into the Android test resources and hard-fails if the copy fails (`.github/workflows/ci.yml:242`); Kotlin reads it from the classpath (`SiteNavigationPolicyTest.kt:295`, and `:257` documents the copy) and throws if it is missing rather than silently shrinking the suite. `tests/gaps.test.js:165` and `tests/android_isolation.test.js:1285` assert the copy step and the vector count from the JS side. Known divergence, documented not hidden: Kotlin has no `MISSING_HOST` reason code, so parity is claimed at vector level over the shared file. |
 | **R-11** | Top-level `data:` rejection and the `blob:` video allowance | **fixed** (evaluated separately) | `data:` as a top-level document is **refused** (`sites/url_policy.rs:192` → `NavBlock::DataNavigation`): an opaque-origin HTML/script carrier no site legitimately needs, while the app's own `data:image/…` logos are sub-resources and never reach that check (test at `:954`). `blob:` stays **allowed on purpose** and is restricted rather than blanket-accepted: `:183` requires the blob's inner origin to be an allowed https origin, so `blob:https://openani.me/…` passes (test `:975`) and `blob:http://…` is rejected (`:978`). MSE players navigate the main frame to `blob:` object URLs, so blocking it would break playback — the two halves are judged on their own merits and both are tested. |
 | **R-12** | Log redaction and CI comment cleanup | **fixed** (the review itself is a separate item) | Diagnostics: Rust and Kotlin now keep separate in-memory structured rings capped at 2,000 events each; the developer panel merges them into a time/source-ordered 4,000-event view, reports dropped events, and exposes only allowlisted codes/counts through a second JavaScript projection. The operation IDs are opaque `r-N`/`k-N`; no URL, host, cookie, token, password, AniList secret, origin, profile name, page/storage content or raw exception text is admitted. Regression coverage is in `src-tauri/src/diagnostics.rs`, `AnimeHubDebugLogTest.kt`, `SiteProfileOpsTest.kt`, and `tests/debug_log.test.js`; navigation still records no per-request/page details (`SiteNavigationGuard.kt`). CI: no PR-comment dump and no exported write token (`ci.yml`, pinned by `tests/gaps.test.js`), no `|| true` / `continue-on-error` masking. The two things R-12 must **not** be read as closing — an independent human review, and a device/emulator matrix — are listed below and in R-04. |
@@ -102,14 +105,16 @@ These stay open pre-merge risks; documenting them is not closing them.
    `animehub://anilist/callback` **and receive the intent**", which contradicted
    the R-05 row and `docs/security-residual-risks.md`. There is no OAuth intent
    to receive, because `anilist_login_start` refuses a custom-scheme redirect
-   before any pending state exists (`mobile_native_login_allowed` +
-   `validate_redirect_uri(uri, cfg!(desktop))`) — not because the app declares
+   before any pending state exists (`mobile_native_login_allowed`) and
+   `prepare_login` refuses it on every platform — not because the app declares
    no filter: `scripts/android_prepare.py` still injects the `animehub` filter
-   into every generated manifest, and nothing sends a redirect to it. What genuinely remains is
-   narrower: a third party can still register the scheme at OS level, and
-   **desktop** still uses it (`deep-link.desktop.schemes: ["animehub"]`,
-   `allow_custom_scheme = cfg!(desktop)`), where the exact host+path check only
-   validates callbacks this app actually receives. Do not read either fact as an
+   into every generated manifest, and nothing sends an OAuth redirect to it.
+   What genuinely remains is narrower still after round 17: a third party can
+   register `animehub://` at OS level, but no platform completes an OAuth login
+   through it any more (`allow_custom_scheme` is `false` in the only shipped
+   caller), so scheme squatting no longer has an OAuth redirect to intercept.
+   The desktop scheme registration that remains exists for the in-app
+   `animehub://close-site` pseudo-navigation. Do not read any of this as an
    Android OAuth hijack (R-05).
 3. **No device or emulator testing.** Every Android claim on this branch is
    backed by compilation and host-side unit tests only (R-04).
@@ -139,7 +144,7 @@ These stay open pre-merge risks; documenting them is not closing them.
 | Redirect validated before pending OAuth state | fixed | `commands.rs` `anilist_login_start` |
 | Flush worker replacement is bounded | fixed (host-tested; device behaviour still R-04) | `SiteProfileOps.kt` `MAX_ABANDONED_WORKERS`, `SiteFlushWorker.kt` refusal |
 | Blocklist transfers serialized + generation-guarded | fixed (host-tested; `cargo test` not runnable in the review environment — see R-04) | `commands.rs` `BlocklistSyncGate`, `transfer_blocklist_with_generation`, `blocklist_transfer_snapshot`, `rebuild_blocklist` |
-| Active workflows pinned to commit SHAs | **implemented on PR branch; CI pending** | see R-09 |
+| Active workflows pinned to commit SHAs | **implemented on PR branch; validated by CI** | see R-09 |
 
 ### Android 8/9 support was dropped
 
