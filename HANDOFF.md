@@ -101,6 +101,30 @@ macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TC
 `CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
 `HANDOFF` bölüm 6.D'de.
 
+**Round 20 — masaüstü ön-uçuş (preflight) fikri değerlendirildi, uygulanmadı.**
+Amaç, site WebView'ı gerçek siteye gitmeden önce yalnızca uygulamanın denetlediği
+bir adrese yönlendirilip "CONNECT vekile mi geldi, yoksa doğrudan dinleyiciye mi
+düştü?" sorusuyla proxy'nin gerçekten uygulandığını kanıtlamaktı. Kaynak
+incelemesi bunun güvenilir bir kapı olmadığını gösterdi. (a) Loopback taraması
+aynı anda iki politikayı ölçer: ayarın uygulanması **ve** motorun loopback'i
+proxy dışında tutup tutmadığı. İkincisini uygulama yalnızca Windows'ta
+(`--proxy-bypass-list=<-loopback>`) denetleyebilir; Linux'ta WebKit'in
+`GSimpleProxyResolver` ignore listesi boş geçilir ama motorun kendi politikası
+belgelenmemiştir, macOS'ta `proxyConfigurations` için de bir belge yoktur. Yani
+"doğrudan isabet" iki platformda belirsizdir; yanlış alarmın bedeli siteyi hiç
+açmamaktır. (b) wry 0.55.1'in macOS gezinme delegesi `didFail*` uygulamaz:
+başarısız bir gezinme hiçbir sayfa-yükleme olayı üretmez, dolayısıyla
+"tamamlandı" koşulu üç platformda üç ayrı şey olurdu (WebView2 ve WebKitGTK'da
+`Finished` hata durumunda da gelir). (c) Loopback'e hiç bağlı olmayan
+`https://<nonce>.probe.invalid/` varyantı daha temizdir (Chromium proxy'yi DNS'ten
+önce çözer) ama reddetme yolu yine bir zaman aşımıdır ve site açma yolunu
+asenkron, fail-closed bir kapıya çevirir; yanlış kurulursa masaüstünde hiçbir
+site açılmaz ve bunu hiçbir CI işi göremez. **Karar: kod değişmedi.** P1'in
+ilk-istek riski **açık**, masaüstü bağlama "uygulandı, cihaz doğrulaması
+bekliyor". Platform kanıt tabloları, uygulamadan önce yapılması gereken ölçüm
+deneyi ve gelecekteki bir uygulamanın uyması gereken koşullar
+`docs/security-residual-risks.md` round 20'de.
+
 **Round 19 — adapter hatası düzeltildi ve watchdog sınırı adlandırıldı.** Üretim
 adapter'ı (`PlatformDnsLookup`) iptal ile "platform rapor verdi" durumunu **aynı**
 bayrakta tutuyordu: `Cancel` bayrağı önce `true` yapıyordu, dolayısıyla iptalden

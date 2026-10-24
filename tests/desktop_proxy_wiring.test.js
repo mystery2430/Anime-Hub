@@ -14,7 +14,8 @@
 // NOT prove that a WebView provider honours `proxy_url`, that macOS applies the
 // data-store proxy, or that the `PageLoadEvent::Finished` check runs after a
 // real un-pinned request. Only a run on each desktop WebView can show that, and
-// none has happened (docs/security-residual-risks.md, round 18).
+// none has happened (docs/security-residual-risks.md, round 18; round 20 explains
+// why a probe cannot substitute for that run).
 
 import test from "node:test";
 import assert from "node:assert/strict";

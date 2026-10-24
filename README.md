@@ -233,7 +233,7 @@ site yolları hiç dokunmaz.
 | `http://` reddi | ✅ `on_navigation` | ⚠️ motorun mixed-content politikası | ✅ `SiteNavigationPolicy` | ✅ `shouldInterceptRequest` |
 | Özel/loopback **IP literalleri** ve host kuralları | ✅ | ❌ | ✅ | ✅ |
 | Kullanıcı engel listesi | ✅ | ❌ masaüstünde alt kaynak kesme noktası yok | ✅ | ✅ |
-| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol, bağlantı pinlenmiyor | ❌ | ✅ **CONNECT proxy'si bağlantıyı denetlenen IP'ye sabitler** (cihazda doğrulanmadı) | ✅ aynı (her istek yeni karar) |
+| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol; vekil kullanılırsa bağlantı denetlenen IP'ye sabitlenir — **ilk isteğin vekilden geçtiği kanıtlanmadı** (round 20) | ❌ | ✅ **CONNECT proxy'si bağlantıyı denetlenen IP'ye sabitler** (cihazda doğrulanmadı) | ✅ aynı (her istek yeni karar) |
 | `data:` üst düzey belge | ✅ reddedilir | ➖ (alt kaynak olarak serbest) | ✅ reddedilir | ➖ serbest |
 | **WebRTC / ICE / STUN / TURN (UDP)** | ❌ | ❌ | ❌ **proxy kapsamı dışı** (API init script ile kaldırılır — garanti değil) | ❌ |
 
