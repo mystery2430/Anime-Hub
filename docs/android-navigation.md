@@ -40,7 +40,8 @@ the WebView is created and is keyed by WebView id (`URL_LOADING_OVERRIDE` in wry
 Tauri calls `load()` from `on_webview_created`, which runs after wry calls
 `setWebViewClient(RustWebViewClient)` (wry `src/android/main_pipe.rs`). So the
 guard wraps wry's client, not a default one. `WebView.getWebViewClient()` is
-public from API 26, which matches `minSdkVersion` 26.
+public from API 26; the app requires `minSdkVersion` 29 because
+MULTI_PROFILE needs the multi-process WebView available from Android 10.
 
 The *first* `loadUrl` for the launcher URL runs before `addJavascriptInterface` and
 before `on_webview_created` (see wry `main_pipe.rs` order below). That initial
@@ -98,12 +99,13 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 | Numeric IPv4 spellings | Fixed in the Kotlin policy: `2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1` are refused (previously allowed). Relies on WHATWG parsing; not tested in a WebView. |
 | Documentation IPv4 ranges | Fixed: `198.51.100.0/24` and `203.0.113.0/24` are refused, as in Rust. |
 | Multicast / reserved IPv4 (`224.0.0.0/4`, `240.0.0.0/4`, `0.0.0.0/8`, `192.88.99.0/24`) | Both Kotlin and Rust refuse them (aligned to IANA 2025-10-09; Rust `a >= 224` + `a == 0` + `192.88.99/24`). |
-| DNS rebinding | DNS on the UI thread would stall the WebView. Not done. |
-| Subframes and sub-resources | The guard only sees top-level navigations. |
+| DNS rebinding (this policy layer) | The checkpoints here are **defence in depth** since round 16. A synchronous check on the UI thread would stall the WebView, and `shouldInterceptRequest` cannot bind the engine's own resolution — so the guarantee moved to the loopback `CONNECT` proxy (`DnsPinnedProxy.kt`), which resolves once, classifies with `IpPolicy`, connects to the vetted address and is installed process-wide via `ProxyController`. See `docs/security-residual-risks.md` (round 16). |
+| WebRTC / ICE / STUN / TURN | **Not covered, and cannot be** by a navigation policy or by the TCP-only pinning proxy: ICE uses UDP to STUN/TURN/peers and Android WebView exposes no WebRTC IP-handling policy. The Android init script removes the API (defence in depth, not a boundary). See `docs/security-residual-risks.md` round 16.1 §1. |
+| Subframes and sub-resources (this policy layer) | The `shouldInterceptRequest` checkpoint sees sub-resources but not every frame type; the proxy sees every `CONNECT` regardless of frame. The guard's own rules remain top-level-only for host/IP shape. |
 | App-initiated `loadUrl` | Not routed through `shouldOverrideUrlLoading`; `open_on_mobile` checks the first URL with `validate_site_url`. |
 | Redirects | Whether the WebView calls `shouldOverrideUrlLoading` for every server redirect is not verified. |
 | `window.open` | Wry does not enable multiple windows, and the init script overrides `window.open` when popup blocking is on. The Android default is that multi-window is off; not device-verified. |
-| The back affordance (`animehub://close-site`) | Verified from source: the overlay snippet (`OVERLAY_SNIPPET`) is installed only by the desktop child-WebView builder (`web/windows.rs`). `open_on_mobile` never installs it, so the app never produces this URL on Android. The guard refuses it there, which blocks no working path. There is no in-site way back on Android. A native return path would need a Kotlin-to-Rust hand-off to `close_site_window` (cookie and storage export first). That is not built and not device-verified. Whether the system back button returns to the launcher is not verified. |
+| The back affordance (`animehub://close-site`) | Verified from source: the overlay snippet (`OVERLAY_SNIPPET`) is installed only by the desktop child-WebView builder (`web/windows.rs`). `open_on_mobile` never installs it, so the app never produces this URL on Android. The guard refuses it there, which blocks no working path. **Built since the per-site profile change:** the system back button is handled natively while a site view is up — fullscreen video first, then the site's own history (`goBack()`), then a launcher-side `window.__animehubBackToLauncher()` evaluation that runs the normal `close_site` flow (native direct close is only the fallback). The Activity is never finished from the site view. See `AnimeHubSiteController` and `docs/android-storage-isolation.md`. Still **not device-verified**. |
 
 ## Verification status
 
@@ -111,8 +113,11 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
   `on_webview_created` ordering; Android `WebView.getWebViewClient()` (API 26).
 - Compiled: not compiled locally (no Android SDK or Kotlin compiler in the
   sandbox). The CI "Android compile (aarch64)" job is the compile check.
-- Behaviour: **not tested on a device.** The policy has no unit test that runs
-  Kotlin; the node test only checks the shared host rules.
+- Behaviour: the Kotlin policy/dns-gate/gateway files now run in the local
+  harness and in CI's Gradle unit-test step (shared vector fixture included),
+  and the round-16 proxy has real-socket JVM tests. **Nothing here has run in a
+  real WebView on a device**; the network matrix is
+  `docs/android-dns-pinning-device-checklist.md`.
 
 ## Next steps
 

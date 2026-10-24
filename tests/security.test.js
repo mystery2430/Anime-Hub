@@ -144,3 +144,34 @@ test("gitignore covers key material and build output", () => {
     assert.ok(gi.includes(needle), `.gitignore must list ${needle}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// IPC surface: no raw cookie-jar authority handed to the launcher WebView.
+// ---------------------------------------------------------------------------
+
+test("the raw cookie-jar commands are not on the IPC surface", () => {
+  const libRs = read(join(ROOT, "src-tauri", "src", "lib.rs"));
+  const commandsRs = read(join(ROOT, "src-tauri", "src", "commands.rs"));
+  const windowsRs = read(join(ROOT, "src-tauri", "src", "web", "windows.rs"));
+  const frontend = walk(join(ROOT, "src"), (p) => /\.(js|html)$/.test(p));
+  assert.ok(frontend.length > 0, "expected to scan some frontend files");
+
+  for (const prefix of ["get", "set"]) {
+    const name = `${prefix}_site_cookies`;
+    assert.ok(!libRs.includes(`commands::${name}`), `${name} is still registered`);
+    assert.ok(!commandsRs.includes(`pub fn ${name}`), `${name} is still defined`);
+    assert.ok(!commandsRs.includes(`fn ${name}`), `${name} has a leftover shim`);
+    for (const file of frontend) {
+      assert.ok(!read(file).includes(name), `${relative(ROOT, file)} refers to ${name}`);
+    }
+  }
+
+  // Removing the commands must not remove the feature they were said to cover:
+  // the one-time 0.3.4 jar import and the mobile protocols still read and write
+  // the per-site key straight through the storage provider.
+  assert.ok(windowsRs.includes("cookies-{"), "windows.rs must keep the per-site jar key");
+  assert.ok(
+    windowsRs.includes("pub struct") || windowsRs.includes("CookieJar"),
+    "windows.rs must still work with CookieJar",
+  );
+});

@@ -9,12 +9,19 @@ classes, the PiP lifecycle on the generated `MainActivity` and
 Three things are generated into the app package:
 
 1. `AnimeHubPlugin.kt` — copied verbatim from `android-plugin/kotlin/`.
-2. `AnimeHubPipController.kt` — a template whose
+2. `AnimeHubSiteController.kt` — the per-site WebView + androidx.webkit
+   profile controller, copied verbatim. Required: `AnimeHubPlugin.kt` routes
+   every `site_*` command through it, so a missing file would only fail the
+   Kotlin compile.
+3. `AnimeHubPipController.kt` — a template whose
    `__ANIMEHUB_PIP_CONTROLLER_JS__` placeholder is filled with the *same*
    `src-tauri/src/web/pip_controller.js` that Rust injects into site pages, so
    the WebView-side controller cannot drift between the two consumers.
-3. the PiP lifecycle block inside the generated `MainActivity.kt`, delimited by
-   markers and replaced on every run.
+4. the PiP/site-WebView lifecycle block inside the generated `MainActivity.kt`,
+   delimited by markers and replaced on every run.
+5. a reproducible `androidx.webkit:webkit:1.16.0` dependency pin in
+   `app/build.gradle.kts` (multi-profile APIs; the template's own version is
+   replaced, never stacked).
 
 `src-tauri/gen/android` is generated: never edit those files by hand, re-run
 this script instead.
@@ -37,8 +44,65 @@ from pathlib import Path
 
 PIP_ATTR = 'android:supportsPictureInPicture="true"'
 SIGN_MARKER = "AnimeHub release signing"
+# Required verbatim copies next to MainActivity (package-checked).
+SITE_CONTROLLER_CLASS = "AnimeHubSiteController"
 # Kotlin template -> generated controller, and the JS that fills its placeholder.
 PIP_CONTROLLER_CLASS = "AnimeHubPipController"
+# androidx.webkit pin: multi-profile (WebViewCompat.setProfile / ProfileStore,
+# stable since androidx.webkit 1.9.0 — every API this app uses). The Tauri
+# template ships its own version of this dependency; this script *replaces*
+# it (or adds it once) so the build does not depend on which CLI version
+# generated the project. 1.16.0 is the researched current stable, minSdk 24
+# against the app's pinned minSdk 29 (Android 10+). No RC/alpha.
+#
+# VERSION ALIGNMENT (do not "fix" one side alone): 1.16.0 declares
+# org.jetbrains.kotlin:kotlin-stdlib:2.1.20. Gradle's highest-wins resolution
+# puts that stdlib on the generated project's classpath, and the Tauri 2.11
+# template's kotlin-gradle-plugin:1.9.25 cannot read Kotlin 2.1 metadata —
+# CI reproduced it as "Module was compiled with an incompatible version of
+# Kotlin / The binary version of its metadata is 2.1.0, expected version is
+# 1.9.0". The fix is to align the compiler *up* with the stdlib the project
+# actually resolves (KGP 2.1.20 == the stdlib family), not to downgrade
+# webkit and not to exclude files from the test compile.
+WEBKIT_PIN = 'implementation("androidx.webkit:webkit:1.16.0")'
+WEBKIT_DEP_RE = re.compile(r'implementation\(\s*"androidx\.webkit:webkit:[^"]+"\s*\)')
+
+# Root build.gradle.kts pin: the generated project's Kotlin Gradle plugin,
+# raised from the template's 1.9.25 to 2.1.20 so the compiler reading the
+# classpath (kotlin-stdlib 2.1.20 via androidx.webkit, plus everything else
+# Gradle resolves to 2.1.x) is the SAME Kotlin family — one compiler version
+# for the APK build and for the CI unit-test run. Gradle 8.14.3 (template
+# wrapper) and AGP 8.11.0 both support Kotlin 2.1.
+KGP_PIN = 'classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.20")'
+KGP_DEP_RE = re.compile(r'classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]+"\)')
+def verify_pin_state(root_gradle: Path, app_gradle: Path) -> None:
+    """Fail if a pin is duplicated, missing or stale.
+
+    The old string/regex replacement could silently no-op when the generated
+    template changed shape, or add a second classpath. A pin that is not exactly
+    one occurrence is a broken build, not a note.
+    """
+    app_text = app_gradle.read_text(encoding="utf-8")
+    if app_text.count(WEBKIT_PIN) != 1:
+        raise SystemExit(
+            "androidx.webkit pin is not exactly one occurrence in "
+            f"{app_gradle}; expected {WEBKIT_PIN!r}"
+        )
+    if app_text.count("androidx.webkit:webkit:") != 1:
+        raise SystemExit(f"expected exactly one androidx.webkit dependency in {app_gradle}")
+    if root_gradle.is_file():
+        root_text = root_gradle.read_text(encoding="utf-8")
+        if root_text.count(KGP_PIN) != 1:
+            raise SystemExit(
+                "kotlin-gradle-plugin pin is not exactly one occurrence in "
+                f"{root_gradle}; expected {KGP_PIN!r}"
+            )
+        if root_text.count("kotlin-gradle-plugin:") != 1:
+            raise SystemExit(
+                f"expected exactly one kotlin-gradle-plugin classpath in {root_gradle}"
+            )
+
+
 PIP_CONTROLLER_JS_REL = ("src-tauri", "src", "web", "pip_controller.js")
 PIP_CONTROLLER_KT_REL = ("src-tauri", "android-plugin", "kotlin")
 PIP_JS_PLACEHOLDER = "__ANIMEHUB_PIP_CONTROLLER_JS__"
@@ -204,7 +268,9 @@ def pip_lifecycle_block() -> str:
 
   override fun onWebViewCreate(webView: WebView) {{
     super.onWebViewCreate(webView)
-    // The Tauri/Wry WebView is the one the launcher and every site page share.
+    // This is the launcher's Tauri/Wry WebView: default profile, launcher
+    // origin only. Sites open in their own profiled WebViews above it and
+    // re-bind PiP themselves (AnimeHubSiteController).
     AnimeHubPipController.attach(this, webView)
   }}
 
@@ -254,14 +320,30 @@ def pip_lifecycle_block() -> str:
   }}
 
   override fun onPause() {{
-    // WryActivity.onPause() pauses the WebView; in PiP it must keep rendering.
+    // WryActivity.onPause() pauses the launcher WebView; the site WebView
+    // (when one is attached) must pause with the Activity too — unless the
+    // Activity is in PiP, where the visible page has to keep rendering.
     super.onPause()
+    AnimeHubSiteController.onPause(this)
     if (isInPictureInPictureMode) {{
       AnimeHubPipController.keepRenderingInPip(AnimeHubPipController.webView())
     }}
   }}
 
+  override fun onResume() {{
+    super.onResume()
+    // Pair of the site-WebView pause above. WryActivity.onResume() already
+    // resumed the launcher WebView.
+    AnimeHubSiteController.onResume(this)
+  }}
+
   override fun onDestroy() {{
+    // Site WebView first: AnimeHubSiteController.destroy(this) hands THAT site
+    // profile's cookie flush to the background worker and AWAITS it for a
+    // bounded budget (ShutdownFlow.DESTROY_FLUSH_BUDGET_MS) before returning,
+    // then destroys the view while the Activity is still whole. PiP unbinds
+    // from the view afterwards.
+    AnimeHubSiteController.destroy(this)
     AnimeHubPipController.detach(this)
     super.onDestroy()
     if (isFinishing) {{
@@ -269,8 +351,15 @@ def pip_lifecycle_block() -> str:
       // against the first Activity. When the system finishes this Activity
       // (for example the PiP window's X), that state keeps pointing at a dead
       // Activity and every site open fails. Ending the process lets the next
-      // launch set everything up again. Cookies are flushed first: flush()
-      // blocks until the cookies are written, so the kill comes after them.
+      // launch set everything up again.
+      //
+      // ORDERING: the kill comes after the site profile's flush was awaited
+      // above. This default-profile flush covers the LAUNCHER's own cookie jar
+      // only — it is NOT evidence that the site profile's store landed, and it
+      // must never be relied on as such. If the site flush budget expired,
+      // durability is not guaranteed, and AnimeHubSiteController says so in the
+      // log ("durability not guaranteed") instead of reporting a clean
+      // shutdown.
       android.webkit.CookieManager.getInstance().flush()
       android.os.Process.killProcess(android.os.Process.myPid())
     }}
@@ -363,21 +452,103 @@ def prepare(root: Path, gen: Path) -> list[str]:
     notes.append(f"copied {class_name}.kt -> {target}")
 
     # Saf IP policy – Android bagimliligi yok, APK ve unit test ortak kullanir
+    # REQUIRED: SiteNavigationPolicy delegates every numeric-host decision to
+    # IpPolicy, so a missing file is an unresolvable reference, not a soft
+    # degradation. Package-checked like the controller.
     ip_policy_src = kotlin_source(root, package, "IpPolicy")
-    if ip_policy_src.is_file():
-        ip_target = dest / "IpPolicy.kt"
-        ip_target.write_text(ip_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
-        notes.append(f"copied IpPolicy.kt -> {ip_target}")
-    else:
-        notes.append(f"warning: IpPolicy.kt not found at {ip_policy_src}")
+    if not ip_policy_src.is_file():
+        raise SystemExit(f"IpPolicy.kt not found at {ip_policy_src}")
+    ip_policy_pkg = package_of(ip_policy_src)
+    if ip_policy_pkg != package:
+        raise SystemExit(
+            f"Kotlin package {ip_policy_pkg!r} != register_android_plugin package {package!r} "
+            f"({ip_policy_src})"
+        )
+    ip_target = dest / "IpPolicy.kt"
+    ip_target.write_text(ip_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
+    notes.append(f"copied IpPolicy.kt -> {ip_target}")
 
+    # The per-site WebView/profile controller: required, the plugin's site
+    # commands have no other implementation.
+    site_controller_src = kotlin_source(root, package, SITE_CONTROLLER_CLASS)
+    if not site_controller_src.is_file():
+        raise SystemExit(f"site controller not found at {site_controller_src}")
+    site_controller_pkg = package_of(site_controller_src)
+    if site_controller_pkg != package:
+        raise SystemExit(
+            f"Kotlin package {site_controller_pkg!r} != register_android_plugin package {package!r} "
+            f"({site_controller_src})"
+        )
+    site_controller_target = dest / f"{SITE_CONTROLLER_CLASS}.kt"
+    site_controller_target.write_text(
+        site_controller_src.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    notes.append(f"copied {SITE_CONTROLLER_CLASS}.kt -> {site_controller_target}")
+
+    # REQUIRED, like every other unit: SiteNavigationPolicy.kt is the class the
+    # guard and the controller call on every navigation, and the blocklist is
+    # resolved from it. A "warning" here used to let the copy silently shrink,
+    # and the next Gradle run failed with an unresolved reference instead of
+    # this script's clear message.
     site_policy_src = kotlin_source(root, package, "SiteNavigationPolicy")
-    if site_policy_src.is_file():
-        site_target = dest / "SiteNavigationPolicy.kt"
-        site_target.write_text(site_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
-        notes.append(f"copied SiteNavigationPolicy.kt -> {site_target}")
-    else:
-        notes.append(f"warning: SiteNavigationPolicy.kt not found at {site_policy_src}")
+    if not site_policy_src.is_file():
+        raise SystemExit(f"SiteNavigationPolicy.kt not found at {site_policy_src}")
+    site_policy_pkg = package_of(site_policy_src)
+    if site_policy_pkg != package:
+        raise SystemExit(
+            f"Kotlin package {site_policy_pkg!r} != register_android_plugin package {package!r} "
+            f"({site_policy_src})"
+        )
+    site_target = dest / "SiteNavigationPolicy.kt"
+    site_target.write_text(site_policy_src.read_text(encoding="utf-8"), encoding="utf-8")
+    notes.append(f"copied SiteNavigationPolicy.kt -> {site_target}")
+
+    # Auxiliary units the bridge/controller depend on. They used to live
+    # INSIDE AnimeHubPlugin.kt; after the split each is its own file and is
+    # REQUIRED — without it neither the APK build nor the CI unit-test
+    # compile (which type-checks AnimeHubSiteController.kt against them)
+    # can resolve the references. Package-checked like the controller.
+    # SiteProfileOps.kt was split by responsibility (its header lists the
+    # layout); EVERY file is required, and the hard failure below is what keeps
+    # a dropped file from silently shrinking the CI unit-test compile.
+    for aux in (
+        "AnimeHubDebugLog",
+        "PipTransferFlow",
+        "SiteFlushWorker",
+        "SiteNavigationGuard",
+        "SiteWebViewSettings",
+        "SiteProfileOps",
+        "SiteBlocklist",
+        "NavigationDnsGate",
+        "ProfileQuarantine",
+        "SiteCloseFlow",
+        "SiteShutdownFlow",
+        "SiteClearFlow",
+        "SiteMigrationFlow",
+        "SiteBackStatus",
+        # Connection pinning (round 16). DnsPinnedProxy/PinnedConnect/SiteProxyGate
+        # are pure JVM (java.net only) and own the decision that makes a
+        # hostname resolve ONCE; SiteProxyController is the androidx.webkit
+        # adapter that installs the process-wide override. All four are
+        # REQUIRED: without them the controller cannot refuse an unpinned open,
+        # and the APK would silently go back to engine-side DNS.
+        "DnsPinnedProxy",
+        "PinnedConnect",
+        "SiteProxyGate",
+        "SiteProxyController",
+    ):
+        aux_src = kotlin_source(root, package, aux)
+        if not aux_src.is_file():
+            raise SystemExit(f"auxiliary Kotlin file not found at {aux_src}")
+        aux_pkg = package_of(aux_src)
+        if aux_pkg != package:
+            raise SystemExit(
+                f"Kotlin package {aux_pkg!r} != register_android_plugin package {package!r} "
+                f"({aux_src})"
+            )
+        aux_target = dest / f"{aux}.kt"
+        aux_target.write_text(aux_src.read_text(encoding="utf-8"), encoding="utf-8")
+        notes.append(f"copied {aux}.kt -> {aux_target}")
 
     # The PiP controller: Kotlin half (template) + the shared WebView JS.
     pip_js = read_pip_controller_js(root)
@@ -420,15 +591,71 @@ def prepare(root: Path, gen: Path) -> list[str]:
     ensure_proguard(proguard, package, class_name)
     notes.append(f"proguard keep for {package}.{class_name}")
 
+    # Align the project's Kotlin plugin with the stdlib the app resolves
+    # (see KGP_PIN). Lives in the ROOT build.gradle.kts of the generated
+    # project; idempotent, same style as the webkit pin below.
+    root_gradle = gen / "build.gradle.kts"
+    if not root_gradle.is_file():
+        notes.append("warning: root build.gradle.kts missing; Kotlin plugin not aligned")
+    else:
+        root_text = root_gradle.read_text(encoding="utf-8")
+        if KGP_PIN in root_text:
+            notes.append("kotlin-gradle-plugin already pinned to 2.1.20")
+        else:
+            aligned, replaced = KGP_DEP_RE.subn(KGP_PIN, root_text)
+            if replaced == 0:
+                # Template changed shape: put the pin in front of the AGP
+                # classpath so both stay inside the buildscript block.
+                agp = re.search(r'\s*classpath\("com\.android\.tools\.build:gradle:[^"]+"\)', aligned)
+                if agp:
+                    aligned = aligned[: agp.start()] + "\n        " + KGP_PIN + aligned[agp.start():]
+                else:
+                    aligned = aligned.replace(
+                        "buildscript {",
+                        'buildscript {\n    dependencies {\n        ' + KGP_PIN + "\n    }",
+                        1,
+                    )
+            root_gradle.write_text(aligned, encoding="utf-8")
+            notes.append(
+                "pinned kotlin-gradle-plugin:2.1.20 (aligns compiler with kotlin-stdlib 2.1.20)"
+            )
+
     gradle = gen / "app" / "build.gradle.kts"
     text = gradle.read_text(encoding="utf-8")
+    gradle_changed = False
+
+    # Reproducible androidx.webkit pin: the multi-profile APIs the site
+    # controller needs are versioned with this library (stable since 1.9.0),
+    # so the build must not depend on whichever version the generated
+    # template happened to ship.
+    if WEBKIT_PIN in text:
+        notes.append("androidx.webkit already pinned to 1.16.0")
+    else:
+        pinned, replaced = WEBKIT_DEP_RE.subn(WEBKIT_PIN, text)
+        if replaced == 0:
+            if "dependencies {" in pinned:
+                pinned = pinned.replace(
+                    "dependencies {", "dependencies {\n    " + WEBKIT_PIN, 1
+                )
+            else:
+                pinned += "\ndependencies {\n    " + WEBKIT_PIN + "\n}\n"
+        text = pinned
+        gradle_changed = True
+        notes.append("pinned androidx.webkit:webkit:1.16.0 (multi-profile)")
+
     if SIGN_MARKER in text:
         notes.append(f"signing config already present in {gradle}")
     else:
         if "import java.util.Properties" not in text:
             text = "import java.util.Properties\n" + text
-        gradle.write_text(text + SIGN_BLOCK, encoding="utf-8")
+        text = text + SIGN_BLOCK
+        gradle_changed = True
         notes.append(f"injected release signing config into {gradle}")
+    if gradle_changed:
+        gradle.write_text(text, encoding="utf-8")
+
+    verify_pin_state(root_gradle, gradle)
+    notes.append("verified: exactly one webkit pin and one Kotlin plugin pin")
     return notes
 
 

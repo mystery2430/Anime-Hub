@@ -353,6 +353,18 @@ impl Registry {
         v
     }
 
+    /// Hidden sites, sorted by name.
+    ///
+    /// Hiding is reversible by design (`set_hidden(id, false)`), but the
+    /// launcher grid only ever asks for [`Self::visible`], so without this
+    /// accessor a hidden built-in was unreachable: no UI path could name it
+    /// again and the user had to wipe the encrypted config to get it back.
+    pub fn hidden(&self) -> Vec<Site> {
+        let mut v: Vec<Site> = self.sites.iter().filter(|s| s.hidden).cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        v
+    }
+
     /// Validate a draft. Returns the reason as an [`AppError`] so the frontend
     /// can show it verbatim.
     pub fn check(&self, draft: &SiteDraft, ignore_id: Option<&str>) -> AppResult<(String, String)> {
@@ -626,6 +638,23 @@ mod tests {
             .unwrap();
         assert_eq!(s.url, "https://animecix.net/");
         assert!(s.builtin);
+    }
+
+    #[test]
+    fn hidden_lists_only_hidden_sites_and_hide_stays_reversible() {
+        let mut r = Registry::new_default();
+        assert!(r.hidden().is_empty());
+        r.remove("builtin-openanime").unwrap();
+        // The tile leaves the grid but the entry, its icon and its URL stay.
+        assert!(!r.visible().iter().any(|s| s.id == "builtin-openanime"));
+        let hidden = r.hidden();
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].id, "builtin-openanime");
+        assert!(hidden[0].builtin);
+        // Restoring is the whole point: `set_hidden(id, false)` puts it back.
+        r.set_hidden("builtin-openanime", false).unwrap();
+        assert!(r.hidden().is_empty());
+        assert!(r.visible().iter().any(|s| s.id == "builtin-openanime"));
     }
 
     #[test]

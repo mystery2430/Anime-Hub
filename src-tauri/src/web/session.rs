@@ -8,17 +8,22 @@
 //! so cookies, localStorage, IndexedDB and cache never cross between sites.
 //!
 //! ## Android
-//! The system WebView has **no** per-profile data directory API, so a
-//! directory-per-site partition is impossible. Instead we partition by
-//! *swapping the cookie jar*: on opening a site we export the previous site's
-//! cookies into its encrypted blob, wipe the live jar, and restore the target
-//! site's cookies. Login state (which is cookie-borne on every site in scope)
-//! is therefore isolated.
-//!
-//! **Documented limitation:** on Android, `localStorage` / IndexedDB / cache
-//! are shared between sites because the platform offers no way to partition
-//! them. Sites that keep auth state in `localStorage` would leak it. This is
-//! surfaced in the About screen rather than hidden.
+//! The launcher keeps Tauri/Wry's single WebView on the **default** profile.
+//! Sites open in a *separate* native WebView above it, bound to their own
+//! persistent androidx.webkit profile (`WebViewCompat.setProfile`, assigned
+//! before any other WebView API call and before the first navigation), so
+//! cookies, localStorage, IndexedDB and cache are partitioned per `site_id` —
+//! including between two sites that share an origin. The legacy cookie-jar
+//! swap and the JSON localStorage/IndexedDB snapshot export/import are gone:
+//! profiles persist by themselves, the dump was never a security boundary,
+//! and re-injecting it would revive the origin TOCTOU it had. One migration
+//! remains: the 0.3.4 encrypted cookie jar is imported once into a *virgin*
+//! profile's own `CookieManager` before that profile's first navigation.
+//! Providers without `WebViewFeature.MULTI_PROFILE` refuse the open outright —
+//! there is no silent fallback to the shared profile. Profile names derive
+//! from the registered `site_id` only (see `web/windows.rs`:
+//! `android_profile_name`), never from the URL or display name. See
+//! `docs/android-storage-isolation.md`.
 
 use crate::error::AppError;
 use crate::sites::blocklist::Blocklist;
@@ -275,6 +280,24 @@ pub fn decide_navigation_dns(
 /// Everything dynamic reaches the page through [`embed_json`], never string
 /// interpolation, so a hostile site name or blocklist entry cannot inject
 /// script.
+///
+/// **Frame scope (AH-P2).** On Android this text is registered with
+/// `WebViewCompat.addDocumentStartJavaScript(.., setOf("*"))`, i.e. it runs in
+/// EVERY frame of EVERY origin — the origin rule set has to stay wide, because
+/// the players these sites embed and the ad frames that call `window.open` are
+/// both third-party origins, and the API offers no "top frame only" rule. What
+/// is narrowed instead is what each part does:
+///
+/// * every frame gets the cosmetic `<style>` (selectors are data, not code) and
+///   the [`popup_guard.js`](popup_guard.js) override, which returns `null` and
+///   keeps no reference to the native `window.open`;
+/// * only the TOP frame installs the PiP controller — [`pip_controller.js`]
+///   returns early in a subframe, so a third-party frame is not handed
+///   `window.__animehubPip*` (the native side re-installs the controller in the
+///   main frame on demand, so PiP does not depend on the document-start copy);
+/// * no frame gets anything else: the payload is the three display settings,
+///   there is no site identity in it and no IPC bridge exists for a site
+///   WebView at all.
 pub fn build_init_script(cfg: &InjectedConfig) -> String {
     let payload = embed_json(cfg);
 
@@ -288,20 +311,19 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
     };
 
     // The popup guard is *omitted* rather than disabled when off, so the
-    // shipped script never contains the `window.open` override at all.
+    // shipped script never contains the `window.open` override at all. It lives
+    // in its own file so the injected text is executable under test
+    // (`tests/init_script.test.js`) instead of pinned only as source prose.
     let popup_guard = if cfg.block_popups {
-        r#"
-  // Neutralise attempts to open new windows from scripts. The Rust side
-  // already denies these; this stops the spinner/blank-tab artefact and the
-  // "popup blocked" retry loops some ad scripts fall into.
-  var nativeOpen = window.open;
-  window.open = function () { return null; };
-  // Keep the original reachable for first-party code that feature-detects.
-  Object.defineProperty(window.open, "__animehubNative", {
-    value: nativeOpen,
-    enumerable: false,
-  });
-"#
+        include_str!("popup_guard.js")
+    } else {
+        ""
+    };
+
+    // Same rule as the popup guard: omitted, never emitted-and-disabled, so the
+    // shipped text for desktop does not contain the override at all.
+    let webrtc_guard = if cfg.webrtc_guard {
+        include_str!("webrtc_guard.js")
     } else {
         ""
     };
@@ -326,7 +348,7 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
   if (window.__animehubInstalled) return;
   window.__animehubInstalled = true;
   var CFG = {payload};
-{popup_guard}{cosmetic}{pip_controller}}})();"#
+{popup_guard}{webrtc_guard}{cosmetic}{pip_controller}}})();"#
     )
 }
 
@@ -361,6 +383,20 @@ pub struct InjectedConfig {
     /// anything the launcher's eval installed. Keeping it in the init script
     /// as well means the site page has it from the first paint on.
     pub pip_controller: bool,
+    /// Android only: append [`WEBRTC_GUARD_JS`] to the injected script.
+    ///
+    /// An HTTP `CONNECT` proxy carries TCP only, and Chromium does not send
+    /// WebRTC's UDP through a configured proxy by default (RFC 8828 §5.1
+    /// principle 4). The API is therefore removed in every frame a site page
+    /// can run in. This is defence in depth, not the guarantee: the guard is a
+    /// page script, and the residual is documented in
+    /// `docs/security-residual-risks.md`.
+    ///
+    /// `serde(skip)`: the flag decides which code the native side injects, it
+    /// is not data for the page — and telling a page which guards are on is a
+    /// hint it does not need.
+    #[serde(skip)]
+    pub webrtc_guard: bool,
 }
 
 impl Default for InjectedConfig {
@@ -373,6 +409,8 @@ impl Default for InjectedConfig {
                 .collect(),
             // Off by default: only the Android caller turns it on.
             pip_controller: false,
+            // Same: desktop has no pinned path to protect here.
+            webrtc_guard: false,
         }
     }
 }
@@ -424,7 +462,7 @@ pub fn ensure_profile_dir(
     Ok(dir)
 }
 
-/// Which site a session belongs to, for the cookie-swap path.
+/// Which site a session belongs to (ownership checks for open/close/wipe).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     pub site_id: String,
@@ -821,6 +859,7 @@ mod tests {
             block_popups: true,
             hide_selectors: vec!["</script><script>alert(1)</script>".into()],
             pip_controller: false,
+            webrtc_guard: false,
         };
         let js = build_init_script(&cfg);
         assert!(
@@ -842,12 +881,47 @@ mod tests {
         assert!(js.contains("adsbygoogle"));
     }
 
+    /// AH-P2: the guard runs in every frame, so it must not hand any frame a
+    /// way back to the native `window.open`. It used to store the original on a
+    /// non-enumerable property of the replacement; nothing read it, and every
+    /// cross-origin ad frame could.
+    #[test]
+    fn init_script_never_keeps_the_native_window_open_reachable() {
+        let js = build_init_script(&InjectedConfig::default());
+        assert!(
+            js.contains("window.open = function"),
+            "the override itself must stay"
+        );
+        assert!(
+            !js.contains("__animehubNative"),
+            "no escape-hatch property on the override"
+        );
+        assert!(
+            !js.contains("nativeOpen"),
+            "no captured reference to the original function"
+        );
+        assert!(
+            !js.contains("defineProperty(window.open"),
+            "the override must not be decorated with extra properties"
+        );
+        // Turning popups off still removes the whole guard, escape hatch and
+        // all, rather than shipping a disabled copy.
+        let off = build_init_script(&InjectedConfig {
+            block_popups: false,
+            hide_selectors: vec![],
+            pip_controller: false,
+            webrtc_guard: false,
+        });
+        assert!(!off.contains("window.open"));
+    }
+
     #[test]
     fn init_script_without_popup_blocking_leaves_open_alone() {
         let js = build_init_script(&InjectedConfig {
             block_popups: false,
             hide_selectors: vec![],
             pip_controller: false,
+            webrtc_guard: false,
         });
         assert!(!js.contains("window.open = function"));
     }
@@ -869,10 +943,90 @@ mod tests {
         assert!(!init.contains("__animehub-back"));
     }
 
+    /// WebRTC is not carried by an HTTP `CONNECT` proxy, so a page that opens a
+    /// peer connection can create traffic the pinning proxy never sees. The
+    /// API is removed where the pinned path exists (Android), and the flag
+    /// itself is never serialised into the page's config payload.
+    #[test]
+    fn init_script_removes_webrtc_where_the_pinned_path_exists() {
+        let js = build_init_script(&InjectedConfig {
+            webrtc_guard: true,
+            ..Default::default()
+        });
+        assert!(js.contains("RTCPeerConnection"), "the guard must ship");
+        assert!(
+            js.contains("configurable: false") && js.contains("writable: false"),
+            "a page must not be able to restore the constructor"
+        );
+        assert!(
+            js.contains("NotSupportedError"),
+            "the refusal must be explicit, not a silent no-op"
+        );
+        // The switch is native-side only: the page payload stays the three
+        // display settings.
+        assert!(!js.contains("webrtcGuard"), "the flag leaked into CFG");
+        // Guard text must satisfy the same inertness rules as the rest.
+        let lowered = js.to_lowercase();
+        for needle in ["token", "secret", "cookie", "authorization", "http:"] {
+            assert!(!lowered.contains(needle), "guard mentions {needle}");
+        }
+    }
+
+    #[test]
+    fn the_webrtc_guard_is_android_only() {
+        let desktop = build_init_script(&InjectedConfig::default());
+        assert!(
+            !desktop.contains("RTCPeerConnection"),
+            "desktop has no pinned path to protect, so the API stays"
+        );
+        assert!(!desktop.contains("NotSupportedError"));
+    }
+
+    /// AH-P2: the document-start channel cannot be scoped to the top frame, so
+    /// the controller scopes itself. A subframe must not end up with the PiP
+    /// globals; the top frame must (that is the copy `pip_controller.js`'s own
+    /// tests exercise, and the native side re-installs it on demand anyway).
+    #[test]
+    fn init_script_scopes_the_pip_controller_to_the_top_frame() {
+        let js = build_init_script(&InjectedConfig {
+            pip_controller: true,
+            webrtc_guard: false,
+            ..Default::default()
+        });
+        assert!(
+            js.contains("window.self === window.top"),
+            "the injected controller must check the frame it runs in"
+        );
+        assert!(
+            js.contains("if (!isTopFrame)"),
+            "a subframe must return before installing anything"
+        );
+        // The check has to fail closed: an opaque-origin frame whose `window.top`
+        // read throws must not be treated as the top frame.
+        let gate = js
+            .split("var isTopFrame")
+            .nth(1)
+            .unwrap_or_default()
+            .split("if (!isTopFrame)")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(gate.contains("catch"), "the frame check must be guarded");
+        assert!(
+            gate.contains("return false"),
+            "an unreadable window.top means: do not install"
+        );
+        // The popup guard and the cosmetic rules stay frame-agnostic — they are
+        // the parts that have to work inside third-party ad frames.
+        assert!(js.contains("window.open = function"));
+        assert!(js.contains("animehub-cosmetic"));
+    }
+
     #[test]
     fn init_script_carries_the_pip_controller_only_when_asked() {
         let with_pip = build_init_script(&InjectedConfig {
             pip_controller: true,
+            webrtc_guard: false,
             ..Default::default()
         });
         // The controller installs through computed keys, so the exact source
@@ -988,5 +1142,62 @@ mod tests {
         assert_ne!(profile_dir_name("a"), profile_dir_name("b"));
         assert!(!profile_dir_name("a/b").contains('/'));
         assert!(!profile_dir_name("").contains('/'));
+    }
+
+    /// AH-P2: `WebViewCompat.addDocumentStartJavaScript(webView, initScript,
+    /// setOf("*"))` runs this script for EVERY origin the site WebView loads,
+    /// including cross-origin player domains and third-party frames. That is
+    /// only acceptable because the script carries no capability and no secret —
+    /// a site WebView has no Tauri IPC bridge at all, and the PiP controller's
+    /// functions are called BY the native side, never the other way round.
+    /// Narrowing the ORIGIN set would break cross-origin players (very common
+    /// for anime sites) and the popup guard on ad-driven redirects, so the
+    /// origin set stays "*" and the requirement is that the payload stays
+    /// inert, which this pins. What CAN be narrowed per frame is narrowed: see
+    /// `init_script_scopes_the_pip_controller_to_the_top_frame` and
+    /// `init_script_never_keeps_the_native_window_open_reachable`.
+    #[test]
+    fn init_script_is_inert_enough_to_run_for_every_origin() {
+        let cfg = InjectedConfig {
+            block_popups: true,
+            hide_selectors: vec![".ad-container".to_string(), "#popup".to_string()],
+            pip_controller: true,
+            webrtc_guard: false,
+        };
+        let script = build_init_script(&cfg);
+        let lowered = script.to_lowercase();
+
+        // Nothing a page could turn into a credential, a request or a redirect.
+        for needle in [
+            "token",
+            "secret",
+            "cookie",
+            "authorization",
+            "bearer",
+            "client_id",
+            "http:",
+            "client_secret",
+            "accesstoken",
+        ] {
+            assert!(
+                !lowered.contains(needle),
+                "init script must stay inert, but mentions {needle}"
+            );
+        }
+        // The injected payload is exactly the three display settings.
+        for key in ["blockPopups", "hideSelectors", "pipController"] {
+            assert!(script.contains(key), "payload lost {key}");
+        }
+        // The site URL, the profile name and any per-site value are not in it.
+        assert!(
+            !lowered.contains("openani"),
+            "no site identity in the script"
+        );
+        assert!(
+            !lowered.contains("profile"),
+            "no profile name in the script"
+        );
+        // And the escape hatch stays: no `</script>` can appear in the payload.
+        assert!(!script.contains("</script>"));
     }
 }

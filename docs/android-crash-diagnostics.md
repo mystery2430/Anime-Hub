@@ -1,12 +1,18 @@
 # Android crash and ANR diagnostics
 
 Status: a procedure, not a verified result. Nothing here was run on a device
-from the sandbox. Use it when the app closes or freezes on a phone.
+from the sandbox. Use it when the app closes or freezes on a phone. For
+feature-flow and diagnostics-emulator testing, see
+[`android-emulator-diagnostics.md`](./android-emulator-diagnostics.md).
 
 ## What the in-app log is and is not
 
-- The in-app debug log (`AnimeHubDebugLog`, Settings → developer options) keeps
-  the last 200 lines in memory. It is lost when the process dies.
+- The in-app diagnostics timeline (`AnimeHubDebugLog`, Settings → developer
+  options) merges the bounded Rust and Kotlin rings: up to 2,000 events per
+  source (4,000 combined), with sequence/time ordering, dropped-event count and
+  opaque operation correlation. It is memory-only and is lost when the process
+  dies. It does not contain URLs, hosts, profile names, cookies or page data.
+  Copy/export is user-triggered and does not send the file anywhere.
 - It is **not** a crash dump. It cannot show a native crash, an ANR, or the
   reason the system ended the process. Those come from `logcat` and `dumpsys`.
 
@@ -60,14 +66,22 @@ Run these in a terminal. Replace `<serial>` with the device serial from `adb dev
 
 ## Redaction rules before sharing any file
 
-Remove or replace before you paste or attach a log:
+Before sharing *any* in-app export, logcat excerpt, screenshot or bug-report
+snippet, verify that none of these values appear; delete or replace the whole
+value rather than keeping a recognizable prefix:
 
-- Cookies, `Cookie:` and `Set-Cookie:` headers, session tokens, `Authorization`
-  headers, and any string that looks like a token or key.
-- The AniList client secret and any value stored under the AniList settings.
-- Full URLs with query strings (keep the host and the path only).
-- Your device serial, account names, email addresses, and the local user path.
-- Anything from a bug report beyond the lines listed above.
+- Cookies, `Cookie:` / `Set-Cookie:` headers, session tokens, passwords,
+  `Authorization` headers, API keys, or any string that looks like a token.
+- The AniList client secret or any value stored under the AniList settings.
+- Full or partial URLs, hostnames, origins, geolocation origins, query strings,
+  page/storage content, site IDs, profile names or filesystem paths.
+- Device serials, account names, email addresses and other personal data.
+- Anything from a bug report beyond the specific lines needed for the issue.
+
+The in-app export is schema-limited and should already contain only safe event
+codes and counts. Still inspect it before sharing, especially if it came from an
+older APK. A redaction check is a required sharing step, not a claim that
+logcat or a system bug report is safe by default.
 
 Never paste a log that still contains a cookie value or a secret. Rotate the
 secret if one was pasted by mistake.
