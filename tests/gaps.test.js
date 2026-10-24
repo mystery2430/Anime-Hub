@@ -215,28 +215,31 @@ test("the resolver budget is documented as capacity, not recovery", () => {
   );
 });
 
-test("every external GitHub Action is pinned to a commit SHA, not a mutable tag", () => {
-  // The hardened copies live in ci-fixes/ because the branch token has no
-  // workflow scope; apply.sh installs them. Validate the proposed files here.
-  const dir = join(ROOT, "ci-fixes");
-  const files = readdirSync(dir).filter((name) => name.endsWith(".yml"));
-  assert.ok(files.length > 0);
+test("all active workflow Actions are pinned to verified commit SHAs", () => {
+  // Active workflows are the release/security boundary. The ci-fixes copies
+  // remain useful references, but are not evidence that the running workflows
+  // are hardened.
+  const paths = [
+    ".github/workflows/ci.yml",
+    ".github/workflows/release-android.yml",
+    ".github/workflows/release-desktop.yml",
+    ".github/workflows/publish-release.yml",
+  ];
   let external = 0;
-  for (const name of files) {
-    const src = read(join(dir, name));
+  for (const path of paths) {
+    const src = read(path);
     for (const line of src.split("\n")) {
-      const match = line.match(/^\s*(?:-\s*)?uses:\s*(\S+)\s*(?:#\s*(\S+))?\s*$/);
-      if (!match) continue;
-      const ref = match[1];
-      if (ref.startsWith("./")) continue;
+      const match = line.match(/^\s*(?:-\s*)?uses:\s*(\S+)/);
+      if (!match || match[1].startsWith("./")) continue;
       external += 1;
+      const ref = match[1];
       const [action, sha] = ref.split("@");
-      assert.ok(action && action.includes("/"), `${name}: malformed action ${ref}`);
-      assert.match(sha || "", /^[0-9a-f]{40}$/, `${name}: ${action} must be pinned to a commit SHA`);
-      assert.match(match[2] || "", /^(?:v?\d|stable$)/, `${name}: version comment missing for ${action}`);
+      assert.ok(action && action.includes("/"), `${path}: malformed action ${ref}`);
+      assert.match(sha || "", /^[0-9a-f]{40}$/, `${path}: ${action} must use a full commit SHA`);
+      assert.match(line, /#\s*(?:v?\d|stable\b)/, `${path}: human-readable version comment missing for ${action}`);
     }
   }
-  assert.ok(external >= 20, `expected the CI/release action set, saw ${external}`);
+  assert.equal(external, 36, `expected 36 external Action references across active workflows, saw ${external}`);
 });
 
 test("android release workflow prepares the project before signing", () => {
@@ -271,7 +274,7 @@ test("CI android job builds and uploads an installable debug APK", () => {
   assert.match(yml, /--debug --apk --target aarch64/);
   assert.match(yml, /CARGO_PROFILE_DEV_DEBUG/);
   assert.match(yml, /animehub-android-aarch64-debug/);
-  assert.match(yml, /actions\/upload-artifact@v7/);
+  assert.match(yml, /actions\/upload-artifact@[0-9a-f]{40} # v7/);
   assert.match(
     read(join(ROOT, "ci-fixes/ci.yml")),
     /actions\/upload-artifact@[0-9a-f]{40} # v7/,
