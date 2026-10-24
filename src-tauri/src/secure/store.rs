@@ -251,15 +251,21 @@ pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // The rename is the last step that can fail, and it leaves the temp
+        // file behind. Remove it: the next read must not find a stray copy of
+        // the store next to it, and a retry has to start from a clean
+        // directory. A cleanup failure is ignored on purpose — the error the
+        // caller sees has to be the one that describes why the write failed.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     // Ensure the rename is durable: fsync the parent directory where the
     // filesystem supports it. Best-effort — a failure to open/fsync the dir
     // must not hide a successful write.
     if let Ok(dir_file) = std::fs::File::open(dir) {
         let _ = dir_file.sync_all();
     }
-    // If rename failed the tmp remains; otherwise this is a no-op.
-    let _ = std::fs::remove_file(&tmp);
     Ok(())
 }
 
@@ -300,6 +306,50 @@ mod tests {
         let err = opened.expect_err("an existing path must not be opened");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+    }
+
+    /// The temp file really exists and has been written when `rename` fails.
+    ///
+    /// The target is a non-empty directory, which `rename` refuses; nothing
+    /// before it can fail that way (the parent exists, the temp name is unique
+    /// and the directory is writable), so the error kind is proof that the
+    /// write reached the rename step. `a_failed_write_leaves_the_existing_target_untouched`
+    /// only covers `create_dir_all`, i.e. before a temp file exists at all.
+    #[test]
+    fn a_failed_rename_removes_its_temp_file_and_keeps_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("store.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside"), b"keep").unwrap();
+
+        let err = atomic_write_locked(&target, b"new").expect_err("the target is a directory");
+        // `rename` is the only step here that refuses a directory target — the
+        // parent exists and is writable and the temp name is unique — so the
+        // error kind is what proves the temp file had already been created and
+        // written. Unix reports EISDIR (Linux) or ENOTDIR (some kernels);
+        // Windows reports access-denied.
+        #[cfg(unix)]
+        {
+            let kind = err.kind();
+            let refused = kind == std::io::ErrorKind::IsADirectory;
+            let refused = refused || kind == std::io::ErrorKind::NotADirectory;
+            assert!(refused, "unexpected error kind: {kind:?}");
+        }
+        #[cfg(not(unix))]
+        {
+            let kind = err.kind();
+            assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
+        }
+
+        // The target is untouched …
+        assert_eq!(std::fs::read(target.join("inside")).unwrap(), b"keep");
+        // … and the temp file that was created and written is gone: the
+        // directory holds the target and nothing else.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["store.json".to_string()]);
     }
 
     #[test]
