@@ -37,7 +37,8 @@ adb shell dumpsys webviewupdate | head -20          # current provider + version
 ```
 
 Build/toolchain check that belongs with this matrix: the declared MSRV is
-`1.87` (`src-tauri/Cargo.toml`); CI reads that value and runs
+`1.89` (`src-tauri/Cargo.toml`, same value in `android-plugin/Cargo.toml`); CI
+reads that value out of the manifest, installs exactly that toolchain and runs
 `cargo +<value> check --locked --all-targets`, so a local `rustc` older than
 that is a support question, not a bug report.
 
@@ -226,10 +227,22 @@ claims are tested here, and only the first one is a guarantee:
 33. Point the device's DNS at a blackholed address (or enable airplane-mode DNS
     behaviour on a captive portal) and open a site. Expected: requests fail
     within ~10 s (`502`), the app stays responsive, and repeat attempts fail
-    just as fast rather than queueing. Check `dumpsys` / thread dump: at most a
-    handful of resolver threads (`AnimeHubProxyResolve`), not one per attempt.
+    just as fast rather than queueing. Check `dumpsys` / thread dump: at most
+    `resolveThreads` threads per generation and never more than the cap of 8
+    (`AnimeHubProxyResolve`), not one per attempt.
 34. Restore DNS and retry. Expected: the site opens — nothing about the failed
-    lookup is remembered.
+    lookup is remembered. If four lookups were still stuck when DNS came back,
+    the first retry should be served by the **spare generation** without
+    restarting the app (JVM behaviour; on-device this is what item 34 confirms
+    or refutes).
+35. Leave DNS blackholed long enough to wedge both generations (8 stuck
+    lookups: keep opening sites for a few minutes), then restore DNS. Expected:
+    requests keep being refused (`502`) immediately, because the threads are
+    gone and `stop()` cannot reclaim a call that ignores the interrupt. The
+    documented recovery is to restart the app, which is a **known availability
+    residual, not a bug you are hunting**. Record it as observed behaviour, and
+    capture a thread dump showing that the resolver thread count never exceeds
+    8 and does not grow with each attempt.
 
 ## 6. Isolation, unchanged by this work (regression check)
 

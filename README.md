@@ -268,6 +268,18 @@ WebRTC/UDP sabitlenmiş sayılmaz. Gerçek çözüm kullanıcı onayı gerektire
 senaryosu: `docs/security-residual-risks.md` (round 16.1) ve
 `docs/android-dns-pinning-device-checklist.md`.
 
+**Çözümleyici (DNS) sınırı:** `InetAddress.getAllByName` ne zaman aşımı ne de
+iptal sunar, bu yüzden çözümleme sınırlı bir havuzda yapılır (`resolveMs = 10 s`,
+nesil başına `resolveThreads = 4`). Takılı kalan bir nesnenin yerine **tek bir
+yedek nesil** açılabilir; toplam iş parçacığı `resolveThreadCap = 8` ile
+sınırlıdır ve bu tavan aşıldığında istek `RESOLVE_EXHAUSTED` (502) ile hemen
+reddedilir. Bu **kapasite**, kurtarma değildir: platform çağrısı hiç dönmezse
+süreç yeniden başlatılana kadar DNS kapalı kalır — belgelenmiş erişilebilirlik
+riski (`docs/security-residual-risks.md`, round 16.2 §3; cihaz maddesi 35).
+Ayrıca `127.0.0.1`'e bağlanmak **yalnızca dış ağ arayüzlerini** kapatır; aynı
+cihazdaki başka uygulamalar bu portu bulup kullanabilir (kimlik doğrulama
+`ProxyConfig` ile mümkün değildir, açık kalan risk).
+
 `NavigationDnsGate` / `shouldInterceptRequest` ön kontrolleri **savunma
 derinliği** olarak korunur; artık garanti olarak sunulmaz. Bu ortamda Android
 SDK, Gradle, cihaz veya emülatör bulunmadığı için proxy'nin WebView ile

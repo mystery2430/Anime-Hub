@@ -728,6 +728,48 @@ class DnsPinnedProxyTest {
     }
   }
 
+  /**
+   * A resolver call that **cannot** be interrupted, the way a stuck
+   * `getAllByName` on a dead resolver really behaves.
+   *
+   * [StuckResolver] above waits on a latch, so `future.cancel(true)` releases
+   * it — that models a slow lookup, not a wedged one. This one swallows the
+   * interrupt and keeps waiting until [release], which is the only honest way
+   * to measure what happens when the pool threads are genuinely owned by the
+   * platform call. [hangCalls] limits which calls hang; `null` means all.
+   */
+  private class UninterruptibleResolver(vararg answers: List<InetAddress>, private val hangCalls: Int? = null) {
+    val calls = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Lookups that are past the hang and have really returned. */
+    val completed = java.util.concurrent.atomic.AtomicInteger(0)
+    val release = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val queue = ArrayDeque(answers.toList())
+
+    fun resolve(host: String): List<InetAddress> {
+      val call = calls.incrementAndGet()
+      val hangs = hangCalls == null || call <= hangCalls
+      if (hangs) {
+        while (!release.get()) {
+          try {
+            Thread.sleep(10)
+          } catch (_: InterruptedException) {
+            // Ignored on purpose: the platform call is not interruptible.
+          }
+        }
+      }
+      val answer = if (queue.isEmpty()) listOf(PUBLIC_ANSWER) else queue.removeFirst()
+      completed.incrementAndGet()
+      return answer
+    }
+  }
+
+  private companion object {
+    /** A public address no test ever connects to for real. */
+    val PUBLIC_ANSWER: InetAddress =
+      InetAddress.getByAddress(byteArrayOf(93.toByte(), 184.toByte(), 216.toByte(), 34.toByte()))
+  }
+
   private fun resolverThreads(): Int =
     Thread.getAllStackTraces().keys.count { it.name.startsWith("AnimeHubProxyResolve") && it.isAlive }
 
@@ -767,41 +809,230 @@ class DnsPinnedProxyTest {
   }
 
   @Test
-  fun stuck_resolutions_hold_at_most_their_own_threads_and_never_queue() {
-    val resolver = StuckResolver()
+  fun a_cap_below_one_generation_is_refused_at_construction() {
+    // A cap smaller than a generation would refuse every lookup as soon as the
+    // first one is slow — a configuration that reads as a bound but behaves as
+    // an outage. It must fail loudly instead of silently wedging the app.
+    var threw = false
+    try {
+      DnsPinnedProxy.Limits(resolveThreads = 4, resolveThreadCap = 2)
+    } catch (_: IllegalArgumentException) {
+      threw = true
+    }
+    assertTrue("a cap below one generation must be rejected", threw)
+    // The defaults themselves are valid and leave room for one spare.
+    val defaults = DnsPinnedProxy.Limits()
+    assertEquals(4, defaults.resolveThreads)
+    assertEquals(8, defaults.resolveThreadCap)
+  }
+
+  @Test
+  fun a_wedged_resolver_gets_one_spare_generation_and_service_returns() {
+    // Two lookups that cannot be interrupted own both threads of the first
+    // generation. Without a spare, every later CONNECT would be refused until
+    // the process restarted — the availability bug this test exists for. The
+    // third call answers, so it runs on a fresh generation.
+    val resolver = UninterruptibleResolver(hangCalls = 2)
+    val baseline = resolverThreads()
+    val origin = EchoOrigin()
     val proxy = DnsPinnedProxy(
-      limits = DnsPinnedProxy.Limits(resolveMs = 150, resolveThreads = 2),
+      limits = DnsPinnedProxy.Limits(resolveMs = 200, resolveThreads = 2, resolveThreadCap = 4),
+      resolver = resolver::resolve,
+      connector = { address, _, _ ->
+        PinnedFakeSocket(
+          Socket().apply { connect(InetSocketAddress(InetAddress.getByName("127.0.0.1"), origin.port), 2_000) },
+          address,
+        )
+      },
+    )
+    val port = proxy.start()
+    try {
+      for (host in listOf("one.example", "two.example")) {
+        val client = Socket("127.0.0.1", port)
+        send(client, "CONNECT $host:443 HTTP/1.1\r\n\r\n")
+        assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(client))
+        client.close()
+      }
+      assertEquals("both lookups must really be running", 2, resolver.calls.get())
+      assertEquals(2L, proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_FAILED))
+
+      // Third attempt: the generation is full, so a new one is created and the
+      // waiting network is used again — no app restart, no cached failure.
+      val client = Socket("127.0.0.1", port)
+      client.soTimeout = 5_000
+      send(client, "CONNECT three.example:443 HTTP/1.1\r\n\r\n")
+      assertEquals("HTTP/1.1 200 Connection Established", statusLine(client))
+      client.close()
+
+      assertEquals("the third lookup must have run", 3, resolver.calls.get())
+      assertEquals(3L, proxy.resolutionCount())
+      assertEquals(0L, proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_EXHAUSTED))
+      assertTrue(
+        "resolver threads must stay within the cap, saw ${resolverThreads() - baseline}",
+        // Idle pool threads from earlier tests can still be shutting down, so
+        // the delta is clamped: the claim is "no more than the cap", never
+        // "exactly the cap".
+        (resolverThreads() - baseline).coerceAtLeast(0) <= 4,
+      )
+    } finally {
+      // `stop()` interrupts every generation, but a call that ignores the
+      // interrupt keeps its thread until the platform returns — which is the
+      // documented residual, not something stop() can fix. Releasing the fake
+      // lookup is what proves the threads are then released and not leaked.
+      resolver.release.set(true)
+      proxy.stop()
+      origin.close()
+      assertTrue(
+        "every generation must be released once the lookups return, saw ${resolverThreads() - baseline}",
+        awaitCondition(3_000) { resolverThreads() <= baseline },
+      )
+    }
+  }
+
+  @Test
+  fun when_every_generation_is_stuck_dns_is_refused_until_the_platform_returns() {
+    // resolveThreads = 1 and a cap of 2: one wedged lookup, one spare thread,
+    // then the ceiling. This is the documented availability residual, measured
+    // instead of asserted in prose.
+    val resolver = UninterruptibleResolver()
+    val baseline = resolverThreads()
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(resolveMs = 200, resolveThreads = 1, resolveThreadCap = 2),
       resolver = resolver::resolve,
       connector = { _, _, _ -> throw java.io.IOException("must not be called") },
     )
     val port = proxy.start()
     try {
-      val started = System.currentTimeMillis()
-      repeat(6) {
+      // 1 and 2 spend the two threads the cap allows, each on its own timeout.
+      repeat(2) {
         val client = Socket("127.0.0.1", port)
-        client.soTimeout = 5_000
-        send(client, "CONNECT stuck.example:443 HTTP/1.1\r\n\r\n")
+        send(client, "CONNECT stuck$it.example:443 HTTP/1.1\r\n\r\n")
+        assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(client))
+        client.close()
+      }
+      assertEquals(2, resolver.calls.get())
+      assertTrue(
+        "threads must stay within the cap, saw ${resolverThreads() - baseline}",
+        (resolverThreads() - baseline).coerceAtLeast(0) <= 2,
+      )
+
+      // From here the refusal is immediate and global: a different host is
+      // refused just as fast, because the shortage is in this process, not in
+      // that host's answer. Nothing is queued and nothing is dialled.
+      val started = System.currentTimeMillis()
+      for (host in listOf("another.example", "third.example")) {
+        val client = Socket("127.0.0.1", port)
+        send(client, "CONNECT $host:443 HTTP/1.1\r\n\r\n")
         assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(client))
         client.close()
       }
       val elapsed = System.currentTimeMillis() - started
+      assertTrue("an exhausted resolver must refuse at once, took $elapsed ms", elapsed < 500)
+      assertEquals("no new lookup may start past the cap", 2, resolver.calls.get())
+      assertEquals(2L, proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_EXHAUSTED))
+      assertTrue(awaitCondition { proxy.activeConnections() == 0 })
+      assertTrue(
+        "the handler slots must not leak while DNS is down",
+        proxy.activeConnections() == 0,
+      )
 
-      // Six attempts cost roughly one timeout, not six: the third one is
-      // refused immediately because both resolver threads are still stuck
-      // inside the platform lookup. `cancel(true)` cannot stop that call, so a
-      // thread per connection would be unbounded growth — it is a fixed pool.
-      assertTrue("six attempts took $elapsed ms", elapsed < 4_000)
-      assertEquals("every attempt must be a refusal", 6L, proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_FAILED))
-      assertTrue("resolver threads must stay bounded, saw ${resolverThreads()}", resolverThreads() <= 2)
-      assertEquals(6, resolver.calls.get())
-      // Nothing reached the connector: no address was ever classified.
-      assertEquals(0L, proxy.activeConnections().toLong())
+      // When the platform calls finally return, capacity comes back on its own
+      // and the very next CONNECT resolves again: no failure was cached.
+      resolver.release.set(true)
+      assertTrue(
+        "the wedged lookups must finish",
+        awaitCondition(3_000) { resolver.completed.get() == 2 },
+      )
+      // A freed worker is handed back to the pool a moment after the callable
+      // returns, so this loop tolerates a refusal or two while it settles.
+      // Nothing is restarted and nothing was cached: what matters is that the
+      // name is resolved again as soon as the platform returns.
+      var status: String? = null
+      val deadline = System.currentTimeMillis() + 5_000
+      while (System.currentTimeMillis() < deadline && resolver.calls.get() < 3) {
+        val client = Socket("127.0.0.1", port)
+        send(client, "CONNECT after.example:443 HTTP/1.1\r\n\r\n")
+        status = statusLine(client)
+        client.close()
+        if (resolver.calls.get() >= 3) break
+        Thread.sleep(25)
+      }
+      assertEquals("the next attempt must resolve again", 3, resolver.calls.get())
+      // Public answer, connector throws: CONNECT_FAILED, not a resolver refusal.
+      assertEquals("HTTP/1.1 502 Bad Gateway", status)
+      assertTrue(
+        "the refusal must be the connector, not the resolver",
+        proxy.refusalCount(DnsPinnedProxy.Refusal.CONNECT_FAILED) >= 1L,
+      )
+      assertTrue(
+        "resolver threads must stay within the cap after the lookups return",
+        (resolverThreads() - baseline).coerceAtLeast(0) <= 2,
+      )
     } finally {
+      resolver.release.set(true)
       proxy.stop()
       assertTrue(
-        "the resolver pool must be released on stop, saw ${resolverThreads()} threads",
-        awaitCondition(3_000) { resolverThreads() == 0 },
+        "every generation must be released once the lookups return, saw ${resolverThreads() - baseline}",
+        awaitCondition(3_000) { resolverThreads() <= baseline },
       )
+    }
+  }
+
+  @Test
+  fun a_late_answer_after_a_timeout_is_never_classified_or_reused() {
+    // The first lookup times out and then answers LOOPBACK. If that late answer
+    // were cached or reused, the second CONNECT would be a NON_PUBLIC refusal
+    // (or worse, a tunnel to 127.0.0.1). It must resolve again and use the
+    // second, public answer.
+    val release = java.util.concurrent.CountDownLatch(1)
+    var calls = 0
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(resolveMs = 200),
+      resolver = { _ ->
+        calls++
+        if (calls == 1) {
+          while (release.count > 0L) {
+            try {
+              release.await()
+            } catch (_: InterruptedException) {
+              // Not interruptible: models the platform call.
+            }
+          }
+          listOf(address(127, 0, 0, 1))
+        } else {
+          listOf(publicA)
+        }
+      },
+      connector = { _, _, _ -> throw java.io.IOException("must not be called") },
+    )
+    val port = proxy.start()
+    try {
+      val first = Socket("127.0.0.1", port)
+      send(first, "CONNECT late.example:443 HTTP/1.1\r\n\r\n")
+      assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(first))
+      first.close()
+      assertEquals(1, calls)
+
+      // The stale lookup now completes with a loopback address.
+      release.countDown()
+      assertTrue(awaitCondition(3_000) { calls == 1 })
+
+      val second = Socket("127.0.0.1", port)
+      send(second, "CONNECT late.example:443 HTTP/1.1\r\n\r\n")
+      assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(second))
+      second.close()
+
+      assertEquals("the name must be resolved again", 2, calls)
+      assertEquals(2L, proxy.resolutionCount())
+      assertEquals(
+        "a timed-out answer must never be classified",
+        0L,
+        proxy.refusalCount(DnsPinnedProxy.Refusal.NON_PUBLIC),
+      )
+      // publicA was classified and dialled, so the failure is the connector.
+      assertEquals(1L, proxy.refusalCount(DnsPinnedProxy.Refusal.CONNECT_FAILED))
+    } finally {
+      proxy.stop()
     }
   }
 

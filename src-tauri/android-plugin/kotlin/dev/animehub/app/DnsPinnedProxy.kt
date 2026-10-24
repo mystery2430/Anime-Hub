@@ -43,6 +43,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.Collections
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutionException
@@ -87,6 +88,15 @@ class DnsPinnedProxy(
     /** The resolver threw, timed out or answered nothing. */
     RESOLVE_FAILED,
 
+    /**
+     * Every resolver thread is stuck inside a lookup that cannot be cancelled,
+     * and no further thread may be created. This is a DNS outage for the whole
+     * process, not a property of the host that was asked for: nothing is
+     * remembered about that host, and service returns by itself only if a
+     * stuck lookup eventually returns (see [resolveThreadCap]).
+     */
+    RESOLVE_EXHAUSTED,
+
     /** A real answer, but at least one address is private/loopback/reserved. */
     NON_PUBLIC,
 
@@ -117,14 +127,38 @@ class DnsPinnedProxy(
      * [resolveThreads] at most, never one per connection.
      */
     val resolveMs: Int = 10_000,
-    /** Dedicated resolver threads; a rejected submission is a refusal, not a queue. */
+    /**
+     * Resolver threads per generation. `InetAddress.getAllByName` cannot be
+     * cancelled, so a lookup that never returns owns its thread forever; when
+     * all threads of the current generation are owned that way, a new
+     * generation may be created (see [resolveThreadCap]) instead of the proxy
+     * staying DNS-dead for the rest of the process.
+     *
+     * A rejected submission is a refusal, not a queue.
+     */
     val resolveThreads: Int = 4,
+    /**
+     * Hard ceiling on resolver threads per proxy instance, across every
+     * generation. It is what keeps an uncancellable platform call from turning
+     * into unbounded thread growth: with the defaults, one spare generation of
+     * four threads exists, and when those are stuck too DNS is refused until
+     * the proxy (or the process) is restarted. **This is a documented
+     * availability residual, not automatic recovery.**
+     */
+    val resolveThreadCap: Int = 8,
     val idleMs: Int = 180_000,
     val headerBytes: Int = 8 * 1024,
     val bufferBytes: Int = 16 * 1024,
     val maxConnections: Int = 16,
     val backlog: Int = 16,
-  )
+  ) {
+    init {
+      // A cap below one generation would make every lookup fail as soon as the
+      // first one is slow, so the two knobs have to agree.
+      require(resolveThreads > 0) { "resolveThreads must be positive" }
+      require(resolveThreadCap >= resolveThreads) { "resolveThreadCap must allow one generation" }
+    }
+  }
 
   /** What one `CONNECT` asks for. Already validated: no userinfo, no zone id. */
   data class Target(val host: String, val port: Int)
@@ -134,7 +168,19 @@ class DnsPinnedProxy(
   private var acceptThread: Thread? = null
   private var handlerPool: ThreadPoolExecutor? = null
   private var pumpPool: ThreadPoolExecutor? = null
+
+  /**
+   * The generation currently used for lookups. Replaced (never mutated) when
+   * every thread of it is stuck; see [rotateResolver].
+   */
+  @Volatile
   private var resolvePool: ThreadPoolExecutor? = null
+
+  /** Every generation this instance created, including abandoned ones. */
+  private val resolveGenerations: MutableList<ThreadPoolExecutor> =
+    Collections.synchronizedList(mutableListOf<ThreadPoolExecutor>())
+
+  private val resolveRotation = Any()
 
   /**
    * Every socket this proxy owns: accepted clients and upstream connections.
@@ -165,9 +211,18 @@ class DnsPinnedProxy(
   /**
    * Bind `127.0.0.1:0` and start accepting. Idempotent.
    *
-   * The bind address is a literal and never `0.0.0.0`: the proxy must not be
-   * reachable from the network, from another app on the device, or from a
-   * Docker/hotspot interface. `ProxyController` points the WebViews at it.
+   * The bind address is a literal and never `0.0.0.0`. That is an **egress**
+   * control, not an isolation boundary: it keeps the listener off the Wi-Fi,
+   * hotspot, USB-tether and Docker interfaces, i.e. nothing outside this
+   * device can reach it. It does **not** hide the port from other apps on the
+   * same device. Android's loopback is shared, so any app that finds or guesses
+   * the ephemeral port can send `CONNECT` to it, and `ProxyConfig` has no
+   * credential mechanism with which this proxy could tell our WebViews from
+   * anyone else. That residual is open and is only *bounded* here — public
+   * destinations only, 16 concurrent clients, a 5 s handshake deadline, no
+   * queue — never authenticated. `ProxyController` points the WebViews at it,
+   * and `docs/security-residual-risks.md` (round 16.1 §2) states the same
+   * thing; do not describe the loopback bind as app isolation.
    */
   fun start(): Int = synchronized(lock) {
     boundPort?.let { return it }
@@ -184,10 +239,11 @@ class DnsPinnedProxy(
     running = true
     handlerPool = pool("AnimeHubProxy", limits.maxConnections)
     pumpPool = pool("AnimeHubProxyTunnel", limits.maxConnections)
-    // Small and fixed: a resolver call that never returns can strand at most
-    // this many threads, and a fifth concurrent lookup is refused rather than
-    // queued behind the stuck ones.
-    resolvePool = pool("AnimeHubProxyResolve", limits.resolveThreads)
+    // Small and fixed per generation: a resolver call that never returns
+    // strands at most `resolveThreads` threads here, a further concurrent
+    // lookup is refused rather than queued behind the stuck ones, and the
+    // total across generations is capped by `resolveThreadCap`.
+    resolvePool = newResolverGeneration()
     acceptThread = Thread({ acceptLoop(socket) }, "AnimeHubProxyAccept").apply {
       isDaemon = true
       start()
@@ -215,8 +271,18 @@ class DnsPinnedProxy(
     handlerPool = null
     pumpPool?.shutdownNow()
     pumpPool = null
-    resolvePool?.shutdownNow()
     resolvePool = null
+    // Every generation, including the abandoned ones: a stuck lookup keeps its
+    // thread until the platform call returns, and interrupting is the only
+    // thing that can be done about it. The rotation lock is held so a handler
+    // that is rotating right now cannot add a generation after the list was
+    // drained — it re-reads `running` (already false) and refuses instead.
+    synchronized(resolveRotation) {
+      synchronized(resolveGenerations) {
+        for (generation in resolveGenerations) generation.shutdownNow()
+        resolveGenerations.clear()
+      }
+    }
     for (socket in live.toList()) {
       closeQuietly(socket)
     }
@@ -302,6 +368,11 @@ class DnsPinnedProxy(
 
       val addresses = try {
         resolveOnce(target.host)
+      } catch (_: ResolverExhausted) {
+        // Not a verdict about this host: the process has no resolver thread
+        // left that a lookup could run on.
+        refuse(client, Refusal.RESOLVE_EXHAUSTED)
+        return
       } catch (_: Exception) {
         refuse(client, Refusal.RESOLVE_FAILED)
         return
@@ -376,20 +447,15 @@ class DnsPinnedProxy(
    */
   private fun resolveOnce(host: String): List<InetAddress> {
     literal(host)?.let { return listOf(it) }
-    val pool = resolvePool ?: throw IOException("proxy not started")
     resolutions.incrementAndGet()
-    val future = try {
-      pool.submit(Callable { resolver(host) })
-    } catch (_: RejectedExecutionException) {
-      // Every resolver thread is busy (typically with lookups that never
-      // returned). Refusing is the fail-closed answer: nothing is queued.
-      throw IOException("resolver busy")
-    }
+    val future = submitLookup(host)
     val answer = try {
       future.get(limits.resolveMs.toLong(), TimeUnit.MILLISECONDS)
     } catch (_: TimeoutException) {
       // Best effort only: `cancel(true)` cannot interrupt a blocking
-      // `getAllByName`. The task keeps its (bounded) resolver thread.
+      // `getAllByName`. The task keeps its (bounded) resolver thread, and its
+      // answer is dropped even if it arrives later — nothing is read from a
+      // future that already timed out.
       future.cancel(true)
       throw IOException("resolver timed out")
     } catch (e: ExecutionException) {
@@ -402,6 +468,54 @@ class DnsPinnedProxy(
     if (answer.isEmpty()) throw IOException("empty answer")
     return answer
   }
+
+  /**
+   * Submit one lookup, rotating to a fresh generation at most once.
+   *
+   * The rejection of a submission means every thread of the current generation
+   * is owned by a call that cannot be interrupted. Refusing there would leave
+   * the whole process without DNS until it is restarted — which is what
+   * happens when a captive portal or a VPN switch strands four lookups and the
+   * network is healthy again a minute later. So one extra generation is
+   * created, subject to [Limits.resolveThreadCap]; the abandoned lookups keep
+   * their threads, their answers are never read, and no verdict about a host is
+   * carried over. When the cap is reached, [Refusal.RESOLVE_EXHAUSTED] is the
+   * answer, and the residual is a documented availability risk rather than
+   * something this file pretends to heal.
+   */
+  private fun submitLookup(host: String): java.util.concurrent.Future<List<InetAddress>> {
+    while (true) {
+      val pool = resolvePool ?: throw IOException("proxy not started")
+      try {
+        return pool.submit(Callable { resolver(host) })
+      } catch (_: RejectedExecutionException) {
+        if (!rotateResolver(pool)) throw ResolverExhausted()
+      }
+    }
+  }
+
+  /** True when [stuck] was replaced by a fresh generation, so the caller retries. */
+  private fun rotateResolver(stuck: ThreadPoolExecutor): Boolean = synchronized(resolveRotation) {
+    // Another handler may already have rotated while this one was rejected.
+    if (resolvePool !== stuck) return true
+    if (!running) return false
+    if (!mayCreateResolverGeneration()) return false
+    resolvePool = newResolverGeneration()
+    return true
+  }
+
+  private fun mayCreateResolverGeneration(): Boolean = synchronized(resolveGenerations) {
+    (resolveGenerations.size + 1) * limits.resolveThreads <= limits.resolveThreadCap
+  }
+
+  private fun newResolverGeneration(): ThreadPoolExecutor {
+    val generation = pool("AnimeHubProxyResolve", limits.resolveThreads)
+    resolveGenerations.add(generation)
+    return generation
+  }
+
+  /** Internal signal: every generation is stuck, nothing may be spawned. */
+  private class ResolverExhausted : IOException("resolver exhausted")
 
   // -------------------------------------------------------------------------
   // Tunnel
@@ -507,7 +621,7 @@ class DnsPinnedProxy(
         Refusal.BUSY -> UNAVAILABLE
         // "Could not reach a vetted address" is a gateway failure, not a
         // policy refusal; neither answer tells the page why.
-        Refusal.CONNECT_FAILED, Refusal.RESOLVE_FAILED -> BAD_GATEWAY
+        Refusal.CONNECT_FAILED, Refusal.RESOLVE_FAILED, Refusal.RESOLVE_EXHAUSTED -> BAD_GATEWAY
         else -> FORBIDDEN
       },
     )

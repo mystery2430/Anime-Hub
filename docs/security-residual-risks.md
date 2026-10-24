@@ -199,6 +199,97 @@ proxy were misconfigured.
   a new process starts unpinned and refuses to open a site until it installs
   the override again. That is the intended fail-closed path, not a gap.
 
+## Round 16.2 — resolver generations, and two claims corrected
+
+### 1. The `start()` comment claimed app isolation from a loopback bind
+
+The KDoc on `DnsPinnedProxy.start()` said the `127.0.0.1` bind meant the proxy
+was not "reachable … from another app on the device". That is wrong, and it
+contradicted both §2 below and device checklist §5c. Binding loopback is an
+**egress** control — no Wi-Fi/hotspot/USB-tether/Docker interface can reach the
+port — and not an isolation boundary between apps: Android loopback is shared,
+and any app that finds the ephemeral port can send `CONNECT`. The comment now
+says exactly that, points at this section, and `ProxyConfig` still offers no
+credential mechanism, so the listener stays unauthenticated. **The residual is
+open; nothing about it was "solved" by editing the comment.**
+
+### 2. Resolver threads: bounded, and what the old test did not measure
+
+The round-16.1 fake resolver waited on a `CountDownLatch`, so
+`future.cancel(true)` released it. That models a *slow* lookup, not a wedged
+one: it let the suite report "at most N threads" and "no 6× timeout wait" while
+the real, uninterruptible case was untested. Round 16.2 adds a resolver that
+swallows interrupts (`UninterruptibleResolver`) and measures what a genuinely
+stuck platform call does. Measured on the JVM (not on a device):
+
+| Scenario | Behaviour |
+| --- | --- |
+| One lookup never returns | `CONNECT` is refused `502` after `resolveMs`; the handler slot is released; the lookup keeps its thread. |
+| Every thread of the current generation is stuck | The next `CONNECT` **rotates to one spare generation** (4 more threads, 8 total) and is resolved there. No restart is needed for this case. |
+| The spare generation is stuck too | `Refusal.RESOLVE_EXHAUSTED` (`502`) immediately, for **every** host, because the shortage is in this process, not in that host's answer. Nothing is queued and nothing is dialled. |
+| A stuck lookup finally returns | Capacity comes back by itself, the next `CONNECT` resolves again, and no failure was cached. |
+| The lookups never return | DNS stays refused until the proxy/process is restarted. **This is the residual.** |
+| `stop()` while lookups are stuck | Every generation is shut down and the listener closes, but a call that ignores the interrupt keeps its thread until the platform returns — `stop()` cannot end it. |
+
+Thread count is bounded by `resolveThreadCap` (8 with the defaults) no matter
+how many connections arrive; a fifth concurrent lookup is refused rather than
+queued, and an abandoned generation's answers are dropped unread (a late
+answer is never classified — `a_late_answer_after_a_timeout_is_never_classified_or_reused`).
+
+### 3. Resolver generations: what "recoverability" this actually buys
+
+Precisely this much: **a wedge no longer becomes permanent on the first four
+stuck lookups.** A captive portal or a VPN switch that strands a whole
+generation and then heals leaves the app working, where before it was DNS-dead
+until relaunch. It is **not** automatic recovery in general — one spare
+generation exists, the total is capped, and a platform resolver that never
+returns still wedges the process, now at 8 threads instead of 4. The docs, the
+naming (`mayCreateResolverGeneration`, `ResolverExhausted`) and the checklist
+say that; none of them call it recycling, deduplication or self-healing.
+
+Rejected alternatives, for the record:
+
+* **A hand-written DNS client over UDP/TCP** would give real cancellation and a
+  real timeout, but it bypasses the system resolver — Private DNS/DoT, VPN
+  split-DNS, captive-portal handling and the user's configured servers — sends
+  queries in cleartext to a server of our choosing, and puts DNS wire-format
+  parsing (compression pointers, EDNS, truncation/TCP fallback) inside the
+  security boundary. A silent parsing bug there would hand the pin the *wrong*
+  address, which is worse than a refusal.
+* **`android.net.DnsResolver.rawQuery` + `CancellationSignal`** (API 29+) is
+  cancellable, but it still needs wire-format queries/answers, breaks this
+  file's "pure `java.net`, so CI runs the real decision path" property, and its
+  cancellation semantics cannot be verified here without a device.
+* **Unbounded threads** (one per lookup) would remove the ceiling by turning a
+  DNS hang into thread growth. That is the leak this design exists to prevent.
+
+### 4. MSRV documentation drift, corrected
+
+`docs/android-dns-pinning-device-checklist.md` still said `1.87` after the
+manifests moved to `1.89`; it now says `1.89` and a JS test pins the checklist
+to the manifest value so the next bump cannot leave it behind. The CI step was
+re-read as well: it extracts `rust-version` from `src-tauri/Cargo.toml`,
+installs exactly that toolchain, prints its `rustc --version`, runs
+`cargo +<value> check --locked --all-targets`, and annotates the failure text.
+Its green run is the evidence; the number in the docs is only a copy of what
+that gate measures.
+
+### 5. Claims re-checked in this round
+
+* **HTTP(S)/WSS pinning is reported separately from WebRTC/ICE/STUN/TURN/UDP.**
+  The pin covers TCP `CONNECT`. WebRTC/UDP is not pinned and is not claimed to
+  be; the init script's API removal is defence in depth only.
+* **DNS rebinding stays `OPEN` for verification purposes.** The design pins the
+  connection to the classified address, but "verified" requires the device
+  capture in checklist items 1–19 on at least two WebView providers. A JVM
+  suite, a green CI run and a source review are not that.
+* **Another app reaching the loopback port is not a solved risk.** The comment
+  was fixed; the exposure is unchanged and stays open (§2 above).
+* **Action SHA pinning is still blocked.** The active workflows reference
+  mutable tags; the SHA-pinned equivalents exist only in `ci-fixes/` and the
+  token lacks `workflow` scope to land them (R-09). A green
+  `Dependency and secret audit` job says nothing about `uses:` pinning.
+
 ## Round 16.1 — what the proxy does NOT cover
 
 Round 16 pinned one thing: the TCP connection a site WebView makes for an
@@ -297,22 +388,22 @@ pivot into the device or the user's LAN — see
 bounded concurrency and handshake deadlines, and no logging of hosts or URLs, so
 another app's use of the port leaves no data behind for this app to leak.
 
-### 3. Resolver timeout and socket lifecycle: fixed, with tests
+### 3. Resolver timeout and socket lifecycle (round 16.1; the pool was revised in 16.2)
 
 `InetAddress.getAllByName` has **no timeout and no cancellation** — with a
 captive portal or a blackholed DNS server a single `CONNECT` could hold a
 handler thread, and 16 of those would wedge every site request. What changed:
 
-* Resolution now runs on a **fixed pool** (`Limits.resolveThreads = 4`) with a
-  bounded wait (`Limits.resolveMs = 10 s`). A timed-out future is cancelled best
-  effort; because the platform call cannot be interrupted, the abandoned lookup
-  keeps its pool thread — bounded by construction, never one thread per
-  connection. When all four are stuck, a further `CONNECT` is refused
-  immediately (a `RejectedExecutionException` mapped to `RESOLVE_FAILED`), so
-  the proxy degrades to "DNS is broken, request refused" instead of queueing.
-  Measured by `stuck_resolutions_hold_at_most_their_own_threads_and_never_queue`
-  (six attempts, ≤ 2 resolver threads, no 6× timeout wait) and
-  `a_stuck_resolver_is_refused_after_a_bounded_wait`.
+* Resolution runs on a bounded pool with a bounded wait
+  (`Limits.resolveMs = 10 s`). A timed-out future is cancelled best effort;
+  because the platform call cannot be interrupted, the abandoned lookup keeps
+  its pool thread — never one thread per connection. A further `CONNECT` while
+  a generation is full does not queue. Round 16.2 adds a **spare generation**
+  and a hard ceiling on total resolver threads
+  (`Limits.resolveThreads = 4` per generation, `Limits.resolveThreadCap = 8`):
+  a wedged generation is replaced once, and past the ceiling the answer is
+  `Refusal.RESOLVE_EXHAUSTED` — still a `502`, still fail-closed. This is
+  capacity, not recovery: see [round 16.2 §3](#3-resolver-generations-what-recoverability-this-actually-buys).
 * A timeout, a resolver exception and an empty answer are all `502` refusals and
   **no address is classified from them**; nothing is cached in either
   direction, so a failure cannot become a public verdict

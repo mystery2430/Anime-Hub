@@ -149,6 +149,23 @@ test("the declared MSRV is one value, and CI actually builds with it", () => {
     `README must state MSRV ${main}`,
   );
   assert.ok(!readme.includes("MSRV `1.77`"), "the 1.77 promise must be gone");
+  // The device checklist quoted 1.87 for a round after the manifests moved to
+  // 1.89. Documentation that names a toolchain nobody builds with is the same
+  // class of bug as a manifest nobody builds with, so the copy is pinned here.
+  const checklist = read("docs/android-dns-pinning-device-checklist.md");
+  assert.ok(
+    checklist.includes(`\`${main}\``),
+    `the device checklist must state the manifest MSRV ${main}`,
+  );
+  assert.ok(
+    !/MSRV is\s*\n?`?1\.(7[0-9]|8[0-8])/.test(checklist),
+    "the device checklist must not name an MSRV below the manifest's",
+  );
+  // ...and the CI step must really build WITH the value it read, not just
+  // print it: install, version print, locked all-targets check, annotation.
+  assert.match(ci, /rustup toolchain install "\$msrv" --profile minimal --no-self-update/);
+  assert.match(ci, /rustc "\+\$msrv" --version/);
+  assert.match(ci, /ci_annotate\.js" "\$RUNNER_TEMP\/msrv\.log" msrv/);
   assert.ok(!ci.includes('"-D warnings" --all-targets > "$RUNNER_TEMP/clippy.log" 2>&1 || true'));
 });
 

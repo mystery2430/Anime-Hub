@@ -1547,6 +1547,30 @@ test("connection pinning is wired from the proxy to the refusal", () => {
   assert.match(proxyKt, /SynchronousQueue/);
   assert.match(proxyKt, /Refusal\.BUSY/);
 
+  // Round 16.2: the loopback bind is an EGRESS control, never app isolation.
+  // The old KDoc claimed the port could not be reached "from another app on
+  // the device", which the platform facts contradict (Android loopback is
+  // shared), so the wording is pinned as well as the behaviour.
+  assert.match(proxyKt, /not an isolation boundary/);
+  assert.doesNotMatch(
+    proxyKt,
+    /must not be[\s\S]{0,40}reachable from the network, from another app/,
+    "the listener is reachable from other apps on the device; do not claim isolation",
+  );
+
+  // Resolver: a bounded pool per generation plus a hard ceiling. A stuck
+  // lookup cannot be cancelled, so the cap — not the pool size — is what keeps
+  // threads bounded, and past the cap the refusal is its own reason.
+  assert.match(proxyKt, /resolveThreads: Int = 4/);
+  assert.match(proxyKt, /resolveThreadCap: Int = 8/);
+  assert.match(proxyKt, /Refusal\.RESOLVE_EXHAUSTED/);
+  assert.match(proxyKt, /newResolverGeneration\(\)/);
+  assert.match(proxyKt, /resolveGenerations/);
+  assert.match(proxyKt, /require\(resolveThreadCap >= resolveThreads\)/);
+  // The tests must model an UNCANCELLABLE lookup: an interruptible fake made
+  // the round-16.1 "stuck" suite pass while proving the opposite case.
+  assert.match(read(`${KOTLIN}/DnsPinnedProxyTest.kt`), /class UninterruptibleResolver/);
+
   // The ONLY configuration: one loopback rule, implicit bypass removed, and no
   // bypass/DIRECT/clear call that would restore a direct path.
   assert.match(gateKt, /const val LOOPBACK_HOST: String = "127\.0\.0\.1"/);
