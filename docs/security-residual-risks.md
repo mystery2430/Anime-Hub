@@ -8,7 +8,194 @@ each one describes the state at the end of its round, including status lines
 that a later round made obsolete. The next section is the only one that
 describes the branch as it stands now.
 
-## Round 19 — current state of the branch
+## Round 20 — current state of the branch
+
+Round 20 asked one question: can a desktop WebView be made to prove, **before**
+the user's site opens, that its proxy is really in use? With the evidence
+available to this app the answer is no. The probe sketched in the round-20 brief
+cannot separate "the provider ignored the setting" from "the engine exempts
+loopback by policy", so its *negative* result is uninterpretable on two of the
+three platforms; on macOS a failed probe produces no WebView event at all, so
+"the probe finished" would be a clock; and turning the result into a gate would
+make every desktop site-open depend on engine behaviour that has never been run
+here. **No code changed in this round.** P1's first-request residual stays
+**Open**; the desktop binding stays *Implemented; device verification pending*.
+What follows is the per-platform evidence and the experiment that has to come
+first.
+
+### 1. The loopback probe measures two policies at once
+
+The proposed probe — create the site WebView on `https://127.0.0.1:<temp-port>/`
+and watch whether the `CONNECT` reaches the proxy or a throwaway listener — is a
+test of (a) *was the proxy setting applied* and (b) *does the engine exempt
+loopback from proxies*. The app needs (a). On two of the three platforms it
+cannot control (b).
+
+| | Windows / WebView2 | Linux / WebKitGTK | macOS / WKWebView |
+| --- | --- | --- | --- |
+| How the app sets the proxy | `additional_browser_args` = wry's own default string + `--proxy-server=http://127.0.0.1:<port>` + `--proxy-bypass-list=<-loopback>`; wry 0.55.1 (`webview2/mod.rs::create_environment`) passes that string to `CreateCoreWebView2EnvironmentWithOptions`, and an app-supplied string **replaces** wry's default | wry `webkitgtk/mod.rs::new_gtk` calls `website_data_manager().set_network_proxy_settings(Custom, ...)` **before** `create_webview`; Tauri keeps one `WryWebContext` per data directory (`tauri-runtime-wry` `WebContextStore`), and on Linux it lives for the app's lifetime | wry `wkwebview/mod.rs` writes the `proxyConfigurations` key on `WKWebsiteDataStore` through KVC, behind the `mac-proxy` feature; the app refuses to open a site below Darwin 23 |
+| Can the app force loopback **through** the proxy? | **Yes, in principle** — `<-loopback>` subtracts Chromium's implicit bypass rules (`localhost`, `*.localhost`, `[::1]`, `127.0.0.1/8`, `169.254/16`, `[FE80::]/10`), and the flag is the documented way to do it | **No such control.** WebKit builds a `GSimpleProxyResolver` with the default proxy and calls `set_ignore_hosts` only when the settings carry a non-empty list (`SoupNetworkSession.cpp`); wry passes an empty list (`NetworkProxySettings::new(uri, &[])`) and GLib's resolver has no built-in localhost list (`gsimpleproxyresolver.c`). Nothing *documents* an exemption — but nothing in the app sets or can read the effective ignore list either | **No such control**, and Apple documents nothing about how `proxyConfigurations` treats loopback |
+| Can the app read the effective proxy back? | No. `ICoreWebView2ProxyController` reports only what the host itself set | No | No |
+| What a direct local hit would mean | a real anomaly: the flags are supposed to proxy loopback | **ambiguous**: ignored setting *or* engine exemption | **ambiguous**: ignored setting *or* engine exemption |
+
+So the deny branch is interpretable only on Windows, and even there the flag can
+be replaced from outside the app: Chromium's `ProxySettings` policy "configures
+the proxy settings ... which ignore all proxy-related options specified from the
+command line", and policies outrank switches. A probe that fails closed on a
+false alarm leaves the app unable to open a site, with nothing in the UI that
+could fix it.
+
+The *positive* branch is meaningful everywhere: a `CONNECT` for the probe target
+arriving at this listener means this WebView, with this data directory and these
+arguments, used this proxy for that navigation. It says nothing about traffic
+the engine can open outside a proxy configuration — WebRTC/ICE/UDP stays out of
+scope (round 17) — and nothing about a configuration that changes afterwards.
+
+### 2. A failed probe is not a terminal event on macOS
+
+The brief's "definitive completion" condition needs a signal that the probe
+navigation ended. In wry 0.55.1 the three platforms differ:
+
+| Platform | Event on a *failed* navigation | Evidence |
+| --- | --- | --- |
+| Windows / WebView2 | `PageLoadEvent::Finished` | `webview2/mod.rs` subscribes to `NavigationCompleted` and calls the handler without reading `IsSuccess` — the event carries that flag, i.e. it is also raised when loading stopped with an error |
+| Linux / WebKitGTK | `PageLoadEvent::Finished` | WebKitGTK `load-changed`: `WEBKIT_LOAD_FINISHED` "when the load finishes successfully or due to an error" |
+| macOS / WKWebView | **none** | `wkwebview/class/wry_navigation_delegate.rs` implements `didCommitNavigation` and `didFinishNavigation` (plus the policy, download and process-termination callbacks); there is no `didStartProvisionalNavigation` and no `didFail*`. A probe that never commits produces no page-load event at all |
+
+On macOS the only completion signal would be the app's own timeout; on the other
+two it is an event whose failure semantics wry does not distinguish. A gate
+built on three different notions of "done" is not a mechanism this branch
+should carry.
+
+### 3. A variant that avoids loopback is sounder — and still not shippable
+
+One variant removes the loopback question entirely: create the site WebView on
+`https://<nonce>.probe.invalid/` and wait for the pinned proxy to record
+`CONNECT <nonce>.probe.invalid:443`. Chromium resolves the proxy *before* the
+name ("Proxy resolution happens before name resolution ... client side name
+resolution may never be performed"), so a proxied navigation reaches our
+listener without any DNS traffic; a bypassed one attempts a lookup of a reserved
+RFC 2606 name and never reaches the listener at all. No temporary listener and
+no loopback policy are involved: a positive result means exactly one thing —
+this WebView sent a `CONNECT` to this proxy.
+
+It is still not shippable as it stands:
+
+* **The deny path is a clock.** "No `CONNECT` within N seconds" cannot tell an
+  ignored setting from a slow start (cold WebView2 environment, disk, first
+  launch on macOS), and the brief requires failure *and* timeout to keep the
+  site closed — so every false timeout costs the user the site.
+* **It makes the open path asynchronous and fail-closed.** Today
+  `open_in_main_window_inner` creates the WebView with
+  `WebviewUrl::External(site_url)` and returns the label; the site starts
+  loading at once. A probe needs the initial URL to be the probe, an
+  exact-URL one-shot allowance inside the `on_navigation` closure that also
+  performs the DNS-rebinding check, a main-thread `navigate()` to the site only
+  after the proxy reports, and a close path for timeout and failure. Each piece
+  is reviewable; the composition has never run on a real WebView and it sits on
+  the same handler as the navigation policy.
+* **The probe host would have to be refused before resolution.** The proxy
+  resolves the `CONNECT` target and classifies every answer; on a resolver that
+  hijacks `.invalid` (NXDOMAIN redirection) the probe would open a real upstream
+  socket. Any future implementation must special-case the exact probe host and
+  refuse it *without* resolving, and must not let that case apply to a
+  user-supplied URL.
+* **The blast radius is inverted.** Today an ignored setting produces a page
+  that loads and is then closed by the `Finished` zero-CONNECT check. A gate
+  turns the same condition into "no site ever opens", which is far harder to
+  diagnose from a bug report — and no CI job can see any of it.
+
+### 4. The experiment that must come before any implementation
+
+A debug-only, throwaway build plus one run per platform answers the open
+questions. None of this is evidence this repository can produce.
+
+1. Log every accepted `CONNECT` in `pinned_proxy.rs` (host and port) and every
+   `on_navigation` decision together with its URL.
+2. Point the site WebView at `https://<nonce>.probe.invalid/` (debug builds
+   only) and record: whether `on_navigation` fires for it; whether the proxy
+   logs `CONNECT <nonce>.probe.invalid:443`; which page-load events arrive
+   (macOS expectation from §2: none); and whether the open path can be closed
+   cleanly from a timeout.
+3. Repeat with `https://127.0.0.1:<port>/` and a throwaway loopback listener
+   (never the proxy port) to learn whether the platform exempts loopback. If it
+   does, that alone disqualifies the loopback variant there.
+4. Repeat after switching sites twice and after closing and reopening the
+   window, to show that no probe state or counter survives.
+
+Only if step 2 is consistently a proxy `CONNECT` on all three platforms does the
+gate have a defined meaning; step 3 decides which probe shape, if any, is
+allowed on each one.
+
+### 5. Conditions any future implementation must satisfy
+
+All of these, before a probe is allowed to decide anything:
+
+* the user-supplied site URL is never opened by the initial `WebviewUrl`, a
+  preload or an automatic redirect before the probe completes;
+* the probe URL is chosen by the app and the document it loads is an engine
+  error page — no user content, no JavaScript, no remote resources;
+* TLS verification is never relaxed and certificate errors are never swallowed
+  to make the probe "succeed";
+* a proxy refusal is never read as permission for a direct connection;
+* the navigation allowance matches exactly the expected URL, is consumed once
+  and lives in a preflight state that expires;
+* failure, timeout, an unexpected page-load event and a direct local hit all
+  leave the site unopened;
+* the proxy-usage counter is not the completion condition: a direct-hit
+  detector *and* an explicit completion condition are both required;
+* switching sites, closing the window and reopening within one session must not
+  reuse preflight state or counters.
+
+### 6. Other mechanisms, as options rather than fixes
+
+Unchanged from round 19 §3 and still not implemented: `WebResourceRequested`
+(WebView2 — deprecated filter, iframe caveat, no WebSocket event, not exposed by
+wry/Tauri), `WebKitWebPage::send-request` (WebKitGTK — a real veto, but it needs
+a web-process extension directory that wry can pass and Tauri 2.11.6 cannot, and
+it does not cover WebSocket handshakes), and macOS has no subresource
+interception at all.
+
+A fourth option is worth naming because it is the only one that would be a real
+boundary rather than a check: an **OS-level packet filter** scoped to the
+WebView's network process (Windows Filtering Platform, Linux cgroup/eBPF or
+`nftables` with a cgroup match, macOS `pf` or a Network Extension). It blocks
+all egress except the proxy port, which is precisely the missing guarantee. It
+is not a code change: it needs administrator/root rights, an installer or a
+system extension, per-OS engineering and a per-platform support story, and the
+WebKit network process is attributed by process/bundle, not per view. It stays
+an option with its own scope and distribution cost, not a fix.
+
+### 7. Status after round 20
+
+| Item | Status | Change this round |
+| --- | --- | --- |
+| Desktop proxy / first request (P1) | **Implemented; device verification pending**; first-request residual **Open** | The preflight was evaluated per platform and **not** implemented (§1–§3); no probe code, no new native component. |
+| Android DNS cancellation (P2) | **Implemented; device verification pending** | Unchanged; round-19 evidence stands. |
+| Loopback proxy authentication (P3) | **Open; product decision** | Unchanged; no `407` code. |
+| WebRTC/UDP (P4) | **Partially fixed**; UDP/QUIC **Open; technical limitation** | Unchanged. |
+| AniList OAuth (P5) | **Implementation fixed; AniList registration/E2E pending** | Unchanged. |
+
+**What is still not proven:** a real WebView2 / WebKitGTK / WKWebView run for
+P1 (and with it the §4 experiment); whether a real Android provider honours the
+cancel and reports afterwards (checklist items 36–42 remain NOT YET RUN);
+an AniList login; the independent human review. R-01(b), GO-01, GO-04, GO-02/03
+and GO-06 stay open, and R-09's pins still live only on this branch.
+
+### Sources fetched this round
+
+| Source | What it established |
+| --- | --- |
+| `chromium.googlesource.com/chromium/src/+/main/net/docs/proxy.md` | The implicit bypass rule list, `<-loopback>` as the only way to subtract it, bypass lists applying to manual settings only, and proxy resolution happening before name resolution |
+| Chrome Enterprise `ProxySettings` policy page | A machine policy overrides proxy options "specified from the command line" |
+| `webkitgtk.org` `WebView::load-changed` (stable) | `WEBKIT_LOAD_FINISHED` is emitted "successfully or due to an error" |
+| WebKit `Source/WebCore/platform/network/soup/SoupNetworkSession.cpp` | Custom proxy → `g_simple_proxy_resolver_new(nullptr, nullptr)`, ignore-hosts set only when non-empty |
+| GLib `gio/gsimpleproxyresolver.c` | No built-in ignore list: with a `NULL` list nothing is bypassed |
+| WebKit `Source/WebKit/UIProcess/API/glib/WebKitWebsiteDataManager.cpp` | Custom proxy settings are stored on the data store that backs the manager |
+| wry 0.55.1 (`webview2/mod.rs`, `webkitgtk/mod.rs`, `wkwebview/mod.rs`, `wkwebview/navigation.rs`, `wkwebview/class/wry_navigation_delegate.rs`) | Where each platform's proxy is applied, that an app-supplied argument string replaces wry's default, and that the macOS delegate has no `didFail*` |
+| tauri-runtime-wry 2.11.6 (`WebContextStore`, `parse_proxy_url`) | One `WebContext` per data directory, kept alive on Linux; `proxy_url` → `with_proxy_config` |
+
+## Round 19 — state at the end of round 19 (history; superseded by round 20)
 
 Round 19 found a real defect in the Android resolver adapter — the shipped code
 did not do what its own tests and documents said it did — and settled, with
