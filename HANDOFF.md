@@ -101,6 +101,40 @@ macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TC
 `CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
 `HANDOFF` bölüm 6.D'de.
 
+**Round 21 — masaüstü yerel vekil erişimi doğrulandı (açık), DNS `Unknown`
+fail-open yolu kapatıldı.** İki bulgu kaynak üzerinden kontrol edildi. (1) P3'ün
+kapsamı masaüstünü de içeriyor: `pinned_proxy.rs` `127.0.0.1` üzerinde efemer bir
+porta bağlanır (ağdan erişilemez) ama istemciyi **kimlik doğrulamaz**
+(`accept_loop` peer adresini `_peer` olarak alır), `parse_connect` sıfır olmayan
+her portu kabul eder ve tek sınır hedef politikasıdır (`PUBLIC_ONLY`). Yani site
+oturumu açıkken yerel bir süreç portu bulup **herkese açık** hedeflere, ürünün
+izin verdiği her porttan tünel açabilir; özel/loopback hedefler reddedildiği için
+LAN'a/cihaza pivot değildir, TLS uçtan uca olduğu için bu uygulamanın trafiğini
+okuyamaz, tavanlar (48 bağlantı, 10 s el sıkışma, 5 s çözümleme, 10 s bağlanma)
+nedeniyle yalnızca sınırlı hizmet reddi üretebilir. Kimlik doğrulama **sevk
+edilmedi**: WebView2'de `BasicAuthenticationRequested` gerçek bir 407 akışı
+sunuyor ve proxy URI'sini veriyor, WebKitGTK'da `authenticate` +
+`is_for_proxy` (2.2+) var, ama **wry 0.55.1 hiçbir masaüstü arka ucunda auth
+işlemez ve Tauri 2.11.6 dışa açmaz**; macOS'ta belgelenmiş kimlik bilgisi yolu
+yok, ayrıca Chromium `--proxy-server` içindeki kimlik bilgisini zaten yok sayar.
+Port sınırlaması (yalnızca 443) **uygulanmadı**: `validate_site_url` özel HTTPS
+portlarını kabul ediyor, 443 kısıtı ürünü bozardı. (2) Masaüstünde üst düzey
+gezinmede DNS `Unknown` artık **reddediliyor** (`session::dns_decision`): bu
+değer yalnızca bir kesinti değil, `MAX_LOOKUP_THREADS` dolduğunda **anında**
+dönen değerdir — yani bir sayfa dört sorguyu askıda tutup kontrolü atlatabiliyordu
+ve masaüstünde ilk istek vekilden geçmediği için (P1) geriye WebView'un kendi
+çözümlemesi kalıyordu. Ayrı bir mesaj (`DNS_UNKNOWN_BLOCK`) kullanılır, rebinding
+iddia edilmez, hiçbir şey önbelleğe/engel listesine yazılmaz, tekrar denenebilir.
+Kapsam **yalnızca üst düzey gezinme**: `blob:`/`about:blank` DNS'e hiç gitmez
+(MSE oynatma ve oyuncu popup'ları bozulmasın diye), `open_site` bu reddi yalnızca
+masaüstünde uygular (Android'de `DnsPinnedProxy` bağlantı anında yeniden çözer).
+TOCTOU/rebinding, alt kaynaklar ve R-01(b) **açık** kalır. Testler:
+`navigation_blocks_a_private_answer_and_an_unanswered_lookup`,
+`a_rejected_url_is_not_rescued_by_a_public_dns_answer`,
+`the_listener_binds_loopback_only`,
+`a_local_client_is_served_without_authentication` ve `command_wiring` içindeki
+kaynak-metni pini. Ayrıntı: `docs/security-residual-risks.md` round 21.
+
 **Round 20 — masaüstü ön-uçuş (preflight) fikri değerlendirildi, uygulanmadı.**
 Amaç, site WebView'ı gerçek siteye gitmeden önce yalnızca uygulamanın denetlediği
 bir adrese yönlendirilip "CONNECT vekile mi geldi, yoksa doğrudan dinleyiciye mi
@@ -212,6 +246,8 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **macOS** | **Round 17: hedef kapsamına alındı** (site vekili `macos-proxy` + Darwin ≥ 23 kapısı; alt sürümlerde açılış reddedilir). CI'da `Tests (macos-latest)` işi derleyip test ediyor; **gerçek WKWebView üzerinde proxy/pin davranışı ve notarization doğrulanmadı**. Anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
 | **İmzalı yayın APK** | ✅ Keystore secret'ları (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) repository secrets'a eklendi; workflow imzalı üretiyor |
 | **`.deb` / AppImage / rpm** | v0.3.2 Release Desktop Ubuntu işi geçti ve üç Linux paketini yayımladı (`.deb`, `.rpm`, AppImage) |
+| **Masaüstü loopback vekili — istemci kimlik doğrulaması** | Round 21'de kaynakta doğrulandı: `pinned_proxy.rs` yalnızca `127.0.0.1`'e bağlanır (ağdan erişilemez) ama istemciyi doğrulamaz; site oturumu açıkken yerel bir süreç efemer portu bulup **herkese açık** hedeflere tünel açabilir. Kimlik doğrulama sevk edilmedi (wry 0.55.1 / Tauri 2.11.6 platformun `407` yolunu dışa açmıyor; macOS'ta belgelenmiş yol yok) ve 443 kısıtı özel portlu siteleri bozacağı için uygulanmadı. **Açık; ürün kararı gerekir.** `docs/security-residual-risks.md` round 21 |
+| **Masaüstü DNS kapısı (round 21)** | `DnsClass::Unknown` artık masaüstünde üst düzey gezinmeyi ve site açılışını reddediyor; birim testleri ve JS kaynak pini var. **Gerçek WebView2 / WebKitGTK / WKWebView çalıştırması yapılmadı** (bu ortamda WebView yok); TOCTOU/rebinding, `fetch`/XHR/iframe ve ilk isteğin vekilden geçtiği kanıtı kapsam dışı ve açık kalıyor |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
 | **Gerçek sitelerin yüklenmesi** | Uygulama GUI'si başsız ortamda açılmıyor; WebView'da `openani.me`'nin gerçekten render olduğu görülmedi |
 | **Site logoları** | OpenAnime ve Animecix karoları yerel dosya kullanır (`public/logos/`). İkisi de sitelerin kendi işaretleri; uydurma oynat simgesi kaldırıldı. Fotoğraf ekleme arayüzü yazıldı |

@@ -233,7 +233,7 @@ site yolları hiç dokunmaz.
 | `http://` reddi | ✅ `on_navigation` | ⚠️ motorun mixed-content politikası | ✅ `SiteNavigationPolicy` | ✅ `shouldInterceptRequest` |
 | Özel/loopback **IP literalleri** ve host kuralları | ✅ | ❌ | ✅ | ✅ |
 | Kullanıcı engel listesi | ✅ | ❌ masaüstünde alt kaynak kesme noktası yok | ✅ | ✅ |
-| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol; vekil kullanılırsa bağlantı denetlenen IP'ye sabitlenir — **ilk isteğin vekilden geçtiği kanıtlanmadı** (round 20) | ❌ | ✅ **CONNECT proxy'si bağlantıyı denetlenen IP'ye sabitler** (cihazda doğrulanmadı) | ✅ aynı (her istek yeni karar) |
+| DNS ile özel adrese çözümleme (rebinding) | ⚠️ ön kontrol; **DNS yanıtsız kalırsa üst düzey gezinme reddedilir** (round 21); vekil kullanılırsa bağlantı denetlenen IP'ye sabitlenir — **ilk isteğin vekilden geçtiği kanıtlanmadı** (round 20) | ❌ | ✅ **CONNECT proxy'si bağlantıyı denetlenen IP'ye sabitler** (cihazda doğrulanmadı) | ✅ aynı (her istek yeni karar) |
 | `data:` üst düzey belge | ✅ reddedilir | ➖ (alt kaynak olarak serbest) | ✅ reddedilir | ➖ serbest |
 | **WebRTC / ICE / STUN / TURN (UDP)** | ❌ | ❌ | ❌ **proxy kapsamı dışı** (API init script ile kaldırılır — garanti değil) | ❌ |
 
@@ -301,7 +301,15 @@ bunun için bir söz vermez; `AsyncDnsResolverTest` bunu fake bir lookup ile
 JVM'de ölçer, cihazı değil (madde 36–39 ve 42; round 19).
 Ayrıca `127.0.0.1`'e bağlanmak **yalnızca dış ağ arayüzlerini** kapatır; aynı
 cihazdaki başka uygulamalar bu portu bulup kullanabilir (kimlik doğrulama
-`ProxyConfig` ile mümkün değildir, açık kalan risk).
+`ProxyConfig` ile mümkün değildir, açık kalan risk). **Round 21:** aynı durum
+masaüstü vekili için de doğrulandı — `pinned_proxy.rs` istemciyi
+kimlik doğrulamaz, yalnızca hedef politikasıyla (yalnızca public adresler)
+sınırlar; oturum açıkken yerel bir süreç portu bulup genel bir çıkış tüneli
+olarak kullanabilir. Kimlik doğrulama sevk edilmedi: Windows'ta
+`BasicAuthenticationRequested`, Linux'ta `authenticate` + `is_for_proxy` var
+ama **sabitlenen wry 0.55.1 hiçbir masaüstü arka ucunda bu yolu dışa açmıyor**,
+macOS/WKWebView'da ise belgelenmiş bir proxy kimlik doğrulama yolu yok. Ayrıntı:
+`docs/security-residual-risks.md` round 21.
 
 `NavigationDnsGate` / `shouldInterceptRequest` ön kontrolleri **savunma
 derinliği** olarak korunur; artık garanti olarak sunulmaz. Bu ortamda Android

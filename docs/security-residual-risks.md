@@ -8,7 +8,140 @@ each one describes the state at the end of its round, including status lines
 that a later round made obsolete. The next section is the only one that
 describes the branch as it stands now.
 
-## Round 20 — current state of the branch
+## Round 21 — current state of the branch
+
+Round 21 checked two findings against the shipped source and the supported
+platform APIs. One was a real, closable gap and is closed; the other was real
+and is **not** closed, because every supported authentication path runs through
+code this stack does not expose. No preflight was revived (round 20 stands), and
+the first-request residual stays **Open**.
+
+### 1. The desktop proxy is reachable by local processes (P3, verified)
+
+`pinned_proxy.rs` binds `("127.0.0.1", 0)` — loopback, OS-chosen port — so
+nothing outside the machine can dial it. It does **not** authenticate the
+caller: `accept_loop` takes the peer address as `_peer` and never looks at it,
+`parse_connect` accepts any non-zero port, and the only thing between a local
+client and the internet is the destination policy (`Policy::PUBLIC_ONLY`).
+
+| Question | Answer |
+| --- | --- |
+| Can another process on the machine reach it? | **Yes**, if it scans or guesses the ephemeral port. |
+| Can it use the listener as a general egress path? | **Yes** — `CONNECT` to any public host on any port is tunnelled. Private, loopback, link-local and ULA destinations are refused, so it is not a pivot into the LAN or the device, but it *is* an unauthenticated public egress on the machine. |
+| Is that a privilege escalation? | **No by itself** — any process that can dial loopback can usually open its own TCP sockets. The delta is exactly the case where it cannot: a sandboxed or firewall-restricted process that is allowed to reach loopback inherits this app's egress, including ports its own rules block. |
+| Can it read this app's traffic? | **No.** Each tunnel is its own socket pair, TLS is end to end, and the proxy holds no cookies, tokens or URLs. |
+| Can it break the site session? | **Only by occupying slots.** 48 connections (`max_connections`), a 10 s handshake deadline, a 5 s resolve deadline and a 10 s connect deadline; beyond the ceiling the answer is an immediate `503`, never a queue. |
+| Can it remove the WebView's proxy binding? | **No.** The binding is per environment/context/data-store and nothing on loopback can change it. |
+
+**Port restriction was considered and rejected.** Limiting `CONNECT` to 443
+would shrink the tunnel surface, but `validate_site_url` accepts custom HTTPS
+ports (it normalises the URL and never touches `port()`), so a 443-only proxy
+would break any site the product currently allows. That is a compatibility
+trade the round was told not to make silently, so it was not made at all.
+
+### 2. Proxy authentication: what each platform supports, and what this stack exposes
+
+The five questions from the brief, per platform:
+
+| | Windows / WebView2 | Linux / WebKitGTK | macOS / WKWebView |
+| --- | --- | --- | --- |
+| 1. Can the app hand a credential to the WebView before the `CONNECT`? | **Only through the auth event**, and only after a challenge. Chromium ignores credentials embedded in `--proxy-server` ("Chrome does not implement this, and will not use any credentials embedded in the proxy settings"). | Yes — `WebKitWebView::authenticate` plus `webkit_authentication_request_authenticate()` is the documented path. | **No documented path.** `proxyConfigurations`/`NWProxyConfig` carries an endpoint, not credentials, and WKWebView exposes no proxy-auth delegate. |
+| 2. Does a real `407` flow exist? | Yes: `BasicAuthenticationRequested` is raised for "a Proxy Authentication request", `args.Uri` is "the URI of the proxy server" for that case, and a 407 surfaces as `ValidProxyAuthenticationRequired` on the navigation. | Yes: `WebKitAuthenticationRequest.is_for_proxy()` (since 2.2) distinguishes proxy challenges. | Not documented for WKWebView. |
+| 3. Does the pinned stack expose it? | **No.** wry 0.55.1's WebView2 backend contains no authentication handler at all (`grep authentication` → nothing), and Tauri 2.11.6 adds none. It would need raw COM (`ICoreWebView2_10::add_BasicAuthenticationRequested`) reached through `with_webview`, which is app-level unsafe code, not a wry feature. | **No.** wry's GTK backend never connects `authenticate`; Tauri exposes no hook. It would need the GTK widget from `with_webview` plus a GObject signal. | **No.** wry's macOS navigation delegate binding has no `didReceive challenge:` method at all. |
+| 4. Could the credential be random, native-only, unlogged? | Yes, in principle — but the handler itself would live in this app and would have to be written per platform. | Same. | n/a. |
+| 5. Could `Proxy-Authorization` leak upstream? | Not with CONNECT: the header travels in the `CONNECT` request to the proxy and the tunnel is opaque bytes afterwards. A future implementation would still have to strip it before tunnelling anything that is not a `CONNECT`. | Same. | n/a. |
+
+**Outcome: no authentication is shipped, and no `407` prototype is shipped.**
+Three platform-specific native components, one of them raw COM and one of them a
+GObject signal on a widget this app never otherwise touches, cannot be validated
+here (no device, no WebView runtime), and the failure mode of a wrong guess is
+"the site never loads". The honest state is a documented, bounded,
+unauthenticated loopback listener — exactly the shape Android already has.
+
+### 3. What round 21 closed: the desktop DNS-`Unknown` fail-open
+
+Before this round the desktop top-level gate reasoned like this: if the resolver
+did not answer, fall back to the string policy, because "a DNS outage must not
+make every site unopenable". The second half of that sentence is true and the
+first half is not safe:
+
+* `DnsClass::Unknown` is not only an outage. `dns.rs` returns it **immediately
+  when four lookups are already in flight** (`MAX_LOOKUP_THREADS`), and a page
+  can keep four lookups in flight. So a hostile page could *choose* to skip the
+  DNS check for its next top-level navigation.
+* On desktop nothing else covered that navigation: the proxy binding is
+  unproven for the first request (P1), so the WebView's own resolver was the
+  only thing left — which is the rebinding window the check exists to close.
+
+**What changed (desktop, top-level navigations only):**
+
+* `session::dns_decision` is now the single DNS verdict, used by the WebView
+  callback and by the site-open path. `Answered { private: true }` keeps the
+  existing message; `Answered { private: false }` still allows; `Unknown` is now
+  a refusal with its **own** notice (`DNS_UNKNOWN_BLOCK`), which says the name
+  could not be verified and never claims a rebinding was detected.
+* The navigation gate classifies only `https` URLs that have a host. `blob:`
+  (the MSE player's object URLs) and `about:blank` pass the string policy and
+  are *not* sent to DNS — blocking them would break playback and player popups
+  while protecting nothing, since they inherit a document that already passed.
+* `open_site` refuses an unanswered lookup **on desktop only**. Android keeps
+  the old behaviour on purpose: its site WebView resolves the name again inside
+  `DnsPinnedProxy` and refuses a private target, so refusing the open there
+  would be a usability regression with no security gain.
+
+**Cost, stated:** a slow or broken resolver now refuses the navigation or the
+open. Nothing about `Unknown` is cached, so a retry resolves again, and no
+blocklist entry, registry row or per-host verdict is written. Public answers
+keep their 15 s cache, so the cost is per host, not per navigation.
+
+**What this does not close** (and the document does not claim otherwise): a
+public answer that later changes to a private one (TOCTOU/DNS rebinding),
+`fetch`/XHR/iframes and every other subresource, WebRTC/UDP, the unproven
+first-request proxy binding, and the local-process access in §1. R-01(b) stays
+**Open**.
+
+### 4. Tests added
+
+| Test | What it proves |
+| --- | --- |
+| `navigation_blocks_a_private_answer_and_an_unanswered_lookup` (`session.rs`) | Private answer blocks with the rebinding message; `Unknown` blocks with the *other* message; a public answer allows. |
+| `a_rejected_url_is_not_rescued_by_a_public_dns_answer` (`session.rs`) | Scheme policy, a private literal and a silent blocklist hit all still win when DNS says "public"; the same holds for `Unknown`. |
+| `the_listener_binds_loopback_only` (`pinned_proxy.rs`) | The listener's bound address is loopback and the port is OS-assigned — the network-side boundary, pinned. |
+| `a_local_client_is_served_without_authentication` (`pinned_proxy.rs`) | Pins the **open** residual: a bare TCP client with no credentials is tunnelled exactly like the WebView. Adding authentication later must change this test and §1 together. |
+| `the desktop DNS gate refuses an unanswered lookup, and only for top-level https` (`tests/command_wiring.test.js`) | Source-string pin for the branch shape (desktop-only open refusal, `https`+host classification, `Unknown` → block). It is **not** a WebView behaviour test. |
+
+### 5. Status after round 21
+
+| Item | Status | Change this round |
+| --- | --- | --- |
+| Desktop proxy / first request (P1) | **Implemented; device verification pending**; first-request residual **Open** | Unchanged. Round 20's preflight stays rejected; no probe code. |
+| Desktop loopback proxy access (P3) | **Open; product decision**, now explicitly desktop **and** Android | Verified in source; no authentication shipped; port restriction rejected as incompatible. |
+| Desktop DNS `Unknown` (top-level) | **Closed for top-level desktop navigations**; rebinding/TOCTOU and subresources **Open** | `Unknown` refuses; distinct notice; open path refuses on desktop only; `blob:`/`about:` carve-out. |
+| Android DNS cancellation (P2) | **Implemented; device verification pending** | Unchanged (round 19 evidence). |
+| Loopback proxy auth (P3, Android) | **Open; product decision** | Unchanged; still no `407` code. |
+| WebRTC/UDP (P4) | **Partially fixed**; UDP/QUIC **Open; technical limitation** | Unchanged. |
+| AniList OAuth (P5) | **Implementation fixed; AniList registration/E2E pending** | Unchanged. |
+
+**What is still not proven:** a real WebView2 / WebKitGTK / WKWebView run for
+P1, the round-20 probe experiment, and the DNS gate above (the tests are
+compiled logic and source pins, not a WebView run); whether a real Android
+provider honours the cancel and reports afterwards (checklist items 36–42 stay
+NOT YET RUN); an AniList login; the independent human review. R-01(b), GO-01,
+GO-04, GO-02/03's rebinding half and GO-06 stay open; R-09's pins still live on
+this branch only.
+
+### Sources fetched this round
+
+| Source | What it established |
+| --- | --- |
+| Microsoft Learn, `CoreWebView2.BasicAuthenticationRequested` / `CoreWebView2BasicAuthenticationRequestedEventArgs` | The event covers proxy authentication; `Uri` is the proxy's URI for that case; the host supplies credentials. |
+| Microsoft Learn, "Basic authentication for WebView2 apps" | A 407 produces `ValidProxyAuthenticationRequired` on the navigation and the auth event, i.e. the flow exists end to end. |
+| Chromium `net/docs/proxy.md` | "Chrome does not implement this, and will not use any credentials embedded in the proxy settings" — the credential-in-URL shortcut is unavailable. |
+| webkitgtk.org `AuthenticationRequest.is_for_proxy` (since 2.2) | WebKitGTK has a documented proxy-challenge discriminator; `authenticate` is the response path. |
+| wry 0.55.1 sources (`webview2/mod.rs`, `webkitgtk/mod.rs`, `wkwebview/*`) | No authentication handling on any desktop backend, and no auth-challenge method in the macOS delegate. |
+| `src-tauri/src/web/pinned_proxy.rs`, `dns.rs`, `session.rs`, `commands.rs` | The behaviour described in §1–§3, including the lookup budget that made `Unknown` attacker-triggerable. |
+
+## Round 20 — state at the end of round 20 (history; superseded by round 21)
 
 Round 20 asked one question: can a desktop WebView be made to prove, **before**
 the user's site opens, that its proxy is really in use? With the evidence

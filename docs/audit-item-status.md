@@ -145,6 +145,8 @@ These stay open pre-merge risks; documenting them is not closing them.
 | Flush worker replacement is bounded | fixed (host-tested; device behaviour still R-04) | `SiteProfileOps.kt` `MAX_ABANDONED_WORKERS`, `SiteFlushWorker.kt` refusal |
 | Blocklist transfers serialized + generation-guarded | fixed (host-tested; `cargo test` not runnable in the review environment — see R-04) | `commands.rs` `BlocklistSyncGate`, `transfer_blocklist_with_generation`, `blocklist_transfer_snapshot`, `rebuild_blocklist` |
 | Active workflows pinned to commit SHAs | **implemented on PR branch; validated by CI** | see R-09 |
+| Desktop DNS `Unknown` refuses the top-level navigation (round 21) | **fixed in source; real WebView run pending** — `session::dns_decision`, the `https`-only classification in `windows.rs`, and the desktop-only refusal in `open_site`; `blob:`/`about:` are not sent to DNS. Scope: top-level only; TOCTOU and subresources unchanged | `src-tauri/src/web/session.rs`, `web/windows.rs`, `commands.rs` |
+| Desktop loopback proxy authenticates its client | **open** — the listener is loopback-only but unauthenticated; any local process can use it as a public-target tunnel. No `407` shipped: no desktop backend of the pinned wry exposes the platform's proxy-auth path | `src-tauri/src/web/pinned_proxy.rs`; `docs/security-residual-risks.md` round 21 |
 
 ### Android 8/9 support was dropped
 
