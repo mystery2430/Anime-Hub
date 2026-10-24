@@ -550,7 +550,7 @@ mod tests {
     /// The second CONNECT must not open a socket to the private address.
     #[tokio::test]
     async fn a_rebinding_second_answer_never_reaches_the_private_address() {
-        let (catcher_port, mut catcher) = {
+        let (catcher_port, catcher) = {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
             (port, listener)
@@ -591,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mixed_answer_is_refused_as_a_whole() {
-        let (catcher_port, mut catcher) = {
+        let (catcher_port, catcher) = {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
             (port, listener)

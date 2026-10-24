@@ -2238,7 +2238,11 @@ mod tests {
     #[tokio::test]
     async fn prepare_login_refuses_the_custom_scheme_on_every_platform() {
         let prepared = prepare_login(&cfg_with("animehub://anilist/callback")).await;
-        let err = prepared.expect_err("the custom scheme must be refused");
+        // `PreparedLogin` has no `Debug`, so a match instead of `expect_err`.
+        let err = match prepared {
+            Ok(_) => panic!("the custom scheme must be refused"),
+            Err(e) => e,
+        };
         assert_eq!(err.code(), "anilist");
         assert!(err.to_string().contains("127.0.0.1"));
         assert!(!err.to_string().contains("animehub://anilist/callback"));

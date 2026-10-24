@@ -22,38 +22,68 @@ const COMMANDS_RS = read("src-tauri/src/commands.rs");
 // Only the implementation matters for ordering; the test module restates
 // pieces of it and would make every index ambiguous.
 const OPEN_PATH = WINDOWS_RS.slice(
-  WINDOWS_RS.indexOf("async fn open_in_main_window_inner"),
+  WINDOWS_RS.indexOf("fn open_in_main_window_inner"),
   WINDOWS_RS.indexOf("fn close_current_child_locked"),
 );
+// The asynchronous half: binds the proxy, then takes the session lock.
+const OPEN_ENTRY = WINDOWS_RS.slice(
+  WINDOWS_RS.indexOf("async fn open_in_main_window("),
+  WINDOWS_RS.indexOf("fn open_in_main_window_inner"),
+);
 
-test("the proxy starts before the WebView exists and its failure aborts the open", () => {
-  const start = OPEN_PATH.indexOf("start_site_proxy().await?");
-  const addChild = OPEN_PATH.indexOf(".add_child(");
-  const builder = OPEN_PATH.indexOf("tauri::WebviewBuilder::new");
-  assert.ok(start > 0, "the open path must start the proxy");
-  assert.ok(builder > 0 && addChild > builder, "the WebView is built and then attached");
-  assert.ok(
-    start < builder,
-    "the proxy must be running before the builder is constructed, so the first navigation is covered",
+test("the proxy is bound before the session lock and before the WebView exists", () => {
+  const bind = OPEN_ENTRY.indexOf("start_site_proxy_handle().await?");
+  const lock = OPEN_ENTRY.indexOf("lock_desktop_session()?");
+  assert.ok(bind > 0, "the open path must bind the proxy");
+  // Binding is the only await on the path, so it happens before the session
+  // lock: a std MutexGuard alive across a suspend point would make the tauri
+  // command future non-Send. Everything that touches session state, including
+  // the install and the add_child call, is in the synchronous half.
+  assert.ok(lock > bind, "the lock is taken after the only await, never across it");
+  // `?` is the fail-closed half: a failed bind returns before the lock and
+  // before any WebView call.
+  assert.match(OPEN_ENTRY, /let proxy = start_site_proxy_handle\(\)\.await\?;/);
+  // The handle crosses into the synchronous half, so that half cannot reach
+  // the builder without one.
+  assert.match(
+    OPEN_ENTRY,
+    /open_in_main_window_inner\(app, site, url, init_script, fullscreen, proxy\)/,
   );
-  // `?` is the fail-closed half: a start error returns before any WebView call.
-  assert.match(OPEN_PATH, /let proxy_port = start_site_proxy\(\)\.await\?;/);
 });
 
-test("the previous session's proxy is stopped before a new one starts", () => {
-  const startFn = WINDOWS_RS.slice(
-    WINDOWS_RS.indexOf("async fn start_site_proxy"),
+test("the inner open installs that proxy before any WebView and cannot start its own", () => {
+  assert.equal(
+    OPEN_PATH.indexOf("start_site_proxy"),
+    -1,
+    "the synchronous half must not bind a proxy of its own: it received one",
+  );
+  const install = OPEN_PATH.indexOf("install_site_proxy(proxy)");
+  const builder = OPEN_PATH.indexOf("tauri::WebviewBuilder::new");
+  const addChild = OPEN_PATH.indexOf(".add_child(");
+  assert.ok(install > 0, "the handle must become the session proxy");
+  assert.ok(builder > 0 && addChild > builder, "the WebView is built and then attached");
+  assert.ok(
+    install < builder,
+    "the proxy must be running before the builder is constructed, so the first navigation is covered",
+  );
+  // The already-open early return happens before the install: the freshly
+  // bound listener is dropped there instead of leaking a port.
+  const early = OPEN_PATH.indexOf("return Ok(label);");
+  assert.ok(early > 0 && early < install, "an early return must not keep the new listener");
+});
+
+test("installing a new proxy stops the previous handle", () => {
+  const installFn = WINDOWS_RS.slice(
+    WINDOWS_RS.indexOf("fn install_site_proxy"),
     WINDOWS_RS.indexOf("fn stop_site_proxy"),
   );
-  assert.match(
-    startFn,
-    /async fn start_site_proxy\(\) -> AppResult<u16> \{\s*stop_site_proxy\(\);/,
-    "a stale port or handle must never serve the next session",
-  );
+  assert.match(installFn, /let port = handle\.port\(\);/);
+  assert.match(installFn, /slot\.replace\(handle\)/, "the slot owns the new handle");
+  assert.match(installFn, /previous\.stop\(\)/, "a stale handle must never serve the next session");
   // Both desktop close paths release the proxy: the normal close and the
-  // wipe-close used by clear/remove.
+  // wipe-close used by clear/remove, plus the attach failure.
   const stops = WINDOWS_RS.match(/stop_site_proxy\(\);/g) || [];
-  assert.ok(stops.length >= 4, `expected the start path, two closes and the attach failure, saw ${stops.length}`);
+  assert.ok(stops.length >= 4, `expected two closes and the attach failure, saw ${stops.length}`);
 });
 
 test("the WebView is pointed at this session's port on every desktop target", () => {

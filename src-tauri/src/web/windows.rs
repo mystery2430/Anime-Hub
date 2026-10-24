@@ -221,14 +221,14 @@ fn site_proxy_url(port: u16) -> AppResult<url::Url> {
         .map_err(|_| AppError::Other("proxy adresi geçersiz".into()))
 }
 
-/// Start the proxy for the session that is about to open.
+/// Bind the proxy for the session that is about to open.
 ///
 /// Failure is fatal for the open: there is no code path here that creates the
-/// WebView without a working pinned path.
+/// WebView without a working pinned path. The returned handle owns a bound,
+/// accepting listener; it is not installed into the session slot until the
+/// caller has closed the previous session, and dropping it closes the socket.
 #[cfg(desktop)]
-async fn start_site_proxy() -> AppResult<u16> {
-    stop_site_proxy();
-
+async fn start_site_proxy_handle() -> AppResult<crate::web::pinned_proxy::ProxyHandle> {
     #[cfg(target_os = "macos")]
     {
         let release = current_darwin_release();
@@ -241,14 +241,25 @@ async fn start_site_proxy() -> AppResult<u16> {
         }
     }
 
-    let handle = crate::web::pinned_proxy::start().await.map_err(|_| {
+    crate::web::pinned_proxy::start().await.map_err(|_| {
         log::error!("site proxy'si başlatılamadı");
         AppError::Network("site proxy'si başlatılamadı; site açılmadı".into())
-    })?;
+    })
+}
+
+/// Make [handle] the session proxy, replacing and stopping any previous one.
+///
+/// Returns the port the WebView must be pointed at. Called under
+/// `DESKTOP_SESSION_LOCK`, and before the `add_child` call below: a handle the
+/// slot does not own must not outlive this function.
+#[cfg(desktop)]
+fn install_site_proxy(handle: crate::web::pinned_proxy::ProxyHandle) -> u16 {
     let port = handle.port();
     let mut slot = lock_recover(&SITE_PROXY);
-    *slot = Some(handle);
-    Ok(port)
+    if let Some(previous) = slot.replace(handle) {
+        previous.stop();
+    }
+    port
 }
 
 /// Stop the proxy and drop every tunnel of the current session.
@@ -332,6 +343,19 @@ pub async fn open_site_window(
 // Desktop: a child WebView inside the main window, per-site profile kept.
 // ---------------------------------------------------------------------------
 
+/// Open the site inside the main window.
+///
+/// The session proxy is bound **before** `DESKTOP_SESSION_LOCK` is taken, and
+/// that ordering is a compile-time requirement, not a preference: binding is
+/// the only `await` on the whole desktop open path, and a
+/// `std::sync::MutexGuard` alive across a suspend point makes the command
+/// future non-`Send` — tauri's `#[tauri::command]` rejects it
+/// ("future cannot be sent between threads safely"). Everything that touches
+/// session state (registry re-validation, closing the previous session,
+/// installing the new proxy, building the WebView) still runs under the lock,
+/// synchronously. The freshly bound handle is installed only after the
+/// previous session is closed, and it is dropped — which closes its listener —
+/// on every early return, so a refused open cannot leave a port behind.
 #[cfg(desktop)]
 async fn open_in_main_window(
     app: &AppHandle,
@@ -340,20 +364,21 @@ async fn open_in_main_window(
     init_script: &str,
     fullscreen: bool,
 ) -> AppResult<String> {
-    // Serialize open against wipe/sync. The inner does the real work while
-    // the lock is held so a concurrent `clear_site_data` cannot delete the
-    // profile directory we are about to create.
+    let proxy = start_site_proxy_handle().await?;
+    // Nothing below this line may await: the guard must not outlive a suspend
+    // point. `open_in_main_window_inner` is synchronous for that reason.
     let _guard = lock_desktop_session()?;
-    open_in_main_window_inner(app, site, url, init_script, fullscreen).await
+    open_in_main_window_inner(app, site, url, init_script, fullscreen, proxy)
 }
 
 #[cfg(desktop)]
-async fn open_in_main_window_inner(
+fn open_in_main_window_inner(
     app: &AppHandle,
     site: &Site,
     url: &Url,
     init_script: &str,
     fullscreen: bool,
+    proxy: crate::web::pinned_proxy::ProxyHandle,
 ) -> AppResult<String> {
     // Re-validate the `Site` snapshot while holding `DESKTOP_SESSION_LOCK`
     // (already held by `open_in_main_window`). A concurrent `remove_site`
@@ -398,10 +423,12 @@ async fn open_in_main_window_inner(
     // never a leftover from the previous site.
     close_current_child_locked(app)?;
 
-    // Pin every request this session makes. Started BEFORE the WebView exists,
-    // so the very first navigation is already covered, and a failure returns
-    // here — there is no branch that opens a site without the proxy.
-    let proxy_port = start_site_proxy().await?;
+    // Pin every request this session makes. The handle was bound BEFORE this
+    // function ran (and before the lock), and it is installed before the
+    // WebView exists, so the very first navigation is already covered. There
+    // is no branch that opens a site without the proxy: a failed bind returned
+    // `Err` from `open_in_main_window` before reaching this point.
+    let proxy_port = install_site_proxy(proxy);
 
     // Per-site profile directory: WebKitGTK's data directory on Linux, and on
     // Windows the WebView2 user-data folder. This is what makes cookies,
@@ -3858,7 +3885,7 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
         let _ = app.emit("animehub://site-closed", site_id);
     }
     // Down with the session: no tunnel survives its WebView, and the next
-    // open starts its own proxy (see `start_site_proxy`).
+    // open binds and installs its own proxy (see `start_site_proxy_handle`).
     stop_site_proxy();
     Ok(())
 }
