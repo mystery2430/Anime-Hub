@@ -688,6 +688,15 @@ class DnsPinnedProxy(
    */
   private fun resolveOnce(host: String): List<InetAddress> {
     literal(host)?.let { return listOf(it) }
+    // A host that "ends in a number" but is NOT a valid IPv4 literal
+    // (`example.0x7f`, `foo.123`, `999.1.1.1`, `1.2.3.4.5`): a browser runs the
+    // WHATWG IPv4 parser on such a host and fails the whole URL, so no WebView
+    // sends it as a CONNECT target, and the desktop proxy refuses it before any
+    // lookup (`url_policy::is_private_host` fails closed on a numeric host the
+    // parser refuses). Refuse it the same way: resolving it would spend a
+    // resolver worker and a platform query on a refusal, and a public answer
+    // would even tunnel a host desktop answers 403.
+    if (IpPolicy.endsInANumber(host)) throw IOException("numeric host is not an IP literal")
     resolutions.incrementAndGet()
     val future = submitLookup(host)
     val answer = try {
@@ -1010,6 +1019,17 @@ class DnsPinnedProxy(
      *    an RFC requirement.
      */
     fun parseConnectHead(head: String): Target? {
+      // The head is judged as one unit, exactly like the Rust `parse_connect`:
+      // a control byte anywhere in it (other than CR, LF and HTAB) is a
+      // malformed request, refused before any lookup or socket. Method,
+      // version and target are exact-matched below, so the bytes this catches
+      // are the ones in HEADER lines: this proxy ignores headers, but it must
+      // not tunnel a head the desktop parser refuses. Without this check the
+      // request line of `CONNECT a.test:443 HTTP/1.1` + `Host: a<0x01>b`
+      // parsed fine here — a 405 on desktop, a tunnel on Android.
+      if (head.any { it.code < 0x20 && it != '\r' && it != '\n' && it != '\t' }) {
+        return null
+      }
       val line = head.substringBefore("\r\n").substringBefore("\n")
       if (line.isEmpty()) return null
       val parts = line.split(' ')

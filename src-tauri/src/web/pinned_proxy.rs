@@ -1011,6 +1011,13 @@ mod tests {
             "2130706433:443",
             "127.1:443",
             "169.254.169.254:443",
+            // Numeric-looking hosts that are NOT valid IPv4 literals: a browser
+            // fails the URL on them, and `is_private_host` fails closed, so they
+            // are refused here without a lookup. The Kotlin proxy refuses the
+            // same class in `resolveOnce`
+            // (`numeric_looking_hosts_that_are_not_ip_literals_are_refused_without_a_lookup`).
+            "example.0x7f:443",
+            "foo.123:443",
         ] {
             let status = connect_via(proxy.port(), authority).await;
             assert!(status.starts_with("HTTP/1.1 403"), "{authority}: {status}");

@@ -395,6 +395,42 @@ class DnsPinnedProxyTest {
     }
   }
 
+  @Test
+  fun numeric_looking_hosts_that_are_not_ip_literals_are_refused_without_a_lookup() {
+    // WHATWG "ends in a number" hosts the IPv4 parser refuses: a browser fails
+    // the whole URL on them, so no WebView sends such a CONNECT target, and the
+    // desktop proxy answers 403 with ZERO resolver calls (`is_private_host`
+    // fails closed on a numeric host the parser refuses). Android must refuse
+    // the same way. The scripted PUBLIC answer proves the refusal is the
+    // numeric-host rule and not the destination policy, and the counters prove
+    // the refusal has no side effect: no lookup, no socket.
+    for (host in listOf("example.0x7f", "foo.123", "999.1.1.1", "1.2.3.4.5", "a.1.2.3.4")) {
+      val resolver = FakeResolver(listOf(publicA))
+      var dialled = 0
+      val proxy = DnsPinnedProxy(
+        resolver = { resolver.resolve(it) },
+        connector = { _, _, _ -> dialled++; throw java.io.IOException("must not be called") },
+      )
+      val port = proxy.start()
+      try {
+        val client = Socket("127.0.0.1", port)
+        send(client, "CONNECT $host:443 HTTP/1.1\r\n\r\n")
+        val status = statusLine(client)
+        assertTrue("$host must be refused, got: $status", status.startsWith("HTTP/1.1 5"))
+        client.close()
+        assertEquals(
+          "$host refusal must be counted",
+          1L,
+          proxy.refusalCount(DnsPinnedProxy.Refusal.RESOLVE_FAILED),
+        )
+      } finally {
+        proxy.stop()
+      }
+      assertEquals("$host must not be resolved", 0, resolver.calls)
+      assertEquals("$host must never be dialled", 0, dialled)
+    }
+  }
+
   // -------------------------------------------------------------------------
   // 7. The socket is verified to be where it was sent
   // -------------------------------------------------------------------------
@@ -775,6 +811,16 @@ class DnsPinnedProxyTest {
       )) {
       assertNull("$line reddedilmeli", DnsPinnedProxy.parseConnectHead("$line\r\n\r\n"))
     }
+    // A control byte in a HEADER line, not the target — the exact fourth vector
+    // of the Rust suite's `control_and_non_ascii_bytes_never_reach_the_resolver`.
+    // The Rust parser checks the whole head, so it refuses this line; the two
+    // suites carry the same inputs, so the Android parser must refuse it too.
+    // Before the whole-head check in `parseConnectHead` the request line parsed
+    // and Android tunnelled a head desktop answers 405.
+    assertNull(
+      "başlık satırındaki kontrol baytı reddedilmeli",
+      DnsPinnedProxy.parseConnectHead("CONNECT a.test:443 HTTP/1.1\r\nHost: a\u0001b\r\n\r\n"),
+    )
   }
 
   @Test
