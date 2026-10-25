@@ -56,7 +56,7 @@ test("the proxy is bound before the session lock and before the WebView exists",
   // the builder without one.
   assert.match(
     OPEN_ENTRY,
-    /open_in_main_window_inner\(app, site, url, init_script, fullscreen, proxy\)/,
+    /open_in_main_window_inner\(app, site, url, init_script, fullscreen, proxy, session_id\)/,
   );
 });
 

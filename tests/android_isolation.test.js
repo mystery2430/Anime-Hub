@@ -275,7 +275,12 @@ test("migration is one-time, profile-scoped, and ordered before first navigation
     "a failed flag write must not be a mere warning any more",
   );
   // `open_on_mobile` delegates and claims the session only afterwards.
-  const openAt = windowsRs.indexOf("fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {");
+  // The signature now also carries the per-opening identity, so match the
+  // parameter list instead of one exact single-line spelling.
+  const openSignature = windowsRs.match(
+    /fn open_on_mobile\([\s\S]*?\) -> AppResult<String> \{/,
+  );
+  const openAt = openSignature?.index ?? -1;
   assert.ok(openAt > 0, "android open_on_mobile missing");
   const openBody = windowsRs.slice(openAt, windowsRs.indexOf("\n}\n", openAt));
   assert.match(openBody, /run_mobile_open_protocol\(/);

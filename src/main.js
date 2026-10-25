@@ -342,7 +342,9 @@ async function openSite(tile) {
   try {
     const opened = await call("open_site", { id: tile.id });
     openSiteLabel = opened.label;
-    backSession.opened(opened.label, tile.id);
+    // `sessionId` identifies this opening, not just `tile.id` (which stays
+    // the same when the site is closed and reopened).
+    backSession.opened(opened.label, tile.id, opened.sessionId);
   } catch (e) {
     showNotice(errMessage(e));
   }
@@ -1286,13 +1288,15 @@ async function wireBackendEvents() {
     void refreshAniListStatus();
     void refreshHero();
   });
-  // The Rust side emits this when the `close_site` flow actually finished
-  // (including closes started by the Android back hook). Clear the label
-  // ONLY for the site this session owns — a stale event from an earlier
-  // close must not orphan a newer one (A.5).
+  // The Rust side emits `{ siteId, sessionId }` when a close actually
+  // finished (including closes started by the Android back hook). Clear the
+  // label ONLY when the event carries the exact identity of this opening.
+  // `siteId` alone is not enough: closing and reopening the same site
+  // reuses it, so a delayed event from the earlier opening would otherwise
+  // orphan the new session. Malformed or identity-less payloads are ignored
+  // by the state machine.
   await on("animehub://site-closed", (payload) => {
-    const siteId = typeof payload === "string" ? payload : null;
-    if (backSession.closedByEvent(siteId)) openSiteLabel = null;
+    if (backSession.closedByEvent(payload)) openSiteLabel = null;
   });
 }
 
