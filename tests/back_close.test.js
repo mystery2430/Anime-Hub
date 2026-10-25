@@ -62,6 +62,16 @@ test("requestClose without a session is not accepted (native fallback)", () => {
   assert.equal(h.calls.length, 0);
 });
 
+test("native close call carries the exact opening identity", () => {
+  const h = harness();
+  h.session.opened("site-a", "id-a", "open-a-1");
+  h.session.requestClose();
+  assert.deepEqual(h.calls[0], {
+    cmd: "close_site",
+    args: { label: "site-a", sessionId: "open-a-1" },
+  });
+});
+
 test("opened() registers the label, site id and opening identity", () => {
   const h = harness();
   h.session.opened("site-a", "id-a", "open-a-1");
@@ -78,7 +88,7 @@ test("first requestClose starts exactly one close and reports pending", async ()
   assert.deepEqual(first, { accepted: true });
   assert.equal(h.session.statusString(), "pending");
   assert.equal(h.calls.length, 1);
-  assert.deepEqual(h.calls[0], { cmd: "close_site", args: { label: "site-a" } });
+  assert.deepEqual(h.calls[0], { cmd: "close_site", args: { label: "site-a", sessionId: "open-a-1" } });
 
   // A second back press while pending must NOT start a second close.
   const second = h.session.requestClose();
@@ -93,7 +103,7 @@ test("native back operation id is forwarded through the launcher close bridge", 
   assert.deepEqual(h.session.requestClose("k-42"), { accepted: true });
   assert.deepEqual(h.calls[0], {
     cmd: "close_site",
-    args: { label: "site-a", operationId: "k-42" },
+    args: { label: "site-a", sessionId: "open-a-1", operationId: "k-42" },
   });
 });
 
