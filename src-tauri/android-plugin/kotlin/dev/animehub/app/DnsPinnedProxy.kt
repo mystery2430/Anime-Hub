@@ -602,6 +602,18 @@ class DnsPinnedProxy(
         return
       }
 
+      // The host policy is checked BEFORE a resolver is touched, exactly like
+      // Rust `classify` -> `is_private_host`. This is what keeps numeric-looking
+      // names such as `example.0x7f`, `foo.123`, `999.1.1.1`, `1.2.3.4.5` and
+      // `a.1.2.3.4` from reaching DNS: they are not valid IPv4 literals, and a
+      // resolver must not get to decide what they mean. `localhost` and the
+      // `.local`/`.internal`/`.lan`/`.home` suffixes take the same path. IPv6
+      // literals are skipped here (their brackets made them unambiguous in the
+      // parser) and classified from the literal answer below.
+      if (hostIsRejectedWithoutDns(target.host)) {
+        refuse(client, Refusal.NON_PUBLIC)
+        return
+      }
       val addresses = try {
         resolveOnce(target.host)
       } catch (_: ResolverExhausted) {
@@ -668,6 +680,22 @@ class DnsPinnedProxy(
       drop(client)
       active.decrementAndGet()
     }
+  }
+
+  /**
+   * True when the shared host policy refuses [host] without asking DNS.
+   *
+   * This deliberately delegates to the same rule the navigation guard uses
+   * instead of keeping a second numeric-host parser in the proxy. Android's
+   * `Uri` does not normalise `010.1`, `0x7f000001` or `example.0x7f`, so a
+   * hand-written check here would drift from desktop; `IpPolicy` and
+   * `SiteNavigationPolicy` are the one implementation of that rule.
+   */
+  private fun hostIsRejectedWithoutDns(host: String): Boolean {
+    if (host.contains(':')) return false
+    return SiteNavigationPolicy.rejection(
+      SiteNavigationPolicy.NavTarget("https", host, null),
+    ) != null
   }
 
   /**
@@ -893,8 +921,8 @@ class DnsPinnedProxy(
       when (byte.toChar()) {
         '\r' -> cr = true
         '\n' -> {
-          // CRLFCRLF ends the head. A bare CR is tolerated because the only
-          // thing read here is the request line we then validate.
+          // CRLFCRLF ends the head. A bare CR or bare LF does not; the parser
+          // rejects that framing explicitly after the bounded read.
           if (cr) seenBlank++ else seenBlank = 0
           if (seenBlank >= 2) return out.toString("ISO-8859-1")
           cr = false
@@ -976,6 +1004,15 @@ class DnsPinnedProxy(
     /** The only address this proxy ever binds or accepts a target on. */
     const val LOOPBACK: String = "127.0.0.1"
 
+    /**
+     * The frozen head ceiling of the shared CONNECT grammar.
+     *
+     * `Limits.headerBytes` may be configured lower; values above this one do
+     * not widen the grammar. Desktop `MAX_HEAD_BYTES` is the same 8 KiB, so a
+     * parser-level decision cannot depend on which side is asked.
+     */
+    private const val MAX_CONNECT_HEAD_BYTES: Int = 8 * 1024
+
     private const val ESTABLISHED = "HTTP/1.1 200 Connection Established\r\n\r\n"
     private const val FORBIDDEN =
       "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1008,9 +1045,34 @@ class DnsPinnedProxy(
      *    syntactically valid `HTTP/1.2` is **also** refused, because this proxy
      *    tunnels HTTP/1.x and nothing else. That is an application choice, not
      *    an RFC requirement.
+     *
+     * The byte/framing contract is the same as Rust `parse_connect`:
+     * exactly one head ending in `\r\n\r\n`; at most 8 KiB; only HTAB,
+     * printable ASCII and CRLF. Every other C0 control (NUL, 0x01), DEL and
+     * every byte >= 0x80 is refused. `readHead` decodes ISO-8859-1, which maps
+     * every socket byte to one char 0..255, so this check sees the wire bytes;
+     * a header containing invalid UTF-8 is therefore refused here exactly as
+     * it is on desktop instead of becoming a Latin-1 header value.
      */
     fun parseConnectHead(head: String): Target? {
-      val line = head.substringBefore("\r\n").substringBefore("\n")
+      if (head.isEmpty() || head.length > MAX_CONNECT_HEAD_BYTES) return null
+      if (head.any { it.code > 0x7e }) return null
+      if (!head.endsWith("\r\n\r\n")) return null
+      // One request head, not a prefix followed by another message.
+      if (head.indexOf("\r\n\r\n") != head.length - 4) return null
+      var index = 0
+      while (index < head.length) {
+        when (head[index].code) {
+          0x0d -> {
+            if (index + 1 >= head.length || head[index + 1] != '\n') return null
+            index += 2
+          }
+          0x0a -> return null
+          0x09, in 0x20..0x7e -> index += 1
+          else -> return null
+        }
+      }
+      val line = head.substringBefore("\r\n")
       if (line.isEmpty()) return null
       val parts = line.split(' ')
       if (parts.size != 3) return null
