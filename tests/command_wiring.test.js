@@ -89,7 +89,7 @@ test("site-closed producers carry the identity of the session they close", () =>
 
   // `open_site` must hand the launcher the identity alongside the label, and
   // the launcher must store it with the active opening.
-  assert.match(commandsRs, /\.map\(\|label\| OpenedSite \{[\s\S]*?session_id,/);
+  assert.match(commandsRs, /\.map\(\|\(label, active_session_id\)\| OpenedSite \{[\s\S]*?session_id: active_session_id,/);
   assert.match(mainJs, /backSession\.opened\(\s*opened\.label,\s*tile\.id,\s*opened\.sessionId,?\s*\)/);
   assert.match(mainJs, /backSession\.closedByEvent\(payload\)/);
 });
