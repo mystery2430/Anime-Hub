@@ -95,7 +95,7 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 
 | Gap | Why |
 | --- | --- |
-| Blocklist | Lives in Rust. Running it needs a Rust round-trip inside a UI-thread callback. Not done. Android navigations are checked for scheme, host shape and IP rules only. |
+| Blocklist | Lives in Rust; Rust pushes the parsed user rules to the process-wide `SiteBlocklist` snapshot before every open and after every settings/reset change. Both `SiteNavigationPolicy` checkpoints (`shouldOverrideUrlLoading` and `shouldInterceptRequest`) consult that snapshot, so an explicit rule rejects the apex and its subdomains in the main frame and in sub-resources. The matching rules have Kotlin unit tests; a real blocked request in a device WebView is still pending device verification. This is WebView policy, not an OS-level firewall. |
 | Numeric IPv4 spellings | Fixed in the Kotlin policy: `2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1` are refused (previously allowed). Relies on WHATWG parsing; not tested in a WebView. |
 | Documentation IPv4 ranges | Fixed: `198.51.100.0/24` and `203.0.113.0/24` are refused, as in Rust. |
 | Multicast / reserved IPv4 (`224.0.0.0/4`, `240.0.0.0/4`, `0.0.0.0/8`, `192.88.99.0/24`) | Both Kotlin and Rust refuse them (aligned to IANA 2025-10-09; Rust `a >= 224` + `a == 0` + `192.88.99/24`). |
@@ -123,6 +123,8 @@ Status: implemented from wry 0.55.1 and Tauri 2.11.6 source. Kotlin is not compi
 
 1. Device test: open a site, tap a link to `http://`, a `192.168.x.x` URL and a
    normal same-site page. Check `AnimeHubNavGuard` logs.
-2. Decide whether the blocklist should reach Android (for example a snapshot
-   pushed to Kotlin when the list changes).
+2. Device test: add a hostname to the user blocklist, then verify the WebView
+   refuses both a top-level navigation to it and a sub-resource request on it.
+   The Kotlin unit test covers the decision; only a device run covers the bridge
+   transfer and both WebView callbacks end to end.
 3. Check the back affordance on Android and give it a native path if needed.

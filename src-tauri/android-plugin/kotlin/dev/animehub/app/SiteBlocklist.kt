@@ -101,6 +101,7 @@ object SiteBlocklist {
 
   fun size(): Int = current.get().size
 
+  /** Test-only: restore the initial empty snapshot. Production never resets it. */
   internal fun resetForTests() {
     current.set(BlocklistRules())
   }
