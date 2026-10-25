@@ -30,13 +30,25 @@ import {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CONTROLLER_PATH = join(ROOT, "src-tauri", "src", "web", "pip_controller.js");
 const CONTROLLER_SRC = readFileSync(CONTROLLER_PATH, "utf8");
+const WEBRTC_GUARD_PATH = join(ROOT, "src-tauri", "src", "web", "webrtc_guard.js");
+const WEBRTC_GUARD_SRC = readFileSync(WEBRTC_GUARD_PATH, "utf8");
+
+/** Run shipped JavaScript in one frame and return the same dom object. */
+function runSource(dom, source, filename) {
+  const sandbox = { window: dom.window, document: dom.document, console };
+  vm.createContext(sandbox);
+  new vm.Script(source, { filename }).runInContext(sandbox);
+  return dom;
+}
 
 /** Run the shipped controller in a frame and return the same dom object. */
 function runController(dom) {
-  const sandbox = { window: dom.window, document: dom.document, console };
-  vm.createContext(sandbox);
-  new vm.Script(CONTROLLER_SRC, { filename: "pip_controller.js" }).runInContext(sandbox);
-  return dom;
+  return runSource(dom, CONTROLLER_SRC, "pip_controller.js");
+}
+
+/** Run the shipped WebRTC/WebTransport guard in a frame. */
+function runWebRtcGuard(dom) {
+  return runSource(dom, WEBRTC_GUARD_SRC, "webrtc_guard.js");
 }
 
 // Phone-like defaults: a 360x800 CSS viewport at devicePixelRatio 3.
@@ -123,6 +135,53 @@ test("the top frame installs the controller and still prepares a player", () => 
   const result = plain(dom.window.__animehubPreparePip());
   assert.equal(result.ok, true, "and the controller still works there");
   assert.equal(result.kind, "video");
+});
+
+test("blocking WebRTC does not disable PiP or MSE media", () => {
+  // BEHAVIOUR in a fake DOM, not a device test. The guard and controller are
+  // shipped files; no real <video>, MediaSource pipeline or PiP window exists.
+  const dom = createFakeDom({ width: 360, height: 800, devicePixelRatio: 3 });
+  const video = addVideo(dom.document, dom.document.body, {
+    rect: { x: 0, y: 80, width: 360, height: 203 },
+  });
+  const NativePeerConnection = function NativePeerConnection() {};
+  const MediaSource = function MediaSource() {};
+  const SourceBuffer = function SourceBuffer() {};
+  dom.window.RTCPeerConnection = NativePeerConnection;
+  dom.window.MediaSource = MediaSource;
+  dom.window.SourceBuffer = SourceBuffer;
+
+  runWebRtcGuard(dom);
+  runController(dom);
+
+  assert.notEqual(dom.window.RTCPeerConnection, NativePeerConnection, "WebRTC is denied");
+  assert.throws(() => new dom.window.RTCPeerConnection(), (e) => e.name === "NotSupportedError");
+  assert.equal(dom.window.MediaSource, MediaSource, "MSE is not replaced");
+  assert.equal(dom.window.SourceBuffer, SourceBuffer, "SourceBuffer is not replaced");
+  assert.equal(video.paused, false, "the existing video element was not paused or replaced");
+  assert.equal(dom.window.__animehubPipVersion, 2, "PiP controller still installed");
+  const result = plain(dom.window.__animehubPreparePip());
+  assert.equal(result.ok, true, "PiP can still prepare the playing video");
+  assert.equal(result.kind, "video");
+});
+
+test("a subframe gets the WebRTC denial but never the PiP API", () => {
+  // Both guards are shipped files. The frame gate belongs to the PiP
+  // controller; the WebRTC denial deliberately applies to every frame.
+  const sub = asSubframe(createFakeDom({ width: 360, height: 800, devicePixelRatio: 3 }));
+  addVideo(sub.document, sub.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  sub.window.RTCPeerConnection = function NativePeerConnection() {};
+  sub.window.WebTransport = function NativeWebTransport() {};
+
+  runWebRtcGuard(sub);
+  runController(sub);
+
+  assert.throws(() => new sub.window.RTCPeerConnection(), (e) => e.name === "NotSupportedError");
+  assert.throws(() => new sub.window.WebTransport(), (e) => e.name === "NotSupportedError");
+  for (const name of PIP_GLOBALS) {
+    assert.equal(sub.window[name], undefined, `a subframe must not get ${name}`);
+  }
+  assert.equal(sub.document.body.getAttribute("style"), null);
 });
 
 test("installs the documented window API", () => {

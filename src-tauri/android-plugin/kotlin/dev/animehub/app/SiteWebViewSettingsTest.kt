@@ -156,6 +156,29 @@ class SiteWebViewSettingsTest {
     }
 
     @Test
+    fun `the settings plan cannot be mistaken for non proxy egress enforcement`() {
+        // REFLECTION/SOURCE-LEVEL ONLY. There is no supported WebSettings field
+        // that disables WebRTC or WebTransport, or that forces UDP/QUIC through
+        // ProxyController. This test prevents a future field from being added
+        // with a name that implies such a guarantee without a platform API and
+        // a real device/network test behind it.
+        val sinkMethods = SiteSettingsSink::class.java.declaredMethods.map { it.name }
+        for (part in listOf("proxy", "webrtc", "webtransport", "quic", "udp")) {
+            assertFalse(
+                "SiteSettingsSink must not grow a fake '$part' egress switch without a supported platform API",
+                sinkMethods.any { it.contains(part, ignoreCase = true) },
+            )
+        }
+
+        // Blocking WebRTC at the document-start layer must not be "fixed" by
+        // disabling media/autoplay at the settings layer. The second test above
+        // pins playback; this keeps the reason visible next to the egress gap.
+        val plan = SiteWebViewSettings.PRODUCTION
+        assertFalse("playback must stay independent of the WebRTC guard", plan.mediaPlaybackRequiresUserGesture)
+        assertTrue("the page still runs its own MSE/DASH player", plan.javaScriptEnabled)
+    }
+
+    @Test
     fun `left at default list does not claim a decided setting`() {
         val sink = RecordingSink()
         applySiteSettings(sink)
