@@ -860,31 +860,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_head_is_refused_before_the_parser() {
+    async fn a_head_that_reaches_the_limit_without_terminator_is_refused() {
         let resolver = ScriptedResolver::new(vec![public_answer()]);
         let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
             .await
             .expect("proxy");
         let mut stream = dial(proxy.port()).await;
-        let mut request = String::from("CONNECT example.test:443 HTTP/1.1\r\n");
-        while request.len() < MAX_HEAD_BYTES + 64 {
-            request.push_str("X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
-        }
-        // A real terminator, so this tests the size boundary and not the
-        // missing-terminator path.
-        request.push_str("\r\n");
-        assert!(request.len() > MAX_HEAD_BYTES);
-        let _ = stream.write_all(request.as_bytes()).await;
+
+        // Send exactly the cap and no bytes beyond it. The reader must return
+        // 431 at the boundary. Sending surplus bytes in the same write can
+        // make Windows reset the TCP connection when the server refuses early,
+        // hiding the response this test is trying to assert.
+        let mut request = b"CONNECT example.test:443 HTTP/1.1\r\n".to_vec();
+        request.resize(MAX_HEAD_BYTES, b'a');
+        assert_eq!(request.len(), MAX_HEAD_BYTES);
+        stream.write_all(&request).await.expect("write capped head");
+
         let mut buf = vec![0u8; 256];
         let n = stream.read(&mut buf).await.unwrap_or(0);
         let head = String::from_utf8_lossy(&buf[..n]).to_string();
         assert!(
             head.starts_with("HTTP/1.1 431"),
-            "an oversized head must be refused explicitly, got: {head:?}"
+            "a head at the size limit must be refused explicitly, got: {head:?}"
         );
         assert_eq!(resolver.calls(), 0, "oversized head reached the resolver");
         assert_eq!(proxy.requests(), 0, "oversized head counted as a CONNECT");
         proxy.stop();
+    }
+
+    #[test]
+    fn parser_rejects_a_completed_head_that_exceeds_the_limit() {
+        // The TCP read-size behaviour is platform dependent; test the parser's
+        // complete-head contract directly so a terminator beyond the cap is
+        // refused even when read_head would have already stopped at the cap.
+        let mut head = b"CONNECT example.test:443 HTTP/1.1\r\n".to_vec();
+        head.resize(MAX_HEAD_BYTES, b'a');
+        head.extend_from_slice(b"\r\n\r\n");
+        assert!(head.len() > MAX_HEAD_BYTES);
+        assert!(parse_connect(&head).is_none());
     }
 
     /// Raw bytes through the real accept/read/parse path. The heads are
