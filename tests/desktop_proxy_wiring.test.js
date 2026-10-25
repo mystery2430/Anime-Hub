@@ -199,3 +199,52 @@ test("the shipped constructor can only be strict, and the test policy is test-on
   assert.match(limits, /resolve: Duration::from_secs\(\d+\)/);
   assert.match(limits, /connect: Duration::from_secs\(\d+\)/);
 });
+
+test("the pseudo-URL close callback closes only the WebView of its own opening", () => {
+  // The "back" affordance navigates to a pseudo-URL instead of closing from
+  // inside the callback. The spawned close must carry the identity captured
+  // when THIS WebView was created, because the same label is reused by a
+  // reopen of the same site.
+  const at = OPEN_PATH.indexOf('if target.scheme() == CLOSE_SCHEME');
+  assert.ok(at > 0, "the navigation callback must intercept the close scheme");
+  const branch = OPEN_PATH.slice(at, at + 900);
+  assert.match(branch, /let session_id = nav_session_id\.clone\(\);/);
+  assert.match(
+    branch,
+    /close_site_window_for_session\(&app, &label, &session_id\)/,
+    "the callback must not close whichever session happens to be current",
+  );
+  assert.ok(
+    !/(^|[^_])close_site_window\(&app, &label\)/m.test(branch),
+    "the unguarded close is not allowed in a delayed callback",
+  );
+  assert.match(branch, /return false;/, "the pseudo-URL itself must never load");
+});
+
+test("reopening a site that is already open reuses that live opening's identity", () => {
+  // Focusing an existing WebView is not a new native session: its installed
+  // callbacks keep the identity they captured, so the command must return the
+  // stored identity instead of the freshly proposed one.
+  const at = OPEN_PATH.indexOf("if app.get_webview(&label).is_some()");
+  assert.ok(at > 0, "the already-open path must be recognised");
+  const branch = OPEN_PATH.slice(at, OPEN_PATH.indexOf("close_current_child_locked"));
+
+  assert.match(
+    branch,
+    /value\.window_label == label && value\.site_id == site\.id/,
+    "the stored record must describe this WebView before it is trusted",
+  );
+  assert.match(branch, /return Ok\(\(label, current\.session_id\)\);/);
+  assert.ok(
+    !branch.includes("*lock_recover(&state.current_site)"),
+    "a focus must not relabel the live WebView with the proposed identity",
+  );
+  assert.ok(
+    !branch.includes("session_id: session_id.clone()"),
+    "the proposed opening identity must not replace the live one",
+  );
+  assert.ok(
+    OPEN_PATH.indexOf("close_current_child_locked") > at,
+    "an already-open site must not be closed and rebuilt underneath its callbacks",
+  );
+});

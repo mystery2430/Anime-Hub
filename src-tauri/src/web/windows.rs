@@ -434,8 +434,8 @@ fn open_in_main_window_inner(
             let value = lock_recover(&state.current_site).clone();
             value
         };
-        let Some(current) = current
-            .filter(|value| value.window_label == label && value.site_id == site.id)
+        let Some(current) =
+            current.filter(|value| value.window_label == label && value.site_id == site.id)
         else {
             return Err(AppError::Other(
                 "site görünümü var ama etkin oturum kaydı eşleşmiyor".into(),
@@ -4051,6 +4051,70 @@ mod tests {
         ));
         assert!(session_identity_matches(Some("opening-new"), "opening-new"));
         assert!(!session_identity_matches(None, "opening-old"));
+    }
+
+    /// A native close must name the exact opening it was issued for.
+    ///
+    /// `close_site` arrives as an independent IPC request: by the time it
+    /// runs, the same site may already have been reopened on the very same
+    /// window label. The guard, not the label, is what stops a stale request
+    /// from destroying a live WebView.
+    #[test]
+    fn a_mismatched_native_close_identity_is_refused_before_any_teardown() {
+        let state = state_with_current_site(Some("s1"));
+        let current = lock_recover(&state.current_site).clone();
+
+        // The opening that owns the slot may close it.
+        assert!(ensure_close_session_identity(&current, Some("session-s1")).is_ok());
+        // Internal wipe paths carry no launcher identity and stay allowed.
+        assert!(ensure_close_session_identity(&current, None).is_ok());
+
+        let refused = ensure_close_session_identity(&current, Some("stale-opening"))
+            .expect_err("a close for a different opening must be refused");
+        assert!(matches!(
+            refused,
+            AppError::Other(ref message) if message.contains("session changed")
+        ));
+
+        // The refusal is not a teardown: the live session is still recorded.
+        let still_live = {
+            let current = lock_recover(&state.current_site).clone();
+            current.map(|c| c.session_id)
+        };
+        assert_eq!(still_live.as_deref(), Some("session-s1"));
+
+        // Against an empty slot there is nothing to close: a launcher-issued
+        // identity must be refused rather than silently accepted.
+        assert!(ensure_close_session_identity(&None, Some("session-s1")).is_err());
+        assert!(ensure_close_session_identity(&None, None).is_ok());
+    }
+
+    /// Both asynchronous close callbacks (the `animehub://site-close`
+    /// navigation and the fail-closed page-load check) close with the identity
+    /// captured by *their own* opening. Model the race: opening 1's callback
+    /// runs after the same site was reopened as opening 2.
+    #[test]
+    fn a_stale_close_callback_cannot_end_a_reopened_session() {
+        let state = state_with_current_site(Some("s1"));
+        // Same site id, same label on desktop — only the identity differs.
+        *lock_recover(&state.current_site) = Some(current_site_at("s1", "session-s2"));
+        let reopened = lock_recover(&state.current_site).clone();
+
+        // Opening 1's delayed navigation/page-load close is refused.
+        assert!(ensure_close_session_identity(&reopened, Some("session-s1")).is_err());
+        let survivor = {
+            let current = lock_recover(&state.current_site).clone();
+            current.map(|c| c.session_id)
+        };
+        assert_eq!(survivor.as_deref(), Some("session-s2"));
+
+        // Opening 2 can still close itself, and the event names opening 2.
+        assert!(ensure_close_session_identity(&reopened, Some("session-s2")).is_ok());
+        let closed = take_current_session_if(&state, "session-s2")
+            .expect("the owning identity closes its own session");
+        assert_eq!(closed.site_id, "s1");
+        assert_eq!(closed.closed_event().session_id, "session-s2");
+        assert!(take_current_session_if(&state, "session-s1").is_none());
     }
 
     /// The WebView2 argument string must keep wry's own defaults, add the
