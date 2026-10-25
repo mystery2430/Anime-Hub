@@ -431,7 +431,8 @@ fn open_in_main_window_inner(
     if app.get_webview(&label).is_some() {
         let current = {
             let state = app.state::<AppState>();
-            lock_recover(&state.current_site).clone()
+            let value = lock_recover(&state.current_site).clone();
+            value
         };
         let Some(current) = current
             .filter(|value| value.window_label == label && value.site_id == site.id)
