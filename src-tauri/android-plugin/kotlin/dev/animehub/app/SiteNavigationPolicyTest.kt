@@ -1,17 +1,40 @@
 package dev.animehub.app
 
+import org.junit.After
 import org.junit.Assert.*
+import org.junit.Before
 import org.junit.Test
 
 /**
- * Unit test for IP policy – runs the real production logic from IpPolicy.kt,
- * which is the same file APK derlemesi kullanıyor. SiteNavigationPolicy de
- * bu dosyaya delege eder, dolayısıyla bu test gerçek uygulama akışını doğrular.
- * CI bu testi Gradle ile çalıştırır.
- * Gerekli vektörler: ::ffff:8.8.8.8, ::ffff:192.168.1.1, ::ffff:10.0.0.1,
- * 3fff:0fff::1, 3fff:1234::1, 2001::1, 2001:1::1, 64:ff9b::8.8.8.8, 64:ff9b::10.0.0.1
+ * JVM tests for the pure Android navigation decision. Three different mechanisms
+ * appear here and must not be conflated:
+ *
+ *  - host/scheme + IP-literal policy: [SiteNavigationPolicy] and [IpPolicy],
+ *    evaluated synchronously at both WebView checkpoints;
+ *  - the user blocklist: the process-wide [SiteBlocklist] snapshot that
+ *    `hostAllowed` consults at both checkpoints (installed explicitly below);
+ *  - DNS resolution: [NavigationDnsGate], the guard's separate pre-check. The
+ *    pure policy never resolves a name, and a DNS answer never overrides a
+ *    scheme/host/blocklist refusal.
+ *
+ * CI runs this class with Gradle. `IpPolicy` vectors include
+ * ::ffff:8.8.8.8, ::ffff:192.168.1.1, ::ffff:10.0.0.1, 3fff:0fff::1,
+ * 3fff:1234::1, 2001::1, 2001:1::1, 64:ff9b::8.8.8.8 and 64:ff9b::10.0.0.1.
  */
 class SiteNavigationPolicyTest {
+
+    // SiteBlocklist is a process-wide snapshot, exactly as in the APK. Reset it
+    // before AND after every test: a rule installed by one test (or left behind
+    // by a failing one) must never change another test's decision.
+    @Before
+    fun resetBlocklistBeforeTest() {
+        SiteBlocklist.resetForTests()
+    }
+
+    @After
+    fun resetBlocklistAfterTest() {
+        SiteBlocklist.resetForTests()
+    }
 
     @Test
     fun `mapped public is allowed`() {
@@ -234,14 +257,20 @@ class SiteNavigationPolicyTest {
     }
 
     @Test
-    fun `subresource blocking is host and scheme only - no dns and no blocklist claims`() {
-        // A hostname that merely RESOLVES to a private address cannot be caught
-        // here, and the user blocklist is not plumbed to the WebView. The test
-        // pins that honest behaviour so nobody mistakes it for a firewall.
+    fun `scheme and host policy alone neither resolves names nor applies user rules`() {
+        // These calls exercise ONLY the pure scheme/host/IP policy. DNS is a
+        // separate pre-check ([NavigationDnsGate], called by
+        // SiteNavigationGuard), not part of this decision. The user blocklist is
+        // also separate: the @Before reset leaves it empty here, so a host with
+        // no rule is allowed; the next test proves a non-empty snapshot is
+        // actually consulted at BOTH checkpoints.
         assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("https://router.local.evil.example/")))
         assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("https://127.0.0.1.nip.io/")))
-        assertNull(SiteNavigationPolicy.subresourceRejection(parseVector("https://ads.example-tracker.com/x.js")))
-        // ... while the literal forms ARE caught.
+        assertNull(
+            "no user rule is installed for this host",
+            SiteNavigationPolicy.subresourceRejection(parseVector("https://ads.example-tracker.com/x.js")),
+        )
+        // ... while the literal private forms ARE caught by host policy alone.
         assertEquals(
             SiteNavigationPolicy.PRIVATE_HOST,
             SiteNavigationPolicy.subresourceRejection(parseVector("https://127.0.0.1/")),
@@ -250,6 +279,33 @@ class SiteNavigationPolicyTest {
             SiteNavigationPolicy.PRIVATE_HOST,
             SiteNavigationPolicy.subresourceRejection(parseVector("https://printer.local/")),
         )
+    }
+
+    @Test
+    fun `user blocklist rejects top level and matching subresource URLs while empty restores both`() {
+        // The explicit snapshot Rust pushes before an open. This suffix rule
+        // matches the apex and every subdomain of the test hostname.
+        SiteBlocklist.update(listOf("ads.example-tracker.com"))
+        // ONE hostname for both checkpoints; the installed apex rule also covers
+        // this subdomain, so the snapshot's suffix matching is part of the test.
+        val topLevel = parseVector("https://cdn.ads.example-tracker.com/watch")
+        val subresource = parseVector("https://cdn.ads.example-tracker.com/segment-0007.ts")
+
+        // Both checkpoints delegate to the same hostAllowed rule. The reason is
+        // the shared host-refusal code, not a separate blocklist code; this pure
+        // decision performs no DNS resolution.
+        assertEquals(SiteNavigationPolicy.PRIVATE_HOST, SiteNavigationPolicy.rejection(topLevel))
+        assertEquals(
+            SiteNavigationPolicy.PRIVATE_HOST,
+            SiteNavigationPolicy.subresourceRejection(subresource),
+        )
+
+        // The empty snapshot (what Rust pushes for a disabled list) revokes the
+        // rule and restores the ordinary host/scheme answer at both checkpoints.
+        SiteBlocklist.update(emptyList())
+        assertEquals(0, SiteBlocklist.size())
+        assertNull(SiteNavigationPolicy.rejection(topLevel))
+        assertNull(SiteNavigationPolicy.subresourceRejection(subresource))
     }
 
     /**
