@@ -799,13 +799,16 @@ pub struct OpenedSite {
 pub async fn close_site(
     app: AppHandle,
     label: String,
+    session_id: String,
     operation_id: Option<String>,
 ) -> AppResult<()> {
     let _operation_scope = operation_id
         .as_deref()
         .map(|id| crate::diagnostics::begin_operation_with_id("close", id))
         .or_else(|| crate::diagnostics::scope_if_missing("close"));
-    windows::close_site_window(&app, &label)
+    // Labels are reused across openings; native close independently validates
+    // that this request still owns the active session.
+    windows::close_site_window_for_session(&app, &label, &session_id)
 }
 
 /// Wipe stored cookies for one site, or for all sites when `id` is `None`.
