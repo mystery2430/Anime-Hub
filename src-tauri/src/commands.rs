@@ -103,12 +103,54 @@ pub struct AppState {
 #[derive(Debug, Clone)]
 pub struct CurrentSite {
     pub site_id: String,
+    /// Opaque identity of this exact opening, not of the site.
+    ///
+    /// A site id is stable across reopens, so a delayed close from the
+    /// previous opening can name the same site as the new one. This id is
+    /// minted once per successful `open_site` and travels with the native
+    /// session: close paths snapshot it before tearing anything down and put
+    /// that snapshot in the `animehub://site-closed` event.
+    pub session_id: String,
     pub host: String,
     pub window_label: String,
     /// Desktop: `true` when opening the site is what put the window into
     /// fullscreen, so closing it may restore the windowed state. Kept
     /// separate so a manual fullscreen choice is never taken away.
     pub entered_fullscreen: bool,
+}
+
+impl CurrentSite {
+    /// The event that closes exactly this native session.
+    ///
+    /// Call this on the record captured for the close, never on the live
+    /// `current_site` after clearing it: that mutable slot may already belong
+    /// to a newer opening of the same site.
+    pub fn closed_event(&self) -> SiteClosedEvent {
+        SiteClosedEvent {
+            site_id: self.site_id.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
+}
+
+/// Payload of `animehub://site-closed`.
+///
+/// `siteId` keeps the event useful for diagnostics; `sessionId` is the
+/// authoritative ownership proof. The launcher clears its active opening only
+/// when `sessionId` exactly matches the opening it owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteClosedEvent {
+    pub site_id: String,
+    pub session_id: String,
+}
+
+/// A fresh opaque identity for one successful site opening.
+///
+/// `uuid` is already a direct dependency (v4 is enabled for OAuth state and
+/// user-site ids); no additional crate is needed.
+fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Launcher theme preference, persisted with the other settings.
@@ -710,6 +752,10 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         webrtc_guard: cfg!(target_os = "android"),
     };
     let init_script = build_init_script(&injected);
+    // The identity belongs to this opening, not to `site.id`: reopening the
+    // same site must produce a distinct value so a delayed event from the
+    // previous opening cannot clear the new session.
+    let session_id = new_session_id();
 
     windows::open_site_window(
         app,
@@ -717,10 +763,12 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         safe.as_url(),
         &init_script,
         settings.fullscreen_sites,
+        session_id.clone(),
     )
     .await
     .map(|label| OpenedSite {
         label,
+        session_id,
         mobile: cfg!(any(target_os = "android", target_os = "ios")),
         // Android now gives real per-site isolation (one WebView profile per
         // site); iOS still shares the single WebView.
@@ -733,6 +781,10 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
 pub struct OpenedSite {
     /// Window label (desktop) or the site label (mobile bookkeeping).
     pub label: String,
+    /// Opaque identity of this particular opening. The launcher stores it and
+    /// accepts `animehub://site-closed` only when the event carries this exact
+    /// value.
+    pub session_id: String,
     pub mobile: bool,
     /// Whether this platform gives true per-site storage isolation: per-site
     /// profile directories on desktop, per-site WebView profiles on Android,
@@ -3216,5 +3268,18 @@ mod tests {
             captured_generations.iter().max().copied() == Some(newest),
             "the workers must have covered the newest generation: {captured_generations:?}"
         );
+    }
+
+    #[test]
+    fn each_site_opening_gets_a_distinct_session_identity() {
+        // Site id is deliberately stable across opens; the session identity
+        // must not be. Reusing it would reintroduce the stale-close race.
+        let first = new_session_id();
+        let second = new_session_id();
+        assert!(!first.is_empty());
+        assert!(!second.is_empty());
+        assert_ne!(first, second);
+        // Opaque and transport-safe without extra encoding.
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 }
