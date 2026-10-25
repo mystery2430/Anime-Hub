@@ -400,6 +400,21 @@ async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, u16> {
 /// `None` means the request is not an acceptable CONNECT: any other method,
 /// a non-absolute target, userinfo, a missing or zero port, or a header block
 /// with control bytes is refused rather than interpreted.
+///
+/// The authority grammar is the one `DnsPinnedProxy.parseAuthority` accepts
+/// (RFC 3986 §3.2.3, authority-form = `host ":" port`):
+///
+///   * `port` is ASCII digits only — no sign, no whitespace, no default.
+///     `u16::from_str` would accept `+443`, which the Android parser refuses;
+///   * a bracketed host is an `IPv6address`, never a bracketed IPv4 or a
+///     bracketed non-literal (RFC 3986 `IP-literal`);
+///   * an **unbracketed** host never contains `:` (an IPv6 literal must be
+///     bracketed in an authority).
+///
+/// Each rule is a form the Android parser already refuses. Without them the
+/// same request line is tunnelled on desktop and answered `403` on Android, so
+/// "which proxies accept this request" depended on the platform. Both suites
+/// read `tests/fixtures/connect-authority.tsv`, which pins the shared grammar.
 fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
@@ -422,6 +437,23 @@ fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
     }
     let (host, port) = target.rsplit_once(':')?;
     if host.is_empty() {
+        return None;
+    }
+    if host.starts_with('[') || host.ends_with(']') {
+        // `IP-literal`: the brackets have to wrap an IPv6 address. `classify`
+        // would happily classify a bracketed IPv4, but the grammar does not
+        // allow one and the Android parser refuses it.
+        let inner = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'))?;
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+    } else if host.contains(':') {
+        // An IPv6 literal without brackets is not an authority.
+        return None;
+    }
+    // `port = *DIGIT` (RFC 3986 §3.2.3), at most five of them: `0000443` is not
+    // a port the Android parser accepts, and a valid port never needs six.
+    if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let port: u16 = port.parse().ok()?;
@@ -809,6 +841,81 @@ mod tests {
         let _ = origin_task.await;
     }
 
+    /// The authority grammar shared with `DnsPinnedProxy.parseAuthority`.
+    ///
+    /// `accept` means "the parser accepts this authority-form"; the destination
+    /// policy still runs afterwards. The fixture is the same file the Kotlin
+    /// suite reads, so a form added to one proxy alone fails the other suite.
+    #[test]
+    fn connect_authority_vectors_match_the_android_parser() {
+        let fixture = include_str!("../../../tests/fixtures/connect-authority.tsv");
+        let mut seen = 0usize;
+        for raw in fixture.lines() {
+            let line = raw.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(
+                cols.len(),
+                2,
+                "a vector is two columns (authority, decision): {line}"
+            );
+            let request = format!("CONNECT {} HTTP/1.1\r\n\r\n", cols[0]);
+            let parsed = parse_connect(request.as_bytes());
+            match cols[1] {
+                "accept" => assert!(
+                    parsed.is_some(),
+                    "'{}' must be accepted by the authority grammar",
+                    cols[0]
+                ),
+                "reject" => assert!(
+                    parsed.is_none(),
+                    "'{}' must be refused before any lookup or socket",
+                    cols[0]
+                ),
+                other => panic!("unknown decision '{other}' ({line})"),
+            }
+            seen += 1;
+        }
+        // A truncated or emptied fixture must not pass by checking nothing.
+        assert!(seen >= 20, "connect vectors shrank: {seen}");
+    }
+
+    /// The alternative IPv4 spellings the WHATWG parser normalises, at the
+    /// CONNECT level.
+    ///
+    /// `parse::<IpAddr>` rejects every one of these, so the only thing that
+    /// stops the proxy from handing them to the resolver is `classify`'s
+    /// `is_private_host` call. The scripted answer is PUBLIC on purpose: if that
+    /// call were removed, the lookup would succeed and the request would be
+    /// tunnelled, so this test fails instead of silently reopening the hole.
+    /// The Kotlin suite carries the same vectors
+    /// (`alternative_ipv4_spellings_and_ip_literals_are_refused`).
+    #[tokio::test]
+    async fn alternative_ipv4_spellings_are_refused_at_the_proxy() {
+        let resolver = ScriptedResolver::new(vec![public_answer()]);
+        let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
+        for authority in [
+            "0177.0.0.1:443",
+            "0x7f000001:443",
+            "2130706433:443",
+            "127.1:443",
+            "169.254.169.254:443",
+        ] {
+            let status = connect_via(proxy.port(), authority).await;
+            assert!(status.starts_with("HTTP/1.1 403"), "{authority}: {status}");
+        }
+        assert_eq!(
+            resolver.calls(),
+            0,
+            "a numeric spelling is a literal, not a name: it must not be resolved"
+        );
+        proxy.stop();
+    }
+
     #[test]
     fn only_connect_with_an_authority_is_accepted() {
         assert_eq!(
@@ -823,5 +930,14 @@ mod tests {
         assert!(parse_connect(b"CONNECT example.test:443 HTTP/2.0\r\n\r\n").is_none());
         assert!(parse_connect(b"CONNECT example.test:443 HTTP/1.1 extra\r\n\r\n").is_none());
         assert!(parse_connect(b"CONNECT :443 HTTP/1.1\r\n\r\n").is_none());
+        // Round 22: forms Android already refused and desktop tunnelled.
+        assert!(parse_connect(b"CONNECT example.test:+443 HTTP/1.1\r\n\r\n").is_none());
+        assert!(parse_connect(b"CONNECT example.test:0000443 HTTP/1.1\r\n\r\n").is_none());
+        assert!(parse_connect(b"CONNECT [8.8.8.8]:443 HTTP/1.1\r\n\r\n").is_none());
+        assert!(parse_connect(b"CONNECT example.test:443:443 HTTP/1.1\r\n\r\n").is_none());
+        assert_eq!(
+            parse_connect(b"CONNECT [::1]:443 HTTP/1.1\r\n\r\n"),
+            Some(("[::1]".to_string(), 443))
+        );
     }
 }

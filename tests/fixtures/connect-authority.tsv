@@ -1,0 +1,65 @@
+# Shared CONNECT-authority grammar for the desktop (Rust) and Android (Kotlin)
+# proxies.
+#
+# Consumers (both load THIS file, neither keeps its own copy of the vectors):
+#   - src-tauri/src/web/pinned_proxy.rs
+#       connect_authority_vectors_match_the_android_parser   (include_str!)
+#   - src-tauri/android-plugin/kotlin/dev/animehub/app/DnsPinnedProxyTest.kt
+#       connect authority vectors agree with the rust parser (test resource)
+#
+# Format: tab-separated, one vector per line, '#' starts a comment, blank lines
+# are ignored.
+#
+#   <authority>	accept|reject
+#
+# `accept` means the PARSER accepts the authority-form (RFC 3986 §3.2.3,
+# `host ":" port`). It does NOT mean the destination is allowed: `127.0.0.1:443`
+# parses and is then refused by the address policy, exactly like an ordinary
+# page requesting loopback. `reject` means the request line is refused before
+# any lookup, socket or policy decision.
+#
+# Why a shared file: until round 22 the desktop parser accepted three forms
+# Android refuses — a signed port (`+443`, because `u16::from_str` accepts it),
+# a bracketed IPv4 (`[8.8.8.8]:443`), and an unbracketed `a:b` host — so "is
+# this request tunnelled" depended on the platform. The vectors below are the
+# grammar both parsers must implement; adding a form to one parser alone now
+# fails the other suite.
+#
+# Not covered here (documented in docs/security-residual-risks.md): the request
+# line itself (method, HTTP version, header framing) and the destination policy.
+
+# --- accepted authority forms -------------------------------------------------
+example.com:443	accept
+EXAMPLE.com.:8443	accept
+h.example:070	accept
+host:1	accept
+host:65535	accept
+8.8.8.8:443	accept
+127.0.0.1:443	accept
+[::1]:443	accept
+[2001:db8::1]:443	accept
+[::ffff:8.8.8.8]:443	accept
+[::]:443	accept
+
+# --- refused authority forms --------------------------------------------------
+example.com	reject
+example.com:	reject
+:443	reject
+example.com:0	reject
+example.com:65536	reject
+example.com:+443	reject
+example.com:0000443	reject
+example.com:-443	reject
+example.com:44 3	reject
+example.com:443?x=1	reject
+example.com:443#f	reject
+user:pw@example.com:443	reject
+example.com:443:443	reject
+[::1]	reject
+[::1]443	reject
+[]:443	reject
+[8.8.8.8]:443	reject
+[not:an:ip]:443	reject
+[fe80::1%25eth0]:443	reject
+[::1]:0	reject
+[v1.foo]:443	reject

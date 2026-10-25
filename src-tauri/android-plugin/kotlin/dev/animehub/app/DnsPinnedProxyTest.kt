@@ -668,6 +668,10 @@ class DnsPinnedProxyTest {
       "", "example.com", "example.com:", ":443", "example.com:0", "example.com:65536",
       "example.com:44 3", "user:pw@example.com:443", "example.com:443?x=1", "[::1]",
       "[::1]443", "[]:443", "exa mple.com:443", "example.com:443\r\nX: y",
+      // Round 22: the forms the desktop parser used to accept (and tunnel) while
+      // this one refused them: a signed port, a bracketed IPv4 and an
+      // unbracketed a:b host.
+      "example.com:+443", "[8.8.8.8]:443", "example.com:443:443",
     )) {
       assertNull("$raw must not parse", DnsPinnedProxy.parseAuthority(raw))
     }
@@ -676,6 +680,39 @@ class DnsPinnedProxyTest {
     assertEquals(443, DnsPinnedProxy.parsePort("443"))
     assertNull(DnsPinnedProxy.parsePort("-1"))
     assertNull(DnsPinnedProxy.parsePort("1e3"))
+  }
+
+  /**
+   * The authority grammar shared with the Rust `parse_connect`.
+   *
+   * `accept` means "the parser accepts this authority-form"; the destination
+   * policy still runs afterwards, so `127.0.0.1:443` parses and is then refused
+   * as loopback. The fixture is the same file the Rust suite includes, so a
+   * form added to one proxy alone fails the other suite.
+   */
+  @Test
+  fun `connect authority vectors agree with the rust parser`() {
+    val fixture =
+      javaClass.classLoader?.getResourceAsStream(CONNECT_FIXTURE)
+        ?: throw AssertionError(
+          "test kaynağı bulunamadı: $CONNECT_FIXTURE — app/src/test/resources altına kopyalanmalı",
+        )
+    var seen = 0
+    for (raw in fixture.bufferedReader().use { it.readLines() }) {
+      val line = raw.trimEnd('\r')
+      if (line.isEmpty() || line.startsWith("#")) continue
+      val cols = line.split('\t')
+      assertEquals("iki sütun (authority, karar): $line", 2, cols.size)
+      val parsed = DnsPinnedProxy.parseConnectHead("CONNECT ${cols[0]} HTTP/1.1\r\n\r\n")
+      when (cols[1]) {
+        "accept" -> assertTrue("${cols[0]} ayrıştırılmalı", parsed != null)
+        "reject" -> assertNull("${cols[0]} ayrıştırılmamalı", parsed)
+        else -> throw AssertionError("bilinmeyen karar: ${cols[1]} ($line)")
+      }
+      seen++
+    }
+    // A truncated or emptied fixture must not pass with zero vectors.
+    assertTrue("connect vektörleri kısalmış: $seen", seen >= 20)
   }
 
   @Test
@@ -768,6 +805,14 @@ class DnsPinnedProxyTest {
     /** A public address no test ever connects to for real. */
     val PUBLIC_ANSWER: InetAddress =
       InetAddress.getByAddress(byteArrayOf(93.toByte(), 184.toByte(), 216.toByte(), 34.toByte()))
+
+    /**
+     * The shared CONNECT-authority vectors. `.github/workflows/ci.yml` copies
+     * `tests/fixtures/connect-authority.tsv` into `app/src/test/resources/`;
+     * a missing copy fails the test instead of shrinking the suite, and the
+     * Rust suite includes the very same file.
+     */
+    const val CONNECT_FIXTURE = "connect-authority.tsv"
   }
 
   /**

@@ -285,6 +285,10 @@ jobs:
           # itself fails loudly) instead of quietly dropping 160 vectors.
           mkdir -p src-tauri/gen/android/app/src/test/resources
           cp tests/fixtures/navigation-policy.tsv src-tauri/gen/android/app/src/test/resources/ || { echo "::error::navigation-policy.tsv could not be copied into the test resources"; exit 1; }
+          # The shared CONNECT-authority grammar (round 22): the same file the
+          # Rust proxy test includes. Without it the Kotlin parser test fails
+          # loudly rather than quietly shrinking to the vectors hard-coded in it.
+          cp tests/fixtures/connect-authority.tsv src-tauri/gen/android/app/src/test/resources/ || { echo "::error::connect-authority.tsv could not be copied into the test resources"; exit 1; }
           echo "=== isolating: move AnimeHubPlugin.kt + MainActivity.kt only; keep the real site controller chain ==="
           echo "=== before move, ls -l src/main ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100

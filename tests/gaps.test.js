@@ -305,12 +305,17 @@ test("CI Kotlin step copies its test sources and reports the real cargo status",
   // The shared navigation-policy vectors are a test RESOURCE: the Kotlin suite
   // loads navigation-policy.tsv from the classpath and the Rust suite includes
   // the same file, so a missing copy must fail the step, not shrink the suite.
-  const fixtureAt = yml.indexOf("cp tests/fixtures/navigation-policy.tsv");
-  assert.ok(fixtureAt > 0, "the shared vectors must reach the test resources");
-  const fixtureLine = yml.slice(fixtureAt, yml.indexOf("\n", fixtureAt));
-  assert.match(fixtureLine, /src\/test\/resources/, "must land in the test resources");
-  assert.match(fixtureLine, /\|\| \{/, "a failed fixture copy must fail the step");
-  assert.equal(fixtureLine.includes("|| true"), false, "fixture copy never masked");
+  for (const [fixture, why] of [
+    ["navigation-policy.tsv", "the shared policy vectors"],
+    ["connect-authority.tsv", "the shared CONNECT-authority grammar (round 22)"],
+  ]) {
+    const fixtureAt = yml.indexOf(`cp tests/fixtures/${fixture}`);
+    assert.ok(fixtureAt > 0, `${why} must reach the test resources`);
+    const fixtureLine = yml.slice(fixtureAt, yml.indexOf("\n", fixtureAt));
+    assert.match(fixtureLine, /src\/test\/resources/, `${fixture}: must land in the test resources`);
+    assert.match(fixtureLine, /\|\| \{/, `${fixture}: a failed copy must fail the step`);
+    assert.equal(fixtureLine.includes("|| true"), false, `${fixture}: copy never masked`);
+  }
 
   // The tauri-gradle generation build stays non-gating on purpose (the real
   // gates are the Gradle exit code and the APK step), but the status it

@@ -1428,6 +1428,35 @@ test("top-level data: is refused on both platforms while blob: playback is kept"
   assert.match(rs, /include_str!\("\.\.\/\.\.\/\.\.\/tests\/fixtures\/navigation-policy\.tsv"\)/);
   const ktTest = read(`${KOTLIN}/SiteNavigationPolicyTest.kt`);
   assert.match(ktTest, /const val FIXTURE = "navigation-policy\.tsv"/);
+  // Round 22: the CONNECT-authority grammar is shared the same way, so a form
+  // added to one proxy parser alone is refused by the other suite.
+  const authority = read("tests/fixtures/connect-authority.tsv");
+  const PROXY_RS = read("src-tauri/src/web/pinned_proxy.rs");
+  const PROXY_KT_TEST = read(`${KOTLIN}/DnsPinnedProxyTest.kt`);
+  assert.match(
+    PROXY_RS,
+    /include_str!\("\.\.\/\.\.\/\.\.\/tests\/fixtures\/connect-authority\.tsv"\)/,
+  );
+  assert.match(PROXY_KT_TEST, /const val CONNECT_FIXTURE = "connect-authority\.tsv"/);
+  assert.match(PROXY_KT_TEST, /getResourceAsStream\(CONNECT_FIXTURE\)/);
+  const authorityVectors = authority
+    .split("\n")
+    .filter((line) => line.includes("\t") && !line.startsWith("#"));
+  assert.ok(
+    authorityVectors.length >= 20,
+    `connect-authority vectors: ${authorityVectors.length} is too few to pin parity`,
+  );
+  // The three forms that used to be desktop-only, and the bracketed literal that
+  // must keep working, have to stay in the fixture.
+  const authorityText = authorityVectors.join("\n");
+  for (const needle of [
+    "example.com:+443\treject",
+    "[8.8.8.8]:443\treject",
+    "example.com:443:443\treject",
+    "[::1]:443\taccept",
+  ]) {
+    assert.ok(authorityText.includes(needle), `missing connect vector: ${needle}`);
+  }
   const kinds = ["url", "host", "ip"];
   for (const kind of kinds) {
     const count = fixture
