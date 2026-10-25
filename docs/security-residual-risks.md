@@ -8,7 +8,143 @@ each one describes the state at the end of its round, including status lines
 that a later round made obsolete. The next section is the only one that
 describes the branch as it stands now.
 
-## Round 21 — current state of the branch
+## Round 22 — current state of the branch
+
+Round 22 audited the two pieces every other network control rests on: the
+address classification (desktop Rust vs Android Kotlin) and the `CONNECT`
+target validation. One class of defect turned up — **the two proxies did not
+accept the same authority grammar** — and it is fixed. The address policy
+itself held: no divergence and no registry mismatch was found, so it was not
+touched. Everything round 21 left open is still open (see §5).
+
+### 1. Address classification: verified, no change
+
+`ip_is_public` (Rust) and `IpPolicy.isPublicIp`/`isPublicIpv6` (Kotlin) were
+compared rule by rule against the IANA registries (**IPv4 registry last updated
+2025-10-09**, **IPv6 registry last updated 2025-10-09**) and against each other:
+
+| Checked | Result |
+| --- | --- |
+| Every IPv4 entry with Globally Reachable = false (0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0.0/24 **except .9/.10**, 192.0.2/24, 192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24, 240/4, 255.255.255.255) | blocked by both |
+| The globally reachable exceptions (192.0.0.9, 192.0.0.10, 192.31.196/24, 192.52.193/24, 192.175.48/24) | allowed by both — adding a blanket `192.0.0.0/24` block would be the wrong fix and was not made |
+| Multicast 224/4 and 233.252.0.0/24 | blocked (outside the special registry, blocked by the `a >= 224` rule) |
+| IPv6 loopback, unspecified, link-local, unique-local, documentation (`2001:db8::/32`, `3fff::/20`), benchmarking, 6to4, site-local, discard (`100::/64`, `100:0:0:1::/64`), SRv6 `5f00::/16` | blocked by both |
+| `2001::/23` with its per-entry exceptions (`2001:1::1-3`, `2001:3::/32`, `2001:4:112::/48`, ORCHIDv2 `2001:20::/28`, DETs `2001:30::/28` allowed; Teredo `2001::/32`, benchmarking `2001:2::/48`, deprecated ORCHID `2001:10::/28`, and every unassigned prefix refused) | identical on both; this is the registry's own "unless allowed by a more specific allocation" footnote, not a blanket block |
+| IPv4-mapped `::ffff:0:0/96` and deprecated IPv4-compatible `::/96` | embedded IPv4 is classified; private inner → blocked, public inner → allowed |
+| NAT64 | `64:ff9b::/96` requires a public embedded IPv4 (RFC 6052); `64:ff9b:1::/48` (local-use) is blocked **including** a public inner address |
+| WHATWG numeric hosts (`0x7f000001`, `2130706433`, `127.1`, `010.0.0.1`, `0177.0.0.1`, `foo.123`, `example.0x7f`) | both run the WHATWG parser and fail closed when it refuses |
+| Cross-implementation differential: 205,472 IPv6 addresses (every interesting `/16` boundary plus random addresses) and the mapped/compatible/NAT64 sets, both classifiers transliterated into one harness | **0 divergences** |
+
+That differential is a model of the two functions, not the compiled code (this
+environment has no Rust or JVM toolchain), so the *authoritative* check is the
+shared fixture both suites execute in CI. Round 22 added 17 `ip` and 9 `host`
+vectors for the classes above that had none (the NAT64-discovery pair
+`192.0.0.170/.171`, the three globally reachable v4 exceptions, `192.88.99.2`,
+mapped metadata `::ffff:169.254.169.254`, local-use NAT64 with a public inner,
+the `2001::/23` edges `2001:1ff::1` / `2001:200::1`, `2001:1::4`, `5eff::1`,
+`2620:4f:8000::1`, and the numeric spellings with a trailing dot or uppercase
+`0X`). One of those vectors was **wrong when written** (`5eff::1` was marked
+public; it is outside `2000::/3` and is correctly blocked) — the model check
+caught it before it reached CI.
+
+**Nothing in the classification was changed.** Round 22 found no address that
+either side misclassifies, so "fixing" it would have been churn.
+
+### 2. The defect: desktop and Android accepted different `CONNECT` authorities
+
+`pinned_proxy.rs` `parse_connect` and `DnsPinnedProxy.parseAuthority` are two
+implementations of one grammar. Three forms were accepted by desktop and
+refused by Android:
+
+| Authority | Round 21 desktop | Android | Consequence |
+| --- | --- | --- | --- |
+| `example.com:+443` | accepted (`u16::from_str` allows a leading `+`) | `403` | desktop tunnelled, Android refused |
+| `[8.8.8.8]:443` | accepted — `classify` strips the brackets and treats it as a literal, so the tunnel opened | `403` (a bracketed host must contain `:`) | desktop tunnelled to a public address, Android refused |
+| `example.com:443:443` | accepted by the parser (`host = "example.com:443"`), refused later by `is_private_host` | `403` | same status, different layer |
+
+None of them reached a private address — the destination policy still ran — so
+this is **not** a rebinding bypass and not a privilege boundary. It is a real
+divergence in the audited surface: the same request line was a tunnel on one
+platform and a refusal on the other, and "the parser accepts what the policy
+can reason about" was not true on desktop. Severity: low, correctness/parity.
+
+**Fix (desktop only, fail-closed):** `parse_connect` now implements the
+authority-form grammar both sides share:
+
+* `port` is one to five ASCII digits (RFC 3986 §3.2.3) — no sign, no
+  whitespace, no zero-padded `0000443`;
+* a bracketed host must be a valid `IPv6address` (`[8.8.8.8]`, `[v1.foo]`,
+  `[fe80::1%25eth0]`, `[]` are refused by the grammar, not by a later stage);
+* an unbracketed host never contains `:`.
+
+No legitimate client is affected: a browser sends `CONNECT <name>:<port>` or
+`CONNECT [<v6>]:<port>`. The destination policy, the pinning, the peer check and
+the TLS pass-through are untouched.
+
+**Tests:** `tests/fixtures/connect-authority.tsv` is now a **shared** fixture —
+`pinned_proxy.rs` `include_str!`s it and `DnsPinnedProxyTest.kt` loads it from
+the test classpath (CI copies it and fails hard if the copy fails). 32 vectors:
+11 accepted forms and 21 refused ones. Both suites read the same file, so a form
+added to one parser alone now fails the other suite. Mutation control: the
+round-21 desktop parser fails **8** of those vectors, the round-22 parser fails
+0.
+
+Two more test gaps were closed:
+
+* `alternative_ipv4_spellings_are_refused_at_the_proxy` (Rust) — the CONNECT
+  level counterpart of the Android test that already existed. The scripted
+  resolution answer is **public on purpose**: if `classify` stopped calling
+  `is_private_host`, the lookup would succeed and the request would be
+  tunnelled, so the test fails instead of silently reopening that path.
+* `the shipped constructor can only be strict, and the test policy is
+  test-only` (JS) — nothing pinned what `start()` (the shipped path) passes.
+  The Rust suite drives `start_with(...)` with explicit policies, so a changed
+  production policy would not have failed any test. This is a source-string
+  pin, not a WebView behaviour test.
+
+### 3. Known tolerance differences that were left alone
+
+These remain different between the two parsers. Each is fail-closed on both
+sides, none changes a decision for anything a WebView sends, and none of them
+was worth touching production code for:
+
+* non-ASCII hosts, `?`, `#` and `\` in the host: refused by the Android parser,
+  accepted by the desktop parser and then refused by the resolver (no lookup
+  succeeds for them);
+* a host longer than 253 bytes or with an empty label (`a..b`): refused at parse
+  by Android, refused by `classify` (400) or the resolver on desktop;
+* `classify` applies the name rules to the bracketed form, but round 22's
+  grammar now guarantees that the only bracketed host reaching it is a valid
+  IPv6 literal, so the literal branch handles it first;
+* **head over-read**: Android's `readHead` is byte-wise and leaves post-head
+  bytes in the socket; desktop reads in 1 KiB chunks and discards anything
+  after `\r\n\r\n`. A client that pipelines tunnel bytes *before* reading the
+  `200` loses them on desktop. RFC 9110 requires a client to wait for the 2xx,
+  and no WebView sends early data, so this is a robustness note — documented,
+  not "fixed", because changing the byte framing of the tunnel for no security
+  gain is the kind of churn this round was told to avoid.
+
+### 4. Status after round 22
+
+| Item | Status | Change this round |
+| --- | --- | --- |
+| Address classification (Rust vs Kotlin, vs IANA) | **Verified; no defect found** | 26 shared vectors added; classification untouched |
+| Desktop ↔ Android CONNECT authority grammar | **Fixed in source; CI-verified** | 3 desktop-only forms refused; shared fixture |
+| Desktop proxy / first request (P1) | **Implemented; device verification pending**; first-request residual **Open** | Unchanged |
+| Desktop loopback proxy access (P3) | **Open; product decision** | Unchanged (round 21 evidence) |
+| Desktop DNS `Unknown` (top level) | **Closed for top-level desktop navigations**; TOCTOU/rebinding and subresources **Open** | Unchanged |
+| Android DNS cancellation (P2) | **Implemented; device verification pending** | Unchanged |
+| Loopback proxy auth (P3, Android) | **Open; product decision** | Unchanged |
+| WebRTC/UDP (P4) | **Partially fixed**; UDP/QUIC **Open; technical limitation** | Unchanged |
+| AniList OAuth (P5) | **Implementation fixed; AniList registration/E2E pending** | Unchanged |
+
+**Still not proven by round 22:** any real WebView run (WebView2 / WebKitGTK /
+WKWebView), the Android device checklist items 36–42 (NOT YET RUN), an AniList
+login, and the independent human review. Round 22 ran the JS suites locally and
+has **no local Rust or JVM toolchain**, so `cargo fmt/clippy/test` and the
+Kotlin/JVM suite are CI evidence only — a build result is not device behaviour.
+
+## Round 21 — state at the end of round 21 (history; superseded by round 22)
 
 Round 21 checked two findings against the shipped source and the supported
 platform APIs. One was a real, closable gap and is closed; the other was real

@@ -253,7 +253,11 @@ Proxy yalnızca `CONNECT` kabul eder (düz HTTP reddedilir), hedefi katı biçim
 ayrıştırır, adı **bir kez** çözer, dönen her adresi mevcut `IpPolicy` ile
 sınıflandırır (karışık/boş/hatalı cevap → ret) ve soketi
 `InetSocketAddress(adres, port)` ile açar — ikinci bir çözümleme yoktur — sonra
-`socket.inetAddress` değerini denetlediği adresle karşılaştırır. TLS hiçbir zaman
+`socket.inetAddress` değerini denetlediği adresle karşılaştırır. Authority
+dilbilgisi iki platformda **aynıdır** (RFC 3986: yalnızca rakamdan oluşan port,
+köşeli parantez varsa geçerli bir IPv6 adresi); vektörler
+`tests/fixtures/connect-authority.tsv` dosyasında ve iki test paketi de onu
+okur, böylece bir biçim yalnızca tek tarafta kabul edilemez (round 22). TLS hiçbir zaman
 sonlandırılmaz veya araya girilmez; sertifika doğrulaması WebView'da kalır ve
 sertifika hataları yutulmaz. Her yeni `CONNECT` (her redirect, her WSS/WebSocket
 isteği) yeni bir karardır.

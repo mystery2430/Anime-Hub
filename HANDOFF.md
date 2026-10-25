@@ -101,6 +101,43 @@ macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TC
 `CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
 `HANDOFF` bölüm 6.D'de.
 
+**Round 22 — IP sınıflandırması ve CONNECT hedef doğrulaması denetlendi;
+iki vekilin authority dilbilgisi eşitlendi.** (1) Adres sınıflandırması
+**değiştirilmedi**: Rust `ip_is_public` ile Kotlin `IpPolicy` kural kural IANA
+IPv4/IPv6 special-purpose kayıtlarıyla (ikisi de 2025-10-09 güncellemeli) ve
+birbirleriyle karşılaştırıldı; 205.472 IPv6 adresi üzerinde model düzeyinde
+diferansiyel **0 sapma** verdi. Kayıtlardaki istisnalar korunuyor
+(`192.0.0.9/.10`, `192.31.196/24`, `192.52.193/24`, `192.175.48/24`,
+`2001:1::1-3`, `2001:3::/32`, `2001:4:112::/48`, ORCHIDv2, DETs); `2001::/23`
+"daha özel atama yoksa engelle" kuralıyla işleniyor, `64:ff9b:1::/48` içine
+gömülü **genel** IPv4 ile bile engelli. Ortak fixture'a 17 `ip` + 9 `host`
+vektörü eklendi (yazarken bir vektör yanlıştı — `5eff::1` `2000::/3` dışında,
+yani private; model kontrolü CI'dan önce yakaladı). (2) **Gerçek kusur:**
+masaüstü `parse_connect` üç biçimi kabul edip tünelliyordu, Android'in
+`parseAuthority`'si reddediyordu: `host:+443` (`u16::from_str` işareti kabul
+eder), `[8.8.8.8]:443` (köşeli parantezli IPv4) ve `example.com:443:443`
+(köşesiz `a:b` host). Özel adrese ulaşan bir yol değildi (hedef politikası yine
+çalışıyordu) ama aynı istek satırı bir platformda tünel, diğerinde 403'tü.
+Düzeltme yalnızca masaüstünde ve fail-closed: port artık yalnızca 1–5 ASCII rakam
+(RFC 3986 §3.2.3), köşeli parantez yalnızca geçerli IPv6 adresi sarabilir,
+köşesiz host `:` içeremez. `tests/fixtures/connect-authority.tsv` (32 vektör)
+artık **ortak**: Rust `include_str!`, Kotlin test classpath'ten okuyor, CI
+kopyalamayı zorunlu tutuyor; mutation kontrolünde round-21 parser'ı bu
+vektörlerin 8'inde düşüyor. (3) Ek test boşlukları: CONNECT düzeyinde WHATWG
+sayı biçimleri (`0177.0.0.1`, `0x7f000001`, `2130706433`, `127.1`) — betikli
+çözümleyici bilerek **public** cevap veriyor, böylece `is_private_host`
+kaldırılırsa test kırmızıya döner; ve `start()`'ın üretim politikasını
+(`PUBLIC_ONLY` + `Limits::DEFAULT`) hiçbir test sabitlemiyordu, JS kaynak pini
+eklendi. (4) Bilerek dokunulmayanlar: ASCII dışı/`?`/`#` host toleransı,
+253 bayttan uzun host ve boş etiketler (ikisi de fail-closed, WebView bunları
+göndermiyor) ve masaüstünün `\r\n\r\n` sonrası baytları atması (Android
+bayt bayt okuyup koruyor; RFC 9110 istemcinin 2xx beklemesini şart koşuyor) —
+güvenlik kazancı olmayan tünel çerçeveleme değişikliği yapılmadı, SRR'ye not
+düşüldü. Round 21'in açık maddeleri (P1 ilk istek, loopback kimlik doğrulaması,
+DNS TOCTOU, cihaz listesi 36–42, WebRTC/UDP, AniList E2E, bağımsız inceleme)
+**aynen açık**. Yerel: `npm test` 284/284, build ve audit temiz; **yerelde
+cargo/JVM yok**, Rust ve Kotlin kanıtı CI'dan.
+
 **Round 21 — masaüstü yerel vekil erişimi doğrulandı (açık), DNS `Unknown`
 fail-open yolu kapatıldı.** İki bulgu kaynak üzerinden kontrol edildi. (1) P3'ün
 kapsamı masaüstünü de içeriyor: `pinned_proxy.rs` `127.0.0.1` üzerinde efemer bir
