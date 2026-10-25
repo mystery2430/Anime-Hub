@@ -683,36 +683,98 @@ class DnsPinnedProxyTest {
   }
 
   /**
-   * The authority grammar shared with the Rust `parse_connect`.
+   * The CONNECT grammar shared with the Rust `parse_connect`.
    *
-   * `accept` means "the parser accepts this authority-form"; the destination
-   * policy still runs afterwards, so `127.0.0.1:443` parses and is then refused
-   * as loopback. The fixture is the same file the Rust suite includes, so a
-   * form added to one proxy alone fails the other suite.
+   * One fixture, two row kinds, and each row runs the **production** parser —
+   * no test-local reimplementation:
+   *
+   *  * `request`   — the whole line, through `parseConnectHead`;
+   *  * `authority` — the authority alone, through `parseAuthority`.
+   *
+   * The Rust suite includes the identical file, so a method, version,
+   * character, bracket or port rule added to one parser alone fails the other
+   * suite. `accept` means the parser accepts the line; the destination policy
+   * still runs afterwards (`127.0.0.1:443` parses and is then refused).
    */
   @Test
-  fun `connect authority vectors agree with the rust parser`() {
+  fun `connect vectors agree with the rust parser`() {
     val fixture =
       javaClass.classLoader?.getResourceAsStream(CONNECT_FIXTURE)
         ?: throw AssertionError(
           "test kaynağı bulunamadı: $CONNECT_FIXTURE — app/src/test/resources altına kopyalanmalı",
         )
-    var seen = 0
+    var requests = 0
+    var authorities = 0
     for (raw in fixture.bufferedReader().use { it.readLines() }) {
       val line = raw.trimEnd('\r')
       if (line.isEmpty() || line.startsWith("#")) continue
       val cols = line.split('\t')
-      assertEquals("iki sütun (authority, karar): $line", 2, cols.size)
-      val parsed = DnsPinnedProxy.parseConnectHead("CONNECT ${cols[0]} HTTP/1.1\r\n\r\n")
-      when (cols[1]) {
-        "accept" -> assertTrue("${cols[0]} ayrıştırılmalı", parsed != null)
-        "reject" -> assertNull("${cols[0]} ayrıştırılmamalı", parsed)
-        else -> throw AssertionError("bilinmeyen karar: ${cols[1]} ($line)")
+      assertEquals("üç sütun (tür, değer, karar): $line", 3, cols.size)
+      val parsed =
+        when (cols[0]) {
+          "request" -> {
+            requests++
+            DnsPinnedProxy.parseConnectHead("${cols[1]}\r\n\r\n")
+          }
+          "authority" -> {
+            authorities++
+            DnsPinnedProxy.parseAuthority(cols[1])
+          }
+          else -> throw AssertionError("bilinmeyen vektör türü: ${cols[0]} ($line)")
+        }
+      when (cols[2]) {
+        "accept" -> assertTrue("${cols[1]} ayrıştırılmalı", parsed != null)
+        "reject" -> assertNull("${cols[1]} ayrıştırılmamalı", parsed)
+        else -> throw AssertionError("bilinmeyen karar: ${cols[2]} ($line)")
       }
-      seen++
     }
-    // A truncated or emptied fixture must not pass with zero vectors.
-    assertTrue("connect vektörleri kısalmış: $seen", seen >= 20)
+    // A truncated or emptied fixture must not pass with zero vectors, and both
+    // row kinds have to survive: dropping every `request` row would otherwise
+    // leave the method and version rules untested.
+    assertTrue("request vektörleri kısalmış: $requests", requests >= 30)
+    assertTrue("authority vektörleri kısalmış: $authorities", authorities >= 30)
+  }
+
+  /**
+   * RFC 9112 §3.1 (method is case-sensitive) and §2.3 (`HTTP/DIGIT.DIGIT`,
+   * case-sensitive), stated next to the fixture so a failure names the rule.
+   * `HTTP/1.2` is valid syntax and is still refused: this proxy is HTTP/1.0 and
+   * 1.1 only, which is an application choice shared with the desktop parser.
+   */
+  @Test
+  fun `only the connect method and http 1x are accepted`() {
+    assertTrue(DnsPinnedProxy.parseConnectHead("CONNECT example.test:443 HTTP/1.1\r\n\r\n") != null)
+    assertTrue(DnsPinnedProxy.parseConnectHead("CONNECT example.test:443 HTTP/1.0\r\n\r\n") != null)
+    for (line in
+      listOf(
+        "connect example.test:443 HTTP/1.1",
+        "Connect example.test:443 HTTP/1.1",
+        "CONNECt example.test:443 HTTP/1.1",
+        "CONNECT example.test:443 HTTP/1.2",
+        "CONNECT example.test:443 HTTP/1.",
+        "CONNECT example.test:443 HTTP/1.foo",
+        "CONNECT example.test:443 HTTP/1.1x",
+        "CONNECT example.test:443 http/1.1",
+        "CONNECT example.test:443 HTTP/2",
+      )) {
+      assertNull("$line reddedilmeli", DnsPinnedProxy.parseConnectHead("$line\r\n\r\n"))
+    }
+  }
+
+  /**
+   * Bytes the TSV cannot carry: a raw control byte and a non-ASCII byte in the
+   * target. Both must die in the parser, before the resolver or a socket.
+   */
+  @Test
+  fun `control and non ascii bytes never reach the resolver`() {
+    for (line in
+      listOf(
+        "CONNECT a\tb.test:443 HTTP/1.1",
+        "CONNECT a\u0001b.test:443 HTTP/1.1",
+        "CONNECT \u00e9xample.test:443 HTTP/1.1",
+      )) {
+      assertNull("$line reddedilmeli", DnsPinnedProxy.parseConnectHead("$line\r\n\r\n"))
+    }
   }
 
   @Test
@@ -807,12 +869,12 @@ class DnsPinnedProxyTest {
       InetAddress.getByAddress(byteArrayOf(93.toByte(), 184.toByte(), 216.toByte(), 34.toByte()))
 
     /**
-     * The shared CONNECT-authority vectors. `.github/workflows/ci.yml` copies
-     * `tests/fixtures/connect-authority.tsv` into `app/src/test/resources/`;
-     * a missing copy fails the test instead of shrinking the suite, and the
-     * Rust suite includes the very same file.
+     * The shared CONNECT request/authority vectors. `.github/workflows/ci.yml`
+     * copies `tests/fixtures/connect-request.tsv` into
+     * `app/src/test/resources/`; a missing copy fails the test instead of
+     * shrinking the suite, and the Rust suite includes the very same file.
      */
-    const val CONNECT_FIXTURE = "connect-authority.tsv"
+    const val CONNECT_FIXTURE = "connect-request.tsv"
   }
 
   /**

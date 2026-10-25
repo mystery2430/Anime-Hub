@@ -397,24 +397,34 @@ async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, u16> {
 
 /// Parse a CONNECT request head into `(host, port)`.
 ///
-/// `None` means the request is not an acceptable CONNECT: any other method,
-/// a non-absolute target, userinfo, a missing or zero port, or a header block
-/// with control bytes is refused rather than interpreted.
+/// `None` means the request is not an acceptable CONNECT and **must not reach
+/// the resolver or a socket**: a different method, an unsupported HTTP version,
+/// a target that is not `authority-form`, userinfo, a missing/zero/oversized
+/// port, or a header block with stray control bytes.
 ///
-/// The authority grammar is the one `DnsPinnedProxy.parseAuthority` accepts
-/// (RFC 3986 §3.2.3, authority-form = `host ":" port`):
+/// The grammar is `DnsPinnedProxy.parseConnectHead` / `parseAuthority`, and
+/// both suites read `tests/fixtures/connect-request.tsv`, so a rule added to
+/// one parser alone fails the other suite.
 ///
-///   * `port` is ASCII digits only — no sign, no whitespace, no default.
-///     `u16::from_str` would accept `+443`, which the Android parser refuses;
-///   * a bracketed host is an `IPv6address`, never a bracketed IPv4 or a
-///     bracketed non-literal (RFC 3986 `IP-literal`);
-///   * an **unbracketed** host never contains `:` (an IPv6 literal must be
-///     bracketed in an authority).
+/// What comes from a standard, and what does not:
 ///
-/// Each rule is a form the Android parser already refuses. Without them the
-/// same request line is tunnelled on desktop and answered `403` on Android, so
-/// "which proxies accept this request" depended on the platform. Both suites
-/// read `tests/fixtures/connect-authority.tsv`, which pins the shared grammar.
+///   * **RFC 9112 §3.1** — "The request method is case-sensitive". `connect`
+///     and `Connect` are different methods and are refused. (Round 23: this
+///     used to be `eq_ignore_ascii_case`, so the desktop tunnelled a request
+///     the RFC does not call CONNECT and Android refused it.)
+///   * **RFC 9112 §2.3** — `HTTP-version = HTTP-name "/" DIGIT "." DIGIT`,
+///     case-sensitive. The app accepts exactly `HTTP/1.0` and `HTTP/1.1`; a
+///     syntactically valid `HTTP/1.2` is **also** refused, because this proxy
+///     tunnels 1.x and nothing else. That is an application choice, not an RFC
+///     requirement, and it is the same choice on Android.
+///   * **RFC 9112 §3.2.3** — `authority-form = uri-host ":" port`, and
+///     **RFC 3986 §3.2.3** — `port = *DIGIT`.
+///   * **Application restrictions** (deliberately stricter than the RFCs, which
+///     would also allow an empty port, `reg-name` sub-delims and
+///     percent-encoding): the port is required and at most five digits; a host
+///     is printable ASCII with no `@ / ? # \`; percent-encoding is refused
+///     because nothing here decodes it; a host is at most 253 bytes with no
+///     empty label; brackets only ever wrap a real IPv6 literal.
 fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
@@ -426,29 +436,60 @@ fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
     if parts.next().is_some() {
         return None;
     }
-    if !method.eq_ignore_ascii_case("CONNECT") {
+    // RFC 9112 §3.1: case-sensitive. `connect` is not the CONNECT method.
+    if method != "CONNECT" {
         return None;
     }
+    // RFC 9112 §2.3: exact, case-sensitive version. See the doc comment for why
+    // `HTTP/1.2` is refused even though its syntax is valid.
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return None;
     }
-    if target.contains('@') || target.contains('/') || target.contains(' ') {
+    // Only printable ASCII can appear in `authority-form`. This one check
+    // rejects spaces, every control byte (including a raw HTAB) and every
+    // non-ASCII byte, so none of them can reach the resolver.
+    if !target.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return None;
+    }
+    // Delimiters that mean something else in a URL, and percent-encoding that
+    // this proxy never decodes.
+    if target
+        .bytes()
+        .any(|b| matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\' | b'%'))
+    {
         return None;
     }
     let (host, port) = target.rsplit_once(':')?;
     if host.is_empty() {
         return None;
     }
-    if host.starts_with('[') || host.ends_with(']') {
-        // `IP-literal`: the brackets have to wrap an IPv6 address. `classify`
-        // would happily classify a bracketed IPv4, but the grammar does not
-        // allow one and the Android parser refuses it.
-        let inner = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'))?;
+    if let Some(inner) = host.strip_prefix('[') {
+        // `IP-literal`: the brackets have to wrap a real IPv6 address, and
+        // nothing else. `classify` would happily classify a bracketed IPv4, but
+        // that is not `authority-form`.
+        let inner = inner.strip_suffix(']')?;
         if inner.parse::<std::net::Ipv6Addr>().is_err() {
             return None;
         }
-    } else if host.contains(':') {
-        // An IPv6 literal without brackets is not an authority.
+        // RFC 4291 text form is at most 45 characters.
+        if inner.len() > 45 {
+            return None;
+        }
+    } else {
+        // An unbracketed host is a name: no ':' (an IPv6 literal must be
+        // bracketed in an authority) and no stray bracket. `foo[bar` used to
+        // pass this and was handed to the resolver.
+        if host.contains(':') || host.contains('[') || host.contains(']') {
+            return None;
+        }
+        if host.len() > 253 {
+            return None;
+        }
+    }
+    // A trailing dot is the root label and is dropped; any other empty label
+    // (`foo..bar`, `.foo`) is not a name this proxy resolves.
+    let trimmed = host.trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.split('.').any(str::is_empty) {
         return None;
     }
     // `port = *DIGIT` (RFC 3986 §3.2.3), at most five of them: `0000443` is not
@@ -841,15 +882,22 @@ mod tests {
         let _ = origin_task.await;
     }
 
-    /// The authority grammar shared with `DnsPinnedProxy.parseAuthority`.
+    /// The CONNECT grammar shared with the Android proxy.
     ///
-    /// `accept` means "the parser accepts this authority-form"; the destination
-    /// policy still runs afterwards. The fixture is the same file the Kotlin
-    /// suite reads, so a form added to one proxy alone fails the other suite.
+    /// One fixture, two row kinds, and each row runs the **production** parser
+    /// on the side that reads it — no test-local reimplementation:
+    ///
+    ///   * `request`   — the whole line, through `parse_connect`;
+    ///   * `authority` — the same line wrapped as `CONNECT <a> HTTP/1.1`.
+    ///
+    /// `DnsPinnedProxyTest` reads the identical file through `parseConnectHead`
+    /// and `parseAuthority`, so a method, version, character, bracket or port
+    /// rule added to one parser alone fails the other suite. `accept` means the
+    /// parser accepts the line; the destination policy still runs afterwards.
     #[test]
-    fn connect_authority_vectors_match_the_android_parser() {
-        let fixture = include_str!("../../../tests/fixtures/connect-authority.tsv");
-        let mut seen = 0usize;
+    fn connect_request_vectors_match_the_android_parser() {
+        let fixture = include_str!("../../../tests/fixtures/connect-request.tsv");
+        let (mut requests, mut authorities) = (0usize, 0usize);
         for raw in fixture.lines() {
             let line = raw.trim_end_matches('\r');
             if line.is_empty() || line.starts_with('#') {
@@ -858,28 +906,87 @@ mod tests {
             let cols: Vec<&str> = line.split('\t').collect();
             assert_eq!(
                 cols.len(),
-                2,
-                "a vector is two columns (authority, decision): {line}"
+                3,
+                "a vector is <kind>\\t<value>\\t<decision>: {line}"
             );
-            let request = format!("CONNECT {} HTTP/1.1\r\n\r\n", cols[0]);
-            let parsed = parse_connect(request.as_bytes());
-            match cols[1] {
+            let head = match cols[0] {
+                "request" => {
+                    requests += 1;
+                    format!("{}\r\n\r\n", cols[1])
+                }
+                "authority" => {
+                    authorities += 1;
+                    format!("CONNECT {} HTTP/1.1\r\n\r\n", cols[1])
+                }
+                other => panic!("unknown vector kind '{other}' ({line})"),
+            };
+            let parsed = parse_connect(head.as_bytes());
+            match cols[2] {
                 "accept" => assert!(
                     parsed.is_some(),
-                    "'{}' must be accepted by the authority grammar",
-                    cols[0]
+                    "'{}' must be accepted by the CONNECT grammar",
+                    cols[1]
                 ),
                 "reject" => assert!(
                     parsed.is_none(),
                     "'{}' must be refused before any lookup or socket",
-                    cols[0]
+                    cols[1]
                 ),
                 other => panic!("unknown decision '{other}' ({line})"),
             }
-            seen += 1;
         }
-        // A truncated or emptied fixture must not pass by checking nothing.
-        assert!(seen >= 20, "connect vectors shrank: {seen}");
+        // A truncated or emptied fixture must not pass by checking nothing, and
+        // both row kinds have to survive: dropping every `request` row would
+        // otherwise leave the method and version rules untested.
+        assert!(requests >= 30, "request vectors shrank: {requests}");
+        assert!(authorities >= 30, "authority vectors shrank: {authorities}");
+    }
+
+    /// The method and version rules, spelled out next to the fixture so a
+    /// failure says which standard rule was broken.
+    ///
+    /// RFC 9112 §3.1: the method is case-sensitive. RFC 9112 §2.3: the version
+    /// is `HTTP/DIGIT.DIGIT` and case-sensitive. `HTTP/1.2` is valid syntax but
+    /// is refused because this proxy implements 1.0 and 1.1 only.
+    #[test]
+    fn only_the_connect_method_and_http_1x_are_accepted() {
+        assert!(parse_connect(b"CONNECT example.test:443 HTTP/1.1\r\n\r\n").is_some());
+        assert!(parse_connect(b"CONNECT example.test:443 HTTP/1.0\r\n\r\n").is_some());
+        for line in [
+            "connect example.test:443 HTTP/1.1",
+            "Connect example.test:443 HTTP/1.1",
+            "CONNECt example.test:443 HTTP/1.1",
+            "CONNECT example.test:443 HTTP/1.2",
+            "CONNECT example.test:443 HTTP/1.",
+            "CONNECT example.test:443 HTTP/1.foo",
+            "CONNECT example.test:443 HTTP/1.1x",
+            "CONNECT example.test:443 http/1.1",
+            "CONNECT example.test:443 HTTP/2",
+        ] {
+            let head = format!("{line}\r\n\r\n");
+            assert!(
+                parse_connect(head.as_bytes()).is_none(),
+                "{line:?} must be refused"
+            );
+        }
+    }
+
+    /// Bytes a TSV cannot carry: a raw control byte and a non-ASCII byte in the
+    /// target. Both must die in the parser, not in the resolver.
+    #[test]
+    fn control_and_non_ascii_bytes_never_reach_the_resolver() {
+        for head in [
+            "CONNECT a\u{9}b.test:443 HTTP/1.1\r\n\r\n",
+            "CONNECT a\u{1}b.test:443 HTTP/1.1\r\n\r\n",
+            "CONNECT \u{e9}xample.test:443 HTTP/1.1\r\n\r\n",
+            // A control byte in a header line, not the target, is refused too.
+            "CONNECT a.test:443 HTTP/1.1\r\nHost: a\u{1}b\r\n\r\n",
+        ] {
+            assert!(
+                parse_connect(head.as_bytes()).is_none(),
+                "{head:?} must be refused"
+            );
+        }
     }
 
     /// The alternative IPv4 spellings the WHATWG parser normalises, at the

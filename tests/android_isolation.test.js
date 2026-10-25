@@ -1428,34 +1428,62 @@ test("top-level data: is refused on both platforms while blob: playback is kept"
   assert.match(rs, /include_str!\("\.\.\/\.\.\/\.\.\/tests\/fixtures\/navigation-policy\.tsv"\)/);
   const ktTest = read(`${KOTLIN}/SiteNavigationPolicyTest.kt`);
   assert.match(ktTest, /const val FIXTURE = "navigation-policy\.tsv"/);
-  // Round 22: the CONNECT-authority grammar is shared the same way, so a form
-  // added to one proxy parser alone is refused by the other suite.
-  const authority = read("tests/fixtures/connect-authority.tsv");
+  // Rounds 22-23: the CONNECT request/authority grammar is shared the same way,
+  // so a method, version, character, bracket or port rule added to one proxy
+  // parser alone is refused by the other suite.
+  const connectFixture = read("tests/fixtures/connect-request.tsv");
   const PROXY_RS = read("src-tauri/src/web/pinned_proxy.rs");
   const PROXY_KT_TEST = read(`${KOTLIN}/DnsPinnedProxyTest.kt`);
   assert.match(
     PROXY_RS,
-    /include_str!\("\.\.\/\.\.\/\.\.\/tests\/fixtures\/connect-authority\.tsv"\)/,
+    /include_str!\("\.\.\/\.\.\/\.\.\/tests\/fixtures\/connect-request\.tsv"\)/,
   );
-  assert.match(PROXY_KT_TEST, /const val CONNECT_FIXTURE = "connect-authority\.tsv"/);
+  assert.match(PROXY_KT_TEST, /const val CONNECT_FIXTURE = "connect-request\.tsv"/);
   assert.match(PROXY_KT_TEST, /getResourceAsStream\(CONNECT_FIXTURE\)/);
-  const authorityVectors = authority
+  // Both suites must check BOTH row kinds: an authority-only fixture cannot
+  // catch a method or version divergence.
+  for (const src of [PROXY_RS, PROXY_KT_TEST]) {
+    // Rust uses `=>`, Kotlin `->`; both must branch on both row kinds.
+    assert.match(src, /"request"\s*(=>|->)/, "the request row kind must be consumed");
+    assert.match(src, /"authority"\s*(=>|->)/, "the authority row kind must be consumed");
+  }
+  const connectVectors = connectFixture
     .split("\n")
     .filter((line) => line.includes("\t") && !line.startsWith("#"));
+  const byKind = (kind) => connectVectors.filter((line) => line.startsWith(`${kind}\t`));
   assert.ok(
-    authorityVectors.length >= 20,
-    `connect-authority vectors: ${authorityVectors.length} is too few to pin parity`,
+    byKind("request").length >= 30,
+    `request vectors: ${byKind("request").length} is too few to pin the line rules`,
   );
-  // The three forms that used to be desktop-only, and the bracketed literal that
-  // must keep working, have to stay in the fixture.
-  const authorityText = authorityVectors.join("\n");
+  assert.ok(
+    byKind("authority").length >= 30,
+    `authority vectors: ${byKind("authority").length} is too few to pin the authority rules`,
+  );
+  // The forms that used to diverge between the platforms, and the ones that must
+  // keep working, have to stay in the fixture.
+  const connectText = connectVectors.join("\n");
   for (const needle of [
+    // Round 22: desktop-only acceptances.
     "example.com:+443\treject",
     "[8.8.8.8]:443\treject",
     "example.com:443:443\treject",
     "[::1]:443\taccept",
+    // Round 23: method case, version, and the authorities that used to reach
+    // the desktop resolver.
+    "connect example.com:443 HTTP/1.1\treject",
+    "Connect example.com:443 HTTP/1.1\treject",
+    "CONNECT example.com:443 HTTP/1.2\treject",
+    "CONNECT example.com:443 HTTP/1.foo\treject",
+    "authority\tfoo[bar:443\treject",
+    "authority\tfoo]bar:443\treject",
+    "authority\tfoo..bar:443\treject",
+    "authority\t[::::]:443\treject",
+    "authority\t[1:2:3:4:5:6:7:8:9]:443\treject",
+    // The port policy that must NOT be confused: five digits is fine, six is not.
+    "authority\th.example:070\taccept",
+    "authority\texample.com:0000443\treject",
   ]) {
-    assert.ok(authorityText.includes(needle), `missing connect vector: ${needle}`);
+    assert.ok(connectText.includes(needle), `missing connect vector: ${needle}`);
   }
   const kinds = ["url", "host", "ip"];
   for (const kind of kinds) {

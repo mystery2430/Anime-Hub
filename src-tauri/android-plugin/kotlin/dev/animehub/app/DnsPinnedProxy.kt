@@ -992,10 +992,22 @@ class DnsPinnedProxy(
      * Parse the request line of a proxy request.
      *
      * `null` for everything that is not a well-formed `CONNECT authority
-     * HTTP/1.x`, including a cleartext `GET` (this proxy exists for TLS and
+     * HTTP/1.0|1.1`, including a cleartext `GET` (this proxy exists for TLS and
      * WSS only) and any authority this policy cannot reason about: a missing
      * or non-numeric port, an out-of-range port, userinfo, a path, quotes,
      * control bytes, an unbalanced IPv6 bracket or an IPv6 zone id.
+     *
+     * The method and the version rules are the Rust `parse_connect` rules
+     * exactly (round 23); `tests/fixtures/connect-request.tsv` is read by both
+     * suites:
+     *
+     *  * **RFC 9112 §3.1** — the method is case-sensitive, so `connect` and
+     *    `Connect` are different methods and are refused;
+     *  * **RFC 9112 §2.3** — `HTTP-version` is case-sensitive and is
+     *    `HTTP/DIGIT.DIGIT`. Exactly `HTTP/1.0` and `HTTP/1.1` are accepted; a
+     *    syntactically valid `HTTP/1.2` is **also** refused, because this proxy
+     *    tunnels HTTP/1.x and nothing else. That is an application choice, not
+     *    an RFC requirement.
      */
     fun parseConnectHead(head: String): Target? {
       val line = head.substringBefore("\r\n").substringBefore("\n")
@@ -1003,17 +1015,30 @@ class DnsPinnedProxy(
       val parts = line.split(' ')
       if (parts.size != 3) return null
       if (parts[0] != "CONNECT") return null
-      if (!parts[2].startsWith("HTTP/1.")) return null
+      if (parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0") return null
       return parseAuthority(parts[1])
     }
 
-    /** Parse `host:port` / `[v6]:port`. See [parseConnectHead]. */
+    /**
+     * Parse `host:port` / `[v6]:port`. See [parseConnectHead].
+     *
+     * The character rules are **application restrictions**, not an RFC claim:
+     * RFC 3986 `reg-name` also allows sub-delims (`!$&'()*+,;=`) and
+     * percent-encoding, and this proxy refuses both because it never decodes
+     * anything and a resolver must not be handed `%2e`-shaped input. What the
+     * RFCs do fix is the shape: `authority-form = uri-host ":" port`
+     * (RFC 9112 §3.2.3) and `port = *DIGIT` (RFC 3986 §3.2.3).
+     */
     fun parseAuthority(raw: String): Target? {
       if (raw.isEmpty() || raw.length > 300) return null
       // Printable ASCII only: no spaces, no controls, no IDN (the browser
       // already punycodes), nothing that could be smuggled into a header.
       if (raw.any { it.code < 0x21 || it.code > 0x7e }) return null
-      if (raw.any { it == '@' || it == '/' || it == '?' || it == '#' || it == '\\' }) return null
+      // URL delimiters that mean something else, and percent-encoding that is
+      // never decoded here (this also covers an IPv6 zone id, `%eth0`).
+      if (raw.any { it == '@' || it == '/' || it == '?' || it == '#' || it == '\\' || it == '%' }) {
+        return null
+      }
 
       val host: String
       val portText: String
@@ -1023,13 +1048,13 @@ class DnsPinnedProxy(
         host = raw.substring(1, end)
         if (end + 1 >= raw.length || raw[end + 1] != ':') return null
         portText = raw.substring(end + 2)
-        // Zone ids are ambiguous in an authority and never needed here.
-        if (host.contains('%')) return null
         if (!host.contains(':')) return null
-        if (!host.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }) {
-          return null
-        }
         if (host.length > 45) return null
+        // A shape is not an address: `[::::]` and a nine-group literal pass a
+        // character filter. The JVM parser is the judge of RFC 4291 text form,
+        // and it cannot reach DNS from here because the filter above and this
+        // branch leave only hex digits, ':' and '.'.
+        if (!isIpv6Literal(host)) return null
       } else {
         val separator = raw.lastIndexOf(':')
         if (separator <= 0) return null
@@ -1045,6 +1070,28 @@ class DnsPinnedProxy(
 
       val port = parsePort(portText) ?: return null
       return Target(normalized, port)
+    }
+
+    /**
+     * True when [text] is an IPv6 address in RFC 4291 text form.
+     *
+     * The shape filter is first and is what keeps this offline: after it only
+     * hex digits, `:` and `.` remain, so `getByName` cannot fall back to a name
+     * lookup — there is no name it could form. It accepts `::ffff:8.8.8.8`,
+     * which the JVM normalises to its IPv4 form; that is a valid literal, which
+     * is why the test is "parses", not "is 16 bytes".
+     */
+    private fun isIpv6Literal(text: String): Boolean {
+      if (!text.contains(':')) return false
+      if (!text.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }) {
+        return false
+      }
+      return try {
+        InetAddress.getByName(text)
+        true
+      } catch (_: Exception) {
+        false
+      }
     }
 
     /** 1..65535, digits only — no sign, no whitespace, no default. */

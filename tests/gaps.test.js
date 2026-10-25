@@ -307,7 +307,7 @@ test("CI Kotlin step copies its test sources and reports the real cargo status",
   // the same file, so a missing copy must fail the step, not shrink the suite.
   for (const [fixture, why] of [
     ["navigation-policy.tsv", "the shared policy vectors"],
-    ["connect-authority.tsv", "the shared CONNECT-authority grammar (round 22)"],
+    ["connect-request.tsv", "the shared CONNECT request/authority grammar (round 23)"],
   ]) {
     const fixtureAt = yml.indexOf(`cp tests/fixtures/${fixture}`);
     assert.ok(fixtureAt > 0, `${why} must reach the test resources`);

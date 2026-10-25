@@ -1,0 +1,141 @@
+# Shared CONNECT grammar for the desktop (Rust) and Android (Kotlin) proxies.
+#
+# Consumers (both load THIS file, neither keeps its own copy of the vectors):
+#   - src-tauri/src/web/pinned_proxy.rs
+#       connect_request_vectors_match_the_android_parser   (include_str!)
+#   - src-tauri/android-plugin/kotlin/dev/animehub/app/DnsPinnedProxyTest.kt
+#       `connect vectors agree with the rust parser`       (test resource)
+#
+# Format: tab-separated, one vector per line, '#' starts a comment, blank lines
+# are ignored. Three columns:
+#
+#   request<TAB><request-line><TAB>accept|reject
+#   authority<TAB><authority><TAB>accept|reject
+#
+# `request` rows go through the production request-line parser
+# (`parse_connect` on desktop, `parseConnectHead` on Android). `authority` rows
+# go through the production authority parser: the whole `CONNECT <authority>
+# HTTP/1.1` line on desktop, `parseAuthority` on Android. One file rather than
+# two keeps the shared rules in one place: a method, version, character,
+# bracket or port rule added to one parser alone fails the other suite.
+#
+# `accept` means the PARSER accepts the line. It does NOT mean the destination
+# is allowed: `127.0.0.1:443` parses and is then refused by the address policy,
+# exactly like an ordinary page requesting loopback. `reject` means the line is
+# refused before any lookup, socket or policy decision.
+#
+# Split of authority between the standard and this app (round 23):
+#   * RFC 9112 §3.1   the method is case-sensitive  -> `connect` is refused
+#   * RFC 9112 §2.3   HTTP-version is `HTTP/DIGIT.DIGIT`, case-sensitive
+#                     -> `HTTP/1.foo`, `HTTP/1.`, `http/1.1` are refused;
+#                        `HTTP/1.2` is valid syntax but refused TOO, because
+#                        this proxy implements HTTP/1.0 and HTTP/1.1 only
+#                        (application choice, identical on both platforms)
+#   * RFC 9112 §3.2.3 authority-form = uri-host ":" port
+#   * RFC 3986 §3.2.3 port = *DIGIT
+#   * application     the port is required and at most five digits; host is
+#                     printable ASCII with no `@ / ? # \ %`; at most 253 bytes;
+#                     no empty label; brackets only around a real IPv6 literal.
+#                     RFC 3986 `reg-name` would also allow sub-delims and
+#                     percent-encoding; both are refused on purpose.
+#
+# Not expressible in a TSV: a literal ASCII control byte (HTAB, 0x01) inside a
+# target, because the separator is a tab. Each suite asserts those separately.
+
+# =============================================================================
+# request lines
+# =============================================================================
+request	CONNECT example.com:443 HTTP/1.1	accept
+request	CONNECT example.com:443 HTTP/1.0	accept
+request	CONNECT [::1]:443 HTTP/1.1	accept
+request	CONNECT [::ffff:8.8.8.8]:443 HTTP/1.1	accept
+request	CONNECT EXAMPLE.com.:8443 HTTP/1.1	accept
+request	CONNECT 8.8.8.8:443 HTTP/1.1	accept
+request	CONNECT h.example:070 HTTP/1.1	accept
+
+# RFC 9112 §3.1 — the method is case-sensitive.
+request	connect example.com:443 HTTP/1.1	reject
+request	Connect example.com:443 HTTP/1.1	reject
+request	CONNECt example.com:443 HTTP/1.1	reject
+request	CONNEC example.com:443 HTTP/1.1	reject
+request	GET example.com:443 HTTP/1.1	reject
+
+# RFC 9112 §2.3 — version syntax and the app's 1.0/1.1-only contract.
+request	CONNECT example.com:443 HTTP/1.2	reject
+request	CONNECT example.com:443 HTTP/1.foo	reject
+request	CONNECT example.com:443 HTTP/1.	reject
+request	CONNECT example.com:443 HTTP/1.1x	reject
+request	CONNECT example.com:443 HTTP/2	reject
+request	CONNECT example.com:443 HTTP/2.0	reject
+request	CONNECT example.com:443 http/1.1	reject
+
+# Request-line shape: single SP, exactly three fields (RFC 9112 §3).
+request	CONNECT example.com:443	reject
+request	CONNECT  example.com:443 HTTP/1.1	reject
+request	CONNECT example.com:443 HTTP/1.1 extra	reject
+request	 CONNECT example.com:443 HTTP/1.1	reject
+
+# Authority errors surface through the whole line as well.
+request	CONNECT example.com?x=1:443 HTTP/1.1	reject
+request	CONNECT example.com#frag:443 HTTP/1.1	reject
+request	CONNECT example.com\evil:443 HTTP/1.1	reject
+request	CONNECT éxample.com:443 HTTP/1.1	reject
+request	CONNECT foo[bar:443 HTTP/1.1	reject
+request	CONNECT foo]bar:443 HTTP/1.1	reject
+request	CONNECT foo..bar:443 HTTP/1.1	reject
+request	CONNECT example.com:+443 HTTP/1.1	reject
+request	CONNECT example.com:0000443 HTTP/1.1	reject
+request	CONNECT [::::]:443 HTTP/1.1	reject
+request	CONNECT [1:2:3:4:5:6:7:8:9]:443 HTTP/1.1	reject
+request	CONNECT example.com:%34%34%33 HTTP/1.1	reject
+request	CONNECT aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443 HTTP/1.1	reject
+
+# =============================================================================
+# authorities (production authority parser on both sides)
+# =============================================================================
+authority	example.com:443	accept
+authority	EXAMPLE.com.:8443	accept
+authority	h.example:070	accept
+authority	host:1	accept
+authority	host:65535	accept
+authority	8.8.8.8:443	accept
+authority	127.0.0.1:443	accept
+authority	[::1]:443	accept
+authority	[2001:db8::1]:443	accept
+authority	[::ffff:8.8.8.8]:443	accept
+authority	[::]:443	accept
+authority	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443	accept
+
+authority	example.com	reject
+authority	example.com:	reject
+authority	:443	reject
+authority	example.com:0	reject
+authority	example.com:65536	reject
+authority	example.com:+443	reject
+authority	example.com:0000443	reject
+authority	example.com:-443	reject
+authority	example.com:44 3	reject
+authority	example.com:443?x=1	reject
+authority	example.com:443#f	reject
+authority	user:pw@example.com:443	reject
+authority	example.com:443:443	reject
+authority	[::1]	reject
+authority	[::1]443	reject
+authority	[]:443	reject
+authority	[8.8.8.8]:443	reject
+authority	[not:an:ip]:443	reject
+authority	[fe80::1%25eth0]:443	reject
+authority	[::1]:0	reject
+authority	[v1.foo]:443	reject
+# Round 23: the forms the desktop parser used to hand to the resolver.
+authority	foo[bar:443	reject
+authority	foo]bar:443	reject
+authority	foo..bar:443	reject
+authority	.foo:443	reject
+authority	éxample.com:443	reject
+authority	example.com\evil:443	reject
+authority	example.com%2e:443	reject
+authority	[::::]:443	reject
+authority	[1:2:3:4:5:6:7:8:9]:443	reject
+authority	[::1]:443x	reject
+authority	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443	reject
