@@ -58,6 +58,30 @@ test("hiddenSiteRows caps the name and strips control characters", () => {
   assert.equal(/[\u0000-\u001f\u007f]/.test(rows[0].name), false);
 });
 
+test("hiddenSiteRows strips bidi overrides so a name cannot reorder the row", () => {
+  // A stored name is data, not layout: U+202E would flip the visual order of
+  // everything rendered after it, letting a hidden entry masquerade as another
+  // site next to its "Geri göster" button.
+  const rows = hiddenSiteRows([
+    site({ id: "bidi", name: "Anime\u202EHidden", hidden: true }),
+    site({ id: "isolate", name: "A\u2066B\u2069C", hidden: true }),
+    site({ id: "c1", name: "X\u0085Y\u009fZ", hidden: true }),
+    site({ id: "sep", name: "Line\u2028Break", hidden: true }),
+  ]);
+  const byId = Object.fromEntries(rows.map((row) => [row.id, row.name]));
+  assert.equal(byId.bidi, "AnimeHidden");
+  assert.equal(byId.isolate, "ABC");
+  assert.equal(byId["c1"], "XYZ");
+  assert.equal(byId.sep, "LineBreak");
+  for (const name of Object.values(byId)) {
+    assert.equal(
+      /[\u061c\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\u0080-\u009f]/.test(name),
+      false,
+      `${JSON.stringify(name)} still carries an invisible/format character`,
+    );
+  }
+});
+
 test("hiddenSiteRows falls back for a blank name", () => {
   const rows = hiddenSiteRows([site({ id: "blank", name: "   ", hidden: true })]);
   assert.equal(rows[0].name, "Adsız site");

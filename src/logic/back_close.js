@@ -48,24 +48,44 @@ export function createBackSession({ call, notify, errorText }) {
   let state = "idle";
   /** Reason of the last failure (kept for diagnostics/retry messages). */
   let lastError = "";
+  /**
+   * How many sessions this object has owned. Bumped by every `opened()`,
+   * `closedByEvent()` and `reset()`.
+   *
+   * WHY A LABEL CHECK ALONE IS NOT OWNERSHIP: Rust derives the label from the
+   * site id (`label_for` = `site-` + sanitized id), so it is DETERMINISTIC —
+   * re-opening the SAME site hands back the SAME label. A close that settles
+   * late (Android's 10 s step watchdog, a slow flush, a retry) then passes a
+   * `label === target` test even though the session it belonged to is gone,
+   * and writes `closed`/`failed` onto the freshly opened one. The observable
+   * damage is on the next back press: `requestClose` answers from the stale
+   * `closed` without ever invoking `close_site`, so Kotlin tears the site
+   * view down natively while Rust still believes a session is open (no flush,
+   * no export, no `site-closed` bookkeeping).
+   */
+  let epoch = 0;
 
   function settle(next, message) {
     state = message ? `${next}:${message}` : next;
   }
 
   async function runClose(target, operationId) {
+    // Snapshot ownership at request time: a completion may only write state
+    // for the epoch that asked for it.
+    const owner = epoch;
     settle("pending");
     try {
       const args = { label: target };
       if (typeof operationId === "string") args.operationId = operationId;
       await call("close_site", args);
-      // The session may already have been re-opened for another site while
-      // this call was in flight — never clobber the newer owner.
-      if (label === target) settle("closed");
+      // The session may already have been re-opened — another site, or the
+      // same site on the same label — while this call was in flight. Never
+      // clobber the newer owner.
+      if (label === target && epoch === owner) settle("closed");
     } catch (e) {
       const message = errorText ? errorText(e) : String(e);
-      lastError = message;
-      if (label === target) {
+      if (label === target && epoch === owner) {
+        lastError = message;
         settle("failed", message);
         if (typeof notify === "function") notify(message);
       }
@@ -78,6 +98,7 @@ export function createBackSession({ call, notify, errorText }) {
      * failure state: the new site starts clean.
      */
     opened(newLabel, newSiteId) {
+      epoch += 1;
       label = newLabel || null;
       siteId = newSiteId ?? null;
       state = "idle";
@@ -131,6 +152,7 @@ export function createBackSession({ call, notify, errorText }) {
      */
     closedByEvent(payloadSiteId) {
       if (siteId && payloadSiteId !== siteId) return false;
+      epoch += 1;
       label = null;
       siteId = null;
       state = "idle";
@@ -143,6 +165,7 @@ export function createBackSession({ call, notify, errorText }) {
      * awaited the close outcome itself (never as a `finally` shortcut).
      */
     reset() {
+      epoch += 1;
       label = null;
       siteId = null;
       state = "idle";

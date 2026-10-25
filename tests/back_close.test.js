@@ -218,6 +218,61 @@ test("reset() clears unconditionally", () => {
   assert.equal(h.session.statusString(), "idle");
 });
 
+// ---------------------------------------------------------------------------
+// Regression: ownership is per OPENING, not merely per label.
+//
+// Rust derives the label deterministically from the site id
+// (`windows::label_for` = "site-" + `profile_dir_name(site_id)`), so opening
+// the same site twice yields the SAME label. A close that settles late (the
+// Android step watchdog, a slow flush, or a retry) must not be able to write
+// its outcome onto the newer session that owns that label now.
+// ---------------------------------------------------------------------------
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test("a delayed close of the SAME site cannot settle a re-opened session", async () => {
+  const h = harness();
+  h.session.opened("site-a", "id-a");
+  h.session.requestClose();
+  assert.equal(h.calls.length, 1);
+
+  // The close is still in flight when the same site is opened again. The label
+  // is identical because it is derived from the site id.
+  h.session.opened("site-a", "id-a");
+  assert.equal(h.session.statusString(), "idle");
+
+  h.resolveClose();
+  await tick();
+  assert.equal(
+    h.session.statusString(),
+    "idle",
+    "a stale completion must not report the newer session as closed",
+  );
+  assert.equal(h.session.currentLabel(), "site-a", "the newer session keeps its label");
+
+  // The next back press must start a REAL close instead of answering from the
+  // stale `closed` state (which let Kotlin tear the view down natively while
+  // Rust still considered the session open).
+  assert.deepEqual(h.session.requestClose(), { accepted: true });
+  assert.equal(h.calls.length, 2, "the newer session owns its own close");
+  assert.equal(h.session.statusString(), "pending");
+});
+
+test("a delayed FAILURE of the SAME site cannot poison a re-opened session", async () => {
+  const h = harness();
+  h.session.opened("site-a", "id-a");
+  h.session.requestClose();
+
+  h.session.opened("site-a", "id-a");
+  h.rejectClose("önceki kapanışın hatası");
+  await tick();
+
+  assert.equal(h.session.statusString(), "idle", "the new session starts clean");
+  assert.equal(h.session.lastError(), "", "stale error must not be recorded");
+  assert.deepEqual(h.notices, [], "stale failure must not be surfaced as this session's");
+  assert.equal(h.session.currentLabel(), "site-a");
+});
+
 test("custom errorText formats the rejection reason", async () => {
   const h = harness({
     errorText: (e) => `formatted:${e}`,
