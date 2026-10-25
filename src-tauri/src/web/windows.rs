@@ -630,7 +630,7 @@ fn open_in_main_window_inner(
         let state = app.state::<AppState>();
         let value = CurrentSite {
             site_id: site.id.clone(),
-            session_id,
+            session_id: session_id.clone(),
             host,
             window_label: label.clone(),
             entered_fullscreen,
