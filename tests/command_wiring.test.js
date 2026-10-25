@@ -50,6 +50,21 @@ test("every command the launcher invokes is registered", () => {
 // BUG-05: hiding a built-in is a registry flag, not a delete, but `list_sites`
 // returns the visible grid only — so `set_site_hidden(id, false)` had no caller
 // and «Başlatıcıdan gizle» was a one-way door. These pin the read/write pair.
+test("close_site requires a session id and delegates to guarded native close", () => {
+  assert.match(
+    commandsRs,
+    /pub async fn close_site\([\s\S]*?session_id: String[\s\S]*?windows::close_site_window_for_session\(&app, &label, &session_id\)/,
+  );
+  assert.match(
+    windowsRs,
+    /fn ensure_close_session_identity\([\s\S]*?session_identity_matches\(/,
+  );
+  assert.match(
+    read("src/logic/back_close.js"),
+    /args\.sessionId = targetSessionId/,
+  );
+});
+
 test("site-closed producers carry the identity of the session they close", () => {
   // This is a wiring check, not the behavioural guard: native emission needs
   // a running Tauri app. The payload construction itself is covered by Rust
