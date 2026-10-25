@@ -155,7 +155,7 @@ test("the site WebView keeps TLS end to end", () => {
 });
 
 test("the open command awaits the now-async window path", () => {
-  assert.match(COMMANDS_RS, /\.await\s*\n\s*\.map\(\|label\| OpenedSite \{/);
+  assert.match(COMMANDS_RS, /\.await\s*\n\s*\.map\(\|\(label, active_session_id\)\| OpenedSite \{/);
   assert.match(WINDOWS_RS, /pub async fn open_site_window\(/);
 });
 
