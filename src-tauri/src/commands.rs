@@ -766,9 +766,9 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         session_id.clone(),
     )
     .await
-    .map(|label| OpenedSite {
+    .map(|(label, active_session_id)| OpenedSite {
         label,
-        session_id,
+        session_id: active_session_id,
         mobile: cfg!(any(target_os = "android", target_os = "ios")),
         // Android now gives real per-site isolation (one WebView profile per
         // site); iOS still shares the single WebView.
