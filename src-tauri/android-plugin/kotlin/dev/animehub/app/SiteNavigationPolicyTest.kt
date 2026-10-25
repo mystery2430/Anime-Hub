@@ -286,7 +286,9 @@ class SiteNavigationPolicyTest {
         // The explicit snapshot Rust pushes before an open. This suffix rule
         // matches the apex and every subdomain of the test hostname.
         SiteBlocklist.update(listOf("ads.example-tracker.com"))
-        val topLevel = parseVector("https://ads.example-tracker.com/watch")
+        // ONE hostname for both checkpoints; the installed apex rule also covers
+        // this subdomain, so the snapshot's suffix matching is part of the test.
+        val topLevel = parseVector("https://cdn.ads.example-tracker.com/watch")
         val subresource = parseVector("https://cdn.ads.example-tracker.com/segment-0007.ts")
 
         // Both checkpoints delegate to the same hostAllowed rule. The reason is
