@@ -1299,4 +1299,44 @@ mod tests {
         // And the escape hatch stays: no `</script>` can appear in the payload.
         assert!(!script.contains("</script>"));
     }
+
+    #[test]
+    fn reachable_site_ids_never_collide_after_profile_normalization() {
+        // SEC-5 regression gate: production reaches this function only with a
+        // shipped builtin or a UUIDv4 simple ID. Neither is transformed by the
+        // filter or the 64-char cut, so profile_dir_name is injective on the
+        // reachable set. If the ID format, cap, or alphabet changes without a
+        // namespace migration, this test fails before two profiles can merge.
+        let mut ids = vec![
+            "builtin-openanime".to_string(),
+            "builtin-animecix".to_string(),
+        ];
+        for _ in 0..512 {
+            ids.push(format!("user-{}", uuid::Uuid::new_v4().simple()));
+        }
+
+        let base = std::path::PathBuf::from("test-base");
+        let mut seen = std::collections::HashMap::new();
+        for id in &ids {
+            assert!(
+                id.len() <= 37,
+                "reachable id is outside the audited length budget: {id}"
+            );
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+                "reachable id is outside the audited alphabet: {id}"
+            );
+
+            let profile = profile_dir_name(id);
+            assert_eq!(profile, format!("site-{id}"));
+            let path = profile_dir_path(&base, id);
+            assert_eq!(path, base.join("profiles").join(&profile));
+
+            if let Some(previous) = seen.insert(profile.clone(), id.clone()) {
+                panic!("{previous} and {id} both derive the profile directory {profile}");
+            }
+        }
+        assert_eq!(seen.len(), ids.len());
+    }
 }
