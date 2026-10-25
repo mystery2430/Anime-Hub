@@ -101,6 +101,50 @@ macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TC
 `CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
 `HANDOFF` bölüm 6.D'de.
 
+**Round 23 — CONNECT istek satırı dilbilgisi iki platformda eşitlendi.**
+Round 22 yalnızca *authority* yarısını hizaladı; satır yarısı hizasız kalmıştı
+ve kaynakta dört gerçek fark vardı. (1) **Masaüstü yanlıştı:** `parse_connect`
+metodu `eq_ignore_ascii_case("CONNECT")` ile karşılaştırıyordu, yani RFC 9112
+§3.1'e göre CONNECT **olmayan** `connect`/`Connect`/`CONNECt` satırlarını
+tünelliyordu. Ayrıca `?`, `#`, `\`, ASCII dışı bayt, tek köşeli parantez
+(`foo[bar`, `foo]bar`), boş etiket (`foo..bar`), 253 bayttan uzun host ve hedef
+içindeki ham HTAB parser'dan geçip **çözümleyiciye** ulaşıyordu — yani
+"parser hatası çözümleyiciye düşmez" değişmezi masaüstünde doğru değildi.
+(2) **Android yanlıştı:** sürüm kontrolü `startsWith("HTTP/1.")` idi; RFC 9112
+§2.3'e göre `HTTP/1.foo`, `HTTP/1.`, `HTTP/1.1x`, `http/1.1` geçerli sürüm
+değilken kabul ediliyordu; köşeli parantez dalı da yalnızca *şekle* bakıyordu,
+yani `[::::]` ve 9 gruplu literal parser'dan geçiyordu. (3) İkisi de özel
+adrese ulaşan bir yol değildi (hedef politikası her durumda çalışıyordu); fark,
+güvenlik yüzeyi ve aynı satırın bir platformda tünel diğerinde ret olmasıydı.
+**Düzeltme:** metot tam olarak `CONNECT` (RFC 9112 §3.1), sürüm tam olarak
+`HTTP/1.0|1.1` (RFC 9112 §2.3; `HTTP/1.2` sözdizimsel olarak geçerli ama bu vekil
+yalnızca 1.x tünelliyor — bu bir **uygulama kararı**, iki tarafta aynı), hedef
+yalnızca yazdırılabilir ASCII ve `@ / ? # \ %` yok (RFC 3986 `reg-name` alt-sınır
+karakterlerine ve yüzde kodlamaya izin verir; ikisi de **bilerek** reddediliyor),
+köşeli parantez yalnızca gerçek IPv6 literalini sarar (Android'de JVM
+`getByName`, öncesinde hex/`:`/`.` filtresi sayesinde DNS'e çıkmaz), host
+≤253 bayt ve boş etiket yok, port 1–5 rakam. **Fixture tek kaynak:**
+`connect-authority.tsv` → **`connect-request.tsv`** (80 vektör: 36 `request`,
+44 `authority`); Rust `include_str!`, Kotlin test classpath'ten okuyor, CI
+kopyalamayı zorunlu tutuyor, iki taraf da **her iki satır türünü** işlemek
+zorunda (JS pini). `h.example:070` **kabul** (beş hane, sıfır dolgulu, değer 70)
+ile `example.com:0000443` **ret** (yedi hane) bilinçli olarak ayrı kurallar:
+yalnızca beş-hane sınırı kaldırıldığında testi kıran tam olarak iki vektör
+`0000443` olanlar, `070` değil. Mutation kontrolü (model düzeyinde, üretim kodu
+değişmeden): metot geri alınınca 3, Android sürüm kontrolü geri alınınca 4,
+masaüstü karakter/uzunluk doğrulaması kaldırılınca 16, Android köşeli parantez
+dalı şekil-only olunca 6, yalnız beş-hane sınırı kaldırılınca 2, yalnız boş
+etiket kuralı kaldırılınca 3 vektör düşüyor. 252.442 satırlık üretilmiş korpusta
+nihai iki dilbilgisi **0** sapma veriyor; Round 22 parser'ları 480 satırlık alt
+matriste 92 sapma veriyordu. **Dokunulmayanlar:** ret **durum kodları** hâlâ
+farklı (masaüstü her parse hatasına 405; Android metot için 405, hedef için 403,
+çözümleme için 502) — ikisi de ret, WebView 200 dışını hata sayıyor, RFC 9112
+§2.2'nin önerdiği 400'e geçmek parser'ın dönüş tipini kozmetik için
+genişletmek olurdu. Round 21/22'nin açık maddeleri (P1 ilk istek, loopback
+kimlik doğrulaması, DNS TOCTOU, cihaz listesi 36–42, WebRTC/UDP, AniList E2E,
+bağımsız inceleme) **aynen açık**. Yerel: `npm test` 284/284, build ve audit
+temiz; **yerelde cargo/JVM yok**, Rust ve Kotlin kanıtı CI'dan.
+
 **Round 22 — IP sınıflandırması ve CONNECT hedef doğrulaması denetlendi;
 iki vekilin authority dilbilgisi eşitlendi.** (1) Adres sınıflandırması
 **değiştirilmedi**: Rust `ip_is_public` ile Kotlin `IpPolicy` kural kural IANA

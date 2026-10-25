@@ -8,7 +8,168 @@ each one describes the state at the end of its round, including status lines
 that a later round made obsolete. The next section is the only one that
 describes the branch as it stands now.
 
-## Round 22 — current state of the branch
+## Round 23 — current state of the branch
+
+Round 22 aligned the *authority* grammar of the two `CONNECT` proxies. Round 23
+audited the rest of the same parser and found that the request **line** was
+still decided differently on the two platforms. That is fixed; the shared
+fixture now carries whole request lines as well as authorities. Nothing from
+rounds 20–22 was reopened, and nothing new was added to the risk list.
+
+### 1. The defect: the two proxies decided the request line differently
+
+`pinned_proxy::parse_connect` and `DnsPinnedProxy.parseConnectHead` are two
+implementations of one grammar. Round 22 pinned the authority half and left the
+line half unpinned; the line half had four real divergences.
+
+| Request line / authority | Round 22 desktop | Round 22 Android | Which side was wrong |
+| --- | --- | --- | --- |
+| `connect example.com:443 HTTP/1.1` | **accepted** (`eq_ignore_ascii_case`) | rejected | **desktop** — RFC 9112 §3.1: the method is case-sensitive, so this is not CONNECT |
+| `Connect example.com:443 HTTP/1.1`, `CONNECt …` | **accepted** | rejected | **desktop** |
+| `CONNECT example.com:443 HTTP/1.2` | rejected | **accepted** (`startsWith("HTTP/1.")`) | **Android** — and the two must agree |
+| `CONNECT example.com:443 HTTP/1.foo`, `HTTP/1.`, `HTTP/1.1x` | rejected | **accepted** | **Android** — not an `HTTP-version` at all (RFC 9112 §2.3: `HTTP/DIGIT.DIGIT`) |
+| `CONNECT example.com?x=1:443`, `#frag`, `\evil`, `éxample…`, `foo[bar`, `foo]bar`, `foo..bar`, a 254-byte host, a raw HTAB | **accepted by the parser** | rejected | **desktop** — these reached `classify` and the **resolver** |
+| `[::::]:443`, `[1:2:3:4:5:6:7:8:9]:443` | rejected (real `Ipv6Addr` parse) | **accepted** (shape-only check) | **Android** — a malformed literal reached the resolve stage |
+
+Two consequences, and neither is a private-address bypass:
+
+1. **Availability and surface.** On desktop, a local process (the residual in
+   round 21 §1 — the listener is unauthenticated) could send `CONNECT
+   foo[bar:443`, `CONNECT a..b:443` or `CONNECT <non-ASCII>:443` and the parser
+   would accept it, take one of the **eight** resolver permits
+   (`max_resolvers`), and spend a blocking `lookup_host` on a name that cannot
+   resolve. That is bounded (a permit is held for at most the 5 s resolve
+   deadline) and it is reachable only from loopback, so it is a nuisance, not a
+   new hole. It is however exactly the "parser errors must not reach the
+   resolver" invariant this round was asked to prove.
+2. **The same request line was a tunnel on one platform and a refusal on the
+   other.** Which one depended on which side you hit.
+
+**Nothing here reached a private address:** the destination policy (`classify`
+→ `is_public_ip`) still ran in every case on both platforms, and Android's
+`resolveOnce` still refuses a mixed or non-public answer. The claim is a parser
+parity and input-validation defect, not a rebinding bypass.
+
+### 2. The contract both parsers now implement
+
+| Rule | Source | Desktop | Android |
+| --- | --- | --- | --- |
+| Method is exactly `CONNECT`, case-sensitive | **RFC 9112 §3.1** | `method != "CONNECT"` → refuse | `parts[0] != "CONNECT"` → refuse |
+| Version is exactly `HTTP/1.1` or `HTTP/1.0`, case-sensitive | **RFC 9112 §2.3** for the syntax; the 1.0/1.1-only set is an **application choice** | exact compare | exact compare |
+| `authority-form = uri-host ":" port` | **RFC 9112 §3.2.3** | enforced | enforced |
+| `port = *DIGIT` | **RFC 3986 §3.2.3** | digits only | digits only |
+| Port present, 1–65535, at most five digits, non-zero | **application** | enforced | enforced |
+| Target printable ASCII, no `@ / ? # \ %` | **application** (RFC `reg-name` would also allow sub-delims and percent-encoding) | enforced | enforced |
+| Host ≤ 253 bytes, no empty label, trailing dot trimmed | **application** (RFC 1035 length; the rest is this app's resolver contract) | enforced | enforced |
+| Brackets only around a real IPv6 literal, ≤ 45 chars | **RFC 3986 `IP-literal`** + RFC 4291 text form | `Ipv6Addr::from_str` | JVM `getByName` after a hex/`:`/`.` shape filter |
+| Stray control bytes in the head | **application** (RFC 9112 §2.2 discourages bare CR) | rejected | rejected |
+
+What is **not** claimed: this is not "an RFC-conformant HTTP proxy". A
+syntactically valid `HTTP/1.2` is refused, an empty port is refused (RFC 3986
+allows `port = *DIGIT`, i.e. empty), and the character set is narrower than
+`reg-name`. Those are deliberate application restrictions, identical on both
+platforms, and the code comments say so.
+
+**Not changed, deliberately:** the refusal *status codes* still differ
+(desktop answers `405` to every parse failure; Android answers `405` for a
+method problem, `403` for a target problem and `502` for a resolve/connect
+failure). RFC 9112 §2.2 suggests `400` for a malformed request-line. Both
+answers are refusals, a WebView treats any non-`200` as failure, and making the
+codes agree would mean widening the parser's return type for a cosmetic gain.
+
+### 3. Fixture design: one file, two row kinds
+
+Round 22's `connect-authority.tsv` could not express a method or version
+vector, and a second parallel file would mean two places to keep in step. The
+file is now **`tests/fixtures/connect-request.tsv`** with two row kinds:
+
+```
+request<TAB><request-line><TAB>accept|reject
+authority<TAB><authority><TAB>accept|reject
+```
+
+* `request` rows run the production **request-line** parser: `parse_connect`
+  on desktop, `parseConnectHead` on Android.
+* `authority` rows run the production **authority** parser: the same
+  `parse_connect` (line wrapped as `CONNECT <a> HTTP/1.1`) on desktop,
+  `parseAuthority` on Android.
+
+80 vectors: 36 `request` (7 accept, 29 reject) and 44 `authority`
+(12 accept, 32 reject). Both
+suites read the *same file* — `include_str!` on the Rust side, the test
+classpath on the Android side, with `.github/workflows/ci.yml` copying it and
+failing the step if the copy fails. Neither suite keeps a private vector list
+and neither re-implements the parser.
+
+Deliberately preserved, and independently pinned:
+
+* `h.example:070` is **accepted** — five digits, zero-padded, value 70. The
+  application caps the *text* at five digits; it does not forbid a leading zero.
+* `example.com:0000443` is **rejected** — seven digits. Removing only the
+  five-digit cap breaks exactly these two vectors and nothing else, which is
+  the mutation control that keeps the two rules from being conflated.
+
+Not expressible in a TSV: a literal ASCII control byte inside a target, because
+the column separator is a tab. Each suite therefore asserts the HTAB, 0x01 and
+non-ASCII cases explicitly (`control_and_non_ascii_bytes_never_reach_the_resolver`
+on both sides, same inputs).
+
+### 4. Tests and mutation controls
+
+| Test | What it proves |
+| --- | --- |
+| `connect_request_vectors_match_the_android_parser` (Rust) | All 80 vectors, through `parse_connect`; both row kinds must still be present (`>= 30` each) so a truncated fixture fails instead of shrinking. |
+| `connect vectors agree with the rust parser` (Kotlin) | The same 80 vectors through `parseConnectHead`/`parseAuthority`, with the same per-kind floors. |
+| `only_the_connect_method_and_http_1x_are_accepted` (both) | Method case and the exact version set, stated next to the fixture so a failure names the standard rule. |
+| `control_and_non_ascii_bytes_never_reach_the_resolver` (both) | HTAB, 0x01 and `é` in the target, plus a control byte in a header line. |
+
+Mutation control (model-level, no production code touched): replaying each
+**round-22** rule against the new fixture fails the new tests.
+
+| Reverted rule | Vectors broken |
+| --- | --- |
+| Method back to `eq_ignore_ascii_case` | 3 |
+| Android version back to `startsWith("HTTP/1.")` | 4 |
+| Desktop target charset/length/empty-label validation removed | 16 |
+| Android bracket branch back to shape-only | 6 |
+| Only the five-digit port cap removed | 2 (`…:0000443` twice) — **not** `h.example:070` |
+| Only the empty-label rule removed | 3 (`foo..bar` ×2, `.foo`) — **not** `EXAMPLE.com.:8443` |
+
+A 252,442-line generated corpus (method × version × authority matrix plus
+random targets) gives **0** divergences between the two final grammars; the
+same corpus against the round-22 parsers gives 92 divergences over a 480-line
+sub-matrix.
+
+### 5. Status after round 23
+
+| Item | Status | Change this round |
+| --- | --- | --- |
+| CONNECT request-line + authority parity | **Fixed in source; both suites run the shared vectors in CI** | method, version, charset, bracket and port rules aligned |
+| Address classification (round 22) | **Verified; no defect found** | Unchanged |
+| Desktop proxy / first request (P1) | **Implemented; device verification pending**; first-request residual **Open** | Unchanged |
+| Desktop loopback proxy access (P3) | **Open; product decision** | Unchanged — this round narrowed what the parser accepts, it did not authenticate the client |
+| Desktop DNS `Unknown` (top level) | **Closed for top-level desktop navigations**; TOCTOU/rebinding and subresources **Open** | Unchanged |
+| Android DNS cancellation (P2) | **Implemented; device verification pending** | Unchanged |
+| Loopback proxy auth (P3, Android) | **Open; product decision** | Unchanged |
+| WebRTC/UDP (P4) | **Partially fixed**; UDP/QUIC **Open; technical limitation** | Unchanged |
+| AniList OAuth (P5) | **Implementation fixed; AniList registration/E2E pending** | Unchanged |
+
+**Still not proven by round 23:** any real WebView run, the Android device
+checklist items 36–42 (**NOT YET RUN**), an AniList login, and the independent
+human review. Round 23 has **no local Rust or JVM toolchain**: the two parser
+suites are executed by CI, and a green CI job is not device behaviour.
+
+### Sources read this round
+
+| Source | What it established |
+| --- | --- |
+| RFC 9112 §2.3 | `HTTP-version = HTTP-name "/" DIGIT "." DIGIT`, and "HTTP-version is case-sensitive" — `HTTP/1.foo`, `HTTP/1.` and `http/1.1` are not versions; `HTTP/1.2` is. |
+| RFC 9112 §3, §3.1 | `request-line = method SP request-target SP HTTP-version`; "The request method is case-sensitive" — `connect` is not CONNECT. |
+| RFC 9112 §3.2.3 | `authority-form = uri-host ":" port`, used only for CONNECT. |
+| RFC 3986 §3.2.3 | `port = *DIGIT` (so an empty port is syntactically allowed and is refused here by application choice). |
+| `src-tauri/src/web/pinned_proxy.rs`, `DnsPinnedProxy.kt` | The behaviour in §1 — read from source, not from a previous round's report. |
+
+## Round 22 — state at the end of round 22 (history; superseded by round 23)
 
 Round 22 audited the two pieces every other network control rests on: the
 address classification (desktop Rust vs Android Kotlin) and the `CONNECT`
