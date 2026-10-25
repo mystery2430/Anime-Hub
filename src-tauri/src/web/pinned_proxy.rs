@@ -255,7 +255,15 @@ async fn handle_connection(
     mut stop: watch::Receiver<bool>,
 ) {
     let limits = context.limits;
-    let Ok(head) = tokio::time::timeout(limits.handshake, read_head(stream)).await else {
+    // `stop()` must also end work that has not reached the tunnel yet. Without
+    // these selects a handshake, lookup or connect could outlive the WebView
+    // it belonged to (up to the handshake/resolve/connect deadlines) and open
+    // an upstream socket after the session was closed.
+    let waited = tokio::select! {
+        _ = stop.changed() => return,
+        waited = tokio::time::timeout(limits.handshake, read_head(stream)) => waited,
+    };
+    let Ok(head) = waited else {
         let _ = reply(stream, 408, "Request Timeout").await;
         return;
     };
@@ -275,7 +283,11 @@ async fn handle_connection(
     // WebView is talking to the proxy at all, not a claim that it was allowed.
     context.requests.fetch_add(1, Ordering::SeqCst);
 
-    let addrs = match classify(&host, port, context).await {
+    let classified = tokio::select! {
+        _ = stop.changed() => return,
+        classified = classify(&host, port, context) => classified,
+    };
+    let addrs = match classified {
         Ok(addrs) => addrs,
         Err(status) => {
             let _ = reply(stream, status, status_text(status)).await;
@@ -283,10 +295,19 @@ async fn handle_connection(
         }
     };
 
-    let Some(upstream) = connect_first(&addrs, port, limits.connect).await else {
+    let connected = tokio::select! {
+        _ = stop.changed() => return,
+        connected = connect_first(&addrs, port, limits.connect) => connected,
+    };
+    let Some(upstream) = connected else {
         let _ = reply(stream, 502, "Bad Gateway").await;
         return;
     };
+    // The stop may have raced the successful connect: close instead of
+    // answering 200 on a session that is already over.
+    if *stop.borrow() {
+        return;
+    }
 
     if reply(stream, 200, "Connection Established").await.is_err() {
         return;
@@ -377,6 +398,14 @@ async fn reply(stream: &mut TcpStream, status: u16, reason: &str) -> std::io::Re
     stream.flush().await
 }
 
+/// Read one request head and nothing after it.
+///
+/// The limit is on the head that is returned, not on a buffer that happened to
+/// grow past it while the terminator was already inside: a head ending after
+/// [`MAX_HEAD_BYTES`] is `431`, even when the final `read()` that delivered the
+/// terminator made the buffer larger. Bytes after the first `\r\n\r\n` are not
+/// part of this head and are discarded (the caller treats the connection as a
+/// single request).
 async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, u16> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
@@ -386,10 +415,17 @@ async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, u16> {
             return Err(400);
         }
         buf.extend_from_slice(&chunk[..read]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n".as_slice()) {
+        if let Some(start) = buf.windows(4).position(|w| w == b"\r\n\r\n".as_slice()) {
+            let head_len = start + 4;
+            if head_len > MAX_HEAD_BYTES {
+                return Err(431);
+            }
+            buf.truncate(head_len);
             return Ok(buf);
         }
-        if buf.len() > MAX_HEAD_BYTES {
+        // No terminator yet: if the buffer is already at the cap, the next
+        // byte can only make the head oversized.
+        if buf.len() >= MAX_HEAD_BYTES {
             return Err(431);
         }
     }
@@ -426,6 +462,9 @@ async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, u16> {
 ///     because nothing here decodes it; a host is at most 253 bytes with no
 ///     empty label; brackets only ever wrap a real IPv6 literal.
 fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
+    if !is_well_formed_head(head) {
+        return None;
+    }
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
     let request = lines.next()?;
@@ -501,15 +540,54 @@ fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
     if port == 0 {
         return None;
     }
-    // A header block that carries control characters other than CR/LF/TAB is
-    // malformed; refusing keeps the parser from guessing at intent.
-    if text
-        .bytes()
-        .any(|b| b < 0x20 && b != b'\r' && b != b'\n' && b != b'\t')
-    {
-        return None;
-    }
     Some((host.to_string(), port))
+}
+
+/// The framing and byte contract shared by `parse_connect` and Android's
+/// `parseConnectHead`.
+///
+/// The two proxies previously disagreed here while agreeing on the request
+/// line: Rust decoded the whole head as strict UTF-8, so `0xFF` in a header
+/// killed the request (while other non-ASCII bytes passed), and Android decoded
+/// ISO-8859-1 and never looked at headers at all. A bare LF inside a header was
+/// ignored by both. This helper makes the accepted language explicit:
+///
+///   * exactly one head, ending in the first `\r\n\r\n`;
+///   * at most [`MAX_HEAD_BYTES`] bytes (the same bound the reader enforces);
+///   * only HTAB, SP..`~`, and CRLF; no other C0 control, no DEL, no byte
+///     ≥ 0x80, and no bare CR or bare LF.
+///
+/// Headers are not interpreted, but they are part of the request this parser
+/// says yes to. Requiring plain ASCII here is an application restriction (an
+/// obs-text field value is not needed by a browser CONNECT) and keeps the
+/// decision identical to the Android parser, whose ISO-8859-1 string can carry
+/// every byte the socket delivered. It also means invalid UTF-8 can never be
+/// accepted merely because it was in a header rather than the target.
+fn is_well_formed_head(head: &[u8]) -> bool {
+    if head.is_empty() || head.len() > MAX_HEAD_BYTES {
+        return false;
+    }
+    let Some(terminator) = head.windows(4).position(|w| w == b"\r\n\r\n".as_slice()) else {
+        return false;
+    };
+    if terminator + 4 != head.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < head.len() {
+        match head[index] {
+            b'\r' => {
+                if head.get(index + 1) != Some(&b'\n') {
+                    return false;
+                }
+                index += 2;
+            }
+            b'\n' => return false,
+            b'\t' | 0x20..=0x7e => index += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -548,6 +626,39 @@ mod tests {
             };
             Box::pin(async move { next.unwrap_or_else(|| Err("script exhausted".to_string())) })
         }
+    }
+
+    /// A resolver call that never answers, and never completes on its own.
+    /// Dropping the returned future is the only way this request ends.
+    struct PendingResolver {
+        calls: AtomicUsize,
+    }
+
+    impl PendingResolver {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Resolver for PendingResolver {
+        fn resolve(&self, _host: String, _port: u16) -> ResolveFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending::<Result<Vec<IpAddr>, String>>())
+        }
+    }
+
+    fn decode_hex(text: &str) -> Vec<u8> {
+        assert_eq!(text.len() % 2, 0, "hex vectors have whole bytes: {text}");
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex byte"))
+            .collect()
     }
 
     /// A loopback listener standing in for a site origin: it echoes one line.
@@ -749,24 +860,235 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_head_is_refused() {
+    async fn a_head_that_reaches_the_limit_without_terminator_is_refused() {
         let resolver = ScriptedResolver::new(vec![public_answer()]);
         let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
             .await
             .expect("proxy");
         let mut stream = dial(proxy.port()).await;
-        let mut request = String::from("CONNECT example.test:443 HTTP/1.1\r\n");
-        while request.len() < MAX_HEAD_BYTES + 64 {
-            request.push_str("X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
-        }
-        let _ = stream.write_all(request.as_bytes()).await;
+
+        // Send exactly the cap and no bytes beyond it. The reader must return
+        // 431 at the boundary. Sending surplus bytes in the same write can
+        // make Windows reset the TCP connection when the server refuses early,
+        // hiding the response this test is trying to assert.
+        let mut request = b"CONNECT example.test:443 HTTP/1.1\r\n".to_vec();
+        request.resize(MAX_HEAD_BYTES, b'a');
+        assert_eq!(request.len(), MAX_HEAD_BYTES);
+        stream.write_all(&request).await.expect("write capped head");
+
         let mut buf = vec![0u8; 256];
         let n = stream.read(&mut buf).await.unwrap_or(0);
         let head = String::from_utf8_lossy(&buf[..n]).to_string();
         assert!(
-            head.starts_with("HTTP/1.1 431") || head.is_empty(),
-            "oversized head must not be parsed: {head}"
+            head.starts_with("HTTP/1.1 431"),
+            "a head at the size limit must be refused explicitly, got: {head:?}"
         );
+        assert_eq!(resolver.calls(), 0, "oversized head reached the resolver");
+        assert_eq!(proxy.requests(), 0, "oversized head counted as a CONNECT");
+        proxy.stop();
+    }
+
+    #[test]
+    fn parser_rejects_a_completed_head_that_exceeds_the_limit() {
+        // The TCP read-size behaviour is platform dependent; test the parser's
+        // complete-head contract directly so a terminator beyond the cap is
+        // refused even when read_head would have already stopped at the cap.
+        let mut head = b"CONNECT example.test:443 HTTP/1.1\r\n".to_vec();
+        head.resize(MAX_HEAD_BYTES, b'a');
+        head.extend_from_slice(b"\r\n\r\n");
+        assert!(head.len() > MAX_HEAD_BYTES);
+        assert!(parse_connect(&head).is_none());
+    }
+
+    /// Raw bytes through the real accept/read/parse path. The heads are
+    /// complete TCP writes, so this exercises `read_head` as well as the
+    /// parser; the resolver counter proves every refusal happened before a
+    /// lookup, and `requests()` proves the parser refused before the policy.
+    #[tokio::test]
+    async fn malformed_framing_and_header_bytes_never_reach_the_resolver() {
+        let resolver = ScriptedResolver::new(vec![public_answer()]);
+        let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
+
+        let bad: &[&[u8]] = &[
+            // Bare LF framing: no CRLFCRLF ever appears.
+            b"CONNECT example.test:443 HTTP/1.1\nHost: example.test\n\n",
+            // A bare LF inside an otherwise terminated head.
+            b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\nX: y\r\n\r\n",
+            // A bare CR.
+            b"CONNECT example.test:443 HTTP/1.1\r\nX: a\rY\r\n\r\n",
+            // Invalid UTF-8 (0xFF) in a header.
+            b"CONNECT example.test:443 HTTP/1.1\r\nX-Test: \xff\r\n\r\n",
+            // Valid UTF-8 but non-ASCII: the same answer on both platforms.
+            b"CONNECT example.test:443 HTTP/1.1\r\nX-Test: caf\xc3\xa9\r\n\r\n",
+            // NUL, SOH and DEL in headers.
+            b"CONNECT example.test:443 HTTP/1.1\r\nX-Test: a\x00b\r\n\r\n",
+            b"CONNECT example.test:443 HTTP/1.1\r\nX-Test: a\x01b\r\n\r\n",
+            b"CONNECT example.test:443 HTTP/1.1\r\nX-Test: a\x7fb\r\n\r\n",
+            // The whole head is missing its blank line.
+            b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\r\n",
+        ];
+        for raw in bad {
+            let mut stream = dial(proxy.port()).await;
+            stream.write_all(raw).await.expect("write raw head");
+            // The bare-LF head cannot terminate on its own; EOF is the
+            // missing-terminator condition and must be a refusal too.
+            let _ = stream.shutdown().await;
+            let mut buf = vec![0u8; 256];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let status = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                status.starts_with("HTTP/1.1 4"),
+                "raw head {raw:?} must be a 4xx refusal, got: {status:?}"
+            );
+        }
+        assert_eq!(resolver.calls(), 0, "a malformed head reached the resolver");
+        assert_eq!(proxy.requests(), 0, "a malformed head reached the policy");
+        proxy.stop();
+
+        // Positive control over the same raw path: a valid target with
+        // ordinary browser headers is not over-rejected. A loopback origin is
+        // used so this test does not depend on outbound network reachability.
+        let (origin_port, origin_task) = origin().await;
+        let resolver = ScriptedResolver::new(vec![Ok(vec![IpAddr::from([127, 0, 0, 1])])]);
+        let proxy = start_with(resolver.clone(), Policy::LOOPBACK_FOR_TESTS, test_limits())
+            .await
+            .expect("proxy");
+        let mut stream = dial(proxy.port()).await;
+        let request = format!(
+            "CONNECT allowed.test:{origin_port} HTTP/1.1\r\nHost: allowed.test:{origin_port}\r\nUser-Agent: audit\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap();
+        let status = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert_eq!(resolver.calls(), 1, "a valid public target must resolve");
+        assert_eq!(proxy.requests(), 1);
+        proxy.stop();
+        let _ = origin_task.await;
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_never_answers_is_cut_off() {
+        let resolver = PendingResolver::new();
+        let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
+        let mut stream = dial(proxy.port()).await;
+        stream
+            .write_all(b"CONNECT stalled.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let mut buf = vec![0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        let status = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+        assert_eq!(resolver.calls(), 1);
+        assert!(
+            started.elapsed() < test_limits().resolve + Duration::from_secs(2),
+            "the resolve deadline was not applied: {:?}",
+            started.elapsed()
+        );
+        proxy.stop();
+    }
+
+    #[tokio::test]
+    async fn resolver_capacity_is_a_refusal_not_a_queue() {
+        let resolver = PendingResolver::new();
+        let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
+        let mut held = Vec::new();
+        for host in ["one.test", "two.test"] {
+            let mut stream = dial(proxy.port()).await;
+            stream
+                .write_all(format!("CONNECT {host}:443 HTTP/1.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            held.push(stream);
+        }
+        for _ in 0..100 {
+            if resolver.calls() == test_limits().max_resolvers {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            resolver.calls(),
+            test_limits().max_resolvers,
+            "both permits must be owned by the held lookups"
+        );
+
+        let mut third = dial(proxy.port()).await;
+        third
+            .write_all(b"CONNECT three.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = third.read(&mut buf).await.unwrap_or(0);
+        let status = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(status.starts_with("HTTP/1.1 503"), "{status}");
+        assert_eq!(
+            resolver.calls(),
+            test_limits().max_resolvers,
+            "a refused request must not start another lookup"
+        );
+        proxy.stop();
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_pending_resolver_and_closes_the_client() {
+        let resolver = PendingResolver::new();
+        let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
+        let mut stream = dial(proxy.port()).await;
+        stream
+            .write_all(b"CONNECT stopping.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if resolver.calls() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(resolver.calls(), 1);
+        proxy.stop();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0))),
+            "stop must close a client waiting in the resolver, got {read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_looking_non_ipv4_names_do_not_reach_the_resolver() {
+        let resolver = ScriptedResolver::new(vec![public_answer()]);
+        let proxy = start_with(resolver.clone(), Policy::PUBLIC_ONLY, test_limits())
+            .await
+            .expect("proxy");
+        for host in [
+            "example.0x7f",
+            "foo.123",
+            "999.1.1.1",
+            "1.2.3.4.5",
+            "a.1.2.3.4",
+        ] {
+            let status = connect_via(proxy.port(), &format!("{host}:443")).await;
+            assert!(status.starts_with("HTTP/1.1 403"), "{host}: {status}");
+        }
+        assert_eq!(
+            resolver.calls(),
+            0,
+            "a numeric-looking non-IPv4 host must be refused before DNS"
+        );
+        assert_eq!(proxy.requests(), 5);
         proxy.stop();
     }
 
@@ -884,11 +1206,15 @@ mod tests {
 
     /// The CONNECT grammar shared with the Android proxy.
     ///
-    /// One fixture, two row kinds, and each row runs the **production** parser
+    /// One fixture, three row kinds, and each row runs the **production** parser
     /// on the side that reads it — no test-local reimplementation:
     ///
     ///   * `request`   — the whole line, through `parse_connect`;
-    ///   * `authority` — the same line wrapped as `CONNECT <a> HTTP/1.1`.
+    ///   * `authority` — the same line wrapped as `CONNECT <a> HTTP/1.1`;
+    ///   * `hex`       — a complete raw head (hex-encoded bytes), through
+    ///     `parse_connect`. This is where bare LF/CR framing, invalid UTF-8,
+    ///     NUL/0x01/DEL and a missing terminator live, because a TSV column
+    ///     cannot carry those bytes literally.
     ///
     /// `DnsPinnedProxyTest` reads the identical file through `parseConnectHead`
     /// and `parseAuthority`, so a method, version, character, bracket or port
@@ -897,7 +1223,7 @@ mod tests {
     #[test]
     fn connect_request_vectors_match_the_android_parser() {
         let fixture = include_str!("../../../tests/fixtures/connect-request.tsv");
-        let (mut requests, mut authorities) = (0usize, 0usize);
+        let (mut requests, mut authorities, mut raw_heads) = (0usize, 0usize, 0usize);
         for raw in fixture.lines() {
             let line = raw.trim_end_matches('\r');
             if line.is_empty() || line.starts_with('#') {
@@ -909,18 +1235,21 @@ mod tests {
                 3,
                 "a vector is <kind>\\t<value>\\t<decision>: {line}"
             );
-            let head = match cols[0] {
+            let parsed = match cols[0] {
                 "request" => {
                     requests += 1;
-                    format!("{}\r\n\r\n", cols[1])
+                    parse_connect(format!("{}\r\n\r\n", cols[1]).as_bytes())
                 }
                 "authority" => {
                     authorities += 1;
-                    format!("CONNECT {} HTTP/1.1\r\n\r\n", cols[1])
+                    parse_connect(format!("CONNECT {} HTTP/1.1\r\n\r\n", cols[1]).as_bytes())
+                }
+                "hex" => {
+                    raw_heads += 1;
+                    parse_connect(&decode_hex(cols[1]))
                 }
                 other => panic!("unknown vector kind '{other}' ({line})"),
             };
-            let parsed = parse_connect(head.as_bytes());
             match cols[2] {
                 "accept" => assert!(
                     parsed.is_some(),
@@ -940,6 +1269,7 @@ mod tests {
         // otherwise leave the method and version rules untested.
         assert!(requests >= 30, "request vectors shrank: {requests}");
         assert!(authorities >= 30, "authority vectors shrank: {authorities}");
+        assert!(raw_heads >= 12, "raw head vectors shrank: {raw_heads}");
     }
 
     /// The method and version rules, spelled out next to the fixture so a
