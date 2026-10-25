@@ -335,7 +335,7 @@ pub async fn open_site_window(
     init_script: &str,
     _fullscreen: bool,
     session_id: String,
-) -> AppResult<String> {
+) -> AppResult<(String, String)> {
     open_on_mobile(&app, site, url, init_script, session_id)
 }
 
@@ -349,7 +349,7 @@ pub async fn open_site_window(
     init_script: &str,
     fullscreen: bool,
     session_id: String,
-) -> AppResult<String> {
+) -> AppResult<(String, String)> {
     open_in_main_window(&app, site, url, init_script, fullscreen, session_id).await
 }
 
@@ -378,7 +378,7 @@ async fn open_in_main_window(
     init_script: &str,
     fullscreen: bool,
     session_id: String,
-) -> AppResult<String> {
+) -> AppResult<(String, String)> {
     let proxy = start_site_proxy_handle().await?;
     // Nothing below this line may await: the guard must not outlive a suspend
     // point. `open_in_main_window_inner` is synchronous for that reason.
@@ -396,7 +396,7 @@ fn open_in_main_window_inner(
     fullscreen: bool,
     proxy: crate::web::pinned_proxy::ProxyHandle,
     session_id: String,
-) -> AppResult<String> {
+) -> AppResult<(String, String)> {
     // Re-validate the `Site` snapshot while holding `DESKTOP_SESSION_LOCK`
     // (already held by `open_in_main_window`). A concurrent `remove_site`
     // may have deleted the site after `open_site` cloned it but before we
@@ -425,39 +425,26 @@ fn open_in_main_window_inner(
         .get_webview_window(LAUNCHER_LABEL)
         .ok_or_else(|| AppError::Other("ana pencere bulunamadı".into()))?;
 
-    // Already showing this exact site: nothing to stack, just focus. The
-    // renderer has been handed a fresh opening identity, so associate it with
-    // the existing WebView before returning: a close of *this* opening must
-    // carry the new identity, and events from the previous opening (if any)
-    // stay stale.
+    // Focusing an already-open WebView is not a new native session. Its
+    // callbacks carry the identity installed when that WebView was created,
+    // so return that same identity rather than relabeling the live view.
     if app.get_webview(&label).is_some() {
+        let current = {
+            let state = app.state::<AppState>();
+            lock_recover(&state.current_site).clone()
+        };
+        let Some(current) = current
+            .filter(|value| value.window_label == label && value.site_id == site.id)
+        else {
+            return Err(AppError::Other(
+                "site görünümü var ama etkin oturum kaydı eşleşmiyor".into(),
+            ));
+        };
         window.set_focus().map_err(|_| {
             log::error!("pencere öne alınamadı");
             AppError::Other("pencere öne alınamadı".into())
         })?;
-        let state = app.state::<AppState>();
-        let mut current = lock_recover(&state.current_site);
-        let same_window = current
-            .as_ref()
-            .is_some_and(|value| value.window_label == label);
-        if same_window {
-            if let Some(value) = current.as_mut() {
-                // The WebView survived; only the renderer-visible opening is
-                // new. Keep its fullscreen bookkeeping intact.
-                value.site_id = site.id.clone();
-                value.host = host;
-                value.session_id = session_id;
-            }
-        } else {
-            *current = Some(CurrentSite {
-                site_id: site.id.clone(),
-                session_id,
-                host,
-                window_label: label.clone(),
-                entered_fullscreen: false,
-            });
-        }
-        return Ok(label);
+        return Ok((label, current.session_id));
     }
 
     // One site at a time inside the single window: close a previous session
@@ -488,8 +475,10 @@ fn open_in_main_window_inner(
 
     let nav_host = host.clone();
     let nav_label = label.clone();
-    // A separate clone for the navigation closure: the builder borrows `app`
-    // for its own lifetime, so the closure cannot also move out of it.
+    let nav_session_id = session_id.clone();
+    let page_load_session_id = session_id.clone();
+    // A separate clone for each callback: the builder borrows `app` for its
+    // own lifetime, and both callbacks must keep this WebView's identity.
     let nav_app = app.clone();
 
     let size = window.inner_size().map_err(|_| {
@@ -517,9 +506,10 @@ fn open_in_main_window_inner(
                 if target.host_str() == Some(CLOSE_HOST) {
                     let app = nav_app.clone();
                     let label = nav_label.clone();
+                    let session_id = nav_session_id.clone();
                     tauri::async_runtime::spawn(async move {
-                        if close_site_window(&app, &label).is_err() {
-                            log::error!("site oturumu kapatılamadı");
+                        if close_site_window_for_session(&app, &label, &session_id).is_err() {
+                            log::debug!("eski site kapatma isteği artık geçerli değil");
                         }
                     });
                 }
@@ -566,7 +556,7 @@ fn open_in_main_window_inner(
         // document-start init script alone proved unreliable on WebView2.
         // `OVERLAY_SNIPPET` self-guards, so repeated installs are no-ops,
         // and it heals itself if a SPA wipes the DOM around the button.
-        .on_page_load(|webview, payload| {
+        .on_page_load(move |webview, payload| {
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 return;
             }
@@ -583,13 +573,14 @@ fn open_in_main_window_inner(
                 log::error!("site görünümü proxy'yi kullanmadı");
                 let app = webview.app_handle().clone();
                 let label = webview.label().to_string();
+                let session_id = page_load_session_id.clone();
                 let _ = app.emit(
                     "animehub://navigation-blocked",
                     "Site proxy'si kullanılmadı; site korumasız açılmadı.",
                 );
                 tauri::async_runtime::spawn(async move {
-                    if close_site_window(&app, &label).is_err() {
-                        log::error!("korumasız site oturumu kapatılamadı");
+                    if close_site_window_for_session(&app, &label, &session_id).is_err() {
+                        log::debug!("eski veya değişmiş site oturumu kapatma isteği reddedildi");
                     }
                 });
                 return;
@@ -651,7 +642,7 @@ fn open_in_main_window_inner(
     // fixed interval until the site is closed or another site takes over.
     spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
 
-    Ok(label)
+    Ok((label, session_id))
 }
 
 /// Close whichever site webview is currently shown inside the main window,
@@ -3506,7 +3497,7 @@ fn open_on_mobile(
     url: &Url,
     init_script: &str,
     session_id: String,
-) -> AppResult<String> {
+) -> AppResult<(String, String)> {
     let _session_guard = lock_android_session()?;
     // Re-validate the `Site` snapshot while holding `ANDROID_SESSION_LOCK`.
     // See `open_in_main_window_inner` for the stale-snapshot race.
@@ -3560,7 +3551,7 @@ fn open_on_mobile(
     let label = label_for(&site.id);
     *lock_recover(&state.current_site) = Some(CurrentSite {
         site_id: site.id.clone(),
-        session_id,
+        session_id: session_id.clone(),
         host: site.host(),
         window_label: label.clone(),
         entered_fullscreen: false,
@@ -3569,7 +3560,7 @@ fn open_on_mobile(
     // Periodic profile-cookie flush: an Android process kill skips close.
     spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
 
-    Ok(label)
+    Ok((label, session_id))
 }
 
 /// Non-Android mobile (iOS): the pre-existing shared-WebView flow, minus the
@@ -3581,7 +3572,7 @@ fn open_on_mobile(
     url: &Url,
     init_script: &str,
     session_id: String,
-) -> AppResult<String> {
+) -> AppResult<(String, String)> {
     let _session_guard = lock_ios_session()?;
     let window = app
         .get_webview_window(LAUNCHER_LABEL)
@@ -3633,7 +3624,7 @@ fn open_on_mobile(
 
     *lock_recover(&state.current_site) = Some(CurrentSite {
         site_id: site.id.clone(),
-        session_id,
+        session_id: session_id.clone(),
         host: site.host(),
         window_label: LAUNCHER_LABEL.into(),
         entered_fullscreen: false,
@@ -3646,7 +3637,7 @@ fn open_on_mobile(
         site.host(),
     );
 
-    Ok(LAUNCHER_LABEL.to_string())
+    Ok((LAUNCHER_LABEL.to_string(), session_id))
 }
 
 /// Save the WebView's current cookie jar into the named site's encrypted blob.
