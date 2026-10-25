@@ -278,7 +278,7 @@ test("migration is one-time, profile-scoped, and ordered before first navigation
   // The signature now also carries the per-opening identity, so match the
   // parameter list instead of one exact single-line spelling.
   const openSignature = windowsRs.match(
-    /fn open_on_mobile\([\s\S]*?\) -> AppResult<String> \{/,
+    /fn open_on_mobile\([\s\S]*?\) -> AppResult<\(String, String\)> \{/,
   );
   const openAt = openSignature?.index ?? -1;
   assert.ok(openAt > 0, "android open_on_mobile missing");
