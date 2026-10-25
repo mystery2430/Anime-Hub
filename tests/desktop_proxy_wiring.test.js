@@ -78,7 +78,7 @@ test("the inner open installs that proxy before any WebView and cannot start its
   );
   // The already-open early return happens before the install: the freshly
   // bound listener is dropped there instead of leaking a port.
-  const early = OPEN_PATH.indexOf("return Ok(label);");
+  const early = OPEN_PATH.indexOf("return Ok((label, current.session_id));");
   assert.ok(early > 0 && early < install, "an early return must not keep the new listener");
 });
 
@@ -141,7 +141,12 @@ test("a page load with zero proxy CONNECTs closes the site afterwards", () => {
   // `close_site_window` also appear in the navigation and pseudo-URL paths.
   const branch = OPEN_PATH.slice(check, check + 900);
   assert.match(branch, /"animehub:\/\/navigation-blocked"/, "the user must see why the site closed");
-  assert.match(branch, /close_site_window\(&app, &label\)/, "the unprotected session must be torn down");
+  assert.match(
+    branch,
+    /close_site_window_for_session\(&app, &label, &session_id\)/,
+    "the unprotected WebView must be closed only if this opening still owns the session",
+  );
+  assert.match(branch, /let session_id = page_load_session_id\.clone\(\)/);
   assert.match(PROXY_RS, /pub fn requests\(&self\) -> usize/);
   // The counter counts parsed CONNECTs before the destination decision, so a
   // refused destination still proves the WebView used the proxy.
