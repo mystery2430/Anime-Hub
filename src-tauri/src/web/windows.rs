@@ -762,7 +762,10 @@ fn ensure_close_session_identity(
     expected_session_id: Option<&str>,
 ) -> AppResult<()> {
     if let Some(expected) = expected_session_id {
-        if !session_identity_matches(current.as_ref().map(|site| site.session_id.as_str()), expected) {
+        if !session_identity_matches(
+            current.as_ref().map(|site| site.session_id.as_str()),
+            expected,
+        ) {
             return Err(AppError::Other("site session changed before close".into()));
         }
     }
@@ -3750,10 +3753,7 @@ pub fn close_site_window_for_session(
 }
 
 #[cfg(mobile)]
-fn close_site_window_mobile(
-    app: &AppHandle,
-    expected_session_id: Option<&str>,
-) -> AppResult<()> {
+fn close_site_window_mobile(app: &AppHandle, expected_session_id: Option<&str>) -> AppResult<()> {
     let _operation_scope = crate::diagnostics::scope_if_missing("close");
     #[cfg(target_os = "android")]
     let _session_guard = lock_android_session()?;
@@ -4053,7 +4053,10 @@ mod tests {
 
     #[test]
     fn a_delayed_close_identity_cannot_match_a_reopened_session() {
-        assert!(!session_identity_matches(Some("opening-new"), "opening-old"));
+        assert!(!session_identity_matches(
+            Some("opening-new"),
+            "opening-old"
+        ));
         assert!(session_identity_matches(Some("opening-new"), "opening-new"));
         assert!(!session_identity_matches(None, "opening-old"));
     }
