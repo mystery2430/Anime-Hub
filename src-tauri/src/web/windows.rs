@@ -101,6 +101,17 @@ pub fn lock_android_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
         .map_err(|_| AppError::Storage("Android oturum kilidi alınamadı".into()))
 }
 
+/// iOS shares one WebView, so open and command-driven close must not race.
+#[cfg(all(mobile, not(target_os = "android")))]
+static IOS_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(mobile, not(target_os = "android")))]
+fn lock_ios_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
+    IOS_SESSION_LOCK
+        .lock()
+        .map_err(|_| AppError::Storage("iOS oturum kilidi alınamadı".into()))
+}
+
 /// Desktop lifecycle lock — serializes every mutation of the live site
 /// session so open / normal close / periodic sync / remove / clear cannot
 /// interleave and resurrect or orphan a profile.
@@ -657,7 +668,7 @@ fn close_current_child_locked(app: &AppHandle) -> AppResult<()> {
             .map(|c| c.window_label.clone())
     };
     match label {
-        Some(label) => close_site_window_locked(app, &label),
+        Some(label) => close_site_window_locked(app, &label, None),
         None => Ok(()),
     }
 }
@@ -739,6 +750,23 @@ fn take_current_session_if(state: &AppState, session_id: &str) -> Option<Current
     } else {
         None
     }
+}
+
+/// A guarded close must match the exact currently owned opening; labels are reusable.
+fn session_identity_matches(current_session_id: Option<&str>, expected_session_id: &str) -> bool {
+    current_session_id == Some(expected_session_id)
+}
+
+fn ensure_close_session_identity(
+    current: &Option<CurrentSite>,
+    expected_session_id: Option<&str>,
+) -> AppResult<()> {
+    if let Some(expected) = expected_session_id {
+        if !session_identity_matches(current.as_ref().map(|site| site.session_id.as_str()), expected) {
+            return Err(AppError::Other("site session changed before close".into()));
+        }
+    }
+    Ok(())
 }
 
 /// The only producer of `animehub://site-closed`.
@@ -3551,6 +3579,7 @@ fn open_on_mobile(
     init_script: &str,
     session_id: String,
 ) -> AppResult<String> {
+    let _session_guard = lock_ios_session()?;
     let window = app
         .get_webview_window(LAUNCHER_LABEL)
         .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
@@ -3708,27 +3737,42 @@ fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> Ap
 /// iOS: persist the jar, then send the shared WebView back to the launcher.
 #[cfg(mobile)]
 pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
+    close_site_window_mobile(app, None)
+}
+
+#[cfg(mobile)]
+pub fn close_site_window_for_session(
+    app: &AppHandle,
+    _label: &str,
+    expected_session_id: &str,
+) -> AppResult<()> {
+    close_site_window_mobile(app, Some(expected_session_id))
+}
+
+#[cfg(mobile)]
+fn close_site_window_mobile(
+    app: &AppHandle,
+    expected_session_id: Option<&str>,
+) -> AppResult<()> {
     let _operation_scope = crate::diagnostics::scope_if_missing("close");
     #[cfg(target_os = "android")]
     let _session_guard = lock_android_session()?;
-
-    #[cfg(target_os = "android")]
-    {
-        // Flush + destroy the site view before releasing state: a failure
-        // here means the view may still be alive, so the session must stay
-        // claimed for a retry.
-        crate::android_bridge::site_close(true)?;
-    }
+    #[cfg(all(mobile, not(target_os = "android")))]
+    let _session_guard = lock_ios_session()?;
 
     let current = {
         let state = app.state::<AppState>();
-        // Bind first: the `MutexGuard` temporary must be dropped before
-        // `state`, whose borrow it holds.
         let value = lock_recover(&state.current_site).clone();
         value
     };
-    // Capture before the native teardown; after it, the only session we may
-    // claim is the one this close actually started for.
+    ensure_close_session_identity(&current, expected_session_id)?;
+
+    #[cfg(target_os = "android")]
+    {
+        // Verify ownership before destroying the active view.
+        crate::android_bridge::site_close(true)?;
+    }
+
     let closing_session_id = current.as_ref().map(|c| c.session_id.clone());
 
     #[cfg(not(target_os = "android"))]
@@ -3739,7 +3783,6 @@ pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
         export_cookies(&window, &current.site_id, &current.host)?;
     }
 
-    // iOS only: the shared WebView was navigated away from the launcher.
     #[cfg(not(target_os = "android"))]
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         let state = app.state::<AppState>();
@@ -3832,6 +3875,8 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
 pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<()> {
     #[cfg(target_os = "android")]
     let _guard = lock_android_session()?;
+    #[cfg(all(mobile, not(target_os = "android")))]
+    let _guard = lock_ios_session()?;
     close_site_window_for_clear_locked(app, site_id)
 }
 
@@ -3902,36 +3947,44 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
 pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
     let _operation_scope = crate::diagnostics::scope_if_missing("close");
     let _guard = lock_desktop_session()?;
-    close_site_window_locked(app, label)
+    close_site_window_locked(app, label, None)
 }
 
 #[cfg(desktop)]
-fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
+pub fn close_site_window_for_session(
+    app: &AppHandle,
+    label: &str,
+    expected_session_id: &str,
+) -> AppResult<()> {
+    let _operation_scope = crate::diagnostics::scope_if_missing("close");
+    let _guard = lock_desktop_session()?;
+    close_site_window_locked(app, label, Some(expected_session_id))
+}
+
+#[cfg(desktop)]
+fn close_site_window_locked(
+    app: &AppHandle,
+    label: &str,
+    expected_session_id: Option<&str>,
+) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
-        // Bind first: the `MutexGuard` temporary must be dropped before
-        // `state`, whose borrow it holds.
         let value = lock_recover(&state.current_site).clone();
         value
     };
-    // `label` comes from the launcher UI, which tracks the label it was
-    // given at open time. If it has gone stale (the session was already
-    // closed via the overlay), fall back to the tracked current site.
+    ensure_close_session_identity(&current, expected_session_id)?;
+
     let child_label = current
         .as_ref()
         .filter(|c| c.window_label != LAUNCHER_LABEL)
         .map(|c| c.window_label.clone())
         .unwrap_or_else(|| label.to_string());
-    // A desktop reopen of the same site reuses the label, so ownership is the
-    // opening identity captured with the session we are about to close.
     let closing_session_id = current
         .as_ref()
         .filter(|c| c.window_label == child_label)
         .map(|c| c.session_id.clone());
 
     if let Some(child) = app.get_webview(&child_label) {
-        // Desktop profiles persist cookies on disk; this jar export is the
-        // same belt-and-braces snapshot the old per-window flow took.
         if let Some(cur) = current.as_ref().filter(|c| c.window_label == child_label) {
             export_cookies_webview(&child, &cur.site_id)?;
         }
@@ -3946,8 +3999,6 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
         take_current_session_if(&state, &session_id)
     });
 
-    // Restore the launcher's chrome: own title again, and leave fullscreen
-    // only when *we* were the ones who entered it.
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         if window.set_title(LAUNCHER_TITLE).is_err() {
             log::warn!("pencere başlığı geri alınamadı");
@@ -3965,8 +4016,6 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
     if let Some(closed) = closed {
         emit_site_closed(app, &closed);
     }
-    // Down with the session: no tunnel survives its WebView, and the next
-    // open binds and installs its own proxy (see `start_site_proxy_handle`).
     stop_site_proxy();
     Ok(())
 }
@@ -4001,6 +4050,13 @@ mod tests {
     use crate::secure::SecretProvider;
     use crate::sites::blocklist::Blocklist;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_delayed_close_identity_cannot_match_a_reopened_session() {
+        assert!(!session_identity_matches(Some("opening-new"), "opening-old"));
+        assert!(session_identity_matches(Some("opening-new"), "opening-new"));
+        assert!(!session_identity_matches(None, "opening-old"));
+    }
 
     /// The WebView2 argument string must keep wry's own defaults, add the
     /// proxy, and subtract Chromium's implicit loopback bypass. This is a
