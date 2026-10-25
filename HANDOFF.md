@@ -110,7 +110,7 @@ diferansiyel **0 sapma** verdi. Kayıtlardaki istisnalar korunuyor
 (`192.0.0.9/.10`, `192.31.196/24`, `192.52.193/24`, `192.175.48/24`,
 `2001:1::1-3`, `2001:3::/32`, `2001:4:112::/48`, ORCHIDv2, DETs); `2001::/23`
 "daha özel atama yoksa engelle" kuralıyla işleniyor, `64:ff9b:1::/48` içine
-gömülü **genel** IPv4 ile bile engelli. Ortak fixture'a 17 `ip` + 9 `host`
+gömülü **genel** IPv4 ile bile engelli. Ortak fixture'a 19 `ip` + 9 `host`
 vektörü eklendi (yazarken bir vektör yanlıştı — `5eff::1` `2000::/3` dışında,
 yani private; model kontrolü CI'dan önce yakaladı). (2) **Gerçek kusur:**
 masaüstü `parse_connect` üç biçimi kabul edip tünelliyordu, Android'in

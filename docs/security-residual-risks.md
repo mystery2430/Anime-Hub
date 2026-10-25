@@ -37,7 +37,7 @@ compared rule by rule against the IANA registries (**IPv4 registry last updated
 
 That differential is a model of the two functions, not the compiled code (this
 environment has no Rust or JVM toolchain), so the *authoritative* check is the
-shared fixture both suites execute in CI. Round 22 added 17 `ip` and 9 `host`
+shared fixture both suites execute in CI. Round 22 added 19 `ip` and 9 `host`
 vectors for the classes above that had none (the NAT64-discovery pair
 `192.0.0.170/.171`, the three globally reachable v4 exceptions, `192.88.99.2`,
 mapped metadata `::ffff:169.254.169.254`, local-use NAT64 with a public inner,
