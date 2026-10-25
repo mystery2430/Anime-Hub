@@ -158,3 +158,39 @@ test("the open command awaits the now-async window path", () => {
   assert.match(COMMANDS_RS, /\.await\s*\n\s*\.map\(\|label\| OpenedSite \{/);
   assert.match(WINDOWS_RS, /pub async fn open_site_window\(/);
 });
+
+test("the shipped constructor can only be strict, and the test policy is test-only", () => {
+  // The Rust suite drives `start_with(...)` with an explicit policy and limits,
+  // so a change to what the SHIPPED `start()` passes would not fail any of
+  // those. This is the only pin on the production configuration, and it is a
+  // source-string pin: it proves the arguments, not that a WebView obeys them.
+  const start = PROXY_RS.slice(
+    PROXY_RS.indexOf("pub async fn start()"),
+    PROXY_RS.indexOf("async fn start_with("),
+  );
+  assert.ok(start.length > 0, "the production constructor must exist");
+  assert.match(start, /Arc::new\(SystemResolver\)/, "production resolves with the platform resolver");
+  assert.match(start, /Policy::PUBLIC_ONLY/, "production tunnels to public addresses only");
+  assert.match(start, /Limits::DEFAULT/, "production uses the shipped bounds");
+  assert.equal(
+    start.includes("LOOPBACK_FOR_TESTS"),
+    false,
+    "the shipped path must never build the loopback policy",
+  );
+  // The strict policy is the constant, and the permissive one exists only under
+  // cfg(test), so no shipped code path can even name it.
+  assert.match(PROXY_RS, /const PUBLIC_ONLY: Policy = Policy \{\s*allow_loopback: false,?\s*\}/);
+  assert.match(PROXY_RS, /#\[cfg\(test\)\]\s*const LOOPBACK_FOR_TESTS/);
+  // The limits are bounded, not "whatever the caller passed": the defaults are
+  // the only production values and they are finite.
+  const limits = PROXY_RS.slice(
+    PROXY_RS.indexOf("impl Limits {"),
+    PROXY_RS.indexOf("/// Largest request head accepted"),
+  );
+  assert.match(limits, /const DEFAULT: Limits = Limits \{/, "there is one shipped default");
+  assert.match(limits, /max_connections: \d+/, "the connection ceiling must be a number");
+  assert.match(limits, /max_resolvers: \d+/, "the resolver ceiling must be a number");
+  assert.match(limits, /handshake: Duration::from_secs\(\d+\)/);
+  assert.match(limits, /resolve: Duration::from_secs\(\d+\)/);
+  assert.match(limits, /connect: Duration::from_secs\(\d+\)/);
+});

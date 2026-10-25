@@ -121,6 +121,16 @@ host	1.2.3.4.5	private
 host	0x7f.1	private
 host	017700000001	private
 host		private
+# Round 22: the same numeric spellings, in the forms the parsers must not lose.
+host	8.8.8.8.	public
+host	0X7F000001	private
+host	0x08080808	public
+host	0x7f000001.	private
+host	169.254.169.254.	private
+host	[::ffff:127.0.0.1]	private
+host	[64:ff9b::127.0.0.1]	private
+host	[2001:1::1]	public
+host	192.0.0.170	private
 host	openani.me.	public
 host	sub.openani.me	public
 host	xn--r8jz45g.xn--zckzah	public
@@ -205,3 +215,27 @@ ip	fd12:3456::1	private
 ip	fe80::1	private
 ip	fec0::1	private
 ip	ff02::1	private
+# Round 22: every globally-reachable-True entry in the IANA IPv4 special
+# registry that the policy used to leave untested, and the False neighbours.
+ip	192.0.0.170	private
+ip	192.0.0.171	private
+ip	192.31.196.1	public
+ip	192.52.193.1	public
+ip	192.175.48.1	public
+ip	192.88.99.2	private
+ip	255.255.255.254	private
+# IPv6: a mapped metadata address, the local-use NAT64 prefix with a PUBLIC
+# inner address (still blocked - the prefix itself is not global), and the
+# 2001::/23 edges plus the /128 anycasts inside it.
+ip	::ffff:169.254.169.254	private
+ip	::ffff:0.0.0.0	private
+ip	64:ff9b:1::8.8.8.8	private
+ip	2001:1::4	private
+ip	2001:5::1	private
+ip	2001:1ff::1	private
+ip	2001:200::1	public
+ip	2001:4:112:1::1	public
+ip	2620:4f:8000::1	public
+ip	5eff::1	private
+ip	5eff:ffff::1	private
+ip	3ffe:ffff::1	public
