@@ -32,6 +32,23 @@ const val CACHE_LOAD_DEFAULT = -1
  * Every WebView setting this app decides for a SITE WebView, with the reason it
  * has that value. Anything not listed here is deliberately left at the platform
  * default (see [leftAtDefault]).
+ *
+ * NON-PROXY EGRESS: this plan is NOT a network confinement control, and
+ * `WebSettings` has no supported field that disables WebRTC or WebTransport, or
+ * that forces ICE/STUN/TURN, raw UDP or QUIC through the connection-pinning
+ * `CONNECT` proxy. `ProxyController` (see `SiteProxyController`) governs URL
+ * requests made through WebView's network stack; it is not a UDP firewall and
+ * cannot prove that the Chromium network service made no direct socket. The
+ * page-level API removal is in `src-tauri/src/web/webrtc_guard.js` and is
+ * defence in depth only. Do not add a property here that claims to enforce
+ * kernel- or network-level egress; a user-consented `VpnService` would be a
+ * separate control with its own lifecycle and consent.
+ *
+ * MEDIA: this plan keeps JavaScript, MSE/DOM storage and autoplay available;
+ * the egress guard deliberately does not remove `MediaSource`, `<video>`, or
+ * the PiP controller. Sites whose playback actually requires WebRTC or
+ * main-thread WebTransport will fail by design and need a documented exception,
+ * not a silent downgrade of the network policy.
  */
 data class SiteWebViewSettings(
     /**
