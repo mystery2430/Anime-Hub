@@ -86,6 +86,8 @@ export function createBackSession({ call, notify, errorText }) {
     settle("pending");
     try {
       const args = { label: target };
+      // Required by the native command: labels are reused, session IDs aren't.
+      if (typeof targetSessionId === "string" && targetSessionId) args.sessionId = targetSessionId;
       if (typeof operationId === "string") args.operationId = operationId;
       await call("close_site", args);
       // The session may already have been re-opened while this call was in
