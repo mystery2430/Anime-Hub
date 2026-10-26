@@ -37,8 +37,10 @@ ve sağlayıcı çerez kavanozlarını değiştirir. Android'de aynı kaynaklı
 Android birincil, Windows/Linux ikincil hedef. **macOS (round 17):** masaüstü
 hedefi artık macOS'u da kapsar — site vekili `macos-proxy` özelliğiyle
 bağlanır ve 14 (Darwin 23) altındaki sürümlerde site **korunmasız açılmaz**,
-açıkça reddedilir. iOS kapsam dışı. macOS üzerinde paket/notarization ve
-gerçek WKWebView doğrulaması yapılmadı.
+açıkça reddedilir. iOS desteği kaldırıldı: iOS'a özgü paylaşılan WebView,
+çerez içe/dışa aktarma ve paketleme yolları artık kod tabanında yok; desteklenen
+hedefler Windows, Linux, macOS (masaüstü) ve Android'dir. macOS üzerinde
+paket/notarization ve gerçek WKWebView doğrulaması yapılmadı.
 
 Paket kimliği `dev.animehub.app`. GPLv3 lisanslı Dantotsu'dan **hiç kod
 taşınmadı** (temiz oda); ayrıntı `NOTICES.md` içinde.

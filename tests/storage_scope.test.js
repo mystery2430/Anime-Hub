@@ -57,7 +57,7 @@ test("the desktop message states the whole-profile scope", () => {
 });
 
 test("the Android message does not claim the cache or service workers were cleared", () => {
-  for (const platform of ["android", "", "ios", "haiku", undefined]) {
+  for (const platform of ["android", "", "haiku", undefined]) {
     const msg = clearResultMessage(platform);
     assert.match(msg, /profil çerezleri/, "cookies were cleared");
     assert.match(msg, /konum izinleri/, "geolocation permissions were cleared");

@@ -43,16 +43,9 @@ use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
 use crate::web::dns::classify_host;
-// `CookieJar` backs the iOS jar swap and the one-time Android profile
-// migration; `restore` is used only by the iOS import path (`import_cookies`),
-// so it carries exactly that gate — Android's host-compiled migration
-// protocol calls it fully qualified, and an ungated `#[cfg(mobile)]` import
-// would be dead there. `capture` (qualified at its single call site, so this
-// import group keeps the exact shape rustfmt approved before) serves the
-// desktop/iOS export path. Android site cookies live in their profile and are
-// never snapshotted.
-#[cfg(all(mobile, not(target_os = "android")))]
-use crate::web::session::restore;
+// `CookieJar` backs the one-time Android profile cookie migration and the
+// desktop per-site cookie export. Android site cookies live in their profile
+// and are never snapshotted.
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, dns_decision, NavDecision};
 use crate::web::session::{profile_dir_name, CookieJar};
@@ -99,17 +92,6 @@ pub fn lock_android_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
     ANDROID_SESSION_LOCK
         .lock()
         .map_err(|_| AppError::Storage("Android oturum kilidi alınamadı".into()))
-}
-
-/// iOS shares one WebView, so open and command-driven close must not race.
-#[cfg(all(mobile, not(target_os = "android")))]
-static IOS_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(all(mobile, not(target_os = "android")))]
-fn lock_ios_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
-    IOS_SESSION_LOCK
-        .lock()
-        .map_err(|_| AppError::Storage("iOS oturum kilidi alınamadı".into()))
 }
 
 /// Desktop lifecycle lock — serializes every mutation of the live site
@@ -327,7 +309,7 @@ pub fn label_for(site_id: &str) -> String {
 /// `add_child` / `set_fullscreen`, which do not exist in tauri's mobile
 /// builds, so even a `cfg!()`-guarded branch would fail to compile on
 /// Android.
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 pub async fn open_site_window(
     app: AppHandle,
     site: &Site,
@@ -861,47 +843,10 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
     });
 }
 
-/// Non-Android mobile (iOS) variant: cookies every tick.
-///
-/// Cookies still ride the encrypted jar on iOS; localStorage/IndexedDB
-/// snapshots were removed everywhere with the JSON transfer machinery — the
-/// old dump was lossy and not a security boundary.
-#[cfg(all(mobile, not(target_os = "android")))]
-fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: String) {
-    std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
-            return;
-        };
-        loop {
-            std::thread::sleep(SESSION_SYNC_INTERVAL);
-            if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
-                log::warn!("site oturum eşitleme süresi doldu");
-                return;
-            }
-            {
-                let state = app.state::<AppState>();
-                if !session_is_current(&state, &site_id) {
-                    return;
-                }
-            }
-            let loaded = window
-                .url()
-                .ok()
-                .is_some_and(|u| u.host_str() == Some(host.as_str()));
-            if !loaded {
-                continue;
-            }
-            if export_cookies(&window, &site_id, &host).is_err() {
-                log::warn!("dönemsel çerez eşitlemesi başarısız");
-            }
-        }
-    });
-}
-
 // ---------------------------------------------------------------------------
-// Mobile: Android opens a separate profiled WebView per site; iOS keeps the
-// shared-WebView flow without the removed JSON storage snapshots.
+// Mobile (Android is the only supported mobile target): a separate profiled
+// WebView per site. The old single shared-WebView flow is gone with the iOS
+// target; there is no cookie jar swap left on any platform.
 // ---------------------------------------------------------------------------
 
 /// Prefix shared with Kotlin's `AnimeHubSiteController` name validator: a
@@ -1278,12 +1223,9 @@ pub fn cookie_belongs_to_site(stored: &crate::web::session::StoredCookie, site_u
 
 /// The live cookies of `jar` that this site may hold.
 ///
-/// One definition for every import path: [`cookie_belongs_to_site`] is the
-/// ownership rule, and a cookie that fails it is dropped before anything writes
-/// it. The Android profile migration always used this rule; the iOS import path
-/// (round 16.4) did not, and restored every live cookie in the jar into the
-/// *shared* WebView — including third-party and foreign-domain cookies that the
-/// next site then inherited.
+/// [`cookie_belongs_to_site`] is the ownership rule, and a cookie that fails
+/// it is dropped before anything writes it. The one-time Android profile
+/// migration is the only importer left, and it uses this rule.
 pub fn cookies_belonging_to_site<'a>(
     cookies: &'a [crate::web::session::StoredCookie],
     site_url: &str,
@@ -3564,102 +3506,7 @@ fn open_on_mobile(
     Ok((label, session_id))
 }
 
-/// Non-Android mobile (iOS): the pre-existing shared-WebView flow, minus the
-/// removed localStorage/IndexedDB snapshot machinery.
-#[cfg(all(mobile, not(target_os = "android")))]
-fn open_on_mobile(
-    app: &AppHandle,
-    site: &Site,
-    url: &Url,
-    init_script: &str,
-    session_id: String,
-) -> AppResult<(String, String)> {
-    let _session_guard = lock_ios_session()?;
-    let window = app
-        .get_webview_window(LAUNCHER_LABEL)
-        .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
-    // Re-validate the `Site` snapshot (see `open_in_main_window_inner`).
-    {
-        let state = app.state::<AppState>();
-        let reg = state
-            .registry
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        match reg.get(&site.id) {
-            Some(current) => {
-                if current.hidden {
-                    return Err(AppError::SiteNotFound(site.id.clone()));
-                }
-                if current.url != site.url {
-                    return Err(AppError::SiteNotFound(site.id.clone()));
-                }
-            }
-            None => return Err(AppError::SiteNotFound(site.id.clone())),
-        }
-    }
-    let state = app.state::<AppState>();
-
-    let previous_site = lock_recover(&state.current_site).clone();
-    if let Some(current) = previous_site.as_ref() {
-        export_cookies(&window, &current.site_id, &current.host)?;
-    }
-
-    window.clear_all_browsing_data().map_err(|_| {
-        log::error!("çerezler temizlenemedi");
-        AppError::Other("çerezler temizlenemedi".into())
-    })?;
-
-    if let Err(e) = import_cookies(&window, &site.id, url) {
-        return Err(e);
-    }
-
-    if window.eval(init_script).is_err() {
-        log::error!("script yüklenemedi");
-        return Err(AppError::Other("script yüklenemedi".into()));
-    }
-
-    if window.navigate(url.clone()).is_err() {
-        log::error!("sayfa açılamadı");
-        return Err(AppError::Other("sayfa açılamadı".into()));
-    }
-
-    *lock_recover(&state.current_site) = Some(CurrentSite {
-        site_id: site.id.clone(),
-        session_id: session_id.clone(),
-        host: site.host(),
-        window_label: LAUNCHER_LABEL.into(),
-        entered_fullscreen: false,
-    });
-
-    spawn_session_sync(
-        app.clone(),
-        LAUNCHER_LABEL.to_string(),
-        site.id.clone(),
-        site.host(),
-    );
-
-    Ok((LAUNCHER_LABEL.to_string(), session_id))
-}
-
-/// Save the WebView's current cookie jar into the named site's encrypted blob.
-///
-/// iOS only: Android's site cookies live in their WebView profile and are
-/// never snapshotted any more (see the module docs).
-#[cfg(all(mobile, not(target_os = "android")))]
-fn export_cookies(
-    window: &tauri::WebviewWindow,
-    site_id: &str,
-    expected_host: &str,
-) -> AppResult<()> {
-    let _ = expected_host;
-    let live = window.cookies().map_err(|_| {
-        log::error!("çerezler okunamadı");
-        AppError::Other("çerezler okunamadı".into())
-    })?;
-    export_cookies_from(live, window.app_handle(), site_id)
-}
-
-/// Same as [`export_cookies`] but for a bare child `Webview` (desktop).
+/// Export the live cookie jar of a bare child `Webview` (desktop).
 #[cfg(desktop)]
 fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<()> {
     let live = webview.cookies().map_err(|_| {
@@ -3669,7 +3516,7 @@ fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<
     export_cookies_from(live, webview.app_handle(), site_id)
 }
 
-#[cfg(any(desktop, all(mobile, not(target_os = "android"))))]
+#[cfg(desktop)]
 fn export_cookies_from(
     live: Vec<cookie::Cookie<'static>>,
     app: &AppHandle,
@@ -3691,51 +3538,20 @@ fn export_cookies_from(
         .put_secret(&format!("cookies-{site_id}"), &bytes)
 }
 
-/// Load a site's encrypted cookie jar into the shared WebView (iOS only).
+/// Close the active site session on mobile (Android).
 ///
-/// Android never reaches this: its jars are imported profile-scoped inside
-/// `AnimeHubSiteController` before the first navigation of a virgin profile.
-#[cfg(all(mobile, not(target_os = "android")))]
-fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> AppResult<()> {
-    let app = window.app_handle().clone();
-    let state = app.state::<AppState>();
-    let stored = state.provider.get_secret(&format!("cookies-{site_id}"))?;
-    let jar: CookieJar = match stored {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
-        None => return Ok(()),
-    };
-
-    // Only the cookies this site owns. The jar is captured from the shared
-    // WebView, so it also holds third-party and other-origin cookies; putting
-    // those back would hand them to whichever site is opened next.
-    let now = crate::anilist::now_unix();
-    for stored in cookies_belonging_to_site(&jar.cookies, url.as_str(), now) {
-        if let Some(cookie) = restore(stored) {
-            if window.set_cookie(cookie).is_err() {
-                log::debug!("site cookie restore did not complete");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Close the active site session on mobile.
-///
-/// Android: destroy the site WebView through the Kotlin controller (which
-/// flushes the *profile* cookie manager first, re-binds PiP and focus to the
-/// launcher). The launcher page never moved, so there is nothing to
-/// navigate back to — removing the site view reveals it. Idempotent: the
-/// Kotlin side resolves normally when no site view exists, which keeps a
-/// stale session record harmless.
-///
-/// iOS: persist the jar, then send the shared WebView back to the launcher.
-#[cfg(mobile)]
+/// Destroys the site WebView through the Kotlin controller (which flushes the
+/// *profile* cookie manager first and re-binds PiP and focus to the launcher).
+/// The launcher page never moved, so there is nothing to navigate back to —
+/// removing the site view reveals it. Idempotent: the Kotlin side resolves
+/// normally when no site view exists, which keeps a stale session record
+/// harmless.
+#[cfg(target_os = "android")]
 pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
     close_site_window_mobile(app, None)
 }
 
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 pub fn close_site_window_for_session(
     app: &AppHandle,
     _label: &str,
@@ -3744,13 +3560,10 @@ pub fn close_site_window_for_session(
     close_site_window_mobile(app, Some(expected_session_id))
 }
 
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 fn close_site_window_mobile(app: &AppHandle, expected_session_id: Option<&str>) -> AppResult<()> {
     let _operation_scope = crate::diagnostics::scope_if_missing("close");
-    #[cfg(target_os = "android")]
     let _session_guard = lock_android_session()?;
-    #[cfg(all(mobile, not(target_os = "android")))]
-    let _session_guard = lock_ios_session()?;
 
     let current = {
         let state = app.state::<AppState>();
@@ -3759,33 +3572,10 @@ fn close_site_window_mobile(app: &AppHandle, expected_session_id: Option<&str>) 
     };
     ensure_close_session_identity(&current, expected_session_id)?;
 
-    #[cfg(target_os = "android")]
-    {
-        // Verify ownership before destroying the active view.
-        crate::android_bridge::site_close(true)?;
-    }
+    // Verify ownership before destroying the active view.
+    crate::android_bridge::site_close(true)?;
 
     let closing_session_id = current.as_ref().map(|c| c.session_id.clone());
-
-    #[cfg(not(target_os = "android"))]
-    if let Some(current) = &current {
-        let window = app
-            .get_webview_window(LAUNCHER_LABEL)
-            .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
-        export_cookies(&window, &current.site_id, &current.host)?;
-    }
-
-    #[cfg(not(target_os = "android"))]
-    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-        let state = app.state::<AppState>();
-        let back = lock_recover(&state.launcher_url).clone();
-        if let Some(url) = back {
-            window.navigate(url).map_err(|_| {
-                log::error!("başlatıcıya dönülemedi");
-                AppError::Other("başlatıcıya dönülemedi".into())
-            })?;
-        }
-    }
 
     let closed = closing_session_id.and_then(|session_id| {
         let state = app.state::<AppState>();
@@ -3860,15 +3650,12 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     Ok(())
 }
 
-/// Mobile wipe-close for `remove_site` / `clear_site_data` when the target
+/// Android wipe-close for `remove_site` / `clear_site_data` when the target
 /// site is currently open. Holds `ANDROID_SESSION_LOCK` so a concurrent sync
 /// tick cannot flush the doomed profile between the close and the wipe.
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<()> {
-    #[cfg(target_os = "android")]
     let _guard = lock_android_session()?;
-    #[cfg(all(mobile, not(target_os = "android")))]
-    let _guard = lock_ios_session()?;
     close_site_window_for_clear_locked(app, site_id)
 }
 
@@ -3881,7 +3668,7 @@ pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<
 /// give the deletion a chance to lose the race. The launcher WebView is
 /// untouched (its data is the default profile and is never part of a site
 /// wipe).
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
@@ -3898,28 +3685,8 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
         return Ok(());
     };
 
-    #[cfg(target_os = "android")]
-    {
-        // Destroy without flushing — the caller wipes right after.
-        crate::android_bridge::site_close(false)?;
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let back = {
-            let state = app.state::<AppState>();
-            let value = lock_recover(&state.launcher_url).clone();
-            value
-        };
-        if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-            if let Some(url) = back {
-                window.navigate(url).map_err(|_| {
-                    log::error!("başlatıcıya dönülemedi");
-                    AppError::Other("başlatıcıya dönülemedi".into())
-                })?;
-            }
-        }
-    }
+    // Destroy without flushing — the caller wipes right after.
+    crate::android_bridge::site_close(false)?;
 
     let closed = {
         let state = app.state::<AppState>();
@@ -4222,7 +3989,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(current),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4984,7 +4750,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -5460,7 +5225,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -5733,7 +5497,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -7628,11 +7391,12 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_webview_import_only_restores_the_sites_own_cookies() {
-        // The iOS import path used to replay every live cookie in the jar into
-        // the shared WebView. The jar is captured from that same WebView, so it
-        // also carries third-party and other-origin cookies — which the next
-        // site then inherited. Both import paths now go through one selector.
+    fn the_cookie_jar_import_only_restores_the_sites_own_cookies() {
+        // The one-time Android profile migration replays the legacy jar. That
+        // jar was written while cookies from several sites could share a
+        // store, so it may carry third-party and other-origin cookies — which
+        // the target profile must never inherit. The migration goes through
+        // this selector.
         let now = crate::anilist::now_unix();
         let cookies = vec![
             cookie_for_test("own", None, None),

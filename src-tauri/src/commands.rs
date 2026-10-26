@@ -69,11 +69,6 @@ pub struct AppState {
     pub oauth_state: Mutex<Option<String>>,
     /// Warning from a registry that could not be decrypted on startup.
     pub startup_warning: Mutex<Option<String>>,
-    /// Absolute URL of the launcher page, captured at startup.
-    ///
-    /// Mobile needs this to navigate the shared WebView *back* to the
-    /// launcher after a site is closed.
-    pub launcher_url: Mutex<Option<url::Url>>,
     /// Which site currently owns the WebView session.
     ///
     /// On desktop this names the extra window; on Android it names the site
@@ -551,10 +546,8 @@ pub fn remove_site(
                 profile: ProfileRemoval::Hidden,
             });
         }
-        // Platform default for this block: no WebView profiles (iOS).
-        #[cfg(not(target_os = "android"))]
-        let profile_outcome = ProfileRemoval::NotApplicable;
-        #[cfg(target_os = "android")]
+        // Android is the only mobile target left, and it always has a
+        // WebView profile to remove.
         let profile_outcome;
         let should_close = {
             let cur = state
@@ -564,10 +557,7 @@ pub fn remove_site(
             cur.as_ref().is_some_and(|c| c.site_id == id)
         };
         if should_close {
-            #[cfg(target_os = "android")]
             crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
-            #[cfg(not(target_os = "android"))]
-            crate::web::windows::close_site_window_for_clear(&app, &id)?;
         }
         // Android: the site's data lives in its WebView profile. Delete the
         // profile *before* the registry mutation so a failure keeps the tile
@@ -769,10 +759,12 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
     .map(|(label, active_session_id)| OpenedSite {
         label,
         session_id: active_session_id,
-        mobile: cfg!(any(target_os = "android", target_os = "ios")),
-        // Android now gives real per-site isolation (one WebView profile per
-        // site); iOS still shares the single WebView.
-        isolated: !cfg!(target_os = "ios"),
+        mobile: cfg!(target_os = "android"),
+        // Every supported target gives true per-site storage isolation:
+        // per-site profile directories on desktop, per-site WebView profiles
+        // on Android. Kept in the payload for wire compatibility with older
+        // launcher builds; it is always true now that iOS is gone.
+        isolated: true,
     })
 }
 
@@ -785,16 +777,16 @@ pub struct OpenedSite {
     /// accepts `animehub://site-closed` only when the event carries this exact
     /// value.
     pub session_id: String,
+    /// True on Android, false on desktop.
     pub mobile: bool,
-    /// Whether this platform gives true per-site storage isolation: per-site
-    /// profile directories on desktop, per-site WebView profiles on Android,
-    /// single shared WebView on iOS.
+    /// Whether this platform gives true per-site storage isolation. Always
+    /// `true`: desktop uses per-site profile directories and Android uses
+    /// per-site WebView profiles. Retained for backward-compatible payloads.
     pub isolated: bool,
 }
 
-/// Close a site session. Mobile keeps the shared WebView's jar (iOS) or
-/// flushes/destroys the site's profiled WebView (Android); desktop removes
-/// the child WebView.
+/// Close a site session. Android flushes/destroys the site's profiled
+/// WebView; desktop removes the child WebView.
 #[tauri::command]
 pub async fn close_site(
     app: AppHandle,
@@ -1743,9 +1735,9 @@ pub fn set_pip_auto_enter(
         // `platform_name()` is the same source `app_info` uses.
         let plat = platform_name();
         if !["windows", "linux", "macos"].contains(&plat.as_str()) && plat != "android" {
-            // Unknown platform – mimic JS's platform check.
-            // In practice this branch is only taken on non-desktop non-android
-            // (e.g. iOS) where PiP is not applicable; treat as unsupported.
+            // Unknown platform – mimic JS's platform check. Only desktop
+            // platforms are recognised here; anything else is unsupported
+            // rather than silently persisted.
             return Err(AppError::Other(PIP_PLATFORM_UNKNOWN_MSG.into()));
         }
         // Desktop: persist only.
@@ -2157,7 +2149,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
