@@ -458,9 +458,11 @@ async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, u16> {
 ///   * **Application restrictions** (deliberately stricter than the RFCs, which
 ///     would also allow an empty port, `reg-name` sub-delims and
 ///     percent-encoding): the port is required and at most five digits; a host
-///     is printable ASCII with no `@ / ? # \`; percent-encoding is refused
-///     because nothing here decodes it; a host is at most 253 bytes with no
-///     empty label; brackets only ever wrap a real IPv6 literal.
+///     is printable ASCII with no `@ / ? # \`; the reserved sub-delims
+///     `! $ & ' ( ) * + , ; =` are refused (round 39, shared with Android);
+///     percent-encoding is refused because nothing here decodes it; a host is
+///     at most 253 bytes with no empty label; brackets only ever wrap a real
+///     IPv6 literal.
 fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
     if !is_well_formed_head(head) {
         return None;
@@ -496,6 +498,19 @@ fn parse_connect(head: &[u8]) -> Option<(String, u16)> {
         .bytes()
         .any(|b| matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\' | b'%'))
     {
+        return None;
+    }
+    // Round 39: RFC 3986 sub-delims have their own meaning inside a URI and
+    // this proxy has no use for any of them in an authority. Android's
+    // `parseAuthority` applies the identical set; the shared fixture pins one
+    // row per character. This gate runs before `rsplit_once` so a rejected
+    // target can never reach the resolver or a socket.
+    if target.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+        )
+    }) {
         return None;
     }
     let (host, port) = target.rsplit_once(':')?;
@@ -1202,6 +1217,33 @@ mod tests {
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
         proxy.stop();
         let _ = origin_task.await;
+    }
+
+    /// Round 39: each reserved sub-delim is refused before any lookup, while
+    /// the ordinary valid targets stay accepted. The shared fixture carries
+    /// the same cases through both production parsers.
+    #[test]
+    fn reserved_sub_delims_are_refused_before_resolution() {
+        for character in ['!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '='] {
+            let authority = format!("anime{character}hub.test:443");
+            let head = format!("CONNECT {authority} HTTP/1.1\r\n\r\n");
+            assert!(
+                parse_connect(head.as_bytes()).is_none(),
+                "{authority:?} must be refused before any lookup or socket"
+            );
+        }
+        for authority in [
+            "example.com:443",
+            "localhost:8080",
+            "127.0.0.1:443",
+            "[2001:db8::1]:8443",
+        ] {
+            let head = format!("CONNECT {authority} HTTP/1.1\r\n\r\n");
+            assert!(
+                parse_connect(head.as_bytes()).is_some(),
+                "{authority:?} must stay accepted"
+            );
+        }
     }
 
     /// The CONNECT grammar shared with the Android proxy.

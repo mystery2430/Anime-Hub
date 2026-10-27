@@ -156,6 +156,29 @@ authority	[1:2:3:4:5:6:7:8:9]:443	reject
 authority	[::1]:443x	reject
 authority	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443	reject
 
+# -----------------------------------------------------------------------------
+# Round 39: RFC 3986 reserved sub-delims are refused in an authority before DNS
+# resolution or a socket. One authority row per character keeps the Rust and
+# Kotlin sets mirrored; the request rows prove the full CONNECT line is refused
+# too, not just the authority helper. The final authority row is the control.
+# -----------------------------------------------------------------------------
+authority	anime!hub.test:443	reject
+authority	anime$hub.test:443	reject
+authority	anime&hub.test:443	reject
+authority	anime'hub.test:443	reject
+authority	anime(hub.test:443	reject
+authority	anime)hub.test:443	reject
+authority	anime*hub.test:443	reject
+authority	anime+hub.test:443	reject
+authority	anime,hub.test:443	reject
+authority	anime;hub.test:443	reject
+authority	anime=hub.test:443	reject
+authority	animehub.test:443	accept
+request	CONNECT anime!hub.test:443 HTTP/1.1	reject
+request	CONNECT anime&hub.test:443 HTTP/1.1	reject
+request	CONNECT anime;hub.test:443 HTTP/1.1	reject
+request	CONNECT anime=hub.test:443 HTTP/1.1	reject
+
 # =============================================================================
 # complete raw heads (hex bytes) — framing and non-printable bytes
 # =============================================================================

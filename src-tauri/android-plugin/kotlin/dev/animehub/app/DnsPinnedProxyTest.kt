@@ -791,6 +791,39 @@ class DnsPinnedProxyTest {
   }
 
   /**
+   * Round 39: every reserved sub-delim is refused by the production authority
+   * and request-head parsers before any lookup, and the ordinary valid targets
+   * stay accepted. The shared fixture pins the same rows on the Rust side.
+   */
+  @Test
+  fun `reserved sub delims are refused before resolution`() {
+    val forbidden = listOf('!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=')
+    for (character in forbidden) {
+      val authority = "anime${character}hub.test:443"
+      assertNull(
+        "$authority reddedilmeli",
+        DnsPinnedProxy.parseAuthority(authority),
+      )
+      assertNull(
+        "CONNECT $authority reddedilmeli",
+        DnsPinnedProxy.parseConnectHead("CONNECT $authority HTTP/1.1\r\n\r\n"),
+      )
+    }
+    for (authority in
+      listOf(
+        "example.com:443",
+        "localhost:8080",
+        "127.0.0.1:443",
+        "[2001:db8::1]:8443",
+      )) {
+      assertTrue(
+        "$authority kabul edilmeli",
+        DnsPinnedProxy.parseAuthority(authority) != null,
+      )
+    }
+  }
+
+  /**
    * The CONNECT grammar shared with the Rust `parse_connect`.
    *
    * One fixture, three row kinds, and each row runs the **production** parser

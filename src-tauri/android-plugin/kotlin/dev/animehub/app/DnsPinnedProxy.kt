@@ -1013,6 +1013,15 @@ class DnsPinnedProxy(
      */
     private const val MAX_CONNECT_HEAD_BYTES: Int = 8 * 1024
 
+    /**
+     * RFC 3986 reserved sub-delims refused in an authority (round 39).
+     *
+     * Must stay identical to the set in Rust `parse_connect`; the shared
+     * fixture has one rejection row per character on both platforms.
+     */
+    private val FORBIDDEN_AUTHORITY_CHARS =
+      charArrayOf('!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=')
+
     private const val ESTABLISHED = "HTTP/1.1 200 Connection Established\r\n\r\n"
     private const val FORBIDDEN =
       "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1099,6 +1108,13 @@ class DnsPinnedProxy(
       // URL delimiters that mean something else, and percent-encoding that is
       // never decoded here (this also covers an IPv6 zone id, `%eth0`).
       if (raw.any { it == '@' || it == '/' || it == '?' || it == '#' || it == '\\' || it == '%' }) {
+        return null
+      }
+      // Round 39: reserved sub-delims are refused before the authority is
+      // split, so a rejected target can never reach the resolver or a socket.
+      // Rust `parse_connect` carries the identical set; one fixture row per
+      // character keeps the mirrors honest.
+      if (raw.any { it in FORBIDDEN_AUTHORITY_CHARS }) {
         return null
       }
 
