@@ -79,7 +79,7 @@ function shade({ r, g, b }, factor) {
  * atanabilir (kullanıcı stringi asla doğrudan geçmez).
  */
 export function bannerStyle(color) {
-  const rgb = hexToRgb(color) || hexToRgb("#6366f1");
+  const rgb = hexToRgb(color) || hexToRgb("#FF174F");
   const deep = shade(rgb, 0.42);
   const mid = shade(rgb, 0.75);
   return (
@@ -95,6 +95,6 @@ export function bannerStyle(color) {
  * `color-mix` içinde kullanılır.
  */
 export function bannerRgb(color) {
-  const rgb = hexToRgb(color) || hexToRgb("#6366f1");
+  const rgb = hexToRgb(color) || hexToRgb("#FF174F");
   return rgbString(rgb);
 }

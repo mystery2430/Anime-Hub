@@ -210,7 +210,7 @@ function renderTile(tile) {
   button.className = "tile";
   button.dataset.siteId = tile.id;
 
-  const color = safeColor(tile.color) || "#6366f1";
+  const color = safeColor(tile.color) || "#FF174F";
   button.style.setProperty("--site", bannerRgb(color));
 
   const banner = document.createElement("span");
