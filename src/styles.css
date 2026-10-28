@@ -7,8 +7,8 @@
 :root,
 :root[data-theme="dark"] {
   --bg: #080F1D;
-  --bg-elev: #111B2C;
-  --bg-elev-2: #1A2638;
+  --bg-elev: #1A2638;
+  --bg-elev-2: color-mix(in srgb, #1A2638 82%, #080F1D);
   --line: #2B3B52;
   --text: #E9EDF4;
   --text-dim: #A5B1C5;
