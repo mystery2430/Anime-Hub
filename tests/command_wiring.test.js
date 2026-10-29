@@ -295,7 +295,7 @@ test("all active GitHub Actions workflows use the reviewed SHA pins", () => {
       assert.equal((line.split("#", 2)[1] || "").trim(), expected[1], path + ": " + action + " must retain the reviewed version comment");
     }
   }
-  assert.equal(external, 36, `expected 36 pinned external Actions, found ${external}`);
+  assert.equal(external, 41, `expected 36 pinned external Actions, found ${external}`);
 
   for (const [action, [sha, tag]] of Object.entries(verified)) {
     assert.match(sha, /^[0-9a-f]{40}$/, `${action}: not a full commit SHA`);

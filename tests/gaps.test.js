@@ -239,7 +239,7 @@ test("all active workflow Actions are pinned to verified commit SHAs", () => {
       assert.match(line, /#\s*(?:v?\d|stable\b)/, `${path}: human-readable version comment missing for ${action}`);
     }
   }
-  assert.equal(external, 36, `expected 36 external Action references across active workflows, saw ${external}`);
+  assert.equal(external, 41, `expected 36 external Action references across active workflows, saw ${external}`);
 });
 
 test("android release workflow prepares the project before signing", () => {
