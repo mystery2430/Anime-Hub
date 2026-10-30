@@ -1,0 +1,241 @@
+# Shared navigation-policy vectors for the desktop (Rust) and Android (Kotlin)
+# implementations of the same rule.
+#
+# Consumers (both load THIS file, neither has its own copy of the vectors):
+#   - src-tauri/src/sites/url_policy.rs
+#       navigation_policy_vectors_match_the_android_policy   (include_str!)
+#   - src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt
+#       sharedVectorsAgreeWithTheRustPolicy                  (test resource)
+#
+# Format: tab-separated, one vector per line, '#' starts a comment, blank lines
+# are ignored. A TSV rather than JSON on purpose: the pure Kotlin source set has
+# no JSON parser (org.json is an unmocked stub in Android unit tests) and the
+# Rust side would need a serde feature for one fixture, so both sides parse this
+# with three lines of code and no dependencies.
+#
+# Three kinds:
+#   url	<url>	allow|block	<reason|->
+#   host	<host>	public|private
+#   ip	<ip>	public|private
+#
+# `url` vectors are TOP-LEVEL navigation decisions (`on_navigation` on desktop,
+# `shouldOverrideUrlLoading` on Android). They are NOT a sub-resource policy:
+# `data:image/...` is a legitimate <img> source and stays untouched — only a
+# top-level data: document is refused. `blob:` stays allowed because MSE players
+# navigate the main frame to blob object URLs.
+#
+# `host` vectors go through Rust `is_private_host` and Kotlin
+# `SiteNavigationPolicy.hostAllowedForTest` (public == allowed, private ==
+# blocked). `ip` vectors go through Rust `is_public_ip` and Kotlin
+# `IpPolicy.isPublicIp`. Both follow the IANA IPv4/IPv6 Special-Purpose
+# registries, fail closed on anything unparseable, and must agree on every line
+# below.
+
+# --- schemes: only https is a real navigation, plus the narrow media cases ----
+url	https://openani.me/	allow	-
+url	https://example.com/watch?id=1&tab=2#t=30	allow	-
+url	HTTPS://openani.me/	allow	-
+url	http://openani.me/	block	insecure_scheme
+url	http://127.0.0.1:17395/callback	block	insecure_scheme
+url	blob:https://openani.me/8c1f0a2e-0000-4000-8000-000000000000	allow	-
+url	blob:http://openani.me/8c1f0a2e	block	insecure_scheme
+url	data:text/html,<script>alert(1)</script>	block	data_navigation
+url	data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==	block	data_navigation
+url	data:image/png;base64,iVBORw0KGgo=	block	data_navigation
+url	about:blank	allow	-
+url	about:srcdoc	block	unknown_about
+url	about:config	block	unknown_about
+url	javascript:alert(1)	block	unsupported_scheme
+url	file:///etc/passwd	block	unsupported_scheme
+url	ftp://openani.me/	block	unsupported_scheme
+url	intent://openani.me/#Intent;scheme=https;end	block	unsupported_scheme
+url	tauri://localhost/index.html	block	unsupported_scheme
+
+# --- hosts: loopback / private / link-local / reserved -----------------------
+url	https://127.0.0.1/x	block	private_host
+url	https://localhost/	block	private_host
+url	https://localhost./	block	private_host
+url	https://tauri.localhost/	block	private_host
+url	https://asset.localhost/	block	private_host
+url	https://10.0.0.1/	block	private_host
+url	https://192.168.1.1/	block	private_host
+url	https://172.16.0.1/	block	private_host
+url	https://169.254.169.254/latest/meta-data/	block	private_host
+url	https://[::1]/	block	private_host
+url	https://[fe80::1]/	block	private_host
+url	https://metadata.google.internal/	block	private_host
+
+# --- numeric host forms: the url crate normalises, Android's Uri does not ----
+url	https://0x7f000001/	block	private_host
+url	https://2130706433/	block	private_host
+url	https://127.1/	block	private_host
+url	https://0177.0.0.1/	block	private_host
+url	https://1.2.3.4/	allow	-
+
+# --- public destinations must not be over-blocked ---------------------------
+url	https://1.1.1.1/	allow	-
+url	https://[2606:4700:4700::1111]/	allow	-
+url	https://openani.me.evil.example/	allow	-
+url	https://evillocalhost/	allow	-
+url	https://xn--r8jz45g.xn--zckzah/	allow	-
+
+# --- host-level vectors (is_private_host / hostAllowedForTest) --------------
+host	openani.me	public
+host	LOCALHOST	private
+host	localhost	private
+host	localhost.	private
+host	localhost.localdomain	private
+host	ip6-localhost	private
+host	ip6-loopback	private
+host	tauri.localhost	private
+host	asset.localhost	private
+host	printer.local	private
+host	nas.lan	private
+host	router.home	private
+host	evil.internal	private
+host	metadata.google.internal	private
+host	192.168.1.1	private
+host	10.255.255.255	private
+host	8.8.8.8	public
+host	1.1.1.1	public
+host	172.32.0.1	public
+host	100.128.0.1	public
+host	[::1]	private
+host	::1	private
+host	[fe80::1]	private
+host	[2606:4700:4700::1111]	public
+host	[not:an:ip]	private
+host	example.0x7f	private
+host	0x	private
+host	example.0x	private
+host	0177.0.0.1	private
+host	010.0.0.1	public
+host	010.1	public
+host	2130706433	private
+host	0x7f000001	private
+host	127.1	private
+url	https://010.1/	allow	-
+host	foo.123	private
+host	a.1.2.3.4	private
+host	1.2.3.4.5	private
+host	0x7f.1	private
+host	017700000001	private
+host		private
+# Round 22: the same numeric spellings, in the forms the parsers must not lose.
+host	8.8.8.8.	public
+host	0X7F000001	private
+host	0x08080808	public
+host	0x7f000001.	private
+host	169.254.169.254.	private
+host	[::ffff:127.0.0.1]	private
+host	[64:ff9b::127.0.0.1]	private
+host	[2001:1::1]	public
+host	192.0.0.170	private
+host	openani.me.	public
+host	sub.openani.me	public
+host	xn--r8jz45g.xn--zckzah	public
+host	例え.テスト	public
+host	127.0.0.1.nip.io	public
+
+# --- ip-level vectors (is_public_ip / IpPolicy.isPublicIp) ------------------
+ip	0.0.0.0	private
+ip	0.1.2.3	private
+ip	8.8.8.8	public
+ip	1.1.1.1	public
+ip	9.255.255.255	public
+ip	10.0.0.0	private
+ip	10.255.255.255	private
+ip	11.0.0.1	public
+ip	100.63.255.255	public
+ip	100.64.0.0	private
+ip	100.64.0.1	private
+ip	100.127.255.255	private
+ip	100.128.0.1	public
+ip	127.0.0.1	private
+ip	127.255.255.254	private
+ip	128.0.0.1	public
+ip	169.253.255.255	public
+ip	169.254.0.1	private
+ip	169.254.169.254	private
+ip	169.255.0.1	public
+ip	172.15.255.255	public
+ip	172.16.0.0	private
+ip	172.31.255.255	private
+ip	172.32.0.0	public
+ip	192.0.0.8	private
+ip	192.0.0.9	public
+ip	192.0.0.10	public
+ip	192.0.0.11	private
+ip	192.0.2.1	private
+ip	192.88.99.1	private
+ip	192.168.0.1	private
+ip	192.169.0.1	public
+ip	198.17.255.255	public
+ip	198.18.0.0	private
+ip	198.19.255.255	private
+ip	198.20.0.1	public
+ip	198.51.100.1	private
+ip	203.0.113.1	private
+ip	223.255.255.255	public
+ip	224.0.0.1	private
+ip	239.255.255.255	private
+ip	240.0.0.1	private
+ip	255.255.255.255	private
+ip	::	private
+ip	::1	private
+ip	::ffff:8.8.8.8	public
+ip	::ffff:127.0.0.1	private
+ip	::ffff:192.168.1.1	private
+ip	::8.8.8.8	public
+ip	::127.0.0.1	private
+ip	64:ff9b::8.8.8.8	public
+ip	64:ff9b::127.0.0.1	private
+ip	64:ff9b:1::1	private
+ip	100::1	private
+ip	100:0:0:1::1	private
+ip	2000::1	public
+ip	2001::1	private
+ip	2001:1::1	public
+ip	2001:1::2	public
+ip	2001:1::3	public
+ip	2001:2::1	private
+ip	2001:3::1	public
+ip	2001:4:112::1	public
+ip	2001:10::1	private
+ip	2001:20::1	public
+ip	2001:30::1	public
+ip	2001:db8::1	private
+ip	2002::1	private
+ip	2606:4700:4700::1111	public
+ip	3fff:0fff::1	private
+ip	3fff:1234::1	public
+ip	5f00::1	private
+ip	fc00::1	private
+ip	fd12:3456::1	private
+ip	fe80::1	private
+ip	fec0::1	private
+ip	ff02::1	private
+# Round 22: every globally-reachable-True entry in the IANA IPv4 special
+# registry that the policy used to leave untested, and the False neighbours.
+ip	192.0.0.170	private
+ip	192.0.0.171	private
+ip	192.31.196.1	public
+ip	192.52.193.1	public
+ip	192.175.48.1	public
+ip	192.88.99.2	private
+ip	255.255.255.254	private
+# IPv6: a mapped metadata address, the local-use NAT64 prefix with a PUBLIC
+# inner address (still blocked - the prefix itself is not global), and the
+# 2001::/23 edges plus the /128 anycasts inside it.
+ip	::ffff:169.254.169.254	private
+ip	::ffff:0.0.0.0	private
+ip	64:ff9b:1::8.8.8.8	private
+ip	2001:1::4	private
+ip	2001:5::1	private
+ip	2001:1ff::1	private
+ip	2001:200::1	public
+ip	2001:4:112:1::1	public
+ip	2620:4f:8000::1	public
+ip	5eff::1	private
+ip	5eff:ffff::1	private
+ip	3ffe:ffff::1	public

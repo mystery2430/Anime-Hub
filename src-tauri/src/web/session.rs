@@ -8,17 +8,22 @@
 //! so cookies, localStorage, IndexedDB and cache never cross between sites.
 //!
 //! ## Android
-//! The system WebView has **no** per-profile data directory API, so a
-//! directory-per-site partition is impossible. Instead we partition by
-//! *swapping the cookie jar*: on opening a site we export the previous site's
-//! cookies into its encrypted blob, wipe the live jar, and restore the target
-//! site's cookies. Login state (which is cookie-borne on every site in scope)
-//! is therefore isolated.
-//!
-//! **Documented limitation:** on Android, `localStorage` / IndexedDB / cache
-//! are shared between sites because the platform offers no way to partition
-//! them. Sites that keep auth state in `localStorage` would leak it. This is
-//! surfaced in the About screen rather than hidden.
+//! The launcher keeps Tauri/Wry's single WebView on the **default** profile.
+//! Sites open in a *separate* native WebView above it, bound to their own
+//! persistent androidx.webkit profile (`WebViewCompat.setProfile`, assigned
+//! before any other WebView API call and before the first navigation), so
+//! cookies, localStorage, IndexedDB and cache are partitioned per `site_id` —
+//! including between two sites that share an origin. The legacy cookie-jar
+//! swap and the JSON localStorage/IndexedDB snapshot export/import are gone:
+//! profiles persist by themselves, the dump was never a security boundary,
+//! and re-injecting it would revive the origin TOCTOU it had. One migration
+//! remains: the 0.3.4 encrypted cookie jar is imported once into a *virgin*
+//! profile's own `CookieManager` before that profile's first navigation.
+//! Providers without `WebViewFeature.MULTI_PROFILE` refuse the open outright —
+//! there is no silent fallback to the shared profile. Profile names derive
+//! from the registered `site_id` only (see `web/windows.rs`:
+//! `android_profile_name`), never from the URL or display name. See
+//! `docs/android-storage-isolation.md`.
 
 use crate::error::AppError;
 use crate::sites::blocklist::Blocklist;
@@ -210,31 +215,70 @@ pub enum NavDecision {
 /// Shown when a public-looking name resolves to a private address.
 pub const DNS_REBIND_BLOCK: &str = "Alan adı özel/ağ içi bir adrese çözümlendi.";
 
-/// Decide whether a WebView navigation may proceed.
+/// Shown when the resolver did not answer at all: timeout, NXDOMAIN, resolver
+/// error, or every lookup slot busy.
+///
+/// Deliberately **not** [`DNS_REBIND_BLOCK`]: nothing was proven about the
+/// name, so the notice must not claim a rebinding was detected.
+pub const DNS_UNKNOWN_BLOCK: &str =
+    "Alan adı doğrulanamadı (DNS yanıtı alınamadı); sayfa açılmadı, tekrar deneyin.";
+
+/// Decide whether a WebView navigation may proceed, using the string policy
+/// only.
 ///
 /// `site_host` is the site the session was opened for; it is unused by the
 /// current rules but keeps the signature honest for future same-site rules.
 ///
-/// This is the string policy only. Production call sites that can block the
-/// WebView thread pass a [`DnsClass`] from [`decide_navigation_dns`] so a
-/// name that *looks* public but resolves to a router or a metadata address
-/// is refused too.
+/// This has no DNS facts, so it cannot judge a name. Callers that can resolve
+/// use [`decide_navigation_dns`] or [`dns_decision`]; `web/windows.rs` runs
+/// both halves, so a host that *looks* public but resolves to a router or a
+/// metadata address is refused too.
 pub fn decide_navigation(url: &Url, site_host: &str, blocklist: &Blocklist) -> NavDecision {
-    decide_navigation_dns(url, site_host, blocklist, DnsClass::Unknown)
+    string_policy(url, site_host, blocklist)
 }
 
 /// [`decide_navigation`] plus the result of a DNS lookup.
 ///
-/// `DnsClass::Unknown` (timeout, NXDOMAIN, resolver error) does **not** block:
-/// a DNS outage must not make every site unopenable. A successful answer that
-/// contains any non-public address does block. The string policy still runs
-/// first, so literal private hosts keep their existing message.
+/// The string policy runs first, so a literal private host keeps its existing
+/// message and a blocklisted host stays silent. [`dns_decision`] then decides
+/// the name: a private answer blocks, and so does [`DnsClass::Unknown`].
 pub fn decide_navigation_dns(
     url: &Url,
     site_host: &str,
     blocklist: &Blocklist,
     dns: DnsClass,
 ) -> NavDecision {
+    match string_policy(url, site_host, blocklist) {
+        NavDecision::Allow => dns_decision(dns),
+        refused => refused,
+    }
+}
+
+/// The DNS half of the top-level policy, shared by the WebView callback and
+/// the site-open path so the two cannot drift.
+///
+/// **`Unknown` is a refusal (round 21).** It used to fall through, on the
+/// argument that a DNS outage must not make every site unopenable. That
+/// argument was wrong for this call site: `Unknown` is not only an outage —
+/// `dns.rs` also returns it *immediately* when every lookup slot is busy, and
+/// a hostile page can cause that — and the allowed navigation was then
+/// resolved again by the WebView's own stack, which is exactly the rebinding
+/// window this check exists to close. The cost is availability: a slow or
+/// broken resolver now refuses the navigation. Nothing is cached for a
+/// timeout, so a retry resolves again.
+///
+/// Scope: top-level navigations only. `fetch`, XHR, iframes and other
+/// subresources never pass through this function.
+pub fn dns_decision(dns: DnsClass) -> NavDecision {
+    match dns {
+        DnsClass::Answered { private: true } => NavDecision::Block(DNS_REBIND_BLOCK),
+        DnsClass::Unknown => NavDecision::Block(DNS_UNKNOWN_BLOCK),
+        DnsClass::Answered { private: false } => NavDecision::Allow,
+    }
+}
+
+/// Scheme, host and blocklist rules. No DNS, no cache, no I/O.
+fn string_policy(url: &Url, site_host: &str, blocklist: &Blocklist) -> NavDecision {
     let _ = site_host;
     if !navigation_allowed(url) {
         return NavDecision::Block(match url.scheme() {
@@ -253,12 +297,6 @@ pub fn decide_navigation_dns(
             return NavDecision::BlockedHost;
         }
     }
-    // After the string policy. A blocklisted host is already refused, so we
-    // never replace that silent decision with a toast just because DNS also
-    // happened to return a private address.
-    if matches!(dns, DnsClass::Answered { private: true }) {
-        return NavDecision::Block(DNS_REBIND_BLOCK);
-    }
     NavDecision::Allow
 }
 
@@ -275,6 +313,24 @@ pub fn decide_navigation_dns(
 /// Everything dynamic reaches the page through [`embed_json`], never string
 /// interpolation, so a hostile site name or blocklist entry cannot inject
 /// script.
+///
+/// **Frame scope (AH-P2).** On Android this text is registered with
+/// `WebViewCompat.addDocumentStartJavaScript(.., setOf("*"))`, i.e. it runs in
+/// EVERY frame of EVERY origin — the origin rule set has to stay wide, because
+/// the players these sites embed and the ad frames that call `window.open` are
+/// both third-party origins, and the API offers no "top frame only" rule. What
+/// is narrowed instead is what each part does:
+///
+/// * every frame gets the cosmetic `<style>` (selectors are data, not code) and
+///   the [`popup_guard.js`](popup_guard.js) override, which returns `null` and
+///   keeps no reference to the native `window.open`;
+/// * only the TOP frame installs the PiP controller — [`pip_controller.js`]
+///   returns early in a subframe, so a third-party frame is not handed
+///   `window.__animehubPip*` (the native side re-installs the controller in the
+///   main frame on demand, so PiP does not depend on the document-start copy);
+/// * no frame gets anything else: the payload is the three display settings,
+///   there is no site identity in it and no IPC bridge exists for a site
+///   WebView at all.
 pub fn build_init_script(cfg: &InjectedConfig) -> String {
     let payload = embed_json(cfg);
 
@@ -288,20 +344,22 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
     };
 
     // The popup guard is *omitted* rather than disabled when off, so the
-    // shipped script never contains the `window.open` override at all.
+    // shipped script never contains the `window.open` override at all. It lives
+    // in its own file so the injected text is executable under test
+    // (`tests/init_script.test.js`) instead of pinned only as source prose.
     let popup_guard = if cfg.block_popups {
-        r#"
-  // Neutralise attempts to open new windows from scripts. The Rust side
-  // already denies these; this stops the spinner/blank-tab artefact and the
-  // "popup blocked" retry loops some ad scripts fall into.
-  var nativeOpen = window.open;
-  window.open = function () { return null; };
-  // Keep the original reachable for first-party code that feature-detects.
-  Object.defineProperty(window.open, "__animehubNative", {
-    value: nativeOpen,
-    enumerable: false,
-  });
-"#
+        include_str!("popup_guard.js")
+    } else {
+        ""
+    };
+
+    // Same rule as the popup guard: omitted, never emitted-and-disabled. On
+    // Android the guard is part of this document-start script (which the
+    // provider applies to every frame). On desktop it is registered
+    // separately with `initialization_script_for_all_frames`, so it is not
+    // duplicated here — see [`WEBRTC_GUARD`].
+    let webrtc_guard = if cfg.webrtc_guard {
+        include_str!("webrtc_guard.js")
     } else {
         ""
     };
@@ -326,9 +384,15 @@ pub fn build_init_script(cfg: &InjectedConfig) -> String {
   if (window.__animehubInstalled) return;
   window.__animehubInstalled = true;
   var CFG = {payload};
-{popup_guard}{cosmetic}{pip_controller}}})();"#
+{popup_guard}{webrtc_guard}{cosmetic}{pip_controller}}})();"#
     )
 }
+
+/// The WebRTC override as shipped, for the desktop all-frames registration.
+///
+/// Kept in one place: the file is the single source of truth for both the
+/// Android document-start script and the desktop `initialization_script_for_all_frames`.
+pub const WEBRTC_GUARD: &str = include_str!("webrtc_guard.js");
 
 /// Serialise a value for embedding inside an inline `<script>` block.
 ///
@@ -361,6 +425,20 @@ pub struct InjectedConfig {
     /// anything the launcher's eval installed. Keeping it in the init script
     /// as well means the site page has it from the first paint on.
     pub pip_controller: bool,
+    /// Android only: append [`WEBRTC_GUARD_JS`] to the injected script.
+    ///
+    /// An HTTP `CONNECT` proxy carries TCP only, and Chromium does not send
+    /// WebRTC's UDP through a configured proxy by default (RFC 8828 §5.1
+    /// principle 4). The API is therefore removed in every frame a site page
+    /// can run in. This is defence in depth, not the guarantee: the guard is a
+    /// page script, and the residual is documented in
+    /// `docs/security-residual-risks.md`.
+    ///
+    /// `serde(skip)`: the flag decides which code the native side injects, it
+    /// is not data for the page — and telling a page which guards are on is a
+    /// hint it does not need.
+    #[serde(skip)]
+    pub webrtc_guard: bool,
 }
 
 impl Default for InjectedConfig {
@@ -373,6 +451,8 @@ impl Default for InjectedConfig {
                 .collect(),
             // Off by default: only the Android caller turns it on.
             pip_controller: false,
+            // Same: desktop has no pinned path to protect here.
+            webrtc_guard: false,
         }
     }
 }
@@ -424,7 +504,7 @@ pub fn ensure_profile_dir(
     Ok(dir)
 }
 
-/// Which site a session belongs to, for the cookie-swap path.
+/// Which site a session belongs to (ownership checks for open/close/wipe).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
     pub site_id: String,
@@ -702,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_blocks_public_name_that_resolves_private() {
+    fn navigation_blocks_a_private_answer_and_an_unanswered_lookup() {
         let bl = Blocklist::default();
         let url = Url::parse("https://rebind.example/latest/meta-data/").unwrap();
         assert_eq!(
@@ -714,11 +794,18 @@ mod tests {
             ),
             NavDecision::Block(DNS_REBIND_BLOCK)
         );
-        // A resolver miss must not fail closed: the string policy already
-        // accepted this host, and a DNS outage is not an attack.
+        // Round 21: an unanswered lookup is refused, not waved through. The
+        // lookup budget alone can produce `Unknown`, so this used to be a way
+        // to skip the check entirely (four hung lookups, then navigate).
         assert_eq!(
             decide_navigation_dns(&url, "openani.me", &bl, DnsClass::Unknown),
-            NavDecision::Allow
+            NavDecision::Block(DNS_UNKNOWN_BLOCK)
+        );
+        // ... and the notice must not claim a rebinding that was never seen.
+        assert_ne!(DNS_UNKNOWN_BLOCK, DNS_REBIND_BLOCK);
+        assert!(
+            !DNS_UNKNOWN_BLOCK.contains("çözümlendi"),
+            "an unanswered lookup resolved nothing"
         );
         assert_eq!(
             decide_navigation_dns(
@@ -728,6 +815,39 @@ mod tests {
                 DnsClass::Answered { private: false }
             ),
             NavDecision::Allow
+        );
+    }
+
+    #[test]
+    fn a_rejected_url_is_not_rescued_by_a_public_dns_answer() {
+        let bl = Blocklist::default();
+        let public = DnsClass::Answered { private: false };
+        let http = Url::parse("http://openani.me/").unwrap();
+        let literal = Url::parse("https://127.0.0.1/x").unwrap();
+        let listed = Url::parse("https://ad.doubleclick.net/x").unwrap();
+        // Scheme policy runs first, whatever the resolver said.
+        assert_eq!(
+            decide_navigation_dns(&http, "openani.me", &bl, public),
+            NavDecision::Block("Güvensiz (HTTP) yönlendirme engellendi.")
+        );
+        // A private literal is judged by the string policy, not by DNS: no
+        // answer can turn it into an allowed navigation.
+        let literal_public = decide_navigation_dns(&literal, "openani.me", &bl, public);
+        assert_ne!(literal_public, NavDecision::Allow);
+        assert_eq!(
+            literal_public,
+            decide_navigation_dns(&literal, "openani.me", &bl, DnsClass::Unknown)
+        );
+        // A blocklist hit stays silent even when the name resolves public.
+        assert_eq!(
+            decide_navigation_dns(&listed, "openani.me", &bl, public),
+            NavDecision::BlockedHost
+        );
+        // The same holds for the unanswered class: it cannot rescue a URL the
+        // string policy already refuses.
+        assert_eq!(
+            decide_navigation_dns(&listed, "openani.me", &bl, DnsClass::Unknown),
+            NavDecision::BlockedHost
         );
     }
 
@@ -821,6 +941,7 @@ mod tests {
             block_popups: true,
             hide_selectors: vec!["</script><script>alert(1)</script>".into()],
             pip_controller: false,
+            webrtc_guard: false,
         };
         let js = build_init_script(&cfg);
         assert!(
@@ -842,12 +963,47 @@ mod tests {
         assert!(js.contains("adsbygoogle"));
     }
 
+    /// AH-P2: the guard runs in every frame, so it must not hand any frame a
+    /// way back to the native `window.open`. It used to store the original on a
+    /// non-enumerable property of the replacement; nothing read it, and every
+    /// cross-origin ad frame could.
+    #[test]
+    fn init_script_never_keeps_the_native_window_open_reachable() {
+        let js = build_init_script(&InjectedConfig::default());
+        assert!(
+            js.contains("window.open = function"),
+            "the override itself must stay"
+        );
+        assert!(
+            !js.contains("__animehubNative"),
+            "no escape-hatch property on the override"
+        );
+        assert!(
+            !js.contains("nativeOpen"),
+            "no captured reference to the original function"
+        );
+        assert!(
+            !js.contains("defineProperty(window.open"),
+            "the override must not be decorated with extra properties"
+        );
+        // Turning popups off still removes the whole guard, escape hatch and
+        // all, rather than shipping a disabled copy.
+        let off = build_init_script(&InjectedConfig {
+            block_popups: false,
+            hide_selectors: vec![],
+            pip_controller: false,
+            webrtc_guard: false,
+        });
+        assert!(!off.contains("window.open"));
+    }
+
     #[test]
     fn init_script_without_popup_blocking_leaves_open_alone() {
         let js = build_init_script(&InjectedConfig {
             block_popups: false,
             hide_selectors: vec![],
             pip_controller: false,
+            webrtc_guard: false,
         });
         assert!(!js.contains("window.open = function"));
     }
@@ -869,10 +1025,107 @@ mod tests {
         assert!(!init.contains("__animehub-back"));
     }
 
+    /// WebRTC is not carried by an HTTP `CONNECT` proxy, so a page that opens a
+    /// peer connection can create traffic the pinning proxy never sees. The
+    /// API is removed where the pinned path exists (Android), and the flag
+    /// itself is never serialised into the page's config payload.
+    #[test]
+    fn init_script_removes_webrtc_where_the_pinned_path_exists() {
+        let js = build_init_script(&InjectedConfig {
+            webrtc_guard: true,
+            ..Default::default()
+        });
+        assert!(js.contains("RTCPeerConnection"), "the guard must ship");
+        assert!(
+            js.contains("configurable: false") && js.contains("writable: false"),
+            "a page must not be able to restore the constructor"
+        );
+        assert!(
+            js.contains("NotSupportedError"),
+            "the refusal must be explicit, not a silent no-op"
+        );
+        // The switch is native-side only: the page payload stays the three
+        // display settings.
+        assert!(!js.contains("webrtcGuard"), "the flag leaked into CFG");
+        // Guard text must satisfy the same inertness rules as the rest.
+        let lowered = js.to_lowercase();
+        for needle in ["token", "secret", "cookie", "authorization", "http:"] {
+            assert!(!lowered.contains(needle), "guard mentions {needle}");
+        }
+    }
+
+    /// Both platforms with a pinned path ship the guard, but they install it
+    /// through different channels: Android composes it into the document-start
+    /// script (every frame), desktop registers [`WEBRTC_GUARD`] separately with
+    /// `initialization_script_for_all_frames`. Neither composes it twice.
+    #[test]
+    fn the_webrtc_guard_is_installed_once_per_platform() {
+        let composed = build_init_script(&InjectedConfig::default());
+        assert!(
+            !composed.contains("RTCPeerConnection"),
+            "the composed script never carries the guard on its own"
+        );
+        assert!(!composed.contains("NotSupportedError"));
+        assert!(
+            WEBRTC_GUARD.contains("RTCPeerConnection") && WEBRTC_GUARD.contains("defineProperty"),
+            "the shared guard text is the shipped override"
+        );
+        // The desktop WebView registers that text for every frame; the pin
+        // lives in windows.rs so a refactor cannot drop it silently.
+        let windows_rs = include_str!("windows.rs");
+        assert!(
+            windows_rs.contains(
+                "initialization_script_for_all_frames(crate::web::session::WEBRTC_GUARD)"
+            ),
+            "the site WebView must install the guard in every frame"
+        );
+    }
+
+    /// AH-P2: the document-start channel cannot be scoped to the top frame, so
+    /// the controller scopes itself. A subframe must not end up with the PiP
+    /// globals; the top frame must (that is the copy `pip_controller.js`'s own
+    /// tests exercise, and the native side re-installs it on demand anyway).
+    #[test]
+    fn init_script_scopes_the_pip_controller_to_the_top_frame() {
+        let js = build_init_script(&InjectedConfig {
+            pip_controller: true,
+            webrtc_guard: false,
+            ..Default::default()
+        });
+        assert!(
+            js.contains("window.self === window.top"),
+            "the injected controller must check the frame it runs in"
+        );
+        assert!(
+            js.contains("if (!isTopFrame)"),
+            "a subframe must return before installing anything"
+        );
+        // The check has to fail closed: an opaque-origin frame whose `window.top`
+        // read throws must not be treated as the top frame.
+        let gate = js
+            .split("var isTopFrame")
+            .nth(1)
+            .unwrap_or_default()
+            .split("if (!isTopFrame)")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(gate.contains("catch"), "the frame check must be guarded");
+        assert!(
+            gate.contains("return false"),
+            "an unreadable window.top means: do not install"
+        );
+        // The popup guard and the cosmetic rules stay frame-agnostic — they are
+        // the parts that have to work inside third-party ad frames.
+        assert!(js.contains("window.open = function"));
+        assert!(js.contains("animehub-cosmetic"));
+    }
+
     #[test]
     fn init_script_carries_the_pip_controller_only_when_asked() {
         let with_pip = build_init_script(&InjectedConfig {
             pip_controller: true,
+            webrtc_guard: false,
             ..Default::default()
         });
         // The controller installs through computed keys, so the exact source
@@ -988,5 +1241,102 @@ mod tests {
         assert_ne!(profile_dir_name("a"), profile_dir_name("b"));
         assert!(!profile_dir_name("a/b").contains('/'));
         assert!(!profile_dir_name("").contains('/'));
+    }
+
+    /// AH-P2: `WebViewCompat.addDocumentStartJavaScript(webView, initScript,
+    /// setOf("*"))` runs this script for EVERY origin the site WebView loads,
+    /// including cross-origin player domains and third-party frames. That is
+    /// only acceptable because the script carries no capability and no secret —
+    /// a site WebView has no Tauri IPC bridge at all, and the PiP controller's
+    /// functions are called BY the native side, never the other way round.
+    /// Narrowing the ORIGIN set would break cross-origin players (very common
+    /// for anime sites) and the popup guard on ad-driven redirects, so the
+    /// origin set stays "*" and the requirement is that the payload stays
+    /// inert, which this pins. What CAN be narrowed per frame is narrowed: see
+    /// `init_script_scopes_the_pip_controller_to_the_top_frame` and
+    /// `init_script_never_keeps_the_native_window_open_reachable`.
+    #[test]
+    fn init_script_is_inert_enough_to_run_for_every_origin() {
+        let cfg = InjectedConfig {
+            block_popups: true,
+            hide_selectors: vec![".ad-container".to_string(), "#popup".to_string()],
+            pip_controller: true,
+            webrtc_guard: false,
+        };
+        let script = build_init_script(&cfg);
+        let lowered = script.to_lowercase();
+
+        // Nothing a page could turn into a credential, a request or a redirect.
+        for needle in [
+            "token",
+            "secret",
+            "cookie",
+            "authorization",
+            "bearer",
+            "client_id",
+            "http:",
+            "client_secret",
+            "accesstoken",
+        ] {
+            assert!(
+                !lowered.contains(needle),
+                "init script must stay inert, but mentions {needle}"
+            );
+        }
+        // The injected payload is exactly the three display settings.
+        for key in ["blockPopups", "hideSelectors", "pipController"] {
+            assert!(script.contains(key), "payload lost {key}");
+        }
+        // The site URL, the profile name and any per-site value are not in it.
+        assert!(
+            !lowered.contains("openani"),
+            "no site identity in the script"
+        );
+        assert!(
+            !lowered.contains("profile"),
+            "no profile name in the script"
+        );
+        // And the escape hatch stays: no `</script>` can appear in the payload.
+        assert!(!script.contains("</script>"));
+    }
+
+    #[test]
+    fn reachable_site_ids_never_collide_after_profile_normalization() {
+        // SEC-5 regression gate: production reaches this function only with a
+        // shipped builtin or a UUIDv4 simple ID. Neither is transformed by the
+        // filter or the 64-char cut, so profile_dir_name is injective on the
+        // reachable set. If the ID format, cap, or alphabet changes without a
+        // namespace migration, this test fails before two profiles can merge.
+        let mut ids = vec![
+            "builtin-openanime".to_string(),
+            "builtin-animecix".to_string(),
+        ];
+        for _ in 0..512 {
+            ids.push(format!("user-{}", uuid::Uuid::new_v4().simple()));
+        }
+
+        let base = std::path::PathBuf::from("test-base");
+        let mut seen = std::collections::HashMap::new();
+        for id in &ids {
+            assert!(
+                id.len() <= 37,
+                "reachable id is outside the audited length budget: {id}"
+            );
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+                "reachable id is outside the audited alphabet: {id}"
+            );
+
+            let profile = profile_dir_name(id);
+            assert_eq!(profile, format!("site-{id}"));
+            let path = profile_dir_path(&base, id);
+            assert_eq!(path, base.join("profiles").join(&profile));
+
+            if let Some(previous) = seen.insert(profile.clone(), id.clone()) {
+                panic!("{previous} and {id} both derive the profile directory {profile}");
+            }
+        }
+        assert_eq!(seen.len(), ids.len());
     }
 }

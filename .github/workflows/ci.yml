@@ -11,12 +11,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  PR_NUMBER: ${{ github.event.pull_request.number }}
-  GH_TOKEN: ${{ github.token }}
 
+# AH-09 / AH-P6: this workflow builds and tests. It used to hand
+# `github.token` to EVERY step of EVERY job through the workflow-level env and
+# ask for `pull-requests: write`, all so one debug step could post a PR comment.
+# That comment is gone (the diagnostics go to the step summary and the log
+# artifacts instead), so the token is no longer exported at all: a compromised
+# build step on a fork PR now has nothing to write with. Jobs that genuinely
+# need a token (the release workflows) set it on their own step.
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   # ------------------------------------------------------------------ tests
@@ -30,7 +34,7 @@ jobs:
         # 22.04's default WebKit is 4.0 and fails this build.
         os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -39,15 +43,15 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev pkg-config
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri -> target
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
@@ -101,6 +105,38 @@ jobs:
             exit "$status"
           fi
 
+      # The declared MSRV is a promise, and it has been wrong before: tauri
+      # 2.11.6 needs 1.77.2, the RustCrypto 0.11 line 1.85, ctutils 0.4.5 (the
+      # RUSTSEC-2026-0385 fix) 1.87, darling/icu_*/keyring/plist/serde_with/
+      # time 1.88 and aes 0.9.3 1.89 — which is how 1.89 was arrived at: this
+      # step rejected the guessed 1.87 with the exact list. It READS the value
+      # declared in src-tauri/Cargo.toml and builds with exactly that
+      # toolchain, so a dependency bump that outgrows the promise fails here
+      # instead of on a user's machine.
+      - name: MSRV (declared rust-version)
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$msrv" ]; then
+            echo "::error::src-tauri/Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          echo "declared MSRV: $msrv"
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+          rustc "+$msrv" --version
+          set +e
+          cargo "+$msrv" check --locked --all-targets > "$RUNNER_TEMP/msrv.log" 2>&1
+          status=$?
+          tail -n 60 "$RUNNER_TEMP/msrv.log" || true
+          if [ "$status" -ne 0 ]; then
+            # Same channel as Clippy: the annotation is what survives when the
+            # job log blob is not readable from the checks API.
+            node "$GITHUB_WORKSPACE/scripts/ci_annotate.js" "$RUNNER_TEMP/msrv.log" msrv || true
+            exit "$status"
+          fi
+
   # ------------------------------------------------ Android actually compiles
   # The previous handoff could not run `tauri android build` (no SDK). This
   # job is that missing compile: one ABI is enough to type-check the Kotlin
@@ -110,16 +146,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
         with:
           distribution: temurin
           java-version: 17
 
       # v3 still asks sdkmanager for the removed `tools` package and fails
       # before any compile. v4 installs cmdline-tools + platform-tools only.
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
 
       # Tauri CLI 2.11 generates compileSdk 36 and, when NDK_HOME is unset,
       # installs NDK 29.0.13846066. A different NDK left in NDK_HOME makes the
@@ -139,15 +175,15 @@ jobs:
           echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-linux-android
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri -> target
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
@@ -222,8 +258,39 @@ jobs:
           fi
           ls -l src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts 2>&1 | head -n 20
           mkdir -p src-tauri/gen/android/app/src/test/java/dev/animehub/app
-          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/
-          echo "=== isolating pure Kotlin for unit test (move Tauri-dependent files, keep IpPolicy+SiteNavigationPolicy) ==="
+          # The Gradle `--tests "dev.animehub.app.*Test"` glob passes when ANY
+          # matching class exists, so a failed copy would silently shrink the
+          # suite (a missing SiteProfileOpsTest.kt would drop all 30 flow
+          # tests) while the step stayed green. A missing source is a hard
+          # failure — no `|| true`, no continue-on-error.
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationPolicyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteNavigationPolicyTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProfileOpsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteProfileOpsTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteWebViewSettingsTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteWebViewSettingsTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubDebugLogTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::AnimeHubDebugLogTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/PipTransferFlowTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::PipTransferFlowTest.kt could not be copied into the test source set"; exit 1; }
+          # Connection pinning: the CONNECT parser, the pinned connect and the
+          # tunnel run against real loopback sockets in this suite. A missing
+          # copy would silently drop the only test that proves a rebinding
+          # answer cannot reach a private address.
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/DnsPinnedProxyTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::DnsPinnedProxyTest.kt could not be copied into the test source set"; exit 1; }
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/SiteProxyGateTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::SiteProxyGateTest.kt could not be copied into the test source set"; exit 1; }
+          # The asynchronous resolver: cancellation, single-flight, the
+          # in-flight ceiling and the "late answer cannot win" rule. Without
+          # this class the proxy could regress to a blocking, uncancellable
+          # lookup without any test noticing.
+          cp src-tauri/android-plugin/kotlin/dev/animehub/app/AsyncDnsResolverTest.kt src-tauri/gen/android/app/src/test/java/dev/animehub/app/ || { echo "::error::AsyncDnsResolverTest.kt could not be copied into the test source set"; exit 1; }
+          # The shared navigation-policy vectors: the Kotlin suite loads this
+          # file from the test classpath and the Rust suite includes the very
+          # same path with include_str!. A missing copy fails here (and the test
+          # itself fails loudly) instead of quietly dropping 160 vectors.
+          mkdir -p src-tauri/gen/android/app/src/test/resources
+          cp tests/fixtures/navigation-policy.tsv src-tauri/gen/android/app/src/test/resources/ || { echo "::error::navigation-policy.tsv could not be copied into the test resources"; exit 1; }
+          # The shared CONNECT request/authority grammar (rounds 22-23): the
+          # same file the Rust proxy test includes. Without it the Kotlin parser
+          # test fails loudly rather than quietly shrinking to the vectors
+          # hard-coded in it.
+          cp tests/fixtures/connect-request.tsv src-tauri/gen/android/app/src/test/resources/ || { echo "::error::connect-request.tsv could not be copied into the test resources"; exit 1; }
+          echo "=== isolating: move AnimeHubPlugin.kt + MainActivity.kt only; keep the real site controller chain ==="
           echo "=== before move, ls -l src/main ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
           echo "=== ls -R before ==="
@@ -234,8 +301,9 @@ jobs:
             echo "found AnimeHubPlugin.kt, moving..."
             rm -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt
             # also move to /tmp for restore
-            cp /home/user/Anime-Hub/src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak 2>&1 | head -n 20 || true
-            echo "rm AnimeHubPlugin.kt exit $?"
+            # Relative path: the absolute /home/user/... path this used to have
+            # does not exist on a runner, so the backup silently never happened.
+            cp src-tauri/android-plugin/kotlin/dev/animehub/app/AnimeHubPlugin.kt /tmp/AnimeHubPlugin.kt.bak || echo "::warning::AnimeHubPlugin.kt backup failed (prepare.py restores it anyway)"
             # also ensure file is gone
             ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt 2>&1 | head -n 5 || echo "AnimeHubPlugin.kt gone after rm"
           else
@@ -248,12 +316,17 @@ jobs:
           else
             echo "MainActivity.kt NOT FOUND before move"
           fi
-          # AnimeHubPipController references AnimeHubDebugLog in AnimeHubPlugin.kt, so remove it for pure test (only IpPolicy+SiteNavigationPolicy)
-          if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt ]; then
-            echo "found AnimeHubPipController.kt, removing for pure test"
-            mv src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt /tmp/AnimeHubPipController.kt.bak
-            echo "moved AnimeHubPipController.kt"
-          fi
+          # TRUST MITIGATION (round 3): ONLY AnimeHubPlugin.kt (tauri types)
+          # and the generated MainActivity leave the source set. The REAL
+          # AnimeHubSiteController.kt, AnimeHubPipController.kt, the split
+          # AnimeHubDebugLog.kt / SiteNavigationGuard.kt, the pure Kotlin flow
+          # files (SiteProfileOps.kt, ProfileQuarantine.kt, SiteCloseFlow.kt,
+          # SiteShutdownFlow.kt, SiteClearFlow.kt, SiteMigrationFlow.kt,
+          # SiteBackStatus.kt, PipTransferFlow.kt),
+          # SiteNavigationPolicy.kt and IpPolicy.kt STAY — so
+          # `:app:test*UnitTest` type-checks the production controller every
+          # run instead of trusting the (unreadable) APK-step logs. Nothing
+          # kept here references Tauri or MainActivity; they compile pure.
           echo "=== after move, ls -l ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 100
           ls -l /tmp/AnimeHubPlugin.kt.bak /tmp/MainActivity.kt.bak 2>&1 | head -n 20
@@ -263,7 +336,7 @@ jobs:
           cat /tmp/ls-after.log
           echo "lsBefore $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 800)"
           echo "lsAfter $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 800)"
-          echo "=== after rm, should be only IpPolicy+SiteNavigationPolicy ==="
+          echo "=== after isolation, Plugin+MainActivity gone, real controller kept ==="
           ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/ 2>&1 | head -n 20
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPlugin.kt ]; then echo "AnimeHubPlugin.kt still present after rm (unexpected)"; else echo "AnimeHubPlugin.kt gone as expected"; fi
           if [ -f src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt ]; then echo "::warning::MainActivity.kt still present after move"; ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt; fi
@@ -282,7 +355,14 @@ jobs:
           # tauri_build generates tauri.settings.gradle and tauri.build.gradle.kts only when
           # TAURI_ANDROID_PROJECT_PATH is set and cargo build runs for an android target.
           # This provides the real :tauri-android project so AnimeHubPlugin.kt can compile.
-          TAURI_ANDROID_PROJECT_PATH=$(pwd)/src-tauri/gen/android cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android  > /tmp/cargo-tauri.log 2>&1 || true
+          # Non-gating on purpose: this build only exists to make tauri_build
+          # emit tauri.settings.gradle / app/tauri.build.gradle.kts for the
+          # unit-test source set; the real gates below are the Gradle test
+          # exit code and the APK step. The step runs under `set +e`, so the
+          # failure does not abort here — but `$?` must be captured from the
+          # build itself, NOT from a trailing `|| true` (which pinned the
+          # reported status to 0 and made a failed generation look green).
+          TAURI_ANDROID_PROJECT_PATH=$(pwd)/src-tauri/gen/android cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android  > /tmp/cargo-tauri.log 2>&1
           cargo_status=$?
           echo "cargo build exit $cargo_status"
           cat /tmp/cargo-tauri.log | tail -n 200
@@ -308,7 +388,7 @@ jobs:
           status=1
           for t in testUniversalDebugUnitTest testArm64DebugUnitTest testDebugUnitTest; do
             echo "=== trying :app:$t --tests ==="
-            ./gradlew :app:$t --tests "dev.animehub.app.SiteNavigationPolicyTest" --info > /tmp/kotlin-test.log 2>&1
+            ./gradlew :app:$t --tests "dev.animehub.app.*Test" --info > /tmp/kotlin-test.log 2>&1
             status=$?
             echo "=== $t exit $status ==="
             cat /tmp/kotlin-test.log | tail -n 200
@@ -325,7 +405,31 @@ jobs:
               break
             fi
           done
+          # Back to the workspace root. Everything below this line uses
+          # repo-relative paths (the MainActivity/AnimeHubPlugin restore, the
+          # android_prepare.py re-run, the source-set listings) and used to run
+          # from `src-tauri/gen/android` instead, where none of them exist: the
+          # restore silently did nothing and prepare.py exited 2 ("can't open
+          # file"), which `| head || true` then hid.
+          cd "$GITHUB_WORKSPACE"
           echo "=== final TEST_TASK=$TEST_TASK status=$status ==="
+          # A green `--tests "dev.animehub.app.*Test"` run only proves that SOME
+          # matching class ran. These suites are the ones a regression must not
+          # be able to silently drop (the connection-pinning tests are the only
+          # proof that a rebinding answer cannot reach a private address), so
+          # require a results file per class. Printed counts make the evidence
+          # visible in the log; a missing file fails the step.
+          if [ $status -eq 0 ]; then
+            for cls in SiteProfileOpsTest SiteNavigationPolicyTest SiteWebViewSettingsTest DnsPinnedProxyTest SiteProxyGateTest AsyncDnsResolverTest; do
+              xml=$(find . -type f -name "TEST-*${cls}.xml" | head -n 1)
+              if [ -n "$xml" ]; then
+                echo "OK ${cls}: $(grep -o 'tests=\"[0-9]*\"' "$xml" | head -n 1) $(grep -o 'failures=\"[0-9]*\"' "$xml" | head -n 1) ($xml)"
+              else
+                echo "::error::${cls} produced no TEST-*.xml - the class did not run"
+                status=1
+              fi
+            done
+          fi
           echo "=== Gradle tail 600 ==="
           cat /tmp/kotlin-test.log | tail -n 600
           echo "=== find test results ==="
@@ -336,9 +440,15 @@ jobs:
           ls -R app/build/test-results 2>&1 | head -n 100 || echo "no test-results"
           echo "=== restoring Tauri-dependent files for APK build ==="
           if [ -f /tmp/MainActivity.kt.bak ]; then mv /tmp/MainActivity.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/MainActivity.kt && echo "restored MainActivity.kt"; fi
-          if [ -f /tmp/AnimeHubPipController.kt.bak ]; then mv /tmp/AnimeHubPipController.kt.bak src-tauri/gen/android/app/src/main/java/dev/animehub/app/AnimeHubPipController.kt && echo "restored AnimeHubPipController.kt"; fi
-          # AnimeHubPlugin.kt is copied by android_prepare.py, so re-run it to restore
-          python3 scripts/android_prepare.py 2>&1 | head -n 20 || true
+          # AnimeHubPlugin.kt is copied by android_prepare.py, so re-run it to restore.
+          # `python3 ... | head || true` used to report the exit code of `head`,
+          # so a failed restore looked green and the APK step then built without
+          # the Tauri plugin sources. Capture Python's own status; the verdict of
+          # the Gradle test run still wins if BOTH failed (a test failure is the
+          # more important one and is reported above).
+          python3 scripts/android_prepare.py > /tmp/prepare-restore.log 2>&1
+          prepare_status=$?
+          head -n 20 /tmp/prepare-restore.log
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           ls -R src-tauri/gen/android/app/src/main/java/dev/animehub/app 2>&1 | head -n 50
           if [ $status -ne 0 ]; then
@@ -354,22 +464,52 @@ jobs:
             cat /tmp/cargo-tauri.log | tail -n 100
             echo "=== gradle tasks grep UnitTest ==="
             cat /tmp/gradle-tasks.log | grep -i "UnitTest" | head -n 30
-            echo "=== PR comment ls logs ==="
+            echo "=== source-set listing logs ==="
             cat /tmp/ls-before.log 2>&1 | head -n 20
             cat /tmp/ls-after.log 2>&1 | head -n 20
-            gh pr comment ${{ github.event.pull_request.number }} --body "DEBUG123 Kotlin tail: $(tail -n 60 /tmp/kotlin-test.log | tr '\n' ' ' | head -c 2000) Cargo: $(tail -n 20 /tmp/cargo-tauri.log | tr '\n' ' ' | head -c 800) Tasks: $(grep -i UnitTest /tmp/gradle-tasks.log | tr '\n' ' ' | head -c 500) lsBefore: $(cat /tmp/ls-before.log | tr '\n' ' ' | head -c 500) lsAfter: $(cat /tmp/ls-after.log | tr '\n' ' ' | head -c 500)" || true
+            # Diagnostics go to the STEP SUMMARY, not onto the pull request.
+            # The debug step this replaces posted build-log tails as a comment
+            # from a workflow that runs on fork PRs: publicly visible, spammy,
+            # one more reason to hand every step a write token, and it could
+            # carry whatever the build happened to log. The summary is
+            # repo-scoped, and the full logs are already uploaded as artifacts.
+            {
+              echo "### Kotlin/Gradle diagnostics"
+              echo '```'
+              tail -n 60 /tmp/kotlin-test.log 2>&1 | head -c 4000
+              echo '```'
+              echo "### cargo (tauri gradle generation)"
+              echo '```'
+              tail -n 20 /tmp/cargo-tauri.log 2>&1 | head -c 1500
+              echo '```'
+              echo "### Gradle UnitTest tasks"
+              echo '```'
+              grep -i UnitTest /tmp/gradle-tasks.log 2>&1 | head -c 800
+              echo '```'
+              echo "### test source set before/after isolation"
+              echo '```'
+              cat /tmp/ls-before.log 2>&1 | head -c 800
+              echo "---"
+              cat /tmp/ls-after.log 2>&1 | head -c 800
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit $status
+          fi
+          if [ "$prepare_status" -ne 0 ]; then
+            echo "::error::android_prepare.py (restore) failed with exit $prepare_status"
+            tail -n 40 /tmp/prepare-restore.log 2>&1 | head -n 40
+            exit "$prepare_status"
           fi
           grep -q "BUILD SUCCESSFUL" /tmp/kotlin-test.log || { echo "::error::BUILD SUCCESSFUL not found"; exit 1; }
           if grep -q "FAILED" /tmp/kotlin-test.log; then
             echo "::error::Kotlin test has FAILED in log"
             exit 1
           fi
-          echo "Kotlin policy test passed via Gradle (IpPolicy.kt – same file APK uses)"
+          echo "Kotlin tests passed via Gradle (SiteNavigationPolicyTest + SiteProfileOpsTest + SiteWebViewSettingsTest + AnimeHubDebugLogTest + PipTransferFlowTest; production AnimeHubSiteController.kt type-checked in the same source set)"
 
       - name: Upload Kotlin test log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: kotlin-test-log
           path: /tmp/kotlin-test.log
@@ -384,6 +524,28 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
+          # The unit-test step moves AnimeHubPlugin.kt out of the generated
+          # source set (it needs Tauri types, which that compile does not have)
+          # and android_prepare.py puts it back. Verify that really happened
+          # HERE, at the last moment it can still be fixed: an APK built without
+          # the plugin class compiles and links fine and only fails at runtime,
+          # so nothing else in this job would notice. A failed restore is a hard
+          # failure, not a warning.
+          python3 "$GITHUB_WORKSPACE/scripts/android_prepare.py" > /tmp/prepare-apk.log 2>&1 || {
+            echo "::error::android_prepare.py failed before the APK build"
+            tail -n 40 /tmp/prepare-apk.log
+            exit 1
+          }
+          tail -n 20 /tmp/prepare-apk.log
+          for required in AnimeHubPlugin AnimeHubSiteController AnimeHubPipController PipTransferFlow SiteNavigationGuard SiteNavigationPolicy SiteWebViewSettings IpPolicy MainActivity; do
+            test -f "src-tauri/gen/android/app/src/main/java/dev/animehub/app/$required.kt" || {
+              echo "::error::$required.kt is missing from the generated source set; the APK would build without it"
+              exit 1
+            }
+          done
+          echo "=== generated Kotlin source set ==="
+          ls -l src-tauri/gen/android/app/src/main/java/dev/animehub/app/
+
           set +e
           npm run tauri android build -- --debug --apk --target aarch64 > /tmp/android-build.log 2>&1
           status=$?
@@ -404,7 +566,7 @@ jobs:
           ls -lh dist-apk
 
       - name: Upload installable Android APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: animehub-android-aarch64-debug
           path: dist-apk/*.apk
@@ -412,7 +574,7 @@ jobs:
 
       - name: Upload Android build log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: android-build-log
           path: /tmp/android-build.log
@@ -427,7 +589,7 @@ jobs:
     name: Release profile (LTO)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Linux system dependencies
         run: |
@@ -435,18 +597,39 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev pkg-config
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri -> target
 
       - name: cargo build --release
         # One codegen unit plus LTO is the memory spike. Don't also fan the
         # rustc jobs out across both cores while linking.
+        #
+        # The failing step's log is not readable from this repository's API
+        # (artifact download returns a storage error), so a failed build is
+        # re-published as an annotation: check-run annotations ARE readable and
+        # carry the actual cargo/rustc message instead of a bare exit code.
         env:
           CARGO_BUILD_JOBS: "1"
-        run: cargo build --release --locked
+        run: |
+          set +e
+          cargo build --release --locked 2>&1 | tee "$RUNNER_TEMP/release.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "disk:"
+              df -h / /home/runner 2>/dev/null | tail -n +2
+              echo "memory:"
+              free -m | head -n 2
+              echo "cargo:"
+              tail -n 30 "$RUNNER_TEMP/release.log"
+            } > "$RUNNER_TEMP/release-report.txt"
+            message="$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/' "$RUNNER_TEMP/release-report.txt" | tr -d '\n' | cut -c1-50000)"
+            echo "::error title=Release build failed::$message"
+          fi
+          exit "$status"
         working-directory: src-tauri
 
   # ------------------------------------------------- secret / hygiene audit
@@ -454,11 +637,11 @@ jobs:
     name: Dependency and secret audit
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
@@ -494,3 +677,63 @@ jobs:
             exit 1
           fi
           echo "ok"
+
+  # ------------------------------------------------ Windows installer artifact
+  # Runs only after the cross-platform tests pass. This is an unsigned CI
+  # build for review/testing, not a signed public release.
+  windows-installer:
+    name: Windows installer (NSIS)
+    runs-on: windows-latest
+    needs: test
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build Windows installer with AnimeHub icon
+        run: npx tauri build --bundles nsis
+
+      - name: Verify installer and generated icon files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installerDir = 'src-tauri/target/release/bundle/nsis'
+          $installers = @(Get-ChildItem -LiteralPath $installerDir -Filter '*.exe' -File)
+          if ($installers.Count -eq 0) {
+            throw "No NSIS installer was produced in $installerDir"
+          }
+          foreach ($icon in @(
+            'src-tauri/icons/icon.ico',
+            'src-tauri/icons/32x32.png',
+            'src-tauri/icons/128x128.png'
+          )) {
+            if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) {
+              throw "Expected generated icon file is missing: $icon"
+            }
+          }
+          $installers | ForEach-Object {
+            Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256 |
+              Select-Object Path, Hash
+          } | Format-Table -AutoSize
+          Get-ChildItem -LiteralPath 'src-tauri/icons' -File |
+            Where-Object { $_.Name -in @('icon.ico', '32x32.png', '128x128.png') } |
+            Select-Object Name, Length | Format-Table -AutoSize
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: animehub-windows-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 7

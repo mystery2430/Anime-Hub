@@ -35,6 +35,15 @@ import {
   createSettingsFlow,
   switchStates,
 } from "./logic/settings_flow.js";
+import { createBackSession } from "./logic/back_close.js";
+import { copyTextFallback } from "./logic/copy_text.js";
+import { clearResultMessage, takeMigrationNotice } from "./logic/storage_scope.js";
+import { hasNoHiddenSites, hiddenSiteRows } from "./logic/hidden_sites.js";
+import {
+  sanitizeDebugLogSnapshot,
+  serializeDebugLogSnapshot,
+} from "./logic/debug_log.js";
+import { createDeveloperLogReader } from "./logic/dev_log_refresh.js";
 
 const el = {
   gridTracking: document.getElementById("grid-tracking"),
@@ -58,6 +67,11 @@ const el = {
   dev: {
     panel: document.getElementById("dev-panel"),
     refresh: document.getElementById("dev-refresh"),
+    copy: document.getElementById("dev-copy"),
+    download: document.getElementById("dev-download"),
+    reset: document.getElementById("dev-reset"),
+    summary: document.getElementById("dev-summary"),
+    status: document.getElementById("dev-status"),
     log: document.getElementById("dev-log"),
   },
   settings: {
@@ -73,6 +87,8 @@ const el = {
     anilistRedirect: document.getElementById("set-anilist-redirect"),
     anilistStatus: document.getElementById("anilist-status"),
     keyHint: document.getElementById("key-backend-hint"),
+    hiddenSites: document.getElementById("hidden-sites"),
+    hiddenSitesEmpty: document.getElementById("hidden-sites-empty"),
   },
   btnSaveBlocklist: document.getElementById("btn-save-blocklist"),
   btnResetBlocklist: document.getElementById("btn-reset-blocklist"),
@@ -130,6 +146,18 @@ let editingId = null;
 /** Last site opened, so "back" knows what to close. */
 let openSiteLabel = null;
 
+/**
+ * Close session driving the Android back handshake
+ * (`window.__animehubBackToLauncher` / `__animehubBackStatus`). Keeps
+ * `openSiteLabel` honest across pending/failed closes — see
+ * `logic/back_close.js` for the contract with Kotlin's `SiteBackStatus`.
+ */
+const backSession = createBackSession({
+  call,
+  notify: (message) => showNotice(`Site kapatılamadı: ${message}`, "warn"),
+  errorText: errMessage,
+});
+
 // ---------------------------------------------------------------------------
 // Notices
 // ---------------------------------------------------------------------------
@@ -182,7 +210,7 @@ function renderTile(tile) {
   button.className = "tile";
   button.dataset.siteId = tile.id;
 
-  const color = safeColor(tile.color) || "#6366f1";
+  const color = safeColor(tile.color) || "#FF174F";
   button.style.setProperty("--site", bannerRgb(color));
 
   const banner = document.createElement("span");
@@ -314,22 +342,45 @@ async function openSite(tile) {
   try {
     const opened = await call("open_site", { id: tile.id });
     openSiteLabel = opened.label;
+    // `sessionId` identifies this opening, not just `tile.id` (which stays
+    // the same when the site is closed and reopened).
+    backSession.opened(opened.label, tile.id, opened.sessionId);
   } catch (e) {
     showNotice(errMessage(e));
   }
 }
 
-/** Ask the backend to close the site WebView and return to the launcher. */
+/**
+ * Ask the backend to close the site WebView and return to the launcher.
+ *
+ * The label is intentionally NOT cleared here: `close_site` may still be
+ * pending or may fail, and claiming success in a `finally` is exactly the
+ * A.5 divergence (JS idle, Rust still open). The session settles to
+ * `closed` only after the invoke resolves, to `failed:<reason>` otherwise,
+ * and the `animehub://site-closed` event performs the actual label clear.
+ */
 export async function backToLauncher() {
-  if (!openSiteLabel) return;
-  try {
-    await call("close_site", { label: openSiteLabel });
-  } catch (e) {
-    showNotice(errMessage(e));
-  } finally {
-    openSiteLabel = null;
-  }
+  backSession.requestClose();
 }
+
+/**
+ * Android system-back hook (`AnimeHubSiteController.closeViaLauncher`).
+ * When the site WebView has no history left, the native side evaluates this
+ * in the launcher so the normal `close_site` flow — Rust state, the
+ * `animehub://site-closed` event, bookkeeping — runs exactly as if the user
+ * had asked for it here.
+ *
+ * Returns whether a close session actually accepted the request (a label
+ * exists). Kotlin then polls `__animehubBackStatus()` for the real outcome:
+ * `pending` while the flow runs, `closed` on success, `failed:<reason>` on
+ * error (which it surfaces with a Toast — the launcher's own notice would
+ * sit behind the site view), or `idle` when there was nothing to close and
+ * it should fall back to a native close.
+ */
+window.__animehubBackToLauncher = (operationId) => backSession.requestClose(operationId).accepted;
+
+/** Status string consumed by Kotlin's `SiteBackStatus` poll. */
+window.__animehubBackStatus = () => backSession.statusString();
 
 // ---------------------------------------------------------------------------
 // Site add / edit / remove
@@ -497,7 +548,9 @@ function showActionSheet(title, actions) {
 async function clearSiteData(id) {
   try {
     await call("clear_site_data", { id });
-    showNotice("Site verileri temizlendi.", "info");
+    // Platform-honest scope: on Android the HTTP cache and service workers are
+    // NOT profile-scoped and are not cleared. See src/logic/storage_scope.js.
+    showNotice(clearResultMessage(currentPlatform), "info");
   } catch (e) {
     showNotice(errMessage(e));
   }
@@ -507,8 +560,20 @@ async function removeSite(tile) {
   const verb = tile.builtin ? "gizlemek" : "silmek";
   if (!window.confirm(`"${tile.name}" kaydını ${verb} istiyor musunuz?`)) return;
   try {
-    await call("remove_site", { id: tile.id });
+    const result = await call("remove_site", { id: tile.id });
     await refreshLauncher();
+    // `remove_site` reports the profile outcome explicitly (A.8 contract):
+    // `deferred` is progress-with-retry (in-use profile, drained at next
+    // start) — say so instead of letting it pass as an instant delete.
+    // `unsupported` arrives as a rejection with the MULTI_PROFILE guidance
+    // (handled in catch), never as a silent success.
+    const outcome = result && typeof result === "object" ? result.profile : null;
+    if (outcome === "deferred") {
+      showNotice(
+        "Profil verisi şu an kullanımda; bir sonraki açılışta otomatik silinecek.",
+        "info",
+      );
+    }
   } catch (e) {
     showNotice(errMessage(e));
   }
@@ -524,6 +589,7 @@ async function removeSite(tile) {
  * clicks and screen readers cannot reach background controls.
  */
 const overlayStack = [];
+let developerLogReader = null;
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
@@ -567,6 +633,7 @@ function openModal(modal) {
 }
 
 function closeModal(modal) {
+  if (modal === el.modalSettings) developerLogReader?.invalidate();
   hideOverlay(modal);
 }
 
@@ -626,6 +693,7 @@ function applyTheme(pref) {
 applyTheme(themePref);
 
 let currentSettings = null;
+let currentDevLog = sanitizeDebugLogSnapshot(null);
 
 // Theme flow: optimistic draw + queue + rollback. `applyTheme` updates DOM +
 // themePref + selector/buttons; cache is the localStorage mirror.
@@ -683,18 +751,78 @@ function wireTheme() {
  * `data-platform="android"` (PiP, developer log) are hidden elsewhere. If the
  * platform is unknown, they stay hidden: the safe choice.
  */
-async function applyPlatformVisibility() {
-  let platform = "";
+/**
+ * `app_info().platform`, cached at boot and reused for anything platform
+ * dependent (settings visibility, the clear-site-data wording). Empty when the
+ * call failed: every consumer treats "" as "unknown" and answers conservatively.
+ */
+let currentPlatform = "";
+
+async function loadPlatform() {
   try {
     const info = await call("app_info");
-    platform = info && typeof info.platform === "string" ? info.platform : "";
+    currentPlatform = info && typeof info.platform === "string" ? info.platform : "";
   } catch {
-    platform = "";
+    currentPlatform = "";
   }
-  const isAndroid = platform === "android";
+  return currentPlatform;
+}
+
+async function applyPlatformVisibility() {
+  const isAndroid = (await loadPlatform()) === "android";
   document.querySelectorAll("[data-platform]").forEach((node) => {
     node.style.display = node.dataset.platform === "android" && isAndroid ? "" : "none";
   });
+}
+
+/**
+ * Render the hidden-site restore list.
+ *
+ * «Başlatıcıdan gizle» keeps the entry, so hiding must be reversible from the
+ * UI: `list_sites` only returns the visible grid, and `list_hidden_sites` is
+ * the read that makes `set_site_hidden(id, false)` reachable at all. Every
+ * value goes through textContent — the repo rule is no innerHTML anywhere.
+ */
+async function refreshHiddenSites() {
+  const list = el.settings.hiddenSites;
+  if (!list) return;
+  let sites = [];
+  try {
+    sites = await call("list_hidden_sites");
+  } catch {
+    // Browser mode without the command, or an older backend: show nothing
+    // rather than a broken section.
+    sites = [];
+  }
+  const rows = hiddenSiteRows(sites);
+  list.replaceChildren();
+  if (el.settings.hiddenSitesEmpty) {
+    el.settings.hiddenSitesEmpty.hidden = !hasNoHiddenSites(sites);
+  }
+  for (const row of rows) {
+    const item = document.createElement("li");
+    item.className = "hidden-site";
+    const name = document.createElement("span");
+    name.textContent = row.name;
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "btn ghost";
+    restore.textContent = "Geri göster";
+    restore.addEventListener("click", async () => {
+      restore.disabled = true;
+      try {
+        await call("set_site_hidden", { id: row.id, hidden: false });
+        await refreshLauncher();
+        await refreshHiddenSites();
+        showNotice(`${row.name} başlatıcıya geri eklendi.`, "info");
+      } catch (e) {
+        showNotice(errMessage(e));
+        restore.disabled = false;
+      }
+    });
+    item.append(name, restore);
+    list.append(item);
+  }
 }
 
 async function openSettings() {
@@ -709,7 +837,7 @@ async function openSettings() {
     el.settings.fullscreen.checked = Boolean(s.fullscreenSites);
     el.settings.pip.checked = Boolean(s.pipAutoEnter);
     el.settings.developer.checked = Boolean(s.developerOptions);
-    el.dev.panel.hidden = !s.developerOptions;
+    setDeveloperPanel(Boolean(s.developerOptions));
     applyTheme(s.theme);
     el.settings.anilistId.value = s.anilist.clientId || "";
     el.settings.anilistSecret.value = "";
@@ -725,23 +853,147 @@ async function openSettings() {
     el.settings.anilistStatus.dataset.state = s.anilist.configured ? "ok" : "";
     el.btnAnilistLogin.disabled = !s.anilist.configured;
     openModal(el.modalSettings);
+    await refreshHiddenSites();
     await refreshAniListStatus();
+    if (s.developerOptions) await refreshDevLog();
   } catch (e) {
     showNotice(errMessage(e));
   }
 }
 
-/** Developer panel: fill the log box with the native PiP lines (textContent only). */
-async function refreshDevLog() {
-  try {
-    const lines = await call("debug_log");
-    const list = Array.isArray(lines) ? lines : [];
-    el.dev.log.textContent = list.length
-      ? list.join("\n")
-      : "Henüz Android kaydı yok (kayıtlar yalnızca Android'de tutulur).";
-  } catch (err) {
-    el.dev.log.textContent = "Kayıt okunamadı: " + (err && err.message ? err.message : String(err));
+function renderDevLog(snapshot) {
+  currentDevLog = sanitizeDebugLogSnapshot(snapshot);
+  const { events, droppedEvents, capacity } = currentDevLog;
+  el.dev.summary.textContent =
+    `${events.length} olay / ${capacity} kapasite · ${droppedEvents} olay düşürüldü`;
+  el.dev.log.textContent = serializeDebugLogSnapshot(currentDevLog);
+}
+
+function canUseDeveloperLog() {
+  return (
+    Boolean(currentSettings?.developerOptions) &&
+    !el.modalSettings.hidden &&
+    !el.dev.panel.hidden
+  );
+}
+
+function setDeveloperPanel(open) {
+  el.dev.panel.hidden = !open;
+  if (!open) {
+    developerLogReader?.invalidate();
+    currentDevLog = sanitizeDebugLogSnapshot(null);
+    el.dev.summary.textContent = "";
+    el.dev.status.textContent = "";
+    el.dev.log.textContent = "";
   }
+}
+
+developerLogReader = createDeveloperLogReader({
+  isEnabled: () => Boolean(currentSettings?.developerOptions),
+  isVisible: () => !el.modalSettings.hidden && !el.dev.panel.hidden,
+  read: () => call("debug_log"),
+  reset: () => call("debug_log_reset"),
+  onSnapshot: (snapshot, operation) => {
+    renderDevLog(snapshot);
+    el.dev.status.textContent =
+      operation === "reset"
+        ? "Tanılama belleği sıfırlandı; yeni olaylar yeniden kaydediliyor."
+        : "Tanılama belleği yenilendi.";
+  },
+  // Never surface native/provider error details in the developer panel.
+  onError: (_error, operation) => {
+    el.dev.status.textContent =
+      operation === "reset"
+        ? "Tanılama belleği sıfırlanamadı. Daha sonra tekrar deneyin."
+        : "Kayıt okunamadı. Ayarı kapatıp yeniden açtıktan sonra tekrar deneyin.";
+  },
+});
+
+/** Read only while the saved gate is enabled and the settings panel is visible. */
+async function refreshDevLog() {
+  if (!currentSettings?.developerOptions) {
+    setDeveloperPanel(false);
+    return false;
+  }
+  return developerLogReader.refresh();
+}
+
+async function copyDebugLog() {
+  if (!(await refreshDevLog()) || !canUseDeveloperLog()) return;
+  const text = serializeDebugLogSnapshot(currentDevLog);
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      throw new Error("clipboard_unavailable");
+    }
+  } catch {
+    // Clipboard permission can resolve after the saved gate is closed.
+    if (!canUseDeveloperLog()) return;
+    try {
+      if (!copyTextFallback(text)) throw new Error("clipboard_unavailable");
+    } catch {
+      if (canUseDeveloperLog()) {
+        el.dev.status.textContent = "Panoya kopyalanamadı. JSON indirme düğmesini kullanabilirsiniz.";
+      }
+      return;
+    }
+  }
+  if (canUseDeveloperLog()) {
+    el.dev.status.textContent = "Güncel güvenli tanılama kaydı panoya kopyalandı.";
+  }
+}
+
+async function downloadDebugLog() {
+  if (!(await refreshDevLog()) || !canUseDeveloperLog()) return;
+  let objectUrl = null;
+  let link = null;
+  let downloadStarted = false;
+  try {
+    const blob = new Blob([serializeDebugLogSnapshot(currentDevLog)], {
+      type: "application/json;charset=utf-8",
+    });
+    objectUrl = URL.createObjectURL(blob);
+    link = document.createElement("a");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    link.href = objectUrl;
+    link.download = `animehub-diagnostics-${stamp}.json`;
+    document.body.append(link);
+    link.click();
+    downloadStarted = true;
+    el.dev.status.textContent = "Güvenli JSON indirme başlatıldı.";
+  } catch {
+    el.dev.status.textContent = "JSON indirme başlatılamadı. Panoya kopyalamayı deneyin.";
+  } finally {
+    try {
+      link?.remove();
+    } catch {
+      // The status message should not be masked by DOM cleanup.
+    }
+    if (objectUrl) {
+      const revoke = () => {
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch {
+          // Best effort: diagnostics are already serialized in memory.
+        }
+      };
+      if (downloadStarted) {
+        try {
+          window.setTimeout(revoke, 0);
+        } catch {
+          revoke();
+        }
+      } else {
+        revoke();
+      }
+    }
+  }
+}
+
+async function resetDevLog() {
+  if (!canUseDeveloperLog()) return;
+  await developerLogReader.resetAndRefresh();
 }
 
 /** Draw the switches from the saved settings (used after a failed change). */
@@ -754,7 +1006,7 @@ function syncSettingSwitches() {
   el.settings.fullscreen.checked = s.fullscreen;
   el.settings.developer.checked = s.developer;
   el.settings.blocklistEnabled.checked = s.blocklistEnabled;
-  el.dev.panel.hidden = !s.developer;
+  setDeveloperPanel(s.developer);
 }
 
 // Save logic and the PiP switch rules live in logic/settings_flow.js.
@@ -768,9 +1020,7 @@ const settingsFlow = createSettingsFlow({
   setCurrent: (value) => {
     currentSettings = value;
   },
-  setDevPanel: (open) => {
-    el.dev.panel.hidden = !open;
-  },
+  setDevPanel: (open) => setDeveloperPanel(open),
   refreshDevLog: () => refreshDevLog(),
 });
 
@@ -793,6 +1043,9 @@ function wireSettings() {
     settingsFlow.changeDeveloperOptions(checked),
   );
   el.dev.refresh.addEventListener("click", () => refreshDevLog());
+  el.dev.copy.addEventListener("click", () => copyDebugLog());
+  el.dev.download.addEventListener("click", () => downloadDebugLog());
+  el.dev.reset.addEventListener("click", () => resetDevLog());
   bindSwitch(el.settings.blocklistEnabled, (checked) =>
     settingsFlow.changeBlocklistEnabled(checked),
   );
@@ -905,13 +1158,6 @@ async function openAbout() {
       "AniList",
       info.anilistConfigured ? "Yerel entegrasyon etkin" : "Yapılandırılmamış (WebView)",
     );
-    if (info.androidIsolationNote) {
-      appendAboutRow(
-        "Oturum izolasyonu",
-        "Android: çerez kavanozu site geçişlerinde değiştirilir; aynı kaynaklı localStorage/IndexedDB yalıtımı henüz çözülmedi.",
-        true,
-      );
-    }
     appendAboutRow("Lisans", "MIT");
   } catch (e) {
     el.aboutList.textContent = "";
@@ -1042,11 +1288,15 @@ async function wireBackendEvents() {
     void refreshAniListStatus();
     void refreshHero();
   });
-  // The Rust side can close a site on its own (the injected back button /
-  // Esc navigates to animehub://close-site, handled natively). Clear the
-  // label so the launcher's own "back" bookkeeping stays honest.
-  await on("animehub://site-closed", () => {
-    openSiteLabel = null;
+  // The Rust side emits `{ siteId, sessionId }` when a close actually
+  // finished (including closes started by the Android back hook). Clear the
+  // label ONLY when the event carries the exact identity of this opening.
+  // `siteId` alone is not enough: closing and reopening the same site
+  // reuses it, so a delayed event from the earlier opening would otherwise
+  // orphan the new session. Malformed or identity-less payloads are ignored
+  // by the state machine.
+  await on("animehub://site-closed", (payload) => {
+    if (backSession.closedByEvent(payload)) openSiteLabel = null;
   });
 }
 
@@ -1055,8 +1305,14 @@ async function boot() {
   wireSettings();
   wireTheme();
   renderLauncher(CATEGORIES.map((c) => ({ id: c.id, title: c.title, tiles: [] })));
+  await loadPlatform();
   await refreshLauncher();
   await wireBackendEvents();
+  // One-time, in-app honesty about the 0.3.4 storage migration: the legacy
+  // localStorage/IndexedDB snapshots are deliberately not re-imported, and a
+  // doc page nobody opens is not a notice. Shown once per launcher profile.
+  const migrationNotice = takeMigrationNotice(window.localStorage);
+  if (migrationNotice) showNotice(migrationNotice, "info");
   void refreshHero();
 
   try {
