@@ -56,7 +56,7 @@ test("the proxy is bound before the session lock and before the WebView exists",
   // the builder without one.
   assert.match(
     OPEN_ENTRY,
-    /open_in_main_window_inner\(app, site, url, init_script, fullscreen, proxy\)/,
+    /open_in_main_window_inner\(app, site, url, init_script, fullscreen, proxy, session_id\)/,
   );
 });
 
@@ -78,7 +78,7 @@ test("the inner open installs that proxy before any WebView and cannot start its
   );
   // The already-open early return happens before the install: the freshly
   // bound listener is dropped there instead of leaking a port.
-  const early = OPEN_PATH.indexOf("return Ok(label);");
+  const early = OPEN_PATH.indexOf("return Ok((label, current.session_id));");
   assert.ok(early > 0 && early < install, "an early return must not keep the new listener");
 });
 
@@ -141,7 +141,12 @@ test("a page load with zero proxy CONNECTs closes the site afterwards", () => {
   // `close_site_window` also appear in the navigation and pseudo-URL paths.
   const branch = OPEN_PATH.slice(check, check + 900);
   assert.match(branch, /"animehub:\/\/navigation-blocked"/, "the user must see why the site closed");
-  assert.match(branch, /close_site_window\(&app, &label\)/, "the unprotected session must be torn down");
+  assert.match(
+    branch,
+    /close_site_window_for_session\(&app, &label, &session_id\)/,
+    "the unprotected WebView must be closed only if this opening still owns the session",
+  );
+  assert.match(branch, /let session_id = page_load_session_id\.clone\(\)/);
   assert.match(PROXY_RS, /pub fn requests\(&self\) -> usize/);
   // The counter counts parsed CONNECTs before the destination decision, so a
   // refused destination still proves the WebView used the proxy.
@@ -155,7 +160,7 @@ test("the site WebView keeps TLS end to end", () => {
 });
 
 test("the open command awaits the now-async window path", () => {
-  assert.match(COMMANDS_RS, /\.await\s*\n\s*\.map\(\|label\| OpenedSite \{/);
+  assert.match(COMMANDS_RS, /\.await\s*\n\s*\.map\(\|\(label, active_session_id\)\| OpenedSite \{/);
   assert.match(WINDOWS_RS, /pub async fn open_site_window\(/);
 });
 
@@ -193,4 +198,53 @@ test("the shipped constructor can only be strict, and the test policy is test-on
   assert.match(limits, /handshake: Duration::from_secs\(\d+\)/);
   assert.match(limits, /resolve: Duration::from_secs\(\d+\)/);
   assert.match(limits, /connect: Duration::from_secs\(\d+\)/);
+});
+
+test("the pseudo-URL close callback closes only the WebView of its own opening", () => {
+  // The "back" affordance navigates to a pseudo-URL instead of closing from
+  // inside the callback. The spawned close must carry the identity captured
+  // when THIS WebView was created, because the same label is reused by a
+  // reopen of the same site.
+  const at = OPEN_PATH.indexOf('if target.scheme() == CLOSE_SCHEME');
+  assert.ok(at > 0, "the navigation callback must intercept the close scheme");
+  const branch = OPEN_PATH.slice(at, at + 900);
+  assert.match(branch, /let session_id = nav_session_id\.clone\(\);/);
+  assert.match(
+    branch,
+    /close_site_window_for_session\(&app, &label, &session_id\)/,
+    "the callback must not close whichever session happens to be current",
+  );
+  assert.ok(
+    !/(^|[^_])close_site_window\(&app, &label\)/m.test(branch),
+    "the unguarded close is not allowed in a delayed callback",
+  );
+  assert.match(branch, /return false;/, "the pseudo-URL itself must never load");
+});
+
+test("reopening a site that is already open reuses that live opening's identity", () => {
+  // Focusing an existing WebView is not a new native session: its installed
+  // callbacks keep the identity they captured, so the command must return the
+  // stored identity instead of the freshly proposed one.
+  const at = OPEN_PATH.indexOf("if app.get_webview(&label).is_some()");
+  assert.ok(at > 0, "the already-open path must be recognised");
+  const branch = OPEN_PATH.slice(at, OPEN_PATH.indexOf("close_current_child_locked"));
+
+  assert.match(
+    branch,
+    /value\.window_label == label && value\.site_id == site\.id/,
+    "the stored record must describe this WebView before it is trusted",
+  );
+  assert.match(branch, /return Ok\(\(label, current\.session_id\)\);/);
+  assert.ok(
+    !branch.includes("*lock_recover(&state.current_site)"),
+    "a focus must not relabel the live WebView with the proposed identity",
+  );
+  assert.ok(
+    !branch.includes("session_id: session_id.clone()"),
+    "the proposed opening identity must not replace the live one",
+  );
+  assert.ok(
+    OPEN_PATH.indexOf("close_current_child_locked") > at,
+    "an already-open site must not be closed and rebuilt underneath its callbacks",
+  );
 });

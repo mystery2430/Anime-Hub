@@ -12,6 +12,7 @@ const anilistRs = read("src-tauri/src/anilist.rs");
 const libRs = read("src-tauri/src/lib.rs");
 const mainJs = read("src/main.js");
 const bridgeJs = read("src/logic/bridge.js");
+const windowsRs = read("src-tauri/src/web/windows.rs");
 
 /** `#[tauri::command]` functions declared in commands.rs. */
 const declared = new Set(
@@ -49,6 +50,50 @@ test("every command the launcher invokes is registered", () => {
 // BUG-05: hiding a built-in is a registry flag, not a delete, but `list_sites`
 // returns the visible grid only — so `set_site_hidden(id, false)` had no caller
 // and «Başlatıcıdan gizle» was a one-way door. These pin the read/write pair.
+test("close_site requires a session id and delegates to guarded native close", () => {
+  assert.match(
+    commandsRs,
+    /pub async fn close_site\([\s\S]*?session_id: String[\s\S]*?windows::close_site_window_for_session\(&app, &label, &session_id\)/,
+  );
+  assert.match(
+    windowsRs,
+    /fn ensure_close_session_identity\([\s\S]*?session_identity_matches\(/,
+  );
+  assert.match(
+    read("src/logic/back_close.js"),
+    /args\.sessionId = targetSessionId/,
+  );
+});
+
+test("site-closed producers carry the identity of the session they close", () => {
+  // This is a wiring check, not the behavioural guard: native emission needs
+  // a running Tauri app. The payload construction itself is covered by Rust
+  // unit tests (`closed_event` / `take_current_session_if`); here we pin that
+  // every producer goes through the one typed emitter and no producer emits
+  // a bare site id.
+  const emits = [...windowsRs.matchAll(/app\.emit\(\s*"animehub:\/\/site-closed"\s*,\s*([^;]+?)\)\s*;/g)].map(
+    (m) => m[1].trim(),
+  );
+  assert.deepEqual(emits, ["closed.closed_event()"], "only the typed shared emitter may publish");
+  assert.doesNotMatch(
+    windowsRs,
+    /app\.emit\(\s*"animehub:\/\/site-closed"\s*,\s*(site_id|closed\.site_id)\b/,
+    "a site id is not an opening identity",
+  );
+
+  const producers = [...windowsRs.matchAll(/emit_site_closed\(app,\s*&closed\);/g)];
+  assert.ok(
+    producers.length >= 5,
+    `all close paths must announce their own snapshot; found ${producers.length}`,
+  );
+
+  // `open_site` must hand the launcher the identity alongside the label, and
+  // the launcher must store it with the active opening.
+  assert.match(commandsRs, /\.map\(\|\(label, active_session_id\)\| OpenedSite \{[\s\S]*?session_id: active_session_id,/);
+  assert.match(mainJs, /backSession\.opened\(\s*opened\.label,\s*tile\.id,\s*opened\.sessionId,?\s*\)/);
+  assert.match(mainJs, /backSession\.closedByEvent\(payload\)/);
+});
+
 test("hidden built-ins can be listed and restored from the launcher", () => {
   assert.equal(registered.has("list_hidden_sites"), true);
   assert.equal(declared.has("list_hidden_sites"), true);
@@ -250,7 +295,7 @@ test("all active GitHub Actions workflows use the reviewed SHA pins", () => {
       assert.equal((line.split("#", 2)[1] || "").trim(), expected[1], path + ": " + action + " must retain the reviewed version comment");
     }
   }
-  assert.equal(external, 36, `expected 36 pinned external Actions, found ${external}`);
+  assert.equal(external, 41, `expected 36 pinned external Actions, found ${external}`);
 
   for (const [action, [sha, tag]] of Object.entries(verified)) {
     assert.match(sha, /^[0-9a-f]{40}$/, `${action}: not a full commit SHA`);

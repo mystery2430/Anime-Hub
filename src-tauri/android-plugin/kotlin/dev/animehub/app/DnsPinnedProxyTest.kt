@@ -152,8 +152,19 @@ class DnsPinnedProxyTest {
   }
 
   private fun send(socket: Socket, text: String) {
-    socket.getOutputStream().write(text.toByteArray(Charsets.ISO_8859_1))
+    sendBytes(socket, text.toByteArray(Charsets.ISO_8859_1))
+  }
+
+  private fun sendBytes(socket: Socket, bytes: ByteArray) {
+    socket.getOutputStream().write(bytes)
     socket.getOutputStream().flush()
+  }
+
+  private fun decodeHex(text: String): ByteArray {
+    assertEquals("hex vectors have whole bytes: $text", 0, text.length % 2)
+    return ByteArray(text.length / 2) { index ->
+      text.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -512,11 +523,107 @@ class DnsPinnedProxyTest {
     }
   }
 
+  /**
+   * Raw bytes through the real accept/read/parse path. `readHead` decodes
+   * ISO-8859-1 and the parser now rejects anything that is not HTAB, printable
+   * ASCII or CRLF, so these heads all die before the resolver. `FakeResolver`
+   * and the connector counter are the proof: zero lookups, zero dials.
+   */
+  @Test
+  fun malformed_framing_and_header_bytes_never_reach_the_resolver() {
+    val resolver = FakeResolver(listOf(publicA))
+    var dialled = 0
+    val proxy = DnsPinnedProxy(
+      limits = DnsPinnedProxy.Limits(handshakeMs = 400),
+      resolver = resolver::resolve,
+      connector = { _, _, _ -> dialled++; throw java.io.IOException("must not be called") },
+    )
+    val port = proxy.start()
+    try {
+      val bad = listOf(
+        // Bare LF framing: no CRLFCRLF appears.
+        "CONNECT example.test:443 HTTP/1.1\nHost: example.test\n\n",
+        // A bare LF inside an otherwise terminated head.
+        "CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\nX: y\r\n\r\n",
+        // A bare CR.
+        "CONNECT example.test:443 HTTP/1.1\r\nX: a\rY\r\n\r\n",
+        // Invalid UTF-8 (0xFF) in a header. Latin-1 would decode it to 'ÿ';
+        // the parser must still refuse the request.
+        "CONNECT example.test:443 HTTP/1.1\r\nX-Test: \u00ff\r\n\r\n",
+        // Valid UTF-8 but non-ASCII: refused, like Rust's strict ASCII head.
+        "CONNECT example.test:443 HTTP/1.1\r\nX-Test: café\r\n\r\n",
+        // NUL, SOH and DEL in headers.
+        "CONNECT example.test:443 HTTP/1.1\r\nX-Test: a\u0000b\r\n\r\n",
+        "CONNECT example.test:443 HTTP/1.1\r\nX-Test: a\u0001b\r\n\r\n",
+        "CONNECT example.test:443 HTTP/1.1\r\nX-Test: a\u007fb\r\n\r\n",
+        // The whole head is missing its blank line.
+        "CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\r\n",
+      )
+      for (raw in bad) {
+        val client = Socket("127.0.0.1", port)
+        send(client, raw)
+        client.shutdownOutput()
+        val status = statusLine(client)
+        assertTrue("$raw must be a 4xx refusal, got $status", status.startsWith("HTTP/1.1 4"))
+        client.close()
+      }
+      assertEquals("a malformed head reached the resolver", 0, resolver.calls)
+      assertEquals("a malformed head reached the connector", 0, dialled)
+    } finally {
+      proxy.stop()
+    }
+
+    // Positive control: a public target with normal browser headers still
+    // reaches the resolver. The connector fails, so no network is touched.
+    val positiveResolver = FakeResolver(listOf(publicA))
+    val positive = DnsPinnedProxy(
+      resolver = positiveResolver::resolve,
+      connector = { _, _, _ -> throw java.io.IOException("no network in tests") },
+    )
+    val other = positive.start()
+    try {
+      val client = Socket("127.0.0.1", other)
+      send(
+        client,
+        "CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\nUser-Agent: audit\r\n\r\n",
+      )
+      assertEquals("HTTP/1.1 502 Bad Gateway", statusLine(client))
+      assertEquals(1, positiveResolver.calls)
+      client.close()
+    } finally {
+      positive.stop()
+    }
+  }
+
+  @Test
+  fun numeric_looking_non_ipv4_names_do_not_reach_the_resolver() {
+    val resolver = FakeResolver(listOf(publicA))
+    var dialled = 0
+    val proxy = DnsPinnedProxy(
+      resolver = resolver::resolve,
+      connector = { _, _, _ -> dialled++; throw java.io.IOException("must not be called") },
+    )
+    val port = proxy.start()
+    try {
+      for (host in listOf("example.0x7f", "foo.123", "999.1.1.1", "1.2.3.4.5", "a.1.2.3.4")) {
+        val client = Socket("127.0.0.1", port)
+        send(client, "CONNECT $host:443 HTTP/1.1\r\n\r\n")
+        assertEquals("$host must be refused by host policy", "HTTP/1.1 403 Forbidden", statusLine(client))
+        client.close()
+      }
+      assertEquals("numeric-looking names must not be looked up", 0, resolver.calls)
+      assertEquals("numeric-looking names must not be dialled", 0, dialled)
+    } finally {
+      proxy.stop()
+    }
+  }
+
   @Test
   fun an_oversized_connect_head_is_refused() {
+    var resolverCalls = 0
     val proxy = DnsPinnedProxy(
       limits = DnsPinnedProxy.Limits(headerBytes = 512),
-      resolver = { listOf(publicA) },
+      resolver = { resolverCalls++; listOf(publicA) },
       connector = { _, _, _ -> throw java.io.IOException("must not be called") },
     )
     val port = proxy.start()
@@ -528,6 +635,7 @@ class DnsPinnedProxyTest {
       assertEquals("HTTP/1.1 403 Forbidden", statusLine(client))
       assertEquals(1L, proxy.refusalCount(DnsPinnedProxy.Refusal.HANDSHAKE))
       client.close()
+      assertEquals("an oversized head must not resolve", 0, resolverCalls)
     } finally {
       proxy.stop()
     }
@@ -683,13 +791,50 @@ class DnsPinnedProxyTest {
   }
 
   /**
+   * Round 39: every reserved sub-delim is refused by the production authority
+   * and request-head parsers before any lookup, and the ordinary valid targets
+   * stay accepted. The shared fixture pins the same rows on the Rust side.
+   */
+  @Test
+  fun `reserved sub delims are refused before resolution`() {
+    val forbidden = listOf('!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=')
+    for (character in forbidden) {
+      val authority = "anime${character}hub.test:443"
+      assertNull(
+        "$authority reddedilmeli",
+        DnsPinnedProxy.parseAuthority(authority),
+      )
+      assertNull(
+        "CONNECT $authority reddedilmeli",
+        DnsPinnedProxy.parseConnectHead("CONNECT $authority HTTP/1.1\r\n\r\n"),
+      )
+    }
+    for (authority in
+      listOf(
+        "example.com:443",
+        "localhost:8080",
+        "127.0.0.1:443",
+        "[2001:db8::1]:8443",
+      )) {
+      assertTrue(
+        "$authority kabul edilmeli",
+        DnsPinnedProxy.parseAuthority(authority) != null,
+      )
+    }
+  }
+
+  /**
    * The CONNECT grammar shared with the Rust `parse_connect`.
    *
-   * One fixture, two row kinds, and each row runs the **production** parser —
-   * no test-local reimplementation:
+   * One fixture, three row kinds, and each row runs the **production** parser
+   * — no test-local reimplementation:
    *
    *  * `request`   — the whole line, through `parseConnectHead`;
-   *  * `authority` — the authority alone, through `parseAuthority`.
+   *  * `authority` — the authority alone, through `parseAuthority`;
+   *  * `hex`       — a complete raw head, decoded byte-for-byte and decoded as
+   *    ISO-8859-1 (the same one-char-per-byte mapping `readHead` uses). This
+   *    is where bare LF/CR framing, invalid UTF-8, NUL/0x01/DEL and a missing
+   *    terminator are pinned.
    *
    * The Rust suite includes the identical file, so a method, version,
    * character, bracket or port rule added to one parser alone fails the other
@@ -705,6 +850,7 @@ class DnsPinnedProxyTest {
         )
     var requests = 0
     var authorities = 0
+    var rawHeads = 0
     for (raw in fixture.bufferedReader().use { it.readLines() }) {
       val line = raw.trimEnd('\r')
       if (line.isEmpty() || line.startsWith("#")) continue
@@ -720,6 +866,12 @@ class DnsPinnedProxyTest {
             authorities++
             DnsPinnedProxy.parseAuthority(cols[1])
           }
+          "hex" -> {
+            rawHeads++
+            DnsPinnedProxy.parseConnectHead(
+              String(decodeHex(cols[1]), Charsets.ISO_8859_1),
+            )
+          }
           else -> throw AssertionError("bilinmeyen vektör türü: ${cols[0]} ($line)")
         }
       when (cols[2]) {
@@ -733,6 +885,7 @@ class DnsPinnedProxyTest {
     // leave the method and version rules untested.
     assertTrue("request vektörleri kısalmış: $requests", requests >= 30)
     assertTrue("authority vektörleri kısalmış: $authorities", authorities >= 30)
+    assertTrue("ham head vektörleri kısalmış: $rawHeads", rawHeads >= 12)
   }
 
   /**

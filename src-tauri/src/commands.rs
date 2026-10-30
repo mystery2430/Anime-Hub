@@ -69,11 +69,6 @@ pub struct AppState {
     pub oauth_state: Mutex<Option<String>>,
     /// Warning from a registry that could not be decrypted on startup.
     pub startup_warning: Mutex<Option<String>>,
-    /// Absolute URL of the launcher page, captured at startup.
-    ///
-    /// Mobile needs this to navigate the shared WebView *back* to the
-    /// launcher after a site is closed.
-    pub launcher_url: Mutex<Option<url::Url>>,
     /// Which site currently owns the WebView session.
     ///
     /// On desktop this names the extra window; on Android it names the site
@@ -103,12 +98,54 @@ pub struct AppState {
 #[derive(Debug, Clone)]
 pub struct CurrentSite {
     pub site_id: String,
+    /// Opaque identity of this exact opening, not of the site.
+    ///
+    /// A site id is stable across reopens, so a delayed close from the
+    /// previous opening can name the same site as the new one. This id is
+    /// minted once per successful `open_site` and travels with the native
+    /// session: close paths snapshot it before tearing anything down and put
+    /// that snapshot in the `animehub://site-closed` event.
+    pub session_id: String,
     pub host: String,
     pub window_label: String,
     /// Desktop: `true` when opening the site is what put the window into
     /// fullscreen, so closing it may restore the windowed state. Kept
     /// separate so a manual fullscreen choice is never taken away.
     pub entered_fullscreen: bool,
+}
+
+impl CurrentSite {
+    /// The event that closes exactly this native session.
+    ///
+    /// Call this on the record captured for the close, never on the live
+    /// `current_site` after clearing it: that mutable slot may already belong
+    /// to a newer opening of the same site.
+    pub fn closed_event(&self) -> SiteClosedEvent {
+        SiteClosedEvent {
+            site_id: self.site_id.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
+}
+
+/// Payload of `animehub://site-closed`.
+///
+/// `siteId` keeps the event useful for diagnostics; `sessionId` is the
+/// authoritative ownership proof. The launcher clears its active opening only
+/// when `sessionId` exactly matches the opening it owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteClosedEvent {
+    pub site_id: String,
+    pub session_id: String,
+}
+
+/// A fresh opaque identity for one successful site opening.
+///
+/// `uuid` is already a direct dependency (v4 is enabled for OAuth state and
+/// user-site ids); no additional crate is needed.
+fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Launcher theme preference, persisted with the other settings.
@@ -509,10 +546,8 @@ pub fn remove_site(
                 profile: ProfileRemoval::Hidden,
             });
         }
-        // Platform default for this block: no WebView profiles (iOS).
-        #[cfg(not(target_os = "android"))]
-        let profile_outcome = ProfileRemoval::NotApplicable;
-        #[cfg(target_os = "android")]
+        // Android is the only mobile target left, and it always has a
+        // WebView profile to remove.
         let profile_outcome;
         let should_close = {
             let cur = state
@@ -522,10 +557,7 @@ pub fn remove_site(
             cur.as_ref().is_some_and(|c| c.site_id == id)
         };
         if should_close {
-            #[cfg(target_os = "android")]
             crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
-            #[cfg(not(target_os = "android"))]
-            crate::web::windows::close_site_window_for_clear(&app, &id)?;
         }
         // Android: the site's data lives in its WebView profile. Delete the
         // profile *before* the registry mutation so a failure keeps the tile
@@ -710,6 +742,10 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         webrtc_guard: cfg!(target_os = "android"),
     };
     let init_script = build_init_script(&injected);
+    // The identity belongs to this opening, not to `site.id`: reopening the
+    // same site must produce a distinct value so a delayed event from the
+    // previous opening cannot clear the new session.
+    let session_id = new_session_id();
 
     windows::open_site_window(
         app,
@@ -717,14 +753,18 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
         safe.as_url(),
         &init_script,
         settings.fullscreen_sites,
+        session_id.clone(),
     )
     .await
-    .map(|label| OpenedSite {
+    .map(|(label, active_session_id)| OpenedSite {
         label,
-        mobile: cfg!(any(target_os = "android", target_os = "ios")),
-        // Android now gives real per-site isolation (one WebView profile per
-        // site); iOS still shares the single WebView.
-        isolated: !cfg!(target_os = "ios"),
+        session_id: active_session_id,
+        mobile: cfg!(target_os = "android"),
+        // Every supported target gives true per-site storage isolation:
+        // per-site profile directories on desktop, per-site WebView profiles
+        // on Android. Kept in the payload for wire compatibility with older
+        // launcher builds; it is always true now that iOS is gone.
+        isolated: true,
     })
 }
 
@@ -733,27 +773,34 @@ pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
 pub struct OpenedSite {
     /// Window label (desktop) or the site label (mobile bookkeeping).
     pub label: String,
+    /// Opaque identity of this particular opening. The launcher stores it and
+    /// accepts `animehub://site-closed` only when the event carries this exact
+    /// value.
+    pub session_id: String,
+    /// True on Android, false on desktop.
     pub mobile: bool,
-    /// Whether this platform gives true per-site storage isolation: per-site
-    /// profile directories on desktop, per-site WebView profiles on Android,
-    /// single shared WebView on iOS.
+    /// Whether this platform gives true per-site storage isolation. Always
+    /// `true`: desktop uses per-site profile directories and Android uses
+    /// per-site WebView profiles. Retained for backward-compatible payloads.
     pub isolated: bool,
 }
 
-/// Close a site session. Mobile keeps the shared WebView's jar (iOS) or
-/// flushes/destroys the site's profiled WebView (Android); desktop removes
-/// the child WebView.
+/// Close a site session. Android flushes/destroys the site's profiled
+/// WebView; desktop removes the child WebView.
 #[tauri::command]
 pub async fn close_site(
     app: AppHandle,
     label: String,
+    session_id: String,
     operation_id: Option<String>,
 ) -> AppResult<()> {
     let _operation_scope = operation_id
         .as_deref()
         .map(|id| crate::diagnostics::begin_operation_with_id("close", id))
         .or_else(|| crate::diagnostics::scope_if_missing("close"));
-    windows::close_site_window(&app, &label)
+    // Labels are reused across openings; native close independently validates
+    // that this request still owns the active session.
+    windows::close_site_window_for_session(&app, &label, &session_id)
 }
 
 /// Wipe stored cookies for one site, or for all sites when `id` is `None`.
@@ -1688,9 +1735,9 @@ pub fn set_pip_auto_enter(
         // `platform_name()` is the same source `app_info` uses.
         let plat = platform_name();
         if !["windows", "linux", "macos"].contains(&plat.as_str()) && plat != "android" {
-            // Unknown platform – mimic JS's platform check.
-            // In practice this branch is only taken on non-desktop non-android
-            // (e.g. iOS) where PiP is not applicable; treat as unsupported.
+            // Unknown platform – mimic JS's platform check. Only desktop
+            // platforms are recognised here; anything else is unsupported
+            // rather than silently persisted.
             return Err(AppError::Other(PIP_PLATFORM_UNKNOWN_MSG.into()));
         }
         // Desktop: persist only.
@@ -2102,7 +2149,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -3216,5 +3262,18 @@ mod tests {
             captured_generations.iter().max().copied() == Some(newest),
             "the workers must have covered the newest generation: {captured_generations:?}"
         );
+    }
+
+    #[test]
+    fn each_site_opening_gets_a_distinct_session_identity() {
+        // Site id is deliberately stable across opens; the session identity
+        // must not be. Reusing it would reintroduce the stale-close race.
+        let first = new_session_id();
+        let second = new_session_id();
+        assert!(!first.is_empty());
+        assert!(!second.is_empty());
+        assert_ne!(first, second);
+        // Opaque and transport-safe without extra encoding.
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 }

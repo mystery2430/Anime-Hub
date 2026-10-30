@@ -91,9 +91,8 @@ case "$cmd" in
     ;;
 
   icon)
-    need python3
-    python3 scripts/make_icon.py
-    $TAURI icon src-tauri/icon.png --output src-tauri/icons
+    need npm
+    $TAURI icon src-tauri/icon.svg --output src-tauri/icons
     ;;
 
   *)

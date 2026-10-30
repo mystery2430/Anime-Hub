@@ -13,7 +13,7 @@ default-run = "animehub"
 
 [lib]
 name = "animehub_lib"
-# `cdylib` + `staticlib` are required for the Android/iOS mobile entry point.
+# `cdylib` + `staticlib` are required for the Android mobile entry point.
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -43,16 +43,9 @@ use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
 use crate::web::dns::classify_host;
-// `CookieJar` backs the iOS jar swap and the one-time Android profile
-// migration; `restore` is used only by the iOS import path (`import_cookies`),
-// so it carries exactly that gate — Android's host-compiled migration
-// protocol calls it fully qualified, and an ungated `#[cfg(mobile)]` import
-// would be dead there. `capture` (qualified at its single call site, so this
-// import group keeps the exact shape rustfmt approved before) serves the
-// desktop/iOS export path. Android site cookies live in their profile and are
-// never snapshotted.
-#[cfg(all(mobile, not(target_os = "android")))]
-use crate::web::session::restore;
+// `CookieJar` backs the one-time Android profile cookie migration and the
+// desktop per-site cookie export. Android site cookies live in their profile
+// and are never snapshotted.
 #[cfg(desktop)]
 use crate::web::session::{decide_navigation, dns_decision, NavDecision};
 use crate::web::session::{profile_dir_name, CookieJar};
@@ -316,15 +309,16 @@ pub fn label_for(site_id: &str) -> String {
 /// `add_child` / `set_fullscreen`, which do not exist in tauri's mobile
 /// builds, so even a `cfg!()`-guarded branch would fail to compile on
 /// Android.
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 pub async fn open_site_window(
     app: AppHandle,
     site: &Site,
     url: &Url,
     init_script: &str,
     _fullscreen: bool,
-) -> AppResult<String> {
-    open_on_mobile(&app, site, url, init_script)
+    session_id: String,
+) -> AppResult<(String, String)> {
+    open_on_mobile(&app, site, url, init_script, session_id)
 }
 
 /// Desktop variant: a child WebView inside the main window, per-site profile
@@ -336,8 +330,9 @@ pub async fn open_site_window(
     url: &Url,
     init_script: &str,
     fullscreen: bool,
-) -> AppResult<String> {
-    open_in_main_window(&app, site, url, init_script, fullscreen).await
+    session_id: String,
+) -> AppResult<(String, String)> {
+    open_in_main_window(&app, site, url, init_script, fullscreen, session_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -364,15 +359,17 @@ async fn open_in_main_window(
     url: &Url,
     init_script: &str,
     fullscreen: bool,
-) -> AppResult<String> {
+    session_id: String,
+) -> AppResult<(String, String)> {
     let proxy = start_site_proxy_handle().await?;
     // Nothing below this line may await: the guard must not outlive a suspend
     // point. `open_in_main_window_inner` is synchronous for that reason.
     let _guard = lock_desktop_session()?;
-    open_in_main_window_inner(app, site, url, init_script, fullscreen, proxy)
+    open_in_main_window_inner(app, site, url, init_script, fullscreen, proxy, session_id)
 }
 
 #[cfg(desktop)]
+#[allow(clippy::too_many_arguments)]
 fn open_in_main_window_inner(
     app: &AppHandle,
     site: &Site,
@@ -380,7 +377,8 @@ fn open_in_main_window_inner(
     init_script: &str,
     fullscreen: bool,
     proxy: crate::web::pinned_proxy::ProxyHandle,
-) -> AppResult<String> {
+    session_id: String,
+) -> AppResult<(String, String)> {
     // Re-validate the `Site` snapshot while holding `DESKTOP_SESSION_LOCK`
     // (already held by `open_in_main_window`). A concurrent `remove_site`
     // may have deleted the site after `open_site` cloned it but before we
@@ -404,17 +402,32 @@ fn open_in_main_window_inner(
         }
     }
     let label = label_for(&site.id);
+    let host = site.host();
     let window = app
         .get_webview_window(LAUNCHER_LABEL)
         .ok_or_else(|| AppError::Other("ana pencere bulunamadı".into()))?;
 
-    // Already showing this exact site: nothing to stack, just focus.
+    // Focusing an already-open WebView is not a new native session. Its
+    // callbacks carry the identity installed when that WebView was created,
+    // so return that same identity rather than relabeling the live view.
     if app.get_webview(&label).is_some() {
+        let current = {
+            let state = app.state::<AppState>();
+            let value = lock_recover(&state.current_site).clone();
+            value
+        };
+        let Some(current) =
+            current.filter(|value| value.window_label == label && value.site_id == site.id)
+        else {
+            return Err(AppError::Other(
+                "site görünümü var ama etkin oturum kaydı eşleşmiyor".into(),
+            ));
+        };
         window.set_focus().map_err(|_| {
             log::error!("pencere öne alınamadı");
             AppError::Other("pencere öne alınamadı".into())
         })?;
-        return Ok(label);
+        return Ok((label, current.session_id));
     }
 
     // One site at a time inside the single window: close a previous session
@@ -443,11 +456,12 @@ fn open_in_main_window_inner(
     })?;
     let data_dir = crate::web::session::ensure_profile_dir(&base, &site.id)?;
 
-    let host = site.host();
     let nav_host = host.clone();
     let nav_label = label.clone();
-    // A separate clone for the navigation closure: the builder borrows `app`
-    // for its own lifetime, so the closure cannot also move out of it.
+    let nav_session_id = session_id.clone();
+    let page_load_session_id = session_id.clone();
+    // A separate clone for each callback: the builder borrows `app` for its
+    // own lifetime, and both callbacks must keep this WebView's identity.
     let nav_app = app.clone();
 
     let size = window.inner_size().map_err(|_| {
@@ -475,9 +489,10 @@ fn open_in_main_window_inner(
                 if target.host_str() == Some(CLOSE_HOST) {
                     let app = nav_app.clone();
                     let label = nav_label.clone();
+                    let session_id = nav_session_id.clone();
                     tauri::async_runtime::spawn(async move {
-                        if close_site_window(&app, &label).is_err() {
-                            log::error!("site oturumu kapatılamadı");
+                        if close_site_window_for_session(&app, &label, &session_id).is_err() {
+                            log::debug!("eski site kapatma isteği artık geçerli değil");
                         }
                     });
                 }
@@ -524,7 +539,7 @@ fn open_in_main_window_inner(
         // document-start init script alone proved unreliable on WebView2.
         // `OVERLAY_SNIPPET` self-guards, so repeated installs are no-ops,
         // and it heals itself if a SPA wipes the DOM around the button.
-        .on_page_load(|webview, payload| {
+        .on_page_load(move |webview, payload| {
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 return;
             }
@@ -541,13 +556,14 @@ fn open_in_main_window_inner(
                 log::error!("site görünümü proxy'yi kullanmadı");
                 let app = webview.app_handle().clone();
                 let label = webview.label().to_string();
+                let session_id = page_load_session_id.clone();
                 let _ = app.emit(
                     "animehub://navigation-blocked",
                     "Site proxy'si kullanılmadı; site korumasız açılmadı.",
                 );
                 tauri::async_runtime::spawn(async move {
-                    if close_site_window(&app, &label).is_err() {
-                        log::error!("korumasız site oturumu kapatılamadı");
+                    if close_site_window_for_session(&app, &label, &session_id).is_err() {
+                        log::debug!("eski veya değişmiş site oturumu kapatma isteği reddedildi");
                     }
                 });
                 return;
@@ -597,6 +613,7 @@ fn open_in_main_window_inner(
         let state = app.state::<AppState>();
         let value = CurrentSite {
             site_id: site.id.clone(),
+            session_id: session_id.clone(),
             host,
             window_label: label.clone(),
             entered_fullscreen,
@@ -608,7 +625,7 @@ fn open_in_main_window_inner(
     // fixed interval until the site is closed or another site takes over.
     spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
 
-    Ok(label)
+    Ok((label, session_id))
 }
 
 /// Close whichever site webview is currently shown inside the main window,
@@ -625,7 +642,7 @@ fn close_current_child_locked(app: &AppHandle) -> AppResult<()> {
             .map(|c| c.window_label.clone())
     };
     match label {
-        Some(label) => close_site_window_locked(app, &label),
+        Some(label) => close_site_window_locked(app, &label, None),
         None => Ok(()),
     }
 }
@@ -691,6 +708,50 @@ pub fn install_main_window_handlers(app: &AppHandle) {
 fn session_is_current(state: &AppState, site_id: &str) -> bool {
     let current = lock_recover(&state.current_site);
     current.as_ref().is_some_and(|c| c.site_id == site_id)
+}
+
+/// Take the tracked session only when it is still the exact opening named by
+/// `session_id`.
+///
+/// Close paths capture the identity before tearing the WebView down, then use
+/// this to remove the record and build the event. Matching the site id (or a
+/// window label) is not enough: a closed site reopened before the delayed
+/// event is delivered has the same site id and, on desktop, the same label.
+fn take_current_session_if(state: &AppState, session_id: &str) -> Option<CurrentSite> {
+    let mut current = lock_recover(&state.current_site);
+    if current.as_ref().is_some_and(|c| c.session_id == session_id) {
+        current.take()
+    } else {
+        None
+    }
+}
+
+/// A guarded close must match the exact currently owned opening; labels are reusable.
+fn session_identity_matches(current_session_id: Option<&str>, expected_session_id: &str) -> bool {
+    current_session_id == Some(expected_session_id)
+}
+
+fn ensure_close_session_identity(
+    current: &Option<CurrentSite>,
+    expected_session_id: Option<&str>,
+) -> AppResult<()> {
+    if let Some(expected) = expected_session_id {
+        if !session_identity_matches(
+            current.as_ref().map(|site| site.session_id.as_str()),
+            expected,
+        ) {
+            return Err(AppError::Other("site session changed before close".into()));
+        }
+    }
+    Ok(())
+}
+
+/// The only producer of `animehub://site-closed`.
+///
+/// `closed` must be the record captured by the close path, never a fresh read
+/// of `current_site`; that mutable slot may already belong to a newer opening.
+fn emit_site_closed(app: &AppHandle, closed: &CurrentSite) {
+    let _ = app.emit("animehub://site-closed", closed.closed_event());
 }
 
 /// Snapshot the live session into the encrypted store on a fixed interval.
@@ -782,47 +843,10 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
     });
 }
 
-/// Non-Android mobile (iOS) variant: cookies every tick.
-///
-/// Cookies still ride the encrypted jar on iOS; localStorage/IndexedDB
-/// snapshots were removed everywhere with the JSON transfer machinery — the
-/// old dump was lossy and not a security boundary.
-#[cfg(all(mobile, not(target_os = "android")))]
-fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, host: String) {
-    std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
-            return;
-        };
-        loop {
-            std::thread::sleep(SESSION_SYNC_INTERVAL);
-            if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
-                log::warn!("site oturum eşitleme süresi doldu");
-                return;
-            }
-            {
-                let state = app.state::<AppState>();
-                if !session_is_current(&state, &site_id) {
-                    return;
-                }
-            }
-            let loaded = window
-                .url()
-                .ok()
-                .is_some_and(|u| u.host_str() == Some(host.as_str()));
-            if !loaded {
-                continue;
-            }
-            if export_cookies(&window, &site_id, &host).is_err() {
-                log::warn!("dönemsel çerez eşitlemesi başarısız");
-            }
-        }
-    });
-}
-
 // ---------------------------------------------------------------------------
-// Mobile: Android opens a separate profiled WebView per site; iOS keeps the
-// shared-WebView flow without the removed JSON storage snapshots.
+// Mobile (Android is the only supported mobile target): a separate profiled
+// WebView per site. The old single shared-WebView flow is gone with the iOS
+// target; there is no cookie jar swap left on any platform.
 // ---------------------------------------------------------------------------
 
 /// Prefix shared with Kotlin's `AnimeHubSiteController` name validator: a
@@ -1199,12 +1223,9 @@ pub fn cookie_belongs_to_site(stored: &crate::web::session::StoredCookie, site_u
 
 /// The live cookies of `jar` that this site may hold.
 ///
-/// One definition for every import path: [`cookie_belongs_to_site`] is the
-/// ownership rule, and a cookie that fails it is dropped before anything writes
-/// it. The Android profile migration always used this rule; the iOS import path
-/// (round 16.4) did not, and restored every live cookie in the jar into the
-/// *shared* WebView — including third-party and foreign-domain cookies that the
-/// next site then inherited.
+/// [`cookie_belongs_to_site`] is the ownership rule, and a cookie that fails
+/// it is dropped before anything writes it. The one-time Android profile
+/// migration is the only importer left, and it uses this rule.
 pub fn cookies_belonging_to_site<'a>(
     cookies: &'a [crate::web::session::StoredCookie],
     site_url: &str,
@@ -3413,7 +3434,13 @@ where
 /// `MULTI_PROFILE`-unsupported provider aborts with [`AppError::Unsupported`]
 /// and no session state is changed.
 #[cfg(target_os = "android")]
-fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
+fn open_on_mobile(
+    app: &AppHandle,
+    site: &Site,
+    url: &Url,
+    init_script: &str,
+    session_id: String,
+) -> AppResult<(String, String)> {
     let _session_guard = lock_android_session()?;
     // Re-validate the `Site` snapshot while holding `ANDROID_SESSION_LOCK`.
     // See `open_in_main_window_inner` for the stale-snapshot race.
@@ -3438,13 +3465,14 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     let state = app.state::<AppState>();
 
     // 1. Close the outgoing site, if any. One site WebView at a time; its
-    //    data stays in its profile, so there is no export step any more.
+    //    data stays in its profile, so there is no export step any more. The
+    //    event names the *outgoing* opening's identity; it must never be read
+    //    back from the slot after the new opening claims it.
     let previous = lock_recover(&state.current_site).clone();
-    if previous.is_some() {
+    if let Some(previous) = previous {
         crate::android_bridge::site_close(true)?;
-        *lock_recover(&state.current_site) = None;
-        if let Some(closed) = previous {
-            let _ = app.emit("animehub://site-closed", closed.site_id);
+        if let Some(closed) = take_current_session_if(&state, &previous.session_id) {
+            emit_site_closed(app, &closed);
         }
     }
 
@@ -3466,6 +3494,7 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     let label = label_for(&site.id);
     *lock_recover(&state.current_site) = Some(CurrentSite {
         site_id: site.id.clone(),
+        session_id: session_id.clone(),
         host: site.host(),
         window_label: label.clone(),
         entered_fullscreen: false,
@@ -3474,97 +3503,10 @@ fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) ->
     // Periodic profile-cookie flush: an Android process kill skips close.
     spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
 
-    Ok(label)
+    Ok((label, session_id))
 }
 
-/// Non-Android mobile (iOS): the pre-existing shared-WebView flow, minus the
-/// removed localStorage/IndexedDB snapshot machinery.
-#[cfg(all(mobile, not(target_os = "android")))]
-fn open_on_mobile(app: &AppHandle, site: &Site, url: &Url, init_script: &str) -> AppResult<String> {
-    let window = app
-        .get_webview_window(LAUNCHER_LABEL)
-        .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
-    // Re-validate the `Site` snapshot (see `open_in_main_window_inner`).
-    {
-        let state = app.state::<AppState>();
-        let reg = state
-            .registry
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        match reg.get(&site.id) {
-            Some(current) => {
-                if current.hidden {
-                    return Err(AppError::SiteNotFound(site.id.clone()));
-                }
-                if current.url != site.url {
-                    return Err(AppError::SiteNotFound(site.id.clone()));
-                }
-            }
-            None => return Err(AppError::SiteNotFound(site.id.clone())),
-        }
-    }
-    let state = app.state::<AppState>();
-
-    let previous_site = lock_recover(&state.current_site).clone();
-    if let Some(current) = previous_site.as_ref() {
-        export_cookies(&window, &current.site_id, &current.host)?;
-    }
-
-    window.clear_all_browsing_data().map_err(|_| {
-        log::error!("çerezler temizlenemedi");
-        AppError::Other("çerezler temizlenemedi".into())
-    })?;
-
-    if let Err(e) = import_cookies(&window, &site.id, url) {
-        return Err(e);
-    }
-
-    if window.eval(init_script).is_err() {
-        log::error!("script yüklenemedi");
-        return Err(AppError::Other("script yüklenemedi".into()));
-    }
-
-    if window.navigate(url.clone()).is_err() {
-        log::error!("sayfa açılamadı");
-        return Err(AppError::Other("sayfa açılamadı".into()));
-    }
-
-    *lock_recover(&state.current_site) = Some(CurrentSite {
-        site_id: site.id.clone(),
-        host: site.host(),
-        window_label: LAUNCHER_LABEL.into(),
-        entered_fullscreen: false,
-    });
-
-    spawn_session_sync(
-        app.clone(),
-        LAUNCHER_LABEL.to_string(),
-        site.id.clone(),
-        site.host(),
-    );
-
-    Ok(LAUNCHER_LABEL.to_string())
-}
-
-/// Save the WebView's current cookie jar into the named site's encrypted blob.
-///
-/// iOS only: Android's site cookies live in their WebView profile and are
-/// never snapshotted any more (see the module docs).
-#[cfg(all(mobile, not(target_os = "android")))]
-fn export_cookies(
-    window: &tauri::WebviewWindow,
-    site_id: &str,
-    expected_host: &str,
-) -> AppResult<()> {
-    let _ = expected_host;
-    let live = window.cookies().map_err(|_| {
-        log::error!("çerezler okunamadı");
-        AppError::Other("çerezler okunamadı".into())
-    })?;
-    export_cookies_from(live, window.app_handle(), site_id)
-}
-
-/// Same as [`export_cookies`] but for a bare child `Webview` (desktop).
+/// Export the live cookie jar of a bare child `Webview` (desktop).
 #[cfg(desktop)]
 fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<()> {
     let live = webview.cookies().map_err(|_| {
@@ -3574,7 +3516,7 @@ fn export_cookies_webview(webview: &tauri::Webview, site_id: &str) -> AppResult<
     export_cookies_from(live, webview.app_handle(), site_id)
 }
 
-#[cfg(any(desktop, all(mobile, not(target_os = "android"))))]
+#[cfg(desktop)]
 fn export_cookies_from(
     live: Vec<cookie::Cookie<'static>>,
     app: &AppHandle,
@@ -3596,93 +3538,51 @@ fn export_cookies_from(
         .put_secret(&format!("cookies-{site_id}"), &bytes)
 }
 
-/// Load a site's encrypted cookie jar into the shared WebView (iOS only).
+/// Close the active site session on mobile (Android).
 ///
-/// Android never reaches this: its jars are imported profile-scoped inside
-/// `AnimeHubSiteController` before the first navigation of a virgin profile.
-#[cfg(all(mobile, not(target_os = "android")))]
-fn import_cookies(window: &tauri::WebviewWindow, site_id: &str, url: &Url) -> AppResult<()> {
-    let app = window.app_handle().clone();
-    let state = app.state::<AppState>();
-    let stored = state.provider.get_secret(&format!("cookies-{site_id}"))?;
-    let jar: CookieJar = match stored {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
-        None => return Ok(()),
-    };
-
-    // Only the cookies this site owns. The jar is captured from the shared
-    // WebView, so it also holds third-party and other-origin cookies; putting
-    // those back would hand them to whichever site is opened next.
-    let now = crate::anilist::now_unix();
-    for stored in cookies_belonging_to_site(&jar.cookies, url.as_str(), now) {
-        if let Some(cookie) = restore(stored) {
-            if window.set_cookie(cookie).is_err() {
-                log::debug!("site cookie restore did not complete");
-            }
-        }
-    }
-
-    Ok(())
+/// Destroys the site WebView through the Kotlin controller (which flushes the
+/// *profile* cookie manager first and re-binds PiP and focus to the launcher).
+/// The launcher page never moved, so there is nothing to navigate back to —
+/// removing the site view reveals it. Idempotent: the Kotlin side resolves
+/// normally when no site view exists, which keeps a stale session record
+/// harmless.
+#[cfg(target_os = "android")]
+pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
+    close_site_window_mobile(app, None)
 }
 
-/// Close the active site session on mobile.
-///
-/// Android: destroy the site WebView through the Kotlin controller (which
-/// flushes the *profile* cookie manager first, re-binds PiP and focus to the
-/// launcher). The launcher page never moved, so there is nothing to
-/// navigate back to — removing the site view reveals it. Idempotent: the
-/// Kotlin side resolves normally when no site view exists, which keeps a
-/// stale session record harmless.
-///
-/// iOS: persist the jar, then send the shared WebView back to the launcher.
-#[cfg(mobile)]
-pub fn close_site_window(app: &AppHandle, _label: &str) -> AppResult<()> {
-    let _operation_scope = crate::diagnostics::scope_if_missing("close");
-    #[cfg(target_os = "android")]
-    let _session_guard = lock_android_session()?;
+#[cfg(target_os = "android")]
+pub fn close_site_window_for_session(
+    app: &AppHandle,
+    _label: &str,
+    expected_session_id: &str,
+) -> AppResult<()> {
+    close_site_window_mobile(app, Some(expected_session_id))
+}
 
-    #[cfg(target_os = "android")]
-    {
-        // Flush + destroy the site view before releasing state: a failure
-        // here means the view may still be alive, so the session must stay
-        // claimed for a retry.
-        crate::android_bridge::site_close(true)?;
-    }
+#[cfg(target_os = "android")]
+fn close_site_window_mobile(app: &AppHandle, expected_session_id: Option<&str>) -> AppResult<()> {
+    let _operation_scope = crate::diagnostics::scope_if_missing("close");
+    let _session_guard = lock_android_session()?;
 
     let current = {
         let state = app.state::<AppState>();
-        // Bind first: the `MutexGuard` temporary must be dropped before
-        // `state`, whose borrow it holds.
         let value = lock_recover(&state.current_site).clone();
         value
     };
+    ensure_close_session_identity(&current, expected_session_id)?;
 
-    #[cfg(not(target_os = "android"))]
-    if let Some(current) = &current {
-        let window = app
-            .get_webview_window(LAUNCHER_LABEL)
-            .ok_or_else(|| AppError::Other("ana WebView bulunamadı".into()))?;
-        export_cookies(&window, &current.site_id, &current.host)?;
-    }
+    // Verify ownership before destroying the active view.
+    crate::android_bridge::site_close(true)?;
 
-    // iOS only: the shared WebView was navigated away from the launcher.
-    #[cfg(not(target_os = "android"))]
-    if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
+    let closing_session_id = current.as_ref().map(|c| c.session_id.clone());
+
+    let closed = closing_session_id.and_then(|session_id| {
         let state = app.state::<AppState>();
-        let back = lock_recover(&state.launcher_url).clone();
-        if let Some(url) = back {
-            window.navigate(url).map_err(|_| {
-                log::error!("başlatıcıya dönülemedi");
-                AppError::Other("başlatıcıya dönülemedi".into())
-            })?;
-        }
-    }
-
-    let closed_site = current.as_ref().map(|c| c.site_id.clone());
-    let state = app.state::<AppState>();
-    *lock_recover(&state.current_site) = None;
-    if let Some(site_id) = closed_site {
-        let _ = app.emit("animehub://site-closed", site_id);
+        take_current_session_if(&state, &session_id)
+    });
+    if let Some(closed) = closed {
+        emit_site_closed(app, &closed);
     }
     Ok(())
 }
@@ -3706,6 +3606,12 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
         .filter(|c| c.window_label != LAUNCHER_LABEL)
         .map(|c| c.window_label.clone())
         .unwrap_or_else(|| label.to_string());
+    // The label can be reused by a reopen of the same site, so it is not an
+    // ownership token. Snapshot the identity of the session this wipe closes.
+    let closing_session_id = current
+        .as_ref()
+        .filter(|c| c.window_label == child_label)
+        .map(|c| c.session_id.clone());
 
     if let Some(child) = app.get_webview(&child_label) {
         // Intentionally skip `export_cookies_webview` — the caller is wiping.
@@ -3715,18 +3621,10 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
         })?;
     }
 
-    let mut closed_site = None;
-    {
+    let closed = closing_session_id.and_then(|session_id| {
         let state = app.state::<AppState>();
-        let mut guard = lock_recover(&state.current_site);
-        if guard
-            .as_ref()
-            .is_some_and(|c| c.window_label == child_label)
-        {
-            closed_site = guard.as_ref().map(|c| c.site_id.clone());
-            *guard = None;
-        }
-    }
+        take_current_session_if(&state, &session_id)
+    });
 
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         if window.set_title(LAUNCHER_TITLE).is_err() {
@@ -3742,8 +3640,8 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
         }
     }
 
-    if let Some(site_id) = closed_site {
-        let _ = app.emit("animehub://site-closed", site_id);
+    if let Some(closed) = closed {
+        emit_site_closed(app, &closed);
     }
     // The session is over: its tunnels must not outlive it. Doing this before
     // the caller wipes the profile also guarantees no in-flight request can
@@ -3752,12 +3650,11 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     Ok(())
 }
 
-/// Mobile wipe-close for `remove_site` / `clear_site_data` when the target
+/// Android wipe-close for `remove_site` / `clear_site_data` when the target
 /// site is currently open. Holds `ANDROID_SESSION_LOCK` so a concurrent sync
 /// tick cannot flush the doomed profile between the close and the wipe.
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<()> {
-    #[cfg(target_os = "android")]
     let _guard = lock_android_session()?;
     close_site_window_for_clear_locked(app, site_id)
 }
@@ -3771,7 +3668,7 @@ pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<
 /// give the deletion a chance to lose the race. The launcher WebView is
 /// untouched (its data is the default profile and is never part of a site
 /// wipe).
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
@@ -3780,44 +3677,23 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
     };
     // Only proceed if the site to delete is still the active one; otherwise
     // another site has taken over and must not be closed.
-    let should_clear = current.as_ref().is_some_and(|c| c.site_id == site_id);
-    if !should_clear {
+    let closing_session_id = current
+        .as_ref()
+        .filter(|c| c.site_id == site_id)
+        .map(|c| c.session_id.clone());
+    let Some(closing_session_id) = closing_session_id else {
         return Ok(());
-    }
+    };
 
-    #[cfg(target_os = "android")]
-    {
-        // Destroy without flushing — the caller wipes right after.
-        crate::android_bridge::site_close(false)?;
-    }
+    // Destroy without flushing — the caller wipes right after.
+    crate::android_bridge::site_close(false)?;
 
-    #[cfg(not(target_os = "android"))]
-    {
-        let back = {
-            let state = app.state::<AppState>();
-            let value = lock_recover(&state.launcher_url).clone();
-            value
-        };
-        if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
-            if let Some(url) = back {
-                window.navigate(url).map_err(|_| {
-                    log::error!("başlatıcıya dönülemedi");
-                    AppError::Other("başlatıcıya dönülemedi".into())
-                })?;
-            }
-        }
-    }
-
-    let closed_site = current.as_ref().map(|c| c.site_id.clone());
-    {
+    let closed = {
         let state = app.state::<AppState>();
-        let mut guard = lock_recover(&state.current_site);
-        if guard.as_ref().is_some_and(|c| c.site_id == site_id) {
-            *guard = None;
-        }
-    }
-    if let Some(site_id) = closed_site {
-        let _ = app.emit("animehub://site-closed", site_id);
+        take_current_session_if(&state, &closing_session_id)
+    };
+    if let Some(closed) = closed {
+        emit_site_closed(app, &closed);
     }
     Ok(())
 }
@@ -3830,30 +3706,44 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
 pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
     let _operation_scope = crate::diagnostics::scope_if_missing("close");
     let _guard = lock_desktop_session()?;
-    close_site_window_locked(app, label)
+    close_site_window_locked(app, label, None)
 }
 
 #[cfg(desktop)]
-fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
+pub fn close_site_window_for_session(
+    app: &AppHandle,
+    label: &str,
+    expected_session_id: &str,
+) -> AppResult<()> {
+    let _operation_scope = crate::diagnostics::scope_if_missing("close");
+    let _guard = lock_desktop_session()?;
+    close_site_window_locked(app, label, Some(expected_session_id))
+}
+
+#[cfg(desktop)]
+fn close_site_window_locked(
+    app: &AppHandle,
+    label: &str,
+    expected_session_id: Option<&str>,
+) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
-        // Bind first: the `MutexGuard` temporary must be dropped before
-        // `state`, whose borrow it holds.
         let value = lock_recover(&state.current_site).clone();
         value
     };
-    // `label` comes from the launcher UI, which tracks the label it was
-    // given at open time. If it has gone stale (the session was already
-    // closed via the overlay), fall back to the tracked current site.
+    ensure_close_session_identity(&current, expected_session_id)?;
+
     let child_label = current
         .as_ref()
         .filter(|c| c.window_label != LAUNCHER_LABEL)
         .map(|c| c.window_label.clone())
         .unwrap_or_else(|| label.to_string());
+    let closing_session_id = current
+        .as_ref()
+        .filter(|c| c.window_label == child_label)
+        .map(|c| c.session_id.clone());
 
     if let Some(child) = app.get_webview(&child_label) {
-        // Desktop profiles persist cookies on disk; this jar export is the
-        // same belt-and-braces snapshot the old per-window flow took.
         if let Some(cur) = current.as_ref().filter(|c| c.window_label == child_label) {
             export_cookies_webview(&child, &cur.site_id)?;
         }
@@ -3863,21 +3753,11 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
         })?;
     }
 
-    let mut closed_site = None;
-    {
+    let closed = closing_session_id.and_then(|session_id| {
         let state = app.state::<AppState>();
-        let mut guard = lock_recover(&state.current_site);
-        if guard
-            .as_ref()
-            .is_some_and(|c| c.window_label == child_label)
-        {
-            closed_site = guard.as_ref().map(|c| c.site_id.clone());
-            *guard = None;
-        }
-    }
+        take_current_session_if(&state, &session_id)
+    });
 
-    // Restore the launcher's chrome: own title again, and leave fullscreen
-    // only when *we* were the ones who entered it.
     if let Some(window) = app.get_webview_window(LAUNCHER_LABEL) {
         if window.set_title(LAUNCHER_TITLE).is_err() {
             log::warn!("pencere başlığı geri alınamadı");
@@ -3892,11 +3772,9 @@ fn close_site_window_locked(app: &AppHandle, label: &str) -> AppResult<()> {
         }
     }
 
-    if let Some(site_id) = closed_site {
-        let _ = app.emit("animehub://site-closed", site_id);
+    if let Some(closed) = closed {
+        emit_site_closed(app, &closed);
     }
-    // Down with the session: no tunnel survives its WebView, and the next
-    // open binds and installs its own proxy (see `start_site_proxy_handle`).
     stop_site_proxy();
     Ok(())
 }
@@ -3931,6 +3809,80 @@ mod tests {
     use crate::secure::SecretProvider;
     use crate::sites::blocklist::Blocklist;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_delayed_close_identity_cannot_match_a_reopened_session() {
+        assert!(!session_identity_matches(
+            Some("opening-new"),
+            "opening-old"
+        ));
+        assert!(session_identity_matches(Some("opening-new"), "opening-new"));
+        assert!(!session_identity_matches(None, "opening-old"));
+    }
+
+    /// A native close must name the exact opening it was issued for.
+    ///
+    /// `close_site` arrives as an independent IPC request: by the time it
+    /// runs, the same site may already have been reopened on the very same
+    /// window label. The guard, not the label, is what stops a stale request
+    /// from destroying a live WebView.
+    #[test]
+    fn a_mismatched_native_close_identity_is_refused_before_any_teardown() {
+        let state = state_with_current_site(Some("s1"));
+        let current = lock_recover(&state.current_site).clone();
+
+        // The opening that owns the slot may close it.
+        assert!(ensure_close_session_identity(&current, Some("session-s1")).is_ok());
+        // Internal wipe paths carry no launcher identity and stay allowed.
+        assert!(ensure_close_session_identity(&current, None).is_ok());
+
+        let refused = ensure_close_session_identity(&current, Some("stale-opening"))
+            .expect_err("a close for a different opening must be refused");
+        assert!(matches!(
+            refused,
+            AppError::Other(ref message) if message.contains("session changed")
+        ));
+
+        // The refusal is not a teardown: the live session is still recorded.
+        let still_live = {
+            let current = lock_recover(&state.current_site).clone();
+            current.map(|c| c.session_id)
+        };
+        assert_eq!(still_live.as_deref(), Some("session-s1"));
+
+        // Against an empty slot there is nothing to close: a launcher-issued
+        // identity must be refused rather than silently accepted.
+        assert!(ensure_close_session_identity(&None, Some("session-s1")).is_err());
+        assert!(ensure_close_session_identity(&None, None).is_ok());
+    }
+
+    /// Both asynchronous close callbacks (the `animehub://site-close`
+    /// navigation and the fail-closed page-load check) close with the identity
+    /// captured by *their own* opening. Model the race: opening 1's callback
+    /// runs after the same site was reopened as opening 2.
+    #[test]
+    fn a_stale_close_callback_cannot_end_a_reopened_session() {
+        let state = state_with_current_site(Some("s1"));
+        // Same site id, same label on desktop — only the identity differs.
+        *lock_recover(&state.current_site) = Some(current_site_at("s1", "session-s2"));
+        let reopened = lock_recover(&state.current_site).clone();
+
+        // Opening 1's delayed navigation/page-load close is refused.
+        assert!(ensure_close_session_identity(&reopened, Some("session-s1")).is_err());
+        let survivor = {
+            let current = lock_recover(&state.current_site).clone();
+            current.map(|c| c.session_id)
+        };
+        assert_eq!(survivor.as_deref(), Some("session-s2"));
+
+        // Opening 2 can still close itself, and the event names opening 2.
+        assert!(ensure_close_session_identity(&reopened, Some("session-s2")).is_ok());
+        let closed = take_current_session_if(&state, "session-s2")
+            .expect("the owning identity closes its own session");
+        assert_eq!(closed.site_id, "s1");
+        assert_eq!(closed.closed_event().session_id, "session-s2");
+        assert!(take_current_session_if(&state, "session-s1").is_none());
+    }
 
     /// The WebView2 argument string must keep wry's own defaults, add the
     /// proxy, and subtract Chromium's implicit loopback bypass. This is a
@@ -4013,18 +3965,23 @@ mod tests {
         assert!(label_for("anything").starts_with(SITE_LABEL_PREFIX));
     }
 
+    fn current_site_at(site_id: &str, session_id: &str) -> CurrentSite {
+        CurrentSite {
+            site_id: site_id.to_string(),
+            session_id: session_id.to_string(),
+            host: "a.example".into(),
+            window_label: LAUNCHER_LABEL.into(),
+            entered_fullscreen: false,
+        }
+    }
+
     /// Minimal app state over a real temp-dir store, for ownership checks.
     fn state_with_current_site(site_id: Option<&str>) -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let key = load_master_key(dir.path()).expect("key");
         let provider = SecureStore::new(&key, dir.path()).expect("store");
         let (registry, warning) = provider.load_registry();
-        let current = site_id.map(|id| CurrentSite {
-            site_id: id.to_string(),
-            host: "a.example".into(),
-            window_label: LAUNCHER_LABEL.into(),
-            entered_fullscreen: false,
-        });
+        let current = site_id.map(|id| current_site_at(id, &format!("session-{id}")));
         AppState {
             provider: Box::new(provider),
             registry: Mutex::new(registry),
@@ -4032,7 +3989,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(current),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4052,6 +4008,50 @@ mod tests {
         let state = state_with_current_site(Some("s1"));
         assert!(session_is_current(&state, "s1"));
         assert!(!session_is_current(&state, "s2"));
+    }
+
+    #[test]
+    fn close_payload_names_the_opening_not_just_its_site() {
+        let first = current_site_at("s1", "open-1");
+        let reopened = current_site_at("s1", "open-2");
+        let old_event = first.closed_event();
+
+        // The exact race: the site id is identical across the reopen, and the
+        // payload must still distinguish the two openings.
+        assert_eq!(old_event.site_id, reopened.site_id);
+        assert_ne!(old_event.session_id, reopened.closed_event().session_id);
+
+        let value = serde_json::to_value(old_event).unwrap();
+        assert_eq!(value["siteId"], "s1");
+        assert_eq!(value["sessionId"], "open-1");
+    }
+
+    #[test]
+    fn a_stale_close_identity_cannot_take_a_reopened_session() {
+        let state = state_with_current_site(Some("s1"));
+        // The slot now belongs to opening 2; opening 1's delayed close runs.
+        *state.current_site.lock().unwrap() = Some(current_site_at("s1", "open-2"));
+
+        assert!(
+            take_current_session_if(&state, "open-1").is_none(),
+            "a stale opening identity must not claim the reopened session"
+        );
+        assert_eq!(
+            state
+                .current_site
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .session_id,
+            "open-2"
+        );
+
+        let closed = take_current_session_if(&state, "open-2")
+            .expect("the owning identity takes its own session");
+        assert_eq!(closed.site_id, "s1");
+        assert_eq!(closed.closed_event().session_id, "open-2");
+        assert!(state.current_site.lock().unwrap().is_none());
     }
 
     #[test]
@@ -4750,7 +4750,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -5226,7 +5225,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -5499,7 +5497,6 @@ mod tests {
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             startup_warning: Mutex::new(warning),
-            launcher_url: Mutex::new(None),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
             pip_generation: std::sync::atomic::AtomicU64::new(0),
@@ -7394,11 +7391,12 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_webview_import_only_restores_the_sites_own_cookies() {
-        // The iOS import path used to replay every live cookie in the jar into
-        // the shared WebView. The jar is captured from that same WebView, so it
-        // also carries third-party and other-origin cookies — which the next
-        // site then inherited. Both import paths now go through one selector.
+    fn the_cookie_jar_import_only_restores_the_sites_own_cookies() {
+        // The one-time Android profile migration replays the legacy jar. That
+        // jar was written while cookies from several sites could share a
+        // store, so it may carry third-party and other-origin cookies — which
+        // the target profile must never inherit. The migration goes through
+        // this selector.
         let now = crate::anilist::now_unix();
         let cookies = vec![
             cookie_for_test("own", None, None),

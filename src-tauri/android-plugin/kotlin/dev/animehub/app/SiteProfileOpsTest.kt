@@ -1071,6 +1071,58 @@ class SiteProfileOpsTest {
     Assert.assertEquals(listOf(both[1]), ProfileQuarantine.pendingOperations(profile))
   }
 
+  @Test
+  fun `a duplicate late callback after a verified reopen cannot settle a newer operation`() {
+    // A times out; its first (late) callback settles A, and a later verified
+    // wipe C reopens the site. Reopening prunes the ledger, which is safe only
+    // while no destructive operation is outstanding.
+    val a = FakeClearPort(cookiesNeverAnswer = true)
+    var aResults = 0
+    SiteClearFlow.run(supported = true, profileName = profile, port = a) { aResults++ }
+    a.timeouts[0].invoke()
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true))
+    Assert.assertEquals("the timeout already answered the caller", 1, aResults)
+    Assert.assertTrue("settling alone is not verification", ProfileQuarantine.isBlocked(profile))
+    val c = FakeClearPort()
+    SiteClearFlow.run(supported = true, profileName = profile, port = c) {}
+    Assert.assertNull("C's verified wipe reopened the name", SiteOpenGate.check(profile))
+
+    // The provider double-delivers A's callback AFTER the reopen. A's record
+    // was retired with the pruned ledger, so this is an unknown operation: it
+    // must not create state, block the name, or re-report.
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true))
+    Assert.assertEquals(1, aResults)
+    Assert.assertEquals(emptyList<Long>(), ProfileQuarantine.pendingOperations(profile))
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull(SiteOpenGate.check(profile))
+
+    // A fresh retry D times out in a NEW ledger state. A's duplicate delivery
+    // is still possible and must not settle D: ownership is the operation id,
+    // not the profile name.
+    val d = FakeClearPort(cookiesNeverAnswer = true)
+    SiteClearFlow.run(supported = true, profileName = profile, port = d) {}
+    d.timeouts[0].invoke()
+    val dOutstanding = ProfileQuarantine.pendingOperations(profile)
+    Assert.assertEquals(1, dOutstanding.size)
+    a.pendingCookies!!.invoke(CookieWipe.Answered(true))
+    a.pendingCookies!!.invoke(CookieWipe.Failed("late duplicate"))
+    Assert.assertEquals(
+      "the stale callback closed nobody else's record",
+      dOutstanding,
+      ProfileQuarantine.pendingOperations(profile),
+    )
+    Assert.assertNotNull("D is still in flight, so the name stays closed", SiteOpenGate.check(profile))
+
+    // Only D's own answer closes D, and the last verification predates it.
+    d.pendingCookies!!.invoke(CookieWipe.Answered(true))
+    Assert.assertEquals(emptyList<Long>(), ProfileQuarantine.pendingOperations(profile))
+    Assert.assertTrue(ProfileQuarantine.isBlocked(profile))
+    val e = FakeClearPort()
+    SiteClearFlow.run(supported = true, profileName = profile, port = e) {}
+    Assert.assertFalse(ProfileQuarantine.isBlocked(profile))
+    Assert.assertNull("a verification after the last settle reopens", SiteOpenGate.check(profile))
+  }
+
   // ------------------------------------------- watchdog arming + cancellation
 
   @Test

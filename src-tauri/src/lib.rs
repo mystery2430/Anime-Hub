@@ -202,9 +202,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Remember where the launcher lives so mobile can navigate back to it.
-    let launcher_url = app.get_webview_window("main").and_then(|w| w.url().ok());
-
     app.manage(AppState {
         provider,
         registry: Mutex::new(registry),
@@ -212,7 +209,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         blocklist: Mutex::new(blocklist),
         oauth_state: Mutex::new(None),
         startup_warning: Mutex::new(startup_warning),
-        launcher_url: Mutex::new(launcher_url),
         current_site: Mutex::new(None),
         pip_lock: Mutex::new(()),
         pip_generation: AtomicU64::new(0),

@@ -750,4 +750,112 @@ mod tests {
         assert!(d2.exists());
         assert_eq!(std::fs::read(d2.join("Cookies")).unwrap(), b"jar-2");
     }
+
+    #[test]
+    fn production_secret_keys_are_injective_and_below_the_cap() {
+        // SEC-5 regression gate: the longest production key is currently
+        // localstorage- + 37 = 50 chars. The fixed literals are shorter. All
+        // use only the preserved alphabet, so the filter and the 64-char cut
+        // are identity transforms and the file mapping stays injective.
+        let mut ids = vec![
+            "builtin-openanime".to_string(),
+            "builtin-animecix".to_string(),
+        ];
+        for _ in 0..512 {
+            ids.push(format!("user-{}", uuid::Uuid::new_v4().simple()));
+        }
+        let fixed = [
+            "anilist-token",
+            "android-pending-profile-deletes",
+            "android-pending-profile-deletes-corrupt",
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            for kind in [
+                "cookies",
+                "localstorage",
+                "indexeddb",
+                "profilemig",
+                "profilegen",
+            ] {
+                let key = format!("{kind}-{id}");
+                assert!(
+                    key.len() <= 51,
+                    "production key stem exceeds the 64-char cap budget: {key}"
+                );
+                let file = secret_file_name(&key);
+                assert_eq!(file, format!("secret.{key}.bin"));
+                assert!(
+                    seen.insert(file.clone()),
+                    "two production keys share the secret file {file}"
+                );
+            }
+        }
+
+        for key in fixed {
+            assert_eq!(secret_file_name(key), format!("secret.{key}.bin"));
+            assert!(
+                seen.insert(secret_file_name(key)),
+                "fixed key overlaps the site-derived namespace: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_one_site_session_never_touches_another_site() {
+        // SEC-5 regression gate: the per-site delete list depends on the same
+        // normalization. Reachable IDs must never make one site's wipe reach
+        // a sibling tile or the global AniList token.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_dir(dir.path());
+        let kinds = ["cookies", "localstorage", "indexeddb", "profilemig"];
+        for kind in kinds {
+            store
+                .put_secret(&format!("{kind}-site-a"), b"a-payload")
+                .unwrap();
+            store
+                .put_secret(&format!("{kind}-site-b"), b"b-payload")
+                .unwrap();
+        }
+        store.put_secret("profilegen-site-a", b"7").unwrap();
+        store.put_secret("anilist-token", b"global-token").unwrap();
+
+        store.delete_site_session("site-a").unwrap();
+
+        for kind in kinds {
+            assert!(
+                store
+                    .get_secret(&format!("{kind}-site-a"))
+                    .unwrap()
+                    .is_none(),
+                "{kind}-site-a survived its own delete"
+            );
+            assert_eq!(
+                store
+                    .get_secret(&format!("{kind}-site-b"))
+                    .unwrap()
+                    .expect("site-b must survive")
+                    .as_slice(),
+                b"b-payload"
+            );
+        }
+        assert_eq!(
+            store
+                .get_secret("profilegen-site-a")
+                .unwrap()
+                .expect("generation must outlive a session wipe")
+                .as_slice(),
+            b"7"
+        );
+        assert!(store.get_secret("profilegen-site-b").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_secret("anilist-token")
+                .unwrap()
+                .expect("global token must survive")
+                .as_slice(),
+            b"global-token"
+        );
+    }
 }

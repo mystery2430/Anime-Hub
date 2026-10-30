@@ -220,7 +220,7 @@ test("PiP: a failed platform lookup is retried on the next change", async () => 
 });
 
 test("PiP: an unrecognised platform name is refused without a save", async () => {
-  const w = fakeWorld({ pipAutoEnter: false }, { platform: "ios" });
+  const w = fakeWorld({ pipAutoEnter: false }, { platform: "haiku" });
   assert.equal(await w.flow.changePipAutoEnter(true), false);
   assert.equal(w.cmd("update_settings").length, 0);
   assert.equal(w.cmd("set_pip_auto_enter").length, 0);

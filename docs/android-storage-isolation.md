@@ -189,9 +189,9 @@ boundary and is no longer needed:
 * Kotlin: `localstorage_export/import`, `indexeddb_export/import` (and the
   `EXPORT_IDB_JS` dump), `webview_cookies_get/replace`, `seal/openSealed`,
   `flushCookieStoreAsync`.
-* UI: the About note claiming same-origin isolation is unsolved (it no longer
-  applies on Android; iOS keeps the single shared WebView and stays
-  unisolated).
+* UI: the About note claiming same-origin isolation is unsolved was removed;
+  it no longer applies on Android, and no other supported target uses a
+  shared WebView.
 
 The periodic sync loop now only flushes the **active site profile's** cookie
 manager every 30 s (process kills skip the close path); the launcher's own
@@ -952,5 +952,6 @@ State-machine coverage that needs a real device/provider (actual
   except for the site's own error UI, that autoplay and PiP still work with
   `mediaPlaybackRequiresUserGesture = false`, and that the migration notice
   appears exactly once.
-* iOS/macOS: out of scope; the iOS path keeps the shared-WebView flow minus
-  the removed snapshot machinery and was not touched beyond that.
+* iOS: removed from the codebase and not a supported target, so this document
+  no longer covers it. macOS desktop has its own per-site profile directory
+  and is out of scope here.

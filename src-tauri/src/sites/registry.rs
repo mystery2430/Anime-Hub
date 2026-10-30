@@ -771,4 +771,107 @@ mod tests {
             Icon::Bundled { .. }
         ));
     }
+
+    #[test]
+    fn generated_ids_stay_inside_the_storage_namespace_budget() {
+        // SEC-5 invariant: the storage proof depends on every generated ID
+        // staying in the pinned UUIDv4 shape and below the 37-char budget.
+        // 128 real additions exercise the production generator, not a fixture.
+        let mut registry = Registry::new_default();
+        let mut ids: Vec<String> = registry.sites.iter().map(|site| site.id.clone()).collect();
+        for index in 0..128 {
+            let site = registry
+                .add(draft(
+                    &format!("Namespace {index}"),
+                    &format!("https://namespace-{index}.example/"),
+                ))
+                .unwrap();
+            ids.push(site.id);
+        }
+
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_profiles = std::collections::HashSet::new();
+        let mut seen_secrets = std::collections::HashSet::new();
+        for id in &ids {
+            assert!(seen_ids.insert(id.clone()), "duplicate site id: {id}");
+            assert!(
+                id.len() <= 37,
+                "reachable id grew past the storage budget: {id}"
+            );
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+                "reachable id uses a character the storage filter would drop: {id}"
+            );
+            if let Some(uuid) = id.strip_prefix("user-") {
+                assert_eq!(uuid.len(), 32, "UUID simple form changed: {id}");
+                assert!(
+                    uuid.chars()
+                        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                    "UUID is not lowercase simple hex: {id}"
+                );
+                assert_eq!(&uuid[12..13], "4", "not a UUIDv4: {id}");
+                assert!(
+                    matches!(&uuid[16..17], "8" | "9" | "a" | "b"),
+                    "UUID variant bits changed: {id}"
+                );
+            } else {
+                assert!(
+                    default_sites().iter().any(|site| site.id == *id),
+                    "a non-builtin id bypassed the UUIDv4 factory: {id}"
+                );
+            }
+
+            let profile = crate::web::session::profile_dir_name(id);
+            assert_eq!(profile, format!("site-{id}"));
+            assert!(
+                seen_profiles.insert(profile.clone()),
+                "two reachable ids share the profile directory {profile}"
+            );
+
+            for kind in [
+                "cookies",
+                "localstorage",
+                "indexeddb",
+                "profilemig",
+                "profilegen",
+            ] {
+                let key = format!("{kind}-{id}");
+                assert!(
+                    key.len() <= 51,
+                    "key stem has no headroom before the 64-char cap: {key}"
+                );
+                let file = crate::secure::store::secret_file_name(&key);
+                assert_eq!(file, format!("secret.{key}.bin"));
+                assert!(
+                    seen_secrets.insert(file.clone()),
+                    "two production keys share the secret file {file}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restore_time_builtins_cannot_introduce_unshipped_ids() {
+        // `ensure_builtins` is the only ID source on the authenticated restore
+        // path. It must add exactly the shipped literals and never rewrite an
+        // ID that was already restored.
+        let mut registry = Registry::new_default();
+        registry.sites.clear();
+        registry.ensure_builtins();
+        let ids: Vec<String> = registry.sites.iter().map(|site| site.id.clone()).collect();
+        assert_eq!(ids, vec!["builtin-openanime", "builtin-animecix"]);
+
+        let json = serde_json::to_string(&registry).unwrap();
+        let mut restored: Registry = serde_json::from_str(&json).unwrap();
+        restored.ensure_builtins();
+        assert_eq!(
+            restored
+                .sites
+                .iter()
+                .map(|site| site.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["builtin-openanime", "builtin-animecix"]
+        );
+    }
 }

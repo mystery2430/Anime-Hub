@@ -11,13 +11,20 @@
 #
 #   request<TAB><request-line><TAB>accept|reject
 #   authority<TAB><authority><TAB>accept|reject
+#   hex<TAB><complete-head-as-hex-bytes><TAB>accept|reject
 #
 # `request` rows go through the production request-line parser
 # (`parse_connect` on desktop, `parseConnectHead` on Android). `authority` rows
 # go through the production authority parser: the whole `CONNECT <authority>
-# HTTP/1.1` line on desktop, `parseAuthority` on Android. One file rather than
-# two keeps the shared rules in one place: a method, version, character,
-# bracket or port rule added to one parser alone fails the other suite.
+# HTTP/1.1` line on desktop, `parseAuthority` on Android. `hex` rows carry a
+# complete wire head, so framing bytes and bytes a TSV column cannot express
+# (bare LF, bare CR, 0xFF, NUL, 0x01, DEL, missing terminator) are decided by
+# the same production entry point. Android's `readHead` decodes ISO-8859-1, so
+# the test decodes these bytes the same way before calling `parseConnectHead`.
+#
+# One file rather than two keeps the shared rules in one place: a method,
+# version, character, bracket, framing or port rule added to one parser alone
+# fails the other suite.
 #
 # `accept` means the PARSER accepts the line. It does NOT mean the destination
 # is allowed: `127.0.0.1:443` parses and is then refused by the address policy,
@@ -39,8 +46,9 @@
 #                     RFC 3986 `reg-name` would also allow sub-delims and
 #                     percent-encoding; both are refused on purpose.
 #
-# Not expressible in a TSV: a literal ASCII control byte (HTAB, 0x01) inside a
-# target, because the separator is a tab. Each suite asserts those separately.
+# A literal ASCII control byte inside a target is not expressible in the
+# tab-separated `request` column; the `hex` rows below carry those, and each
+# suite also asserts them directly.
 
 # =============================================================================
 # request lines
@@ -99,6 +107,14 @@ authority	h.example:070	accept
 authority	host:1	accept
 authority	host:65535	accept
 authority	8.8.8.8:443	accept
+# Numeric-looking but not valid IPv4. The CONNECT grammar accepts them as
+# hostnames; the destination policy refuses them before the resolver (both
+# suites pin that separately with a resolver counter).
+authority	example.0x7f:443	accept
+authority	foo.123:443	accept
+authority	999.1.1.1:443	accept
+authority	1.2.3.4.5:443	accept
+authority	a.1.2.3.4:443	accept
 authority	127.0.0.1:443	accept
 authority	[::1]:443	accept
 authority	[2001:db8::1]:443	accept
@@ -139,3 +155,49 @@ authority	[::::]:443	reject
 authority	[1:2:3:4:5:6:7:8:9]:443	reject
 authority	[::1]:443x	reject
 authority	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443	reject
+
+# -----------------------------------------------------------------------------
+# Round 39: RFC 3986 reserved sub-delims are refused in an authority before DNS
+# resolution or a socket. One authority row per character keeps the Rust and
+# Kotlin sets mirrored; the request rows prove the full CONNECT line is refused
+# too, not just the authority helper. The final authority row is the control.
+# -----------------------------------------------------------------------------
+authority	anime!hub.test:443	reject
+authority	anime$hub.test:443	reject
+authority	anime&hub.test:443	reject
+authority	anime'hub.test:443	reject
+authority	anime(hub.test:443	reject
+authority	anime)hub.test:443	reject
+authority	anime*hub.test:443	reject
+authority	anime+hub.test:443	reject
+authority	anime,hub.test:443	reject
+authority	anime;hub.test:443	reject
+authority	anime=hub.test:443	reject
+authority	animehub.test:443	accept
+request	CONNECT anime!hub.test:443 HTTP/1.1	reject
+request	CONNECT anime&hub.test:443 HTTP/1.1	reject
+request	CONNECT anime;hub.test:443 HTTP/1.1	reject
+request	CONNECT anime=hub.test:443 HTTP/1.1	reject
+
+# =============================================================================
+# complete raw heads (hex bytes) — framing and non-printable bytes
+# =============================================================================
+# The parser sees exactly these bytes, including the terminator. No row below
+# relies on the test appending a CRLFCRLF.
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a486f73743a206578616d706c652e636f6d3a3434330d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e300d0a557365722d4167656e743a2061756469740d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a582d456d7074793a0d0a582d5461623a206109620d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a582d5061643a20616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310a486f73743a206578616d706c652e636f6d0a0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a486f73743a206578616d706c652e636f6d0a583a20790d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20610d590d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20ff0d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20636166c3a90d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a206100620d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a206101620d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20617f620d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a	reject
+hex		reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a0d0a583a20747261696c696e67	reject
+hex	434f4e4e45435420657861006d706c652e636f6d3a34343320485454502f312e310d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20611f620d0a0d0a	reject

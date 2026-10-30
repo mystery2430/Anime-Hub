@@ -10,13 +10,14 @@
  * runs in EVERY frame of EVERY origin; what has to be true is that no frame
  * gets a capability out of it.
  *
- * These tests execute the shipped files (not a paraphrase) in a fake DOM:
- *  - the popup guard must neutralise `window.open` in the top frame AND in a
- *    cross-origin subframe, and must not leave the original reachable;
- *  - the composition must stay inert (no credential-looking word, no site
- *    identity, no `</script>` escape);
- *  - `session.rs` must still compose exactly these files, in this order, so a
- *    future inline copy cannot quietly reintroduce what was removed here.
+ * TWO KINDS OF ASSERTION, KEPT APART:
+ *  1. BEHAVIOUR: the shipped JavaScript files are executed in a Node `vm`
+ *     against a fake DOM. These tests prove what the guard does to the fake
+ *     window and that unrelated media/fetch APIs keep their identity. They do
+ *     NOT run a WebView, open a socket, capture packets or test a device.
+ *  2. SOURCE PINS: some tests read Rust/Kotlin/JS source and assert that the
+ *     wiring still mentions the shipped file. They catch accidental deletion
+ *     from a call site; they are not evidence that network traffic is blocked.
  *
  * The PiP controller's own frame gate is tested in `pip_controller.test.js`,
  * against the same file.
@@ -127,52 +128,140 @@ test("the popup guard neutralises window.open in the top frame and in a subframe
   }
 });
 
-test("the WebRTC guard removes the API and cannot be undone by the page", () => {
-  // Executed, not grepped: the shipped file runs against a window that has a
-  // platform `RTCPeerConnection`, the way a site page would see it.
-  const dom = createFakeDom({ width: 360, height: 800 });
-  let constructed = 0;
-  class NativePeerConnection {
-    constructor() {
-      constructed += 1;
+test("the WebRTC guard removes the API in the top frame and in a subframe", () => {
+  // BEHAVIOUR (fake DOM, not a WebView or network test). The guard does not
+  // read window.top, so applying it to any frame must not depend on the frame
+  // being top-level.
+  for (const [label, prepare] of [
+    ["top frame", (dom) => dom],
+    ["cross-origin subframe", asSubframe],
+  ]) {
+    const dom = prepare(createFakeDom({ width: 360, height: 800 }));
+    let peerConnections = 0;
+    let transports = 0;
+    class NativePeerConnection {
+      constructor() {
+        peerConnections += 1;
+      }
     }
-  }
-  dom.window.RTCPeerConnection = NativePeerConnection;
-  dom.window.webkitRTCPeerConnection = NativePeerConnection;
-
-  run(dom, compose({ webrtc: true }));
-
-  for (const name of ["RTCPeerConnection", "webkitRTCPeerConnection"]) {
-    const value = dom.window[name];
-    assert.equal(typeof value, "function", `${name} is still something callable`);
-    assert.notEqual(value, NativePeerConnection, `${name} is replaced, not wrapped`);
-    // Calling it must refuse loudly instead of silently returning null.
-    assert.throws(
-      () => new value(),
-      (error) => error && error.name === "NotSupportedError",
-      `${name} must refuse with NotSupportedError`,
-    );
-  }
-  // The original constructor is unreachable: it was never captured, and the
-  // property cannot be reassigned or deleted.
-  assert.throws(() => {
-    "use strict";
+    class NativeWebTransport {
+      constructor() {
+        transports += 1;
+      }
+    }
     dom.window.RTCPeerConnection = NativePeerConnection;
-  });
-  assert.equal(dom.window.RTCPeerConnection, dom.window.RTCPeerConnection);
-  assert.notEqual(dom.window.RTCPeerConnection, NativePeerConnection);
-  const descriptor = Object.getOwnPropertyDescriptor(dom.window, "RTCPeerConnection");
-  assert.equal(descriptor.configurable, false);
-  assert.equal(descriptor.writable, false);
-  // Applying it twice (document-start + the page-start fallback) must not
-  // stack a second override or re-expose anything.
-  const applied = dom.window.RTCPeerConnection;
-  run(dom, compose({ webrtc: true }));
-  assert.equal(dom.window.RTCPeerConnection, applied);
-  assert.equal(constructed, 0, "the native constructor never ran");
+    dom.window.webkitRTCPeerConnection = NativePeerConnection;
+    dom.window.WebTransport = NativeWebTransport;
+
+    run(dom, compose({ webrtc: true }));
+
+    for (const name of ["RTCPeerConnection", "webkitRTCPeerConnection", "WebTransport"]) {
+      const value = dom.window[name];
+      assert.equal(typeof value, "function", `${label}: ${name} is still callable`);
+      assert.notEqual(value, NativePeerConnection, `${label}: ${name} is replaced`);
+      assert.notEqual(value, NativeWebTransport, `${label}: ${name} is replaced`);
+      // Calling it must refuse loudly instead of silently returning null.
+      assert.throws(
+        () => new value(),
+        (error) => error && error.name === "NotSupportedError",
+        `${label}: ${name} must refuse with NotSupportedError`,
+      );
+      assert.throws(
+        () => value(),
+        (error) => error && error.name === "NotSupportedError",
+        `${label}: ${name} must refuse without new too`,
+      );
+      // The original constructor is unreachable: the property cannot be
+      // reassigned, redefined or deleted by the page.
+      const descriptor = Object.getOwnPropertyDescriptor(dom.window, name);
+      assert.equal(descriptor.configurable, false, `${label}: ${name} is not configurable`);
+      assert.equal(descriptor.writable, false, `${label}: ${name} is not writable`);
+      assert.throws(
+        () => {
+          "use strict";
+          dom.window[name] = NativePeerConnection;
+        },
+        TypeError,
+        `${label}: ${name} cannot be reassigned`,
+      );
+      assert.throws(
+        () => Object.defineProperty(dom.window, name, { value: NativePeerConnection }),
+        TypeError,
+        `${label}: ${name} cannot be redefined`,
+      );
+      assert.throws(
+        () => {
+          "use strict";
+          delete dom.window[name];
+        },
+        TypeError,
+        `${label}: ${name} cannot be deleted`,
+      );
+    }
+    // Applying it twice (document-start + a page-start fallback) must not
+    // stack a second override or re-expose anything.
+    const applied = dom.window.RTCPeerConnection;
+    run(dom, compose({ webrtc: true }));
+    assert.equal(dom.window.RTCPeerConnection, applied, `${label}: never applied twice`);
+    assert.equal(peerConnections, 0, `${label}: the native constructor never ran`);
+    assert.equal(transports, 0, `${label}: the native WebTransport constructor never ran`);
+  }
 });
 
-test("the WebRTC guard is composed once per platform, never twice", () => {
+test("the guard leaves MSE, media and other egress APIs untouched", () => {
+  // BEHAVIOUR (fake DOM only). WebRTC is not on the MSE/HLS/DASH playback
+  // path. The test stubs the browser-shaped APIs and checks that the guard
+  // neither replaces nor wraps them. It cannot prove a real video plays.
+  const dom = createFakeDom({ width: 360, height: 800 });
+  const NativePeerConnection = function NativePeerConnection() {};
+  const MediaSource = function MediaSource() {};
+  MediaSource.isTypeSupported = (type) => type === "video/mp4";
+  const SourceBuffer = function SourceBuffer() {};
+  const play = function play() {};
+  const load = function load() {};
+  const createObjectURL = function createObjectURL() {};
+  const revokeObjectURL = function revokeObjectURL() {};
+  const getUserMedia = function getUserMedia() {};
+  const fetch = function fetch() {};
+  const WebSocket = function WebSocket() {};
+
+  dom.window.RTCPeerConnection = NativePeerConnection;
+  dom.window.MediaSource = MediaSource;
+  dom.window.SourceBuffer = SourceBuffer;
+  dom.window.HTMLMediaElement = { prototype: { play, load } };
+  dom.window.URL = { createObjectURL, revokeObjectURL };
+  dom.window.navigator = { mediaDevices: { getUserMedia } };
+  dom.window.fetch = fetch;
+  dom.window.WebSocket = WebSocket;
+
+  run(dom, compose({ webrtc: true }));
+
+  assert.notEqual(dom.window.RTCPeerConnection, NativePeerConnection, "WebRTC is blocked");
+  assert.equal(dom.window.MediaSource, MediaSource, "MSE is not replaced");
+  assert.equal(dom.window.MediaSource.isTypeSupported("video/mp4"), true, "MSE probing still works");
+  assert.equal(dom.window.SourceBuffer, SourceBuffer, "SourceBuffer is not replaced");
+  assert.equal(dom.window.HTMLMediaElement.prototype.play, play, "media play is not wrapped");
+  assert.equal(dom.window.HTMLMediaElement.prototype.load, load, "media load is not wrapped");
+  assert.equal(dom.window.URL.createObjectURL, createObjectURL, "MSE blob URLs still work");
+  assert.equal(dom.window.URL.revokeObjectURL, revokeObjectURL, "MSE blob URLs can still be revoked");
+  assert.equal(dom.window.navigator.mediaDevices.getUserMedia, getUserMedia);
+  assert.equal(dom.window.fetch, fetch, "fetch keeps the platform implementation");
+  assert.equal(dom.window.WebSocket, WebSocket, "WebSocket keeps the platform implementation");
+});
+
+test("WebTransport is only replaced where the provider exposes it", () => {
+  // BEHAVIOUR (fake DOM). Defining the constructor on an older browser would
+  // make feature detection dishonest and could send a player down a path it
+  // cannot support.
+  const dom = createFakeDom({ width: 360, height: 800 });
+  assert.equal("WebTransport" in dom.window, false, "precondition: provider has no WebTransport");
+  run(dom, compose({ webrtc: true }));
+  assert.equal("WebTransport" in dom.window, false, "no fake WebTransport constructor is invented");
+  assert.equal(dom.window.WebTransport, undefined);
+  assert.throws(() => new dom.window.RTCPeerConnection(), (e) => e.name === "NotSupportedError");
+});
+
+test("source pin: the shipped guard is wired once per platform for every frame", () => {
   const dom = createFakeDom({ width: 360, height: 800 });
   const NativePeerConnection = function NativePeerConnection() {};
   dom.window.RTCPeerConnection = NativePeerConnection;
@@ -203,9 +292,14 @@ test("the WebRTC guard is composed once per platform, never twice", () => {
     /\.initialization_script_for_all_frames\(crate::web::session::WEBRTC_GUARD\)/,
     "the desktop site WebView must install the guard in every frame",
   );
+  // SOURCE-ONLY LIMIT: this regex proves that the call site still exists. It
+  // does not prove that WebView2/WebKitGTK applied the script before page
+  // code, that the provider honoured it, or that no UDP/QUIC packet escaped.
+  // Android additionally gates on DOCUMENT_START_SCRIPT in the controller;
+  // desktop has no equivalent runtime attestation.
 });
 
-test("the popup guard source keeps no reference to the original function", () => {
+test("source pin: the popup guard keeps no reference to the original function", () => {
   assert.match(POPUP_GUARD, /window\.open = function/, "the override is the shipped text");
   assert.ok(!POPUP_GUARD.includes("__animehubNative"), "no escape-hatch property name");
   assert.ok(!POPUP_GUARD.includes("nativeOpen"), "no captured reference");
@@ -282,7 +376,7 @@ test("the cosmetic rules still reach a subframe document", () => {
   );
 });
 
-test("session.rs composes exactly these files, in this order", () => {
+test("source pin: session.rs composes exactly these files, in this order", () => {
   // This is the pin that makes the tests above about the SHIPPED script: the
   // generator has to keep interpolating the popup guard, the cosmetic rules and
   // the controller from these files, in the order they are composed here.
