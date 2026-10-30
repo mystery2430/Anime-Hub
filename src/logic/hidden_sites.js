@@ -44,9 +44,33 @@ export function hasNoHiddenSites(sites) {
   return hiddenSiteRows(sites).length === 0;
 }
 
+/**
+ * Characters that may not appear in a rendered row.
+ *
+ * C0/DEL/C1 controls are invisible but break the layout; the Unicode
+ * bidirectional controls are worse: U+202E (RIGHT-TO-LEFT OVERRIDE) reorders
+ * everything after it, so a stored name such as `Kötü\u202E...` can render as
+ * a different site's name next to the "Geri göster" button. The row is written
+ * with `textContent` (no markup risk), but reordering is a spoofing risk the
+ * restore list does not need to carry. Line/paragraph separators and the BOM
+ * are stripped for the same layout reason.
+ */
+function isDisplayable(code) {
+  if (code < 0x20 || code === 0x7f) return false; // C0, DEL
+  if (code >= 0x80 && code <= 0x9f) return false; // C1
+  if (code === 0x061c) return false; // ARABIC LETTER MARK
+  if (code >= 0x200b && code <= 0x200f) return false; // zero-width + LRM/RLM
+  if (code === 0x2028 || code === 0x2029) return false; // line/paragraph separator
+  if (code >= 0x202a && code <= 0x202e) return false; // bidi embeddings/overrides
+  if (code >= 0x2060 && code <= 0x2064) return false; // word joiner, invisible ops
+  if (code >= 0x2066 && code <= 0x206f) return false; // bidi isolates + deprecated formats
+  if (code === 0xfeff) return false; // BOM / zero-width no-break space
+  return true;
+}
+
 function displayName(raw) {
   const cleaned = [...raw]
-    .filter((char) => char.codePointAt(0) >= 0x20 && char.codePointAt(0) !== 0x7f)
+    .filter((char) => isDisplayable(char.codePointAt(0)))
     .slice(0, NAME_MAX)
     .join("")
     .trim();
