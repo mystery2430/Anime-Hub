@@ -439,6 +439,52 @@ class SiteNavigationPolicyTest {
     }
 
     @Test
+    fun `request checkpoint blocks a private answer and caches it`() {
+        val gate = NavigationDnsGate()
+        var resolves = 0
+        val loopback = listOf("127.0.0.1")
+
+        assertTrue(
+            gate.blocksRequest("req.example", 0L) {
+                resolves += 1
+                loopback
+            },
+        )
+        assertEquals(1, resolves)
+        // The second request answers from the cached PRIVATE verdict: no second
+        // resolver call, and still refused.
+        assertTrue(
+            gate.blocksRequest("REQ.example.", 1L) { error("must not resolve twice") },
+        )
+        assertEquals(1, resolves)
+    }
+
+    @Test
+    fun `request checkpoint fails closed on resolver failure or timeout`() {
+        val gate = NavigationDnsGate()
+        // AsyncDnsResolver throws IOException at its deadline; the request path
+        // must refuse rather than serve an unverified host.
+        assertTrue(
+            gate.blocksRequest("timeout.example", 0L) {
+                throw java.io.IOException("resolver timed out")
+            },
+        )
+        assertNull(gate.cachedVerdict("timeout.example", 1L))
+
+        // A later successful answer is still usable: the failure cached nothing.
+        assertFalse(gate.blocksRequest("timeout.example", 1L) { listOf("93.184.216.34") })
+        assertFalse(gate.blocksRequest("timeout.example", 2L) { error("must not resolve") })
+    }
+
+    @Test
+    fun `request checkpoint treats an empty answer as a refusal`() {
+        val gate = NavigationDnsGate()
+        assertTrue(gate.blocksRequest("empty.example", 0L) { emptyList() })
+        assertNull(gate.cachedVerdict("empty.example", 1L))
+        assertEquals(0, gate.size())
+    }
+
+    @Test
     fun `the probe budget bounds the resolver queue and recovers when a slot frees`() {
         val gate = NavigationDnsGate(maxProbing = 2)
 

@@ -25,9 +25,11 @@ import java.util.LinkedHashMap
  *
  * A top-level navigation cannot wait for a resolver (it runs on the UI thread),
  * so [decide] only ever answers from the cache and asks the caller to probe on
- * a miss. The request path resolves synchronously — it is already off the UI
- * thread — and feeds the answer back through [record], which is what makes the
- * NEXT top-level navigation block a redirect to a private address.
+ * a miss. The request path uses [blocksRequest], which is allowed to wait only
+ * for the caller-owned resolver deadline (never an unbounded platform call)
+ * and fails closed when resolution fails or times out. Both paths feed their
+ * answers back through [record], which is what makes the NEXT top-level
+ * navigation block a redirect to a private address.
  *
  * TWO THINGS THIS DELIBERATELY REFUSES TO DO:
  *
@@ -100,10 +102,41 @@ class NavigationDnsGate(
       // pressure that keeps `probing` and the resolver executor's task queue
       // bounded when a page navigates through many distinct hostnames; the
       // navigation is treated like a normal cache miss (allowed, unprobed) and
-      // the request checkpoint still resolves it synchronously.
+      // the request checkpoint still resolves it with a bounded deadline.
       return Decision.ALLOW
     }
     return if (probing.add(host)) Decision.ALLOW_AND_PROBE else Decision.ALLOW
+  }
+
+  /**
+   * Decision for the request checkpoint (`shouldInterceptRequest`), where a
+   * bounded wait is acceptable because the callback is already off the UI
+   * thread.
+   *
+   * Unlike [decide], a missing verdict is not fail-open: [resolve] must be the
+   * caller's resolver with its own deadline, and a throw (timeout, interrupt,
+   * resolver outage) or an empty answer refuses the request. The top-level
+   * checkpoint keeps its ALLOW_AND_PROBE behaviour because it cannot wait.
+   */
+  fun blocksRequest(rawHost: String?, now: Long, resolve: (String) -> List<String>): Boolean {
+    val host = normalize(rawHost) ?: return false
+    when (cachedVerdict(host, now)) {
+      Verdict.PUBLIC -> return false
+      Verdict.PRIVATE, Verdict.CHANGED -> return true
+      null -> Unit
+    }
+    val answer =
+      try {
+        resolve(host)
+      } catch (_: Exception) {
+        recordLookupFailure(host)
+        return true
+      }
+    if (answer.isEmpty()) {
+      recordLookupFailure(host)
+      return true
+    }
+    return record(host, answer, now) == Decision.BLOCK
   }
 
   /** Record a resolver answer; returns the decision it implies for this host. */

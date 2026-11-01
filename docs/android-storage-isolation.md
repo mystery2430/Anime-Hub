@@ -257,8 +257,8 @@ Two checkpoints, deliberately different rules:
 | --- | --- | --- | --- | --- |
 | cleartext `http://` / `ws://` | blocked (`on_navigation`) | engine mixed-content policy | blocked (`SiteNavigationPolicy`) | blocked (`shouldInterceptRequest`) |
 | private/loopback/reserved **IP literals** and host rules | blocked | not checked | blocked | blocked |
-| user blocklist | blocked | not checked | **not enforced** | **not enforced** |
-| DNS answer resolving to a private address | checked at navigation time (fail-open) | not checked | **refused at CONNECT by the pinning proxy** (authoritative); `NavigationDnsGate` pre-check kept as defence in depth | same (every request is a new `CONNECT`) |
+| user blocklist | blocked | not checked | blocked (`SiteNavigationPolicy.hostAllowed`) | blocked (`SiteNavigationPolicy.hostAllowed`) |
+| DNS answer resolving to a private address | checked at navigation time (fail-open) | not checked | **refused at CONNECT by the pinning proxy** (authoritative); `NavigationDnsGate` pre-check kept as defence in depth and fails closed on the request path | same (every request is a new `CONNECT`) |
 | top-level `data:` document | refused | n/a (`data:` sub-resources stay allowed) | refused | allowed (sub-resource) |
 | `WebView.loadUrl` by the app itself | Rust validates the first URL | — | bypasses the guard | — |
 
@@ -267,13 +267,20 @@ it returns an empty `403` (no body, no headers, nothing about the request or the
 reason handed back to the page) for a refused request and forwards everything
 else unchanged. It runs on the WebView's background thread.
 
+The user blocklist is part of `SiteNavigationPolicy.hostAllowed`, so both the
+top-level and the request checkpoint enforce it. Rust pushes the parsed snapshot
+fail-closed before every open (and after settings/reset); a failed push aborts
+the open, or closes an already-open site, instead of running with stale rules.
+
 **DNS is now decided at connect time (round 16).** Resolving a hostname inside
 `shouldInterceptRequest` and returning `null` does not bind the engine's own
 resolution — the answer we checked is not the address it connects to — so that
-callback alone cannot see a rebinding hostname. Android does expose a
-process-wide hook, `androidx.webkit.ProxyController` (`PROXY_OVERRIDE`), and
-from round 16 a site WebView's traffic goes through an in-process loopback
-proxy that owns the connection:
+callback alone cannot see a rebinding hostname. The request checkpoint now uses
+the bounded `AsyncDnsResolver` (deadline, fail-closed), but that only removes
+the unbounded blocking call; it still cannot pin the engine's connection. Android
+does expose a process-wide hook, `androidx.webkit.ProxyController`
+(`PROXY_OVERRIDE`), and from round 16 a site WebView's traffic goes through an
+in-process loopback proxy that owns the connection:
 
 * `SiteProxyController` installs one `ProxyConfig` with a single
   `addProxyRule("127.0.0.1:<ephemeral>")` and `removeImplicitRules()`. There is

@@ -326,6 +326,24 @@ test("reset() clears unconditionally", () => {
   assert.equal(h.session.statusString(), "idle");
 });
 
+test("an out-of-order open result cannot overwrite a newer opening", () => {
+  const h = harness();
+  // Two rapid tile clicks: each starts an attempt before either resolves.
+  const first = h.session.beginOpen();
+  const second = h.session.beginOpen();
+
+  // The newer invoke resolves first and owns the label.
+  assert.equal(h.session.opened("site-b", "id-b", "open-b-1", second), true);
+  assert.equal(h.session.currentLabel(), "site-b");
+
+  // The older invoke resolves later. It must not resurrect its label/session.
+  assert.equal(h.session.opened("site-a", "id-a", "open-a-1", first), false);
+  assert.equal(h.session.currentLabel(), "site-b");
+  assert.equal(h.session.currentSessionId(), "open-b-1");
+  assert.equal(h.session.hasSession(), true);
+  assert.equal(h.session.statusString(), "idle");
+});
+
 test("custom errorText formats the rejection reason", async () => {
   const h = harness({
     errorText: (e) => `formatted:${e}`,

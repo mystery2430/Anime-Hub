@@ -208,6 +208,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         settings: Mutex::new(settings),
         blocklist: Mutex::new(blocklist),
         oauth_state: Mutex::new(None),
+        anilist_refresh_lock: tokio::sync::Mutex::new(()),
         startup_warning: Mutex::new(startup_warning),
         current_site: Mutex::new(None),
         pip_lock: Mutex::new(()),

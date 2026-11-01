@@ -926,6 +926,25 @@ pub fn map_search(d: wire::SearchPage) -> Vec<SearchResult> {
 // Client
 // ---------------------------------------------------------------------------
 
+/// Whether a failed refresh proves the refresh token is dead (delete it) or
+/// the failure is transient (keep the token and retry later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshFailure {
+    Rejected,
+    Transient,
+}
+
+/// Only an explicit `invalid_grant` or HTTP 401 proves the refresh token is
+/// dead. Rate limits, server errors and unparseable bodies are transient and
+/// must not sign the user out.
+fn classify_refresh_failure(status: reqwest::StatusCode, error: Option<&str>) -> RefreshFailure {
+    if status == reqwest::StatusCode::UNAUTHORIZED || error == Some("invalid_grant") {
+        RefreshFailure::Rejected
+    } else {
+        RefreshFailure::Transient
+    }
+}
+
 pub struct AniListClient {
     http: reqwest::Client,
     cfg: AniListConfig,
@@ -1000,7 +1019,19 @@ impl AniListClient {
             .send()
             .await?;
         if !resp.status().is_success() {
-            return Err(AppError::Unauthorized);
+            let status = resp.status();
+            let body: OAuthError = resp.json().await.unwrap_or(OAuthError {
+                error: None,
+                error_description: None,
+                message: None,
+            });
+            return match classify_refresh_failure(status, body.error.as_deref()) {
+                RefreshFailure::Rejected => Err(AppError::Unauthorized),
+                RefreshFailure::Transient => Err(AppError::AniList(format!(
+                    "AniList oturumu yenilenemedi (HTTP {}); daha sonra tekrar denenecek",
+                    status.as_u16()
+                ))),
+            };
         }
         let body: TokenResponse = resp.json().await?;
         Ok(body.into_token(now_unix()))
@@ -2002,6 +2033,30 @@ mod tests {
         assert!(t.needs_refresh(940), "60s skew must apply");
         assert!(t.needs_refresh(2000));
         assert_eq!(t.authorization_header(), "Bearer a");
+    }
+
+    #[test]
+    fn refresh_failure_classification_keeps_transient_errors_retryable() {
+        assert_eq!(
+            classify_refresh_failure(reqwest::StatusCode::UNAUTHORIZED, None),
+            RefreshFailure::Rejected
+        );
+        assert_eq!(
+            classify_refresh_failure(reqwest::StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            RefreshFailure::Rejected
+        );
+        assert_eq!(
+            classify_refresh_failure(reqwest::StatusCode::TOO_MANY_REQUESTS, None),
+            RefreshFailure::Transient
+        );
+        assert_eq!(
+            classify_refresh_failure(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None),
+            RefreshFailure::Transient
+        );
+        assert_eq!(
+            classify_refresh_failure(reqwest::StatusCode::BAD_REQUEST, Some("invalid_client")),
+            RefreshFailure::Transient
+        );
     }
 
     #[test]

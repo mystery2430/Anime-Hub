@@ -292,10 +292,6 @@ pub fn lock_desktop_session() -> AppResult<std::sync::MutexGuard<'static, ()>> {
 /// close path entirely) can lose.
 const SESSION_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Safety valve: a sync thread ends itself after this long even if the
-/// ownership checks somehow never fire.
-const SESSION_SYNC_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
-
 /// Window/webview label used for a site session.
 pub fn label_for(site_id: &str) -> String {
     format!("{SITE_LABEL_PREFIX}{}", profile_dir_name(site_id))
@@ -769,13 +765,10 @@ fn emit_site_closed(app: &AppHandle, closed: &CurrentSite) {
 #[cfg(desktop)]
 fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: String) {
     std::thread::spawn(move || {
-        let started = std::time::Instant::now();
+        // No lifetime cap: the session-ownership check below is the only stop
+        // condition, so an open site keeps persisting for as long as it lives.
         loop {
             std::thread::sleep(SESSION_SYNC_INTERVAL);
-            if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
-                log::warn!("site oturum eşitleme süresi doldu");
-                return;
-            }
             // Hold the desktop session lock across the ownership check and the
             // cookie export. `clear_site_data`/`remove_site` hold the same
             // lock across close+delete, so this thread either sees the session
@@ -816,13 +809,10 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
 #[cfg(target_os = "android")]
 fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: String) {
     std::thread::spawn(move || {
-        let started = std::time::Instant::now();
+        // No lifetime cap: the session-ownership check below is the only stop
+        // condition, so an open site keeps flushing for as long as it lives.
         loop {
             std::thread::sleep(SESSION_SYNC_INTERVAL);
-            if started.elapsed() > SESSION_SYNC_MAX_LIFETIME {
-                log::warn!("site oturum eşitleme süresi doldu");
-                return;
-            }
             let _guard = match lock_android_session() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -1187,14 +1177,16 @@ fn queued_site_profile_prefix(site_id: &str) -> String {
 
 /// Whether a legacy jar entry belongs to the site being opened.
 ///
-/// The 0.3.4 jar was captured from the shared WebView's whole cookie store, so
-/// it can contain cookies for CDN/player/ad origins that a profile-scoped
-/// `setCookie(site_url, …)` will reject. Replaying those turned one rejected
-/// third-party cookie into a permanent `migration-partial` loop. Migration is
-/// therefore restricted to cookies the target site can actually own:
-/// host-only entries (no Domain attribute) and entries whose Domain is the
-/// site host or one of its parents. Anything else is intentionally not
-/// migrated and is reported by count, not treated as a failure.
+/// The 0.3.4 Android jar is URL-scoped, not a dump of the shared store: base
+/// export asked the cookie manager for the site URL and kept only the
+/// `name=value` pairs, so legacy entries are host-only and cannot carry a
+/// foreign origin's cookie. The ownership filter
+/// still applies to structured or future jars that can carry a `Domain`:
+/// `setCookie(site_url, …)` rejects a foreign domain, and replaying one such
+/// rejection turned migration into a permanent `migration-partial` loop.
+/// Migration therefore accepts host-only entries (no Domain attribute) and
+/// entries whose Domain is the site host or one of its parents. Anything else
+/// is intentionally not migrated and is reported by count, not as a failure.
 ///
 /// A URL that does not parse is fail-closed here: no cookie is imported.
 pub fn cookie_belongs_to_site(stored: &crate::web::session::StoredCookie, site_url: &str) -> bool {
@@ -3988,6 +3980,7 @@ mod tests {
             settings: Mutex::new(Settings::default()),
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
+            anilist_refresh_lock: tokio::sync::Mutex::new(()),
             startup_warning: Mutex::new(warning),
             current_site: Mutex::new(current),
             pip_lock: Mutex::new(()),
@@ -4055,13 +4048,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_intervals_are_sane() {
+    fn sync_interval_is_bounded() {
         // A crash loses at most one interval of session changes; keep that
-        // bounded but not chatty.
+        // bounded but not chatty. There is deliberately no lifetime cap: the
+        // loop stops only when the session stops being current.
         assert!(SESSION_SYNC_INTERVAL.as_secs() >= 15);
         assert!(SESSION_SYNC_INTERVAL.as_secs() <= 300);
-        // The safety valve must always outlive many intervals.
-        assert!(SESSION_SYNC_MAX_LIFETIME > SESSION_SYNC_INTERVAL * 100);
     }
 
     #[test]
@@ -4749,6 +4741,7 @@ mod tests {
             settings: Mutex::new(Settings::default()),
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
+            anilist_refresh_lock: tokio::sync::Mutex::new(()),
             startup_warning: Mutex::new(warning),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
@@ -4760,7 +4753,8 @@ mod tests {
     }
 
     /// A legacy 0.3.4 jar with two live cookies (one session cookie, one
-    /// with a future expiry) — both must reach phase 1 as headers.
+    /// with a future expiry) — both must reach phase 1 as headers. The entries
+    /// are host-only, matching the URL-scoped Android capture.
     fn live_jar_bytes() -> Vec<u8> {
         let jar = CookieJar {
             site_id: "jar-site".into(),
@@ -5224,6 +5218,7 @@ mod tests {
             settings: Mutex::new(Settings::default()),
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
+            anilist_refresh_lock: tokio::sync::Mutex::new(()),
             startup_warning: Mutex::new(warning),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
@@ -5496,6 +5491,7 @@ mod tests {
             settings: Mutex::new(Settings::default()),
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
+            anilist_refresh_lock: tokio::sync::Mutex::new(()),
             startup_warning: Mutex::new(warning),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
@@ -7392,11 +7388,11 @@ mod tests {
 
     #[test]
     fn the_cookie_jar_import_only_restores_the_sites_own_cookies() {
-        // The one-time Android profile migration replays the legacy jar. That
-        // jar was written while cookies from several sites could share a
-        // store, so it may carry third-party and other-origin cookies — which
-        // the target profile must never inherit. The migration goes through
-        // this selector.
+        // The one-time Android profile migration replays the legacy jar. The
+        // 0.3.4 capture is URL-scoped, but the filter also protects structured
+        // or future jars that can carry a Domain: a foreign or third-party
+        // entry must never enter the target profile. The migration goes
+        // through this selector.
         let now = crate::anilist::now_unix();
         let cookies = vec![
             cookie_for_test("own", None, None),

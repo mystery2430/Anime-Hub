@@ -1538,14 +1538,17 @@ test("navigation policy wraps the site client too", () => {
     "src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt",
   );
   assert.match(guardKt, /class SiteNavigationGuard/);
-  assert.match(guardKt, /InetAddress\.getAllByName\(host\)/);
+  // The request path uses the bounded resolver (F-04); the top-level path can
+  // only consult the cache because it must answer synchronously.
+  assert.match(guardKt, /AsyncDnsResolver\(PlatformDnsLookup\(\), timeoutMs = DNS_TIMEOUT_MS\)/);
   // The verdict cache is shared by both checkpoints (round 6): the guard keeps
   // the resolver calls, NavigationDnsGate owns classify/caching/bounds.
   assert.match(guardKt, /dnsGate\.decide\(uri\.host/);
-  assert.match(guardKt, /dnsGate\.cachedVerdict\(host, now\)/);
+  assert.match(guardKt, /dnsGate\.blocksRequest\(uri\.host/);
   const dnsGateKt = read(
     "src-tauri/android-plugin/kotlin/dev/animehub/app/NavigationDnsGate.kt",
   );
+  assert.match(dnsGateKt, /fun blocksRequest\(rawHost: String\?, now: Long/);
   assert.match(dnsGateKt, /ResolvedHostPolicy\.classify\(previous, answer\)/);
   assert.match(dnsGateKt, /DnsVerdict\.PRIVATE_ADDRESS/);
   assert.match(dnsGateKt, /MAX_HOSTS/);

@@ -343,6 +343,9 @@ test("the obsolete Android storage-isolation warning is gone from the UI", () =>
   const openSite = ui.slice(start, end);
   assert.equal(openSite.includes("opened.isolated"), false);
   assert.equal(openSite.includes("şifreli blob'lara aktarılır"), false);
+  // S-01: an out-of-order open result must not overwrite a newer attempt.
+  assert.match(openSite, /const opening = backSession\.beginOpen\(\);/);
+  assert.match(openSite, /backSession\.opened\([^;]*opening\)/);
   // Android now isolates per site through WebView profiles, so the old
   // "same-origin isolation not yet solved" claim must not reappear anywhere,
   // and the flag that surfaced it was removed with the claim.
@@ -672,6 +675,27 @@ test("the Android navigation guard keeps the desktop host rules in step", () => 
 
   // The launcher origin has no exception: a site must not load it.
   assert.equal(/tauri\.localhost"\s*->\s*return true/.test(kt), false);
+});
+
+test("the storage matrix states the Android user blocklist is enforced at both checkpoints", () => {
+  // F-06: the code and `docs/audit-item-status.md` say the snapshot is
+  // enforced, but the storage matrix used to say "not enforced" for Android.
+  const doc = read(join(ROOT, "docs/android-storage-isolation.md"));
+  const row = doc
+    .split("\n")
+    .find((line) => line.startsWith("| user blocklist |"));
+  assert.ok(row, "user blocklist matrix row is missing");
+  const cells = row.split("|").map((cell) => cell.trim());
+  assert.equal(cells[1], "user blocklist");
+  assert.equal(cells[4].includes("not enforced"), false, "Android top-level must not claim the blocklist is unenforced");
+  assert.equal(cells[5].includes("not enforced"), false, "Android sub-resource must not claim the blocklist is unenforced");
+  assert.match(cells[4], /blocked/);
+  assert.match(cells[5], /blocked/);
+  // The push is fail-closed: the same claim `docs/audit-item-status.md` makes.
+  assert.match(
+    doc.replace(/\s+/g, " "),
+    /pushes the parsed snapshot fail-closed before every open/i,
+  );
 });
 
 test("Android navigation policy: numeric IPv4 spellings and documentation ranges are refused like Rust", () => {

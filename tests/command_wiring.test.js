@@ -90,7 +90,11 @@ test("site-closed producers carry the identity of the session they close", () =>
   // `open_site` must hand the launcher the identity alongside the label, and
   // the launcher must store it with the active opening.
   assert.match(commandsRs, /\.map\(\|\(label, active_session_id\)\| OpenedSite \{[\s\S]*?session_id: active_session_id,/);
-  assert.match(mainJs, /backSession\.opened\(\s*opened\.label,\s*tile\.id,\s*opened\.sessionId,?\s*\)/);
+  assert.match(mainJs, /const opening = backSession\.beginOpen\(\)/);
+  assert.match(
+    mainJs,
+    /backSession\.opened\(\s*opened\.label,\s*tile\.id,\s*opened\.sessionId,\s*opening\s*\)/,
+  );
   assert.match(mainJs, /backSession\.closedByEvent\(payload\)/);
 });
 
@@ -241,8 +245,12 @@ test("top-level navigation consults the DNS gate and the gate is shipped", () =>
   const guard = read("src-tauri/android-plugin/kotlin/dev/animehub/app/SiteNavigationGuard.kt");
   const gate = read("src-tauri/android-plugin/kotlin/dev/animehub/app/NavigationDnsGate.kt");
   assert.match(guard, /shouldOverrideUrlLoading[\s\S]{0,900}dnsGate\.decide/);
-  assert.match(guard, /dnsGate\.cachedVerdict/);
+  // The request checkpoint resolves through the bounded resolver (F-04) and
+  // fails closed; it no longer calls the synchronous resolver directly.
+  assert.match(guard, /dnsGate\.blocksRequest\(uri\.host/);
+  assert.match(guard, /AsyncDnsResolver\(PlatformDnsLookup\(\), timeoutMs = DNS_TIMEOUT_MS\)/);
   assert.match(gate, /class NavigationDnsGate/);
+  assert.match(gate, /fun blocksRequest\(/);
   assert.match(gate, /Decision\.BLOCK/);
   assert.match(read("scripts/android_prepare.py"), /"NavigationDnsGate"/);
 });

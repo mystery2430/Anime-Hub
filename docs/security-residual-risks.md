@@ -1504,7 +1504,8 @@ Two defects were found and fixed in `NavigationDnsGate`:
    blocks for the resolver timeout. `NavigationDnsGate` now caps the set at
    `MAX_PROBING` (32); a host that cannot get a slot is simply not probed,
    which is the same "unknown, fail open" state as a cache miss (the request
-   checkpoint still resolves synchronously). Regression test: `the probe budget
+   checkpoint still resolves, through the bounded `AsyncDnsResolver` with its
+   deadline, and fails closed on a failure). Regression test: `the probe budget
    bounds the resolver queue and recovers when a slot frees`.
 
 One resource leak was found and fixed: `SiteNavigationGuard` owns
@@ -1763,15 +1764,17 @@ no longer presented as the guarantee, and their own documentation says so:
   `MAX_PROBING`, so neither the verdict set nor the single resolver queue grows
   with a page's host count;
 * a verdict lasts `CACHE_MS` (60 s), after which the host is unknown and is
-  re-probed; the request checkpoint re-resolves synchronously, so an expired
-  verdict cannot turn a known-bad host into an allowed connection.
+  re-probed; the request checkpoint resolves again through the bounded
+  `AsyncDnsResolver` and fails closed on failure, so an expired verdict cannot
+  turn a known-bad host into an allowed connection.
 
 Their residual is the **TOCTOU** window: the engine resolves again when it
 connects, so a rebinding server could answer a public address to both
 checkpoints and a private one to the socket. That window is what the proxy
-removes — by owning the connect, not by adding a callback. A resolver outage
-remains deliberately fail-open inside `NavigationDnsGate` so an offline DNS
-server does not brick the app; the proxy is the component that turns an empty or
+removes — by owning the connect, not by adding a callback. At the top level a
+resolver outage remains deliberately fail-open inside `NavigationDnsGate` so an
+offline DNS server does not brick the app; the request checkpoint fails closed
+on a timeout or failure, and the proxy is the component that turns an empty or
 broken answer into a refusal (502) instead.
 
 What remains genuinely open on Android, stated as open:

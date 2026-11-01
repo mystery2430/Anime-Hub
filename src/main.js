@@ -339,12 +339,14 @@ async function refreshLauncher() {
 // ---------------------------------------------------------------------------
 
 async function openSite(tile) {
+  const opening = backSession.beginOpen();
   try {
     const opened = await call("open_site", { id: tile.id });
-    openSiteLabel = opened.label;
-    // `sessionId` identifies this opening, not just `tile.id` (which stays
-    // the same when the site is closed and reopened).
-    backSession.opened(opened.label, tile.id, opened.sessionId);
+    // A newer click may have started while this invoke was in flight. Only the
+    // newest attempt may own the label; a stale success must not overwrite it.
+    if (backSession.opened(opened.label, tile.id, opened.sessionId, opening)) {
+      openSiteLabel = opened.label;
+    }
   } catch (e) {
     showNotice(errMessage(e));
   }

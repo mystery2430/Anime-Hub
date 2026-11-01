@@ -62,9 +62,11 @@ test("the Android message does not claim the cache or service workers were clear
     assert.match(msg, /profil çerezleri/, "cookies were cleared");
     assert.match(msg, /konum izinleri/, "geolocation permissions were cleared");
     assert.match(msg, /web depolama/, "Web Storage was cleared");
-    // The caveat, and no overclaim.
-    assert.match(msg, /HTTP önbelleği ve servis çalışanları/);
+    // The caveat names all three residual stores, not just "cache".
+    assert.match(msg, /HTTP önbelleği, servis çalışanları ve Cache Storage/);
     assert.match(msg, /profil bazında silinemiyor/);
+    // And it names the only action that actually removes them.
+    assert.match(msg, /Tam temizlik için siteyi silin/);
     assert.equal(
       /önbelle[^.]*silindi/i.test(msg),
       false,

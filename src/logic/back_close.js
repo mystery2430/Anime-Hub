@@ -22,7 +22,10 @@
  *    payload carries the exact opaque `sessionId` returned by THIS
  *    `open_site`. A site id is not an opening identity: closing and reopening
  *    the same site produces two sessions with the same site id, so a delayed
- *    event from the first opening must not clear the second.
+ *    event from the first opening must not clear the second;
+ *  * an `open_site` result is committed only while it is still the newest
+ *    attempt, so two rapid tile clicks cannot leave the label on the losing
+ *    site when their invokes resolve out of order.
  *
  * Pure logic: no DOM, no Tauri import — `main.js` injects the `call`
  * bridge, the notice callback and the error formatter, and the tests drive
@@ -51,6 +54,11 @@ export function createBackSession({ call, notify, errorText }) {
    * native `open_site` command and echoed by `animehub://site-closed`.
    */
   let sessionId = null;
+  /**
+   * Monotonic attempt counter. An `open_site` result may arrive after a newer
+   * attempt has started; only the newest attempt may replace the label.
+   */
+  let openGeneration = 0;
   /** idle | pending | closed | failed:<message> */
   let state = "idle";
   /** Reason of the last failure (kept for diagnostics/retry messages). */
@@ -106,19 +114,33 @@ export function createBackSession({ call, notify, errorText }) {
 
   return {
     /**
+     * Start an opening attempt and return its generation token. Pass the token
+     * to [opened] so a slow result cannot overwrite a newer attempt.
+     */
+    beginOpen() {
+      openGeneration += 1;
+      return openGeneration;
+    },
+
+    /**
      * Take ownership after `open_site` succeeded. Resets any leftover
      * failure state: the new opening starts clean.
      *
      * `newSessionId` is the native opening identity. Without it, no close
      * event can prove ownership, so such a session can only be cleared by the
      * explicit `reset()` path.
+     *
+     * `generation` is the token from [beginOpen]. When supplied, the commit is
+     * refused if a newer attempt has started; returns whether it committed.
      */
-    opened(newLabel, newSiteId, newSessionId) {
+    opened(newLabel, newSiteId, newSessionId, generation) {
+      if (typeof generation === "number" && generation !== openGeneration) return false;
       label = newLabel || null;
       siteId = newSiteId ?? null;
       sessionId = typeof newSessionId === "string" && newSessionId ? newSessionId : null;
       state = "idle";
       lastError = "";
+      return true;
     },
 
     /** Whether a close can be started right now (the Kotlin hook's value). */

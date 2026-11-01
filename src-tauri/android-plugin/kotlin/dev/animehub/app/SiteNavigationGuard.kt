@@ -14,7 +14,6 @@ import android.webkit.WebResourceResponse
 import android.os.SystemClock
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import java.net.InetAddress
 import java.util.concurrent.Executors
 
 /**
@@ -38,10 +37,11 @@ import java.util.concurrent.Executors
  *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
  *    `open_on_mobile` already validates the first URL).
  *  - Partially covered: DNS rebinding. BOTH checkpoints consult
- *    [NavigationDnsGate]: `shouldInterceptRequest` resolves the host (short,
- *    bounded cache) and refuses a private/loopback/link-local answer or a
- *    changed public answer, and `shouldOverrideUrlLoading` cancels a
- *    redirect/main-frame target whose *cached* answer is private or changed.
+ *    [NavigationDnsGate]: `shouldInterceptRequest` resolves the host through
+ *    [AsyncDnsResolver] with a bounded deadline and refuses a private/
+ *    loopback/link-local answer, a changed public answer, or any resolver
+ *    failure; `shouldOverrideUrlLoading` cancels a redirect/main-frame target
+ *    whose *cached* answer is private or changed.
  *    On a cache miss the top-level check cannot block (it must answer
  *    synchronously and never resolve on the UI thread), so it allows the
  *    navigation and probes in the background. This is defence in depth, not
@@ -60,6 +60,14 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
 
   /** Shared verdict cache for both checkpoints. */
   private val dnsGate = NavigationDnsGate()
+
+  /**
+   * Bounded resolver for the request checkpoint and the top-level probe.
+   * `DnsResolver.query` with a caller-owned deadline: a provider that never
+   * answers cannot hold the WebView request thread past [DNS_TIMEOUT_MS].
+   */
+  private val dnsResolver =
+    AsyncDnsResolver(PlatformDnsLookup(), timeoutMs = DNS_TIMEOUT_MS)
 
   /**
    * One daemon thread for top-level probes. The UI thread must never resolve:
@@ -100,8 +108,11 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
    * engine's own later resolution keeps a TOCTOU window, documented in
    * `docs/security-residual-risks.md` and NOT claimed as fixed.
    *
-   * The cache is per-process, keyed by hostname, and bounded. A resolver
-   * failure is fail-open: a DNS outage must not brick every site.
+   * The cache is per-process, keyed by hostname, and bounded. The request
+   * checkpoint fails CLOSED when resolution fails, times out or returns no
+   * address: the pinned proxy is the authoritative check, and serving a
+   * subresource whose address was not established would be the weaker choice.
+   * The top-level probe remains fail-open because it must answer synchronously.
    *
    * Runs on the WebView's background thread, never the UI thread.
    */
@@ -115,7 +126,7 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
       // Keep the existing fail-closed response, without per-request logging.
       return blockedResponse()
     }
-    if (resolvesToPrivateAddress(uri)) {
+    if (requestDnsBlocks(uri)) {
       return blockedResponse()
     }
     return inner.shouldInterceptRequest(view, request)
@@ -132,10 +143,11 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
     try {
       probeExecutor.execute {
         try {
-          val answer = InetAddress.getAllByName(host).mapNotNull { it.hostAddress }
+          val answer = dnsResolver(host).mapNotNull { it.hostAddress }
           dnsGate.record(host, answer, SystemClock.elapsedRealtime())
         } catch (_: Exception) {
-          // Resolver outage: fail-open, and never leave the host "probing".
+          // Resolver outage: fail-open at the top level, and never leave the
+          // host "probing". The request checkpoint still fails closed.
           dnsGate.recordLookupFailure(host)
         }
       }
@@ -170,40 +182,17 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
   }
 
   /**
-   * Best-effort DNS pre-check. `shouldInterceptRequest` runs on a WebView
-   * background thread, so the resolver call cannot block the UI.
+   * Request-path DNS pre-check. The resolver is bounded by
+   * [DNS_TIMEOUT_MS]: a provider that never answers releases the request at
+   * the deadline and [NavigationDnsGate.blocksRequest] refuses it. IP literals
+   * and non-HTTPS schemes are left to the pure policy, as before.
    */
-  private fun resolvesToPrivateAddress(uri: android.net.Uri): Boolean {
+  private fun requestDnsBlocks(uri: android.net.Uri): Boolean {
     val scheme = uri.scheme?.lowercase() ?: return false
     if (scheme != "https" && scheme != "wss") return false
-    val host = uri.host?.lowercase()?.trimEnd('.') ?: return false
-    if (host.isEmpty()) return false
-    // IP literals are already covered by the pure policy; skip the resolver.
-    // The "is this a number" rule is `IpPolicy.endsInANumber`, the SAME one
-    // `NavigationDnsGate.normalize` uses — two slightly different definitions
-    // (this used to be "all digits and dots") is how one path resolves a host
-    // the other deliberately leaves to the policy.
-    val bare = host.removePrefix("[").removeSuffix("]")
-    if (bare.contains(':') || IpPolicy.endsInANumber(bare)) return false
-    val now = SystemClock.elapsedRealtime()
-    when (dnsGate.cachedVerdict(host, now)) {
-      NavigationDnsGate.Verdict.PUBLIC -> return false
-      NavigationDnsGate.Verdict.PRIVATE, NavigationDnsGate.Verdict.CHANGED -> return true
-      null -> Unit
+    return dnsGate.blocksRequest(uri.host, SystemClock.elapsedRealtime()) { host ->
+      dnsResolver(host).mapNotNull { it.hostAddress }
     }
-    val answer =
-      try {
-        InetAddress.getAllByName(host).mapNotNull { it.hostAddress }
-      } catch (_: Exception) {
-        // Resolver unavailable: do not turn a network outage into a local block.
-        dnsGate.recordLookupFailure(host)
-        return false
-      }
-    if (answer.isEmpty()) {
-      dnsGate.recordLookupFailure(host)
-      return false
-    }
-    return dnsGate.record(host, answer, now) == NavigationDnsGate.Decision.BLOCK
   }
 
   /**
@@ -229,5 +218,14 @@ class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
   override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
     // Forward the original callback unchanged; page errors are not diagnostics.
     inner.onReceivedError(view, request, error)
+  }
+
+  private companion object {
+    /**
+     * Deliberately shorter than the proxy's 10 s deadline: a subresource must
+     * not hold the WebView's request thread for the proxy budget. A timeout
+     * fails closed, which the request path can afford.
+     */
+    const val DNS_TIMEOUT_MS = 3_000
   }
 }

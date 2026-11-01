@@ -45,8 +45,9 @@ export function clearResultMessage(platform) {
   }
   return (
     "Site verileri temizlendi: profil çerezleri, konum izinleri ve web depolama " +
-    "(localStorage/IndexedDB) silindi. Android'de HTTP önbelleği ve servis çalışanları " +
-    "profil bazında silinemiyor; site önbellekten içerik gösterebilir."
+    "(localStorage/IndexedDB) silindi. Android'de HTTP önbelleği, servis çalışanları ve " +
+    "Cache Storage profil bazında silinemiyor; site önbellekten içerik gösterebilir. " +
+    "Tam temizlik için siteyi silin."
   );
 }
 

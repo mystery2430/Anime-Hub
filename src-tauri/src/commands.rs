@@ -67,6 +67,9 @@ pub struct AppState {
     pub blocklist: Mutex<Blocklist>,
     /// Set while an OAuth flow is waiting for its redirect.
     pub oauth_state: Mutex<Option<String>>,
+    /// Serializes AniList token refreshes so concurrent commands cannot race
+    /// the same refresh token or delete a token a newer refresh just saved.
+    pub anilist_refresh_lock: tokio::sync::Mutex<()>,
     /// Warning from a registry that could not be decrypted on startup.
     pub startup_warning: Mutex<Option<String>>,
     /// Which site currently owns the WebView session.
@@ -1492,33 +1495,57 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
         Err(_) => return Ok(None),
     };
 
-    let token = if token.needs_refresh(anilist::now_unix()) {
-        match token.refresh_token.as_deref() {
-            Some(rt) => match cli.refresh(rt).await {
-                Ok(t) => {
-                    save_token(state, &t)?;
-                    t
-                }
-                // Refresh rejected => the session is over.
-                Err(_) => {
-                    if state.provider.delete_secret("anilist-token").is_err() {
-                        log::error!("süresi dolmuş AniList oturumu silinemedi");
-                    }
-                    return Ok(None);
-                }
-            },
-            None => {
-                if state.provider.delete_secret("anilist-token").is_err() {
-                    log::error!("yenilenemeyen AniList oturumu silinemedi");
-                }
-                return Ok(None);
-            }
-        }
-    } else {
-        token
+    if !token.needs_refresh(anilist::now_unix()) {
+        return Ok(Some((cli, token)));
+    }
+
+    // Single-flight: only one caller refreshes. The others wait, then re-read
+    // the saved token instead of replaying a possibly rotated refresh token.
+    let _refreshing = state.anilist_refresh_lock.lock().await;
+    let Some(token) = load_token(state)? else {
+        return Ok(None);
+    };
+    if !token.needs_refresh(anilist::now_unix()) {
+        return Ok(Some((cli, token)));
+    }
+
+    let Some(refresh_token) = token.refresh_token.as_deref() else {
+        // Expired with no refresh token: nothing is left to preserve.
+        delete_token_if_current(state, &token);
+        return Ok(None);
     };
 
-    Ok(Some((cli, token)))
+    match cli.refresh(refresh_token).await {
+        Ok(t) => {
+            save_token(state, &t)?;
+            Ok(Some((cli, t)))
+        }
+        // Only a definitive rejection ends the session; a transient failure
+        // (429/5xx/timeout) keeps the token so a later call can retry.
+        Err(AppError::Unauthorized) => {
+            delete_token_if_current(state, &token);
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Compare-and-delete: never remove a token a concurrent login or a newer
+/// refresh has already replaced.
+fn delete_token_if_current(state: &AppState, failed: &Token) {
+    match load_token(state) {
+        Ok(stored) if token_matches(stored, failed) => {
+            if state.provider.delete_secret("anilist-token").is_err() {
+                log::error!("geçersiz AniList oturumu silinemedi");
+            }
+        }
+        Ok(_) => {}
+        Err(_) => log::error!("AniList oturumu silinemedi: mevcut token okunamadı"),
+    }
+}
+
+fn token_matches(stored: Option<Token>, failed: &Token) -> bool {
+    matches!(stored, Some(stored) if &stored == failed)
 }
 
 /// Clears a token the server rejected outright.
@@ -1582,8 +1609,9 @@ pub async fn anilist_library(
     page: Option<u32>,
 ) -> AppResult<LibraryPage> {
     let state = app.state::<AppState>();
-    let token = load_token(&state)?.ok_or(AppError::Unauthorized)?;
-    let (cli, _) = client(&state)?;
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Err(AppError::Unauthorized);
+    };
     let (entries, has_next) = cli.library(&token, status, page.unwrap_or(1)).await?;
     Ok(LibraryPage { entries, has_next })
 }
@@ -1601,8 +1629,9 @@ pub async fn anilist_search(
     query: String,
 ) -> AppResult<Vec<anilist::SearchResult>> {
     let state = app.state::<AppState>();
-    let token = load_token(&state)?.ok_or(AppError::Unauthorized)?;
-    let (cli, _) = client(&state)?;
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Err(AppError::Unauthorized);
+    };
     cli.search(&token, &query).await
 }
 
@@ -1614,8 +1643,9 @@ pub async fn anilist_update(
     progress: u32,
 ) -> AppResult<UpdatedEntry> {
     let state = app.state::<AppState>();
-    let token = load_token(&state)?.ok_or(AppError::Unauthorized)?;
-    let (cli, _) = client(&state)?;
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Err(AppError::Unauthorized);
+    };
     let (id, s, p) = cli.save_entry(&token, media_id, status, progress).await?;
     Ok(UpdatedEntry {
         entry_id: id,
@@ -1635,8 +1665,9 @@ pub struct UpdatedEntry {
 #[tauri::command]
 pub async fn anilist_delete(app: AppHandle, entry_id: i64) -> AppResult<bool> {
     let state = app.state::<AppState>();
-    let token = load_token(&state)?.ok_or(AppError::Unauthorized)?;
-    let (cli, _) = client(&state)?;
+    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
+        return Err(AppError::Unauthorized);
+    };
     cli.delete_entry(&token, entry_id).await
 }
 
@@ -2148,6 +2179,7 @@ mod tests {
             settings: Mutex::new(Settings::default()),
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
+            anilist_refresh_lock: tokio::sync::Mutex::new(()),
             startup_warning: Mutex::new(warning),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
@@ -2155,6 +2187,28 @@ mod tests {
             diagnostics_lock: Mutex::new(()),
             blocklist_sync: BlocklistSyncGate::new(),
         }
+    }
+
+    #[test]
+    fn only_the_failed_token_is_deleted() {
+        let failed = Token {
+            access_token: "old".into(),
+            refresh_token: Some("refresh".into()),
+            token_type: "Bearer".into(),
+            expires_at: 1,
+            scope: None,
+        };
+        assert!(token_matches(Some(failed.clone()), &failed));
+
+        let newer = Token {
+            access_token: "new".into(),
+            ..failed.clone()
+        };
+        assert!(
+            !token_matches(Some(newer), &failed),
+            "a concurrent refresh must keep its newer token"
+        );
+        assert!(!token_matches(None, &failed));
     }
 
     #[test]
