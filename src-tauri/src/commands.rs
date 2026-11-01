@@ -1534,7 +1534,7 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
 /// refresh has already replaced.
 fn delete_token_if_current(state: &AppState, failed: &Token) {
     match load_token(state) {
-        Ok(stored) if token_matches(stored, failed) => {
+        Ok(stored) if token_matches(stored.as_ref(), failed) => {
             if state.provider.delete_secret("anilist-token").is_err() {
                 log::error!("geçersiz AniList oturumu silinemedi");
             }
@@ -1544,8 +1544,8 @@ fn delete_token_if_current(state: &AppState, failed: &Token) {
     }
 }
 
-fn token_matches(stored: Option<Token>, failed: &Token) -> bool {
-    matches!(stored, Some(stored) if &stored == failed)
+fn token_matches(stored: Option<&Token>, failed: &Token) -> bool {
+    matches!(stored, Some(stored) if stored == failed)
 }
 
 /// Clears a token the server rejected outright.
@@ -2198,14 +2198,12 @@ mod tests {
             expires_at: 1,
             scope: None,
         };
-        assert!(token_matches(Some(failed.clone()), &failed));
+        assert!(token_matches(Some(&failed), &failed));
 
-        let newer = Token {
-            access_token: "new".into(),
-            ..failed.clone()
-        };
+        let mut newer = failed.clone();
+        newer.access_token = "new".into();
         assert!(
-            !token_matches(Some(newer), &failed),
+            !token_matches(Some(&newer), &failed),
             "a concurrent refresh must keep its newer token"
         );
         assert!(!token_matches(None, &failed));
