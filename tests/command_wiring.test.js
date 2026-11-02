@@ -160,7 +160,7 @@ test("blocklist sync is fail-closed for opens, settings and reset", () => {
 test("OAuth login validates the redirect before writing pending state", () => {
   const loginStart = commandsRs.slice(commandsRs.indexOf("pub async fn anilist_login_start"));
   const prepareAt = loginStart.indexOf("anilist::prepare_login");
-  const stateAt = loginStart.indexOf("*s = Some(prepared.state)");
+  const stateAt = loginStart.indexOf("oauth.arm(prepared.state)");
   assert.ok(prepareAt > 0, "login start must bind the return path via prepare_login");
   assert.ok(stateAt > 0, "login start still writes pending state");
   assert.ok(
@@ -423,7 +423,7 @@ test("R-05 and the 'Not closed' list agree about Android OAuth", () => {
   );
   const refuseAt = loginStart.indexOf("mobile_native_login_allowed");
   const prepareAt = loginStart.indexOf("anilist::prepare_login");
-  const stateWriteAt = loginStart.indexOf("*s = Some(prepared.state)");
+  const stateWriteAt = loginStart.indexOf("oauth.arm(prepared.state)");
   assert.ok(refuseAt > 0, "the Android custom-scheme refusal must exist");
   assert.ok(
     prepareAt > refuseAt && stateWriteAt > prepareAt,

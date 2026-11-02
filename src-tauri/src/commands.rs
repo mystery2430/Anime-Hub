@@ -66,8 +66,8 @@ pub struct AppState {
     pub registry: Mutex<Registry>,
     pub settings: Mutex<Settings>,
     pub blocklist: Mutex<Blocklist>,
-    /// Set while an OAuth flow is waiting for its redirect.
-    pub oauth_state: Mutex<Option<String>>,
+    /// Pending OAuth attempt and the generation that invalidates stale callbacks.
+    pub oauth_state: Mutex<anilist::OAuthState>,
     /// Serializes AniList token refreshes so concurrent commands cannot race
     /// the same refresh token or delete a token a newer refresh just saved.
     pub anilist_refresh_lock: tokio::sync::Mutex<()>,
@@ -1353,14 +1353,36 @@ fn load_token(state: &AppState) -> AppResult<Option<Token>> {
 }
 
 /// Writes the stored token under the token lock.
+#[cfg(test)]
 fn save_token(state: &AppState, token: &Token) -> AppResult<()> {
     let _tokens = lock_recover(&state.anilist_token_lock);
     save_token_unlocked(state, token)
 }
 
-/// Clears the stored token under the token lock.
+/// Commits an OAuth token only if its attempt generation is still current.
+///
+/// Holds the token lock and then the OAuth lock across the check and the
+/// write, so a logout or a newer login that lands in between is observed
+/// instead of being overwritten. Lock order: token -> oauth.
+fn save_oauth_token(state: &AppState, token: &Token, generation: u64) -> AppResult<bool> {
+    let _tokens = lock_recover(&state.anilist_token_lock);
+    let oauth = lock_recover(&state.oauth_state);
+    if oauth.generation() != generation {
+        return Ok(false);
+    }
+    save_token_unlocked(state, token)?;
+    Ok(true)
+}
+
+/// Logout: invalidates every in-flight OAuth callback and clears the token.
+///
+/// Token lock then OAuth lock, the same order as `save_oauth_token`, so a
+/// callback commit either completes before this runs (and its token is
+/// deleted) or runs after it and is rejected by the generation check.
 fn clear_token(state: &AppState) -> AppResult<()> {
     let _tokens = lock_recover(&state.anilist_token_lock);
+    let mut oauth = lock_recover(&state.oauth_state);
+    oauth.invalidate();
     state.provider.delete_secret("anilist-token")
 }
 
@@ -1397,11 +1419,11 @@ pub async fn anilist_login_start(app: AppHandle) -> AppResult<LoginStart> {
     // it has to disarm an armed login instead of leaving the state pending.
     let attempt_state = prepared.state.clone();
     {
-        let mut s = state
+        let mut oauth = state
             .oauth_state
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        *s = Some(prepared.state);
+        oauth.arm(prepared.state);
     }
     let url = prepared.url;
 
@@ -1483,12 +1505,14 @@ pub async fn anilist_login_callback(
         anilist::PendingState::Mismatched => {
             return Err(AppError::AniList("state doğrulaması başarısız".into()))
         }
-        anilist::PendingState::Consumed(_) => {}
+        anilist::PendingState::Consumed { generation, .. } => generation,
     }
 
     let token = cli.exchange_code(&code).await?;
     let viewer = cli.viewer(&token).await?;
-    save_token(&state, &token)?;
+    if !save_oauth_token(&state, &token, generation)? {
+        return Err(AppError::AniList("oturum açma iptal edildi".into()));
+    }
     Ok(AniListUser {
         id: viewer.id,
         name: viewer.name,
@@ -2227,7 +2251,7 @@ mod tests {
             registry: Mutex::new(registry),
             settings: Mutex::new(Settings::default()),
             blocklist: Mutex::new(Blocklist::default()),
-            oauth_state: Mutex::new(None),
+            oauth_state: Mutex::new(Default::default()),
             anilist_refresh_lock: tokio::sync::Mutex::new(()),
             anilist_token_lock: Mutex::new(()),
             startup_warning: Mutex::new(warning),
@@ -2594,6 +2618,185 @@ mod tests {
             load_token(&st).unwrap(),
             Some(token("a2", "r2", FAR_FUTURE))
         );
+    }
+
+    fn arm_oauth(st: &AppState, state: &str) {
+        lock_recover(&st.oauth_state).arm(state.to_string());
+    }
+
+    fn begin_callback(st: &AppState, state: &str) -> u64 {
+        arm_oauth(st, state);
+        match anilist::take_pending_state(&st.oauth_state, state).unwrap() {
+            anilist::PendingState::Consumed { generation, .. } => generation,
+            other => panic!("unexpected pending state: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_callback_completed_after_logout_cannot_restore_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = std::sync::Arc::new(state_in(dir.path()));
+        let generation = begin_callback(&st, "state-a");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let saver = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                release_rx.recv().unwrap();
+                save_oauth_token(
+                    &st,
+                    &token("old-access", "old-refresh", FAR_FUTURE),
+                    generation,
+                )
+            })
+        };
+
+        clear_token(&st).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(!saver.join().unwrap().unwrap());
+        assert!(load_token(&st).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_oauth_callback_cannot_overwrite_new_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        let generation_a = begin_callback(&st, "state-a");
+        let generation_b = begin_callback(&st, "state-b");
+        let new_login = token("new-login", "new-refresh", FAR_FUTURE);
+
+        assert!(save_oauth_token(&st, &new_login, generation_b).unwrap());
+        assert!(!save_oauth_token(
+            &st,
+            &token("old-login", "old-refresh", FAR_FUTURE),
+            generation_a,
+        )
+        .unwrap());
+        assert_eq!(load_token(&st).unwrap(), Some(new_login));
+    }
+
+    #[test]
+    fn logout_invalidates_in_flight_oauth_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+
+        // A callback that has not arrived yet is dropped with the attempt.
+        arm_oauth(&st, "state-a");
+        clear_token(&st).unwrap();
+        assert_eq!(
+            anilist::take_pending_state(&st.oauth_state, "state-a").unwrap(),
+            anilist::PendingState::None
+        );
+
+        // A callback that already consumed its state cannot save either.
+        let generation = begin_callback(&st, "state-b");
+        clear_token(&st).unwrap();
+        assert!(!save_oauth_token(
+            &st,
+            &token("late-access", "late-refresh", FAR_FUTURE),
+            generation
+        )
+        .unwrap());
+        assert!(load_token(&st).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_old_callback_cannot_clear_new_pending_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        arm_oauth(&st, "state-a");
+        arm_oauth(&st, "state-b");
+
+        assert!(!anilist::abandon_pending_state(&st.oauth_state, "state-a"));
+        assert_eq!(
+            anilist::take_pending_state(&st.oauth_state, "state-b").unwrap(),
+            anilist::PendingState::Consumed {
+                state: "state-b".to_string(),
+                generation: 2
+            }
+        );
+    }
+
+    #[test]
+    fn oauth_state_remains_single_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        arm_oauth(&st, "state-a");
+
+        assert!(matches!(
+            anilist::take_pending_state(&st.oauth_state, "state-a").unwrap(),
+            anilist::PendingState::Consumed { .. }
+        ));
+        assert_eq!(
+            anilist::take_pending_state(&st.oauth_state, "state-a").unwrap(),
+            anilist::PendingState::None
+        );
+    }
+
+    #[test]
+    fn logout_and_callback_save_cannot_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let store = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = store.load_registry();
+        let gate = std::sync::Arc::new(DeleteGate::new());
+        let provider = PausingDeleteProvider {
+            inner: store,
+            gate: gate.clone(),
+        };
+        let st = std::sync::Arc::new(state_with(Box::new(provider), registry, warning));
+        let generation = begin_callback(&st, "state-a");
+
+        let logout = {
+            let st = st.clone();
+            std::thread::spawn(move || clear_token(&st))
+        };
+        gate.wait_entered();
+
+        // Logout is inside delete_secret while holding the token lock. The
+        // saver proves that by failing a non-blocking acquire before it tries.
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let saver = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                observed_tx
+                    .send(st.anilist_token_lock.try_lock().is_err())
+                    .unwrap();
+                save_oauth_token(
+                    &st,
+                    &token("late-access", "late-refresh", FAR_FUTURE),
+                    generation,
+                )
+            })
+        };
+        assert!(
+            observed_rx.recv().unwrap(),
+            "logout must still hold the token lock"
+        );
+
+        gate.release();
+        assert!(logout.join().unwrap().is_ok());
+        assert!(!saver.join().unwrap().unwrap());
+        assert!(load_token(&st).unwrap().is_none());
+    }
+
+    #[test]
+    fn armed_new_login_rejects_old_callback_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        let existing = token("existing", "existing-refresh", FAR_FUTURE);
+        save_token(&st, &existing).unwrap();
+
+        let generation_a = begin_callback(&st, "state-a");
+        arm_oauth(&st, "state-b");
+
+        assert!(!save_oauth_token(
+            &st,
+            &token("old-login", "old-refresh", FAR_FUTURE),
+            generation_a
+        )
+        .unwrap());
+        assert_eq!(load_token(&st).unwrap(), Some(existing));
     }
 
     #[test]

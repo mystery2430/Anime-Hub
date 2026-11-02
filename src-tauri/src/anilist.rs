@@ -365,13 +365,45 @@ pub fn parse_callback(raw: &str, expected_redirect: &str) -> AppResult<(String, 
     Ok((code, state))
 }
 
+/// The pending OAuth attempt plus the generation its callback is bound to.
+///
+/// `arm` and `invalidate` are the only writers, and each advances the
+/// generation while holding the same mutex that stores the pending state. A
+/// callback therefore consumes its state and learns its generation in one
+/// atomic step; a later logout or new login cannot be mistaken for the attempt
+/// the callback started.
+#[derive(Debug, Default)]
+pub struct OAuthState {
+    generation: u64,
+    pending: Option<String>,
+}
+
+impl OAuthState {
+    /// Arm a new login attempt and invalidate every older callback.
+    pub fn arm(&mut self, state: String) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = Some(state);
+    }
+
+    /// Logout: invalidate every in-flight callback and drop the pending state.
+    pub fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = None;
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 /// What the single-use OAuth state slot decided about one callback.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PendingState {
     /// No login was pending at all.
     None,
     /// The state matched and the attempt is now CONSUMED (the slot is empty).
-    Consumed(String),
+    /// The generation identifies the attempt the callback belongs to.
+    Consumed { state: String, generation: u64 },
     /// A login is pending but this state does not match it. The genuine attempt
     /// is deliberately left in place, so a bogus or replayed callback cannot
     /// destroy a real login.
@@ -390,27 +422,27 @@ pub enum PendingState {
 /// pending session and is refused, and a *mismatched* state never consumes
 /// anything, so a stray callback cannot burn a legitimate login.
 pub fn take_pending_state(
-    slot: &std::sync::Mutex<Option<String>>,
+    slot: &std::sync::Mutex<OAuthState>,
     returned_state: &str,
 ) -> AppResult<PendingState> {
     let mut guard = slot
         .lock()
         .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-    Ok(match guard.as_deref() {
+    let matches = match guard.pending.as_deref() {
         // No pending session — including a slot that somehow holds an empty
         // state, which must never compare equal to anything.
-        None | Some("") => PendingState::None,
-        Some(expected) => {
-            if state_matches(expected, returned_state) {
-                match guard.take() {
-                    Some(taken) => PendingState::Consumed(taken),
-                    None => PendingState::None,
-                }
-            } else {
-                PendingState::Mismatched
-            }
+        None | Some("") => None,
+        Some(expected) => Some(state_matches(expected, returned_state)),
+    };
+    match matches {
+        None => Ok(PendingState::None),
+        Some(false) => Ok(PendingState::Mismatched),
+        Some(true) => {
+            let generation = guard.generation;
+            let state = guard.pending.take().expect("matched pending state");
+            Ok(PendingState::Consumed { state, generation })
         }
-    })
+    }
 }
 
 /// Drop the pending state of an attempt that can no longer complete.
@@ -428,10 +460,10 @@ pub fn take_pending_state(
 /// Conditional on purpose: a newer attempt may have overwritten the slot
 /// between the failure and this call, and clearing THAT attempt's state would
 /// break the login the user is actually running.
-pub fn abandon_pending_state(slot: &std::sync::Mutex<Option<String>>, expected: &str) -> bool {
+pub fn abandon_pending_state(slot: &std::sync::Mutex<OAuthState>, expected: &str) -> bool {
     let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.as_deref() == Some(expected) && !expected.is_empty() {
-        *guard = None;
+    if guard.pending.as_deref() == Some(expected) && !expected.is_empty() {
+        guard.pending = None;
         return true;
     }
     false
@@ -1917,50 +1949,59 @@ mod tests {
         }
     }
 
+    fn armed_slot(state: &str) -> Mutex<OAuthState> {
+        let mut oauth = OAuthState::default();
+        oauth.arm(state.to_string());
+        Mutex::new(oauth)
+    }
+
     #[test]
     fn abandoning_a_pending_state_clears_only_its_own_attempt() {
-        let slot: Mutex<Option<String>> = Mutex::new(Some("ours".to_string()));
+        let slot = armed_slot("ours");
         assert!(abandon_pending_state(&slot, "ours"));
         assert!(
-            slot.lock().unwrap().is_none(),
+            slot.lock().unwrap().pending.is_none(),
             "a failed attempt must not leave an armed state behind"
         );
         // Nothing pending: a second abandon is a no-op, not a panic.
         assert!(!abandon_pending_state(&slot, "ours"));
 
         // A newer attempt owns the slot: never clear somebody else's login.
-        let slot: Mutex<Option<String>> = Mutex::new(Some("newer".to_string()));
+        let slot = armed_slot("newer");
         assert!(!abandon_pending_state(&slot, "ours"));
-        assert_eq!(slot.lock().unwrap().as_deref(), Some("newer"));
+        assert_eq!(slot.lock().unwrap().pending.as_deref(), Some("newer"));
 
         // An empty expected value is never a match.
-        let slot: Mutex<Option<String>> = Mutex::new(Some("".to_string()));
+        let slot = armed_slot("");
         assert!(!abandon_pending_state(&slot, ""));
     }
 
     #[test]
     fn take_pending_state_is_single_use_and_only_consumes_on_a_match() {
-        let slot: Mutex<Option<String>> = Mutex::new(Some("st4te".to_string()));
+        let slot = armed_slot("st4te");
 
         // A bogus callback does NOT burn the genuine attempt...
         assert_eq!(
             take_pending_state(&slot, "nope").unwrap(),
             PendingState::Mismatched
         );
-        assert_eq!(slot.lock().unwrap().as_deref(), Some("st4te"));
+        assert_eq!(slot.lock().unwrap().pending.as_deref(), Some("st4te"));
         // ... and neither does a malformed one.
         assert_eq!(
             take_pending_state(&slot, "").unwrap(),
             PendingState::Mismatched
         );
-        assert_eq!(slot.lock().unwrap().as_deref(), Some("st4te"));
+        assert_eq!(slot.lock().unwrap().pending.as_deref(), Some("st4te"));
 
         // The matching callback consumes it exactly once.
         assert_eq!(
             take_pending_state(&slot, "st4te").unwrap(),
-            PendingState::Consumed("st4te".to_string())
+            PendingState::Consumed {
+                state: "st4te".to_string(),
+                generation: 1
+            }
         );
-        assert!(slot.lock().unwrap().is_none());
+        assert!(slot.lock().unwrap().pending.is_none());
         // A replay of the same callback now finds no pending session instead of
         // racing a second token exchange.
         assert_eq!(
@@ -1971,7 +2012,7 @@ mod tests {
 
     #[test]
     fn take_pending_state_never_matches_an_empty_slot() {
-        let slot: Mutex<Option<String>> = Mutex::new(Some(String::new()));
+        let slot = armed_slot("");
         assert_eq!(take_pending_state(&slot, "").unwrap(), PendingState::None);
         assert_eq!(
             take_pending_state(&slot, "st4te").unwrap(),
@@ -1981,7 +2022,7 @@ mod tests {
 
     #[test]
     fn take_pending_state_reports_no_pending_session() {
-        let slot: Mutex<Option<String>> = Mutex::new(None);
+        let slot: Mutex<OAuthState> = Mutex::new(OAuthState::default());
         assert_eq!(
             take_pending_state(&slot, "anything").unwrap(),
             PendingState::None
