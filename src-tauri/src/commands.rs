@@ -14,6 +14,7 @@ use crate::web::windows;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // State
@@ -70,6 +71,9 @@ pub struct AppState {
     /// Serializes AniList token refreshes so concurrent commands cannot race
     /// the same refresh token or delete a token a newer refresh just saved.
     pub anilist_refresh_lock: tokio::sync::Mutex<()>,
+    /// Serializes every AniList token-store read/compare/write/delete sequence.
+    /// Never held across an `.await`; lock order is refresh lock -> this lock.
+    pub anilist_token_lock: Mutex<()>,
     /// Warning from a registry that could not be decrypted on startup.
     pub startup_warning: Mutex<Option<String>>,
     /// Which site currently owns the WebView session.
@@ -1330,16 +1334,34 @@ fn client(state: &AppState) -> AppResult<(AniListClient, AniListConfig)> {
     Ok((AniListClient::new(cfg.clone()), cfg))
 }
 
-fn load_token(state: &AppState) -> AppResult<Option<Token>> {
+fn load_token_unlocked(state: &AppState) -> AppResult<Option<Token>> {
     match state.provider.get_secret("anilist-token")? {
         Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         None => Ok(None),
     }
 }
 
-fn save_token(state: &AppState, token: &Token) -> AppResult<()> {
+fn save_token_unlocked(state: &AppState, token: &Token) -> AppResult<()> {
     let bytes = serde_json::to_vec(token)?;
     state.provider.put_secret("anilist-token", &bytes)
+}
+
+/// Reads the stored token under the token lock.
+fn load_token(state: &AppState) -> AppResult<Option<Token>> {
+    let _tokens = lock_recover(&state.anilist_token_lock);
+    load_token_unlocked(state)
+}
+
+/// Writes the stored token under the token lock.
+fn save_token(state: &AppState, token: &Token) -> AppResult<()> {
+    let _tokens = lock_recover(&state.anilist_token_lock);
+    save_token_unlocked(state, token)
+}
+
+/// Clears the stored token under the token lock.
+fn clear_token(state: &AppState) -> AppResult<()> {
+    let _tokens = lock_recover(&state.anilist_token_lock);
+    state.provider.delete_secret("anilist-token")
 }
 
 /// Start the OAuth flow: returns the URL to open plus the redirect URI that
@@ -1486,17 +1508,40 @@ pub struct AniListUser {
 /// the "not configured/signed out" case uniformly for every caller that
 /// needs an authenticated GraphQL request.
 async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListClient, Token)>> {
-    let Some(token) = load_token(state)? else {
+    if load_token(state)?.is_none() {
         return Ok(None);
-    };
+    }
     let (cli, _) = match client(state) {
         Ok(c) => c,
         // Not configured any more: report signed-out rather than erroring.
         Err(_) => return Ok(None),
     };
 
+    let Some(token) = refresh_session_token(state, |refresh_token| {
+        let cli = &cli;
+        async move { cli.refresh(refresh_token.as_str()).await }
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some((cli, token)))
+}
+
+/// Refreshes an expired token under the refresh single-flight lock. The
+/// result is committed only if the stored token is still the one this call
+/// started with, so a concurrent login/logout wins over an older refresh.
+async fn refresh_session_token<F, Fut>(state: &AppState, refresh: F) -> AppResult<Option<Token>>
+where
+    F: FnOnce(Zeroizing<String>) -> Fut,
+    Fut: std::future::Future<Output = AppResult<Token>>,
+{
+    let Some(token) = load_token(state)? else {
+        return Ok(None);
+    };
     if !token.needs_refresh(anilist::now_unix()) {
-        return Ok(Some((cli, token)));
+        return Ok(Some(token));
     }
 
     // Single-flight: only one caller refreshes. The others wait, then re-read
@@ -1506,19 +1551,28 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
         return Ok(None);
     };
     if !token.needs_refresh(anilist::now_unix()) {
-        return Ok(Some((cli, token)));
+        return Ok(Some(token));
     }
 
-    let Some(refresh_token) = token.refresh_token.as_deref() else {
+    let Some(refresh_token) = token.refresh_token.clone() else {
         // Expired with no refresh token: nothing is left to preserve.
         delete_token_if_current(state, &token);
         return Ok(None);
     };
 
-    match cli.refresh(refresh_token).await {
-        Ok(t) => {
-            save_token(state, &t)?;
-            Ok(Some((cli, t)))
+    match refresh(Zeroizing::new(refresh_token)).await {
+        Ok(fresh) => {
+            // Compare-and-save: do not overwrite a token a login, logout or
+            // another refresh installed while the network call was in flight.
+            let _tokens = lock_recover(&state.anilist_token_lock);
+            match load_token_unlocked(state) {
+                Ok(Some(current)) if token_matches(Some(&current), &token) => {
+                    save_token_unlocked(state, &fresh)?;
+                    Ok(Some(fresh))
+                }
+                Ok(current) => Ok(current),
+                Err(e) => Err(e),
+            }
         }
         // Only a definitive rejection ends the session; a transient failure
         // (429/5xx/timeout) keeps the token so a later call can retry.
@@ -1533,8 +1587,9 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
 /// Compare-and-delete: never remove a token a concurrent login or a newer
 /// refresh has already replaced.
 fn delete_token_if_current(state: &AppState, failed: &Token) {
-    match load_token(state) {
-        Ok(stored) if token_matches(stored.as_ref(), failed) => {
+    let _tokens = lock_recover(&state.anilist_token_lock);
+    match load_token_unlocked(state) {
+        Ok(Some(stored)) if token_matches(Some(&stored), failed) => {
             if state.provider.delete_secret("anilist-token").is_err() {
                 log::error!("geçersiz AniList oturumu silinemedi");
             }
@@ -1546,13 +1601,6 @@ fn delete_token_if_current(state: &AppState, failed: &Token) {
 
 fn token_matches(stored: Option<&Token>, failed: &Token) -> bool {
     matches!(stored, Some(stored) if stored == failed)
-}
-
-/// Clears a token the server rejected outright.
-fn drop_rejected_token(state: &AppState) {
-    if state.provider.delete_secret("anilist-token").is_err() {
-        log::error!("geçersiz AniList oturumu silinemedi");
-    }
 }
 
 /// Current session, refreshing the token if it is close to expiry.
@@ -1570,7 +1618,7 @@ pub async fn anilist_status(app: AppHandle) -> AppResult<Option<AniListUser>> {
             avatar: v.avatar_large,
         })),
         Err(AppError::Unauthorized) => {
-            drop_rejected_token(&state);
+            delete_token_if_current(&state, &token);
             Ok(None)
         }
         Err(e) => Err(e),
@@ -1589,7 +1637,7 @@ pub async fn anilist_hero_stats(app: AppHandle) -> AppResult<Option<anilist::Vie
     match cli.viewer_stats(&token).await {
         Ok(s) => Ok(Some(s)),
         Err(AppError::Unauthorized) => {
-            drop_rejected_token(&state);
+            delete_token_if_current(&state, &token);
             Ok(None)
         }
         Err(e) => Err(e),
@@ -1599,7 +1647,7 @@ pub async fn anilist_hero_stats(app: AppHandle) -> AppResult<Option<anilist::Vie
 #[tauri::command]
 pub async fn anilist_logout(app: AppHandle) -> AppResult<()> {
     let state = app.state::<AppState>();
-    state.provider.delete_secret("anilist-token")
+    clear_token(&state)
 }
 
 #[tauri::command]
@@ -2169,17 +2217,19 @@ mod tests {
     // unused import in the non-test build.
     use crate::web::session::CookieJar;
 
-    fn state_in(dir: &std::path::Path) -> AppState {
-        let key = load_master_key(dir).expect("key");
-        let provider = SecureStore::new(&key, dir).expect("store");
-        let (registry, warning) = provider.load_registry();
+    fn state_with(
+        provider: Box<dyn SecretProvider>,
+        registry: Registry,
+        warning: Option<String>,
+    ) -> AppState {
         AppState {
-            provider: Box::new(provider),
+            provider,
             registry: Mutex::new(registry),
             settings: Mutex::new(Settings::default()),
             blocklist: Mutex::new(Blocklist::default()),
             oauth_state: Mutex::new(None),
             anilist_refresh_lock: tokio::sync::Mutex::new(()),
+            anilist_token_lock: Mutex::new(()),
             startup_warning: Mutex::new(warning),
             current_site: Mutex::new(None),
             pip_lock: Mutex::new(()),
@@ -2187,6 +2237,13 @@ mod tests {
             diagnostics_lock: Mutex::new(()),
             blocklist_sync: BlocklistSyncGate::new(),
         }
+    }
+
+    fn state_in(dir: &std::path::Path) -> AppState {
+        let key = load_master_key(dir).expect("key");
+        let provider = SecureStore::new(&key, dir).expect("store");
+        let (registry, warning) = provider.load_registry();
+        state_with(Box::new(provider), registry, warning)
     }
 
     #[test]
@@ -2207,6 +2264,336 @@ mod tests {
             "a concurrent refresh must keep its newer token"
         );
         assert!(!token_matches(None, &failed));
+    }
+
+    const FAR_FUTURE: i64 = 9_999_999_999;
+
+    fn token(access: &str, refresh: &str, expires_at: i64) -> Token {
+        Token {
+            access_token: access.into(),
+            refresh_token: Some(refresh.into()),
+            token_type: "Bearer".into(),
+            expires_at,
+            scope: None,
+        }
+    }
+
+    /// Blocks the provider's delete while signalling the test, so the
+    /// compare-and-delete window can be held open deterministically.
+    struct DeleteGate {
+        entered: (Mutex<bool>, std::sync::Condvar),
+        released: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl DeleteGate {
+        fn new() -> Self {
+            Self {
+                entered: (Mutex::new(false), std::sync::Condvar::new()),
+                released: (Mutex::new(false), std::sync::Condvar::new()),
+            }
+        }
+
+        fn block_until_released(&self) {
+            *self.entered.0.lock().unwrap() = true;
+            self.entered.1.notify_all();
+            let mut released = self.released.0.lock().unwrap();
+            while !*released {
+                released = self.released.1.wait(released).unwrap();
+            }
+        }
+
+        fn wait_entered(&self) {
+            let mut entered = self.entered.0.lock().unwrap();
+            while !*entered {
+                entered = self.entered.1.wait(entered).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+    }
+
+    impl Default for DeleteGate {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    struct PausingDeleteProvider {
+        inner: SecureStore,
+        gate: std::sync::Arc<DeleteGate>,
+    }
+
+    impl SecretProvider for PausingDeleteProvider {
+        fn backend(&self) -> Backend {
+            self.inner.backend()
+        }
+
+        fn load_doc_bytes(&self, name: &str) -> AppResult<Option<Zeroizing<Vec<u8>>>> {
+            self.inner.load_doc_bytes(name)
+        }
+
+        fn save_doc_bytes(&self, name: &str, bytes: &[u8]) -> AppResult<()> {
+            self.inner.save_doc_bytes(name, bytes)
+        }
+
+        fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()> {
+            self.inner.put_secret(name, plaintext)
+        }
+
+        fn get_secret(&self, name: &str) -> AppResult<Option<Zeroizing<Vec<u8>>>> {
+            self.inner.get_secret(name)
+        }
+
+        fn delete_secret(&self, name: &str) -> AppResult<()> {
+            self.gate.block_until_released();
+            self.inner.delete_secret(name)
+        }
+
+        fn wipe_secrets(&self) -> AppResult<usize> {
+            self.inner.wipe_secrets()
+        }
+
+        fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
+            self.inner.delete_site_session(site_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_completed_after_logout_cannot_restore_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = std::sync::Arc::new(state_in(dir.path()));
+        save_token(&st, &token("old-access", "old-refresh", 1)).unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                refresh_session_token(&st, |refresh_token| async move {
+                    assert_eq!(refresh_token.as_str(), "old-refresh");
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(token("refreshed-old", "rotated-refresh", FAR_FUTURE))
+                })
+                .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        clear_token(&st).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(
+            task.await.unwrap().unwrap().is_none(),
+            "a refresh that finished after logout must not return a session"
+        );
+        assert!(load_token(&st).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_viewer_401_does_not_delete_a_new_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        let rejected = token("old-access", "old-refresh", 1);
+        let new = token("new-login", "new-login-refresh", FAR_FUTURE);
+        save_token(&st, &rejected).unwrap();
+        save_token(&st, &new).unwrap();
+
+        delete_token_if_current(&st, &rejected);
+
+        assert_eq!(load_token(&st).unwrap(), Some(new));
+    }
+
+    #[test]
+    fn current_rejected_token_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_in(dir.path());
+        let rejected = token("old-access", "old-refresh", 1);
+        save_token(&st, &rejected).unwrap();
+
+        delete_token_if_current(&st, &rejected);
+
+        assert!(load_token(&st).unwrap().is_none());
+    }
+
+    #[test]
+    fn compare_and_delete_cannot_remove_a_token_saved_in_between() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = load_master_key(dir.path()).expect("key");
+        let store = SecureStore::new(&key, dir.path()).expect("store");
+        let (registry, warning) = store.load_registry();
+        let gate = std::sync::Arc::new(DeleteGate::new());
+        let provider = PausingDeleteProvider {
+            inner: store,
+            gate: gate.clone(),
+        };
+        let st = std::sync::Arc::new(state_with(Box::new(provider), registry, warning));
+
+        let old = token("old", "old-refresh", 1);
+        let new = token("new", "new-refresh", FAR_FUTURE);
+        save_token(&st, &old).unwrap();
+
+        let deleter = {
+            let st = st.clone();
+            let old = old.clone();
+            std::thread::spawn(move || delete_token_if_current(&st, &old))
+        };
+        gate.wait_entered();
+        assert!(
+            st.anilist_token_lock.try_lock().is_err(),
+            "compare-and-delete must hold the token lock across the delete"
+        );
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let saver = {
+            let st = st.clone();
+            let new = new.clone();
+            std::thread::spawn(move || {
+                attempted_tx.send(()).unwrap();
+                save_token(&st, &new).unwrap();
+            })
+        };
+        attempted_rx.recv().unwrap();
+        gate.release();
+        deleter.join().unwrap();
+        saver.join().unwrap();
+
+        assert_eq!(load_token(&st).unwrap(), Some(new));
+    }
+
+    #[tokio::test]
+    async fn refresh_cannot_overwrite_a_new_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = std::sync::Arc::new(state_in(dir.path()));
+        save_token(&st, &token("old-access", "old-refresh", 1)).unwrap();
+        let new = token("new-login", "new-login-refresh", FAR_FUTURE);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                refresh_session_token(&st, |refresh_token| async move {
+                    assert_eq!(refresh_token.as_str(), "old-refresh");
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(token("refreshed-old", "rotated-old", FAR_FUTURE))
+                })
+                .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        save_token(&st, &new).unwrap();
+        release_tx.send(()).unwrap();
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some(new.clone()));
+        assert_eq!(load_token(&st).unwrap(), Some(new));
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_does_not_delete_a_new_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = std::sync::Arc::new(state_in(dir.path()));
+        save_token(&st, &token("old-access", "old-refresh", 1)).unwrap();
+        let new = token("new-login", "new-login-refresh", FAR_FUTURE);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                refresh_session_token(&st, |_refresh_token| async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Err(AppError::Unauthorized)
+                })
+                .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        save_token(&st, &new).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(task.await.unwrap().unwrap().is_none());
+        assert_eq!(
+            load_token(&st).unwrap(),
+            Some(new),
+            "an old rejected refresh must not delete a newer login"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_run_once_and_keep_the_rotated_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let st = std::sync::Arc::new(state_in(dir.path()));
+        save_token(&st, &token("a1", "r1", 1)).unwrap();
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let args = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let st = st.clone();
+            let calls = calls.clone();
+            let args = args.clone();
+            let entered_tx = entered_tx.clone();
+            let release_rx = release_rx.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                refresh_session_token(&st, move |refresh_token| {
+                    let calls = calls.clone();
+                    let args = args.clone();
+                    let entered_tx = entered_tx.clone();
+                    let mut release_rx = release_rx.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        args.lock()
+                            .unwrap()
+                            .push(refresh_token.as_str().to_string());
+                        let _ = entered_tx.send(());
+                        release_rx.wait_for(|released| *released).await.unwrap();
+                        Ok(token("a2", "r2", FAR_FUTURE))
+                    }
+                })
+                .await
+            }));
+        }
+
+        entered_rx
+            .recv()
+            .await
+            .expect("the first refresh must start");
+        release_tx.send(true).unwrap();
+
+        for task in tasks {
+            let result = task.await.unwrap().unwrap().expect("a session");
+            assert_eq!(result.access_token, "a2");
+            assert_eq!(result.refresh_token.as_deref(), Some("r2"));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the refresh single-flight lock must run the network call once"
+        );
+        let seen = args.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0], "r1");
+        assert_eq!(
+            load_token(&st).unwrap(),
+            Some(token("a2", "r2", FAR_FUTURE))
+        );
     }
 
     #[test]
@@ -2526,7 +2913,7 @@ mod tests {
         assert_eq!(back.access_token, "tok");
         assert_eq!(back.refresh_token.as_deref(), Some("ref"));
 
-        st.provider.delete_secret("anilist-token").unwrap();
+        clear_token(&st).unwrap();
         assert!(load_token(&st).unwrap().is_none());
     }
 
