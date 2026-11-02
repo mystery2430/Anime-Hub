@@ -1498,7 +1498,7 @@ pub async fn anilist_login_callback(
     // Single-use, consumed under the lock and only on a match: a repeated or
     // replayed callback finds no pending attempt and cannot race a second token
     // exchange, while a bogus state never burns the genuine login.
-    match anilist::take_pending_state(&state.oauth_state, &returned_state)? {
+    let generation = match anilist::take_pending_state(&state.oauth_state, &returned_state)? {
         anilist::PendingState::None => {
             return Err(AppError::AniList("bekleyen bir oturum yok".into()))
         }
@@ -1506,7 +1506,7 @@ pub async fn anilist_login_callback(
             return Err(AppError::AniList("state doğrulaması başarısız".into()))
         }
         anilist::PendingState::Consumed { generation, .. } => generation,
-    }
+    };
 
     let token = cli.exchange_code(&code).await?;
     let viewer = cli.viewer(&token).await?;
