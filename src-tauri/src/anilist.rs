@@ -25,7 +25,7 @@ pub const ANILIST_SITE: &str = "https://anilist.co/";
 /// request in flight never races the deadline.
 const EXPIRY_SKEW_SECS: i64 = 60;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AniListConfig {
     /// From <https://anilist.co/settings/developer>. Not a secret, but kept
@@ -38,6 +38,18 @@ pub struct AniListConfig {
     /// Must match the redirect URI registered for the client, character for
     /// character.
     pub redirect_uri: String,
+}
+
+// Manual `Debug` instead of the derived one: the config carries
+// `client_secret`, and a plain `{:?}` log/panic print would leak it.
+impl std::fmt::Debug for AniListConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AniListConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 impl Default for AniListConfig {
@@ -114,7 +126,11 @@ pub fn authorize_url(cfg: &AniListConfig, state: &str) -> AppResult<String> {
 }
 
 /// The stored OAuth token.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+//
+// `Debug` is manual (not derived) for the same reason as `AniListConfig`: the
+// token carries live credentials, and `{:?}` prints — including inside
+// `assert_eq!`/`.unwrap()` panic messages — would leak them.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Token {
     pub access_token: String,
@@ -144,6 +160,23 @@ impl Drop for Token {
         if let Some(r) = self.refresh_token.as_mut() {
             r.zeroize();
         }
+    }
+}
+
+// Presence/absence of the refresh token stays visible; its value, the access
+// token and any other secret never do.
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Token")
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .finish()
     }
 }
 
@@ -2133,6 +2166,43 @@ mod tests {
             scope: None,
         };
         assert_eq!(r.into_token(100).expires_at, 100);
+    }
+
+    #[test]
+    fn debug_impls_redact_secret_material() {
+        let cfg = AniListConfig {
+            client_id: "cid-1".into(),
+            client_secret: "hunter2".into(),
+            redirect_uri: "http://127.0.0.1:17395/callback".into(),
+        };
+        let printed = format!("{cfg:?}");
+        assert!(printed.contains("cid-1"));
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("[redacted]"));
+
+        let token = Token {
+            access_token: "atok".into(),
+            refresh_token: Some("rtok".into()),
+            token_type: "Bearer".into(),
+            expires_at: 1_000,
+            scope: Some("PUBLIC".into()),
+        };
+        let printed = format!("{token:?}");
+        assert!(
+            !printed.contains("atok") && !printed.contains("rtok"),
+            "{printed}"
+        );
+        assert!(printed.contains("[redacted]"));
+
+        // An absent refresh token still shows up as absent.
+        let missing = Token {
+            access_token: "atok".into(),
+            refresh_token: None,
+            ..token
+        };
+        let printed = format!("{missing:?}");
+        assert!(!printed.contains("atok"), "{printed}");
+        assert!(printed.contains("None"));
     }
 
     #[test]

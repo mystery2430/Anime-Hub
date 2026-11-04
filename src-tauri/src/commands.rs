@@ -3,7 +3,7 @@
 //! Commands are deliberately thin: validation, encryption and window policy
 //! all live in the modules they belong to, so this file is mostly plumbing.
 
-use crate::anilist::{self, AniListClient, AniListConfig, MediaListStatus, Token};
+use crate::anilist::{self, AniListClient, AniListConfig, Token};
 use crate::error::{AppError, AppResult};
 use crate::secure::master_key::Backend;
 use crate::secure::SecretProvider;
@@ -437,7 +437,11 @@ pub fn profile_removal_for(action: crate::android_bridge::SiteProfileAction) -> 
     }
 }
 
-#[tauri::command]
+// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
+// thread: this command blocks on the desktop/android session lock, and a sync
+// command would block that thread on the same lock the lifecycle worker holds
+// across main-thread dispatches — a whole-app deadlock.
+#[tauri::command(async)]
 pub fn remove_site(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1119,6 +1123,19 @@ fn commit_settings_with_diagnostics_preflight(
     Ok(())
 }
 
+/// M-11: the settings form re-sends every field, with `clientSecret` blanked
+/// while the modal is open, so an empty patch value must not wipe a stored
+/// secret — that silently downgrades a confidential client to public and
+/// breaks logins. There is no explicit clearing sentinel; a secret is only
+/// ever absent after a fresh install/default env state.
+fn merge_anilist_patch(stored: &AniListConfig, patch: &AniListConfig) -> AniListConfig {
+    let mut merged = patch.clone();
+    if merged.client_secret.is_empty() && !stored.client_secret.is_empty() {
+        merged.client_secret = stored.client_secret.clone();
+    }
+    merged
+}
+
 #[tauri::command]
 pub fn update_settings(
     app: AppHandle,
@@ -1204,8 +1221,8 @@ pub fn update_settings(
             if let Some(v) = patch.developer_options {
                 next.developer_options = v;
             }
-            if let Some(a) = patch.anilist {
-                next.anilist = a;
+            if let Some(a) = &patch.anilist {
+                next.anilist = merge_anilist_patch(&next.anilist, a);
             }
             write_settings_doc(&state, &next)?;
             *live = next;
@@ -1674,74 +1691,9 @@ pub async fn anilist_logout(app: AppHandle) -> AppResult<()> {
     clear_token(&state)
 }
 
-#[tauri::command]
-pub async fn anilist_library(
-    app: AppHandle,
-    status: Option<MediaListStatus>,
-    page: Option<u32>,
-) -> AppResult<LibraryPage> {
-    let state = app.state::<AppState>();
-    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
-        return Err(AppError::Unauthorized);
-    };
-    let (entries, has_next) = cli.library(&token, status, page.unwrap_or(1)).await?;
-    Ok(LibraryPage { entries, has_next })
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LibraryPage {
-    pub entries: Vec<anilist::LibraryEntry>,
-    pub has_next: bool,
-}
-
-#[tauri::command]
-pub async fn anilist_search(
-    app: AppHandle,
-    query: String,
-) -> AppResult<Vec<anilist::SearchResult>> {
-    let state = app.state::<AppState>();
-    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
-        return Err(AppError::Unauthorized);
-    };
-    cli.search(&token, &query).await
-}
-
-#[tauri::command]
-pub async fn anilist_update(
-    app: AppHandle,
-    media_id: i64,
-    status: MediaListStatus,
-    progress: u32,
-) -> AppResult<UpdatedEntry> {
-    let state = app.state::<AppState>();
-    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
-        return Err(AppError::Unauthorized);
-    };
-    let (id, s, p) = cli.save_entry(&token, media_id, status, progress).await?;
-    Ok(UpdatedEntry {
-        entry_id: id,
-        status: s,
-        progress: p,
-    })
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdatedEntry {
-    pub entry_id: i64,
-    pub status: MediaListStatus,
-    pub progress: u32,
-}
-
-#[tauri::command]
-pub async fn anilist_delete(app: AppHandle, entry_id: i64) -> AppResult<bool> {
-    let state = app.state::<AppState>();
-    let Some((cli, token)) = fresh_anilist_session(&state).await? else {
-        return Err(AppError::Unauthorized);
-    };
-    cli.delete_entry(&token, entry_id).await
-}
+// The AniList library/search/update/delete commands were removed (M-16):
+// nothing in `src/` called them, and a live-invoke command that bypasses the
+// session paths is one more surface to keep in sync for nothing.
 
 // ---------------------------------------------------------------------------
 // Görünüm / PiP / misc
@@ -2918,6 +2870,37 @@ mod tests {
         assert!(p.block_popups.is_none());
         assert!(p.anilist.is_none());
         assert!(p.blocklist.is_none());
+    }
+
+    fn anilist_config() -> AniListConfig {
+        AniListConfig {
+            client_id: "42".into(),
+            client_secret: String::new(),
+            redirect_uri: "http://127.0.0.1:1/callback".into(),
+        }
+    }
+
+    #[test]
+    fn partial_settings_save_does_not_wipe_the_stored_client_secret() {
+        let stored = AniListConfig {
+            client_secret: "SUPER-SECRET".into(),
+            ..anilist_config()
+        };
+        // The form blanks the secret field and re-sends everything.
+        let patch = AniListConfig {
+            client_id: "43".into(),
+            client_secret: String::new(),
+            ..anilist_config()
+        };
+        let merged = merge_anilist_patch(&stored, &patch);
+        assert_eq!(merged.client_id, "43");
+        assert_eq!(merged.client_secret, "SUPER-SECRET");
+        assert!(merged.is_confidential(), "no silent downgrade to public");
+
+        // With no stored secret an empty patch stays empty — no fake values.
+        assert!(merge_anilist_patch(&anilist_config(), &anilist_config())
+            .client_secret
+            .is_empty());
     }
 
     #[test]
