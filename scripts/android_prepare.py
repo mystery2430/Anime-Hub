@@ -115,6 +115,13 @@ MAIN_ACTIVITY_IMPORTS = (
     "import android.webkit.WebView",
 )
 MAIN_ACTIVITY_CLASS_RE = re.compile(r"class\s+MainActivity\b[^{]*\{")
+# The manifest can carry more than one <activity>; the PiP flag belongs to the
+# template's own entry, identified by full-path or relative name ending in
+# MainActivity. `[^>]` matches newlines too, since Tauri writes the activity
+# across several lines.
+MAIN_ACTIVITY_TAG_RE = re.compile(
+    r"<activity\b[^>]*?\bandroid:name=\"[^\"]*MainActivity\"[^>]*?>"
+)
 IMPORT_RE = re.compile(r"^import\s+\S+\s*$", re.MULTILINE)
 # Tauri v2's generated Android template has no signing config at all, so a
 # release build is always unsigned unless we inject one. The block is a
@@ -152,6 +159,11 @@ REGISTER_RE = re.compile(
     r'register_android_plugin\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)'
 )
 PACKAGE_RE = re.compile(r"^package\s+(\S+)", re.MULTILINE)
+# Generated paths are built from `package.replace(".", "/")` below; an
+# unsanitised name (typo or injected in register_android_plugin) would have
+# written Kotlin outside the gen tree. Lower-case, dot-separated, no leading
+# digits: what the Android tooling itself defines as valid.
+PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
 
 
 def rust_registration(lib_rs: Path) -> tuple[str, str]:
@@ -160,6 +172,16 @@ def rust_registration(lib_rs: Path) -> tuple[str, str]:
     if not match:
         raise SystemExit(f"register_android_plugin(...) not found in {lib_rs}")
     return match.group(1), match.group(2)
+
+
+def validate_package(package: str) -> None:
+    """Refuse a package name that cannot be used to build gen-tree paths."""
+    if not PACKAGE_NAME_RE.match(package):
+        raise SystemExit(
+            f"register_android_plugin package {package!r} is not lower-case "
+            "dot-separated identifiers (^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$); "
+            "refusing to build generated paths from it"
+        )
 
 
 def find_main_activity(gen: Path) -> Path:
@@ -181,12 +203,28 @@ def package_of(path: Path) -> str:
     return match.group(1).rstrip(";")
 
 
+def inject_pip_attr(tag: str) -> str:
+    """Append PIP_ATTR inside the matched <activity ...> tag verbatim.
+
+    Both closing forms are handled: the self-closing `<activity ... />` the
+    template writes and a plain `>` if a hand-edited manifest dropped the
+    slash.
+    """
+    attr = "\n        " + PIP_ATTR
+    if tag.endswith("/>"):
+        return tag[:-2].rstrip() + attr + "\n    />"
+    return tag[:-1].rstrip() + attr + "\n    >"
+
+
 def ensure_pip(xml: str) -> str:
     if "supportsPictureInPicture" in xml:
         return xml
-    updated, n = re.subn(r"<activity\b", f"<activity\n        {PIP_ATTR}", xml, count=1)
+    updated, n = re.subn(MAIN_ACTIVITY_TAG_RE, lambda m: inject_pip_attr(m.group(0)), xml, count=1)
     if n != 1:
-        raise SystemExit("AndroidManifest.xml has no <activity> element to mark for PiP")
+        raise SystemExit(
+            "AndroidManifest.xml has no <activity> whose android:name ends with "
+            "MainActivity to mark for PiP"
+        )
     return updated
 
 
@@ -423,6 +461,7 @@ def prepare(root: Path, gen: Path) -> list[str]:
     notes: list[str] = []
     lib_rs = root / "src-tauri" / "android-plugin" / "src" / "lib.rs"
     package, class_name = rust_registration(lib_rs)
+    validate_package(package)
 
     kt_src = kotlin_source(root, package, class_name)
     if not kt_src.is_file():

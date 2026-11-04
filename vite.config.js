@@ -2,21 +2,23 @@ import { defineConfig } from "vite";
 
 // Fixed port: `tauri.conf.json > build.devUrl` points at 1420, and Tauri
 // refuses to start if something else took it.
+//
+// `devUrl` is a localhost origin, so the Tauri dev webview only ever talks to
+// the dev server over loopback; bind 127.0.0.1 for both `dev` and `preview`
+// and keep Vite's default Host check (no allowedHosts override). Binding to
+// all interfaces with the Host check off turned dev into a LAN- and
+// rebinding-reachable origin exposing /@fs and VITE_*/TAURI_* env.
 export default defineConfig({
   clearScreen: false,
   server: {
-    host: "0.0.0.0",
+    host: "127.0.0.1",
     port: 1420,
     strictPort: true,
-    // The preview proxy uses a non-localhost Host header.
-    allowedHosts: true,
   },
-  // Allow the Tauri preview origin so the sandboxed preview works too.
   preview: {
-    host: "0.0.0.0",
+    host: "127.0.0.1",
     port: 1420,
     strictPort: true,
-    allowedHosts: true,
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

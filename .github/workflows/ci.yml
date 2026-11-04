@@ -658,6 +658,10 @@ jobs:
         run: |
           # Patterns are assembled so this file does not match itself, and so
           # the frontend secret test (which scans YAML) does not either.
+          # tests/ is scanned too: the fragments in tests/security.test.js are
+          # built with .join(), so none of these three regexes match there.
+          # If a fixture ever needs a token-shaped string, exclude that one
+          # file, never all of tests/.
           private_key="$(printf '%s %s' 'BEGIN (RSA |EC )?PRIVATE' 'KEY')"
           aws_key="$(printf '%s_%s_%s_%s' aws secret access key)"
           access_key="$(printf '%s[0-9A-Z]{16}' AKIA)"
@@ -665,7 +669,7 @@ jobs:
             -e "$private_key" \
             -e "$aws_key" \
             -e "$access_key" \
-            -- . ':(exclude)tests/*'; then
+            -- .; then
             echo "::error::possible secret committed"
             exit 1
           fi
