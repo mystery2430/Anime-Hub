@@ -42,7 +42,7 @@ use crate::commands::{lock_recover, AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
-use crate::web::dns::classify_host;
+use crate::web::dns::{classify_host, classify_host_nav};
 // `CookieJar` backs the one-time Android profile cookie migration and the
 // desktop per-site cookie export. Android site cookies live in their profile
 // and are never snapshotted.
@@ -314,7 +314,18 @@ pub async fn open_site_window(
     _fullscreen: bool,
     session_id: String,
 ) -> AppResult<(String, String)> {
-    open_on_mobile(&app, site, url, init_script, session_id)
+    // The Android open runs multi-second blocking bridge calls (profile
+    // creation, cookie re-import, WebView build) under
+    // `ANDROID_SESSION_LOCK`; offload them so an async-runtime worker is not
+    // blocked for the whole swap (MAIN_TREE_AUDIT M-06).
+    let site = site.clone();
+    let url = url.clone();
+    let init_script = init_script.to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        open_on_mobile(&app, &site, &url, &init_script, session_id)
+    })
+    .await
+    .map_err(|_| AppError::Other("site açma görevi başlatılamadı".into()))?
 }
 
 /// Desktop variant: a child WebView inside the main window, per-site profile
@@ -456,6 +467,7 @@ fn open_in_main_window_inner(
     let nav_label = label.clone();
     let nav_session_id = session_id.clone();
     let page_load_session_id = session_id.clone();
+    let page_load_own_host = host.clone();
     // A separate clone for each callback: the builder borrows `app` for its
     // own lifetime, and both callbacks must keep this WebView's identity.
     let nav_app = app.clone();
@@ -486,7 +498,9 @@ fn open_in_main_window_inner(
                     let app = nav_app.clone();
                     let label = nav_label.clone();
                     let session_id = nav_session_id.clone();
-                    tauri::async_runtime::spawn(async move {
+                    // Blocking native close: off the async worker
+                    // (MAIN_TREE_AUDIT M-06).
+                    tauri::async_runtime::spawn_blocking(move || {
                         if close_site_window_for_session(&app, &label, &session_id).is_err() {
                             log::debug!("eski site kapatma isteği artık geçerli değil");
                         }
@@ -511,7 +525,7 @@ fn open_in_main_window_inner(
                     // for them would break playback or a player popup without
                     // closing anything — they inherit a document that already
                     // went through this check.
-                    ("https", Some(host)) => dns_decision(classify_host(host)),
+                    ("https", Some(host)) => dns_decision(classify_host_nav(host)),
                     _ => NavDecision::Allow,
                 }
             } else {
@@ -557,13 +571,35 @@ fn open_in_main_window_inner(
                     "animehub://navigation-blocked",
                     "Site proxy'si kullanılmadı; site korumasız açılmadı.",
                 );
-                tauri::async_runtime::spawn(async move {
+                // Blocking native close: off the async worker
+                // (MAIN_TREE_AUDIT M-06).
+                tauri::async_runtime::spawn_blocking(move || {
                     if close_site_window_for_session(&app, &label, &session_id).is_err() {
                         log::debug!("eski veya değişmiş site oturumu kapatma isteği reddedildi");
                     }
                 });
                 return;
             }
+            // Pre-warm the DNS answer cache for the origins this page needs:
+            // the site's own name plus the host it actually landed on (a
+            // redirect chain often finishes on a different name than the one
+            // the nav guard approved). The next in-page redirect usually then
+            // hits the cache instead of a lookup on the navigation thread
+            // (MAIN_TREE_AUDIT M-07). `classify_host` only caches decisive
+            // answers, so an unlucky pre-warm records nothing.
+            let landed_host = webview
+                .url()
+                .ok()
+                .filter(|landed| landed.scheme() == "https")
+                .and_then(|landed| landed.host_str().map(str::to_string));
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::web::dns::classify_host(&page_load_own_host);
+                if let Some(landed) = landed_host {
+                    if landed != page_load_own_host {
+                        crate::web::dns::classify_host(&landed);
+                    }
+                }
+            });
             let _ = webview.eval(crate::web::session::OVERLAY_SNIPPET);
         });
 
@@ -641,14 +677,6 @@ fn close_current_child_locked(app: &AppHandle) -> AppResult<()> {
         Some(label) => close_site_window_locked(app, &label, None),
         None => Ok(()),
     }
-}
-
-/// Wrapper that acquires `DESKTOP_SESSION_LOCK` for callers outside `open`.
-#[cfg(desktop)]
-#[allow(dead_code)]
-fn close_current_child(app: &AppHandle) -> AppResult<()> {
-    let _guard = lock_desktop_session()?;
-    close_current_child_locked(app)
 }
 
 /// Watch the main window so the hosted site webview tracks its size.
@@ -746,8 +774,16 @@ fn ensure_close_session_identity(
 ///
 /// `closed` must be the record captured by the close path, never a fresh read
 /// of `current_site`; that mutable slot may already belong to a newer opening.
+///
+/// Targeted at the launcher webview instead of broadcast: the remote site
+/// page renders next to it in the same webviewset and must not observe
+/// launcher session events (MAIN_TREE_AUDIT M-14).
 fn emit_site_closed(app: &AppHandle, closed: &CurrentSite) {
-    let _ = app.emit("animehub://site-closed", closed.closed_event());
+    let _ = app.emit_to(
+        LAUNCHER_LABEL,
+        "animehub://site-closed",
+        closed.closed_event(),
+    );
 }
 
 /// Snapshot the live session into the encrypted store on a fixed interval.
@@ -776,9 +812,12 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
             // sees it as gone and exits without resurrecting the jar.
             let _guard = match lock_desktop_session() {
                 Ok(g) => g,
+                // One transient acquisition failure must not retire the
+                // safety net for the rest of the session: skip this tick,
+                // re-arm on the next interval (MAIN_TREE_AUDIT M-15).
                 Err(_) => {
-                    log::error!("masaüstü oturum eşitlemesi kilitlenemedi");
-                    return;
+                    log::warn!("masaüstü oturum eşitlemesi kilitlenemedi; tekrar denenecek");
+                    continue;
                 }
             };
             {
@@ -815,9 +854,11 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
             std::thread::sleep(SESSION_SYNC_INTERVAL);
             let _guard = match lock_android_session() {
                 Ok(guard) => guard,
+                // Skip this tick and re-arm; a single contended acquisition
+                // must not end the durability flush (MAIN_TREE_AUDIT M-15).
                 Err(_) => {
-                    log::error!("Android oturum eşitlemesi kilitlenemedi");
-                    return;
+                    log::warn!("Android oturum eşitlemesi kilitlenemedi; tekrar denenecek");
+                    continue;
                 }
             };
             {
@@ -3737,7 +3778,14 @@ fn close_site_window_locked(
 
     if let Some(child) = app.get_webview(&child_label) {
         if let Some(cur) = current.as_ref().filter(|c| c.window_label == child_label) {
-            export_cookies_webview(&child, &cur.site_id)?;
+            // Best-effort final snapshot: one persistent export failure must
+            // not wedge the close itself and every later site open (both come
+            // back through this path). The periodic `spawn_session_sync`
+            // snapshot is the durability backstop, so log and proceed with
+            // the close either way (MAIN_TREE_AUDIT M-05).
+            if let Err(e) = export_cookies_webview(&child, &cur.site_id) {
+                log::error!("kapatma öncesi çerez dışa aktarımı başarısız: {e:?}");
+            }
         }
         child.close().map_err(|_| {
             log::error!("site görünümü kapatılamadı");

@@ -131,20 +131,24 @@ impl CurrentSite {
         SiteClosedEvent {
             site_id: self.site_id.clone(),
             session_id: self.session_id.clone(),
+            label: windows::label_for(&self.site_id),
         }
     }
 }
 
 /// Payload of `animehub://site-closed`.
 ///
-/// `siteId` keeps the event useful for diagnostics; `sessionId` is the
-/// authoritative ownership proof. The launcher clears its active opening only
-/// when `sessionId` exactly matches the opening it owns.
+/// `sessionId` is the authoritative ownership proof: the launcher clears its
+/// active opening only when it exactly matches the opening it owns. `siteId`
+/// and `label` (the derived launcher window label) keep the event useful for
+/// diagnostics and for listeners that key on the label instead
+/// (MAIN_TREE_AUDIT M-14).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteClosedEvent {
     pub site_id: String,
     pub session_id: String,
+    pub label: String,
 }
 
 /// A fresh opaque identity for one successful site opening.
@@ -812,6 +816,18 @@ pub async fn close_site(
     // Labels are reused across openings; native close independently validates
     // that this request still owns the active session.
     windows::close_site_window_for_session(&app, &label, &session_id)
+}
+
+/// Open a URL in the system browser.
+///
+/// The launcher webview's `opener` capability is protocol-level and broad, so
+/// JS must route every external open through THIS command and the
+/// `opener:openUrl` plugin call stays unused: [`windows::open_externally`]
+/// applies the HTTPS-only `validate_site_url` choke point and the blocklist
+/// check before anything leaves the app (MAIN_TREE_AUDIT M-03).
+#[tauri::command]
+pub fn open_external(app: AppHandle, url: String) -> AppResult<()> {
+    windows::open_externally(&app, &url)
 }
 
 /// Wipe stored cookies for one site, or for all sites when `id` is `None`.

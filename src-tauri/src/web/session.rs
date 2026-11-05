@@ -30,7 +30,6 @@ use crate::sites::blocklist::Blocklist;
 use crate::sites::url_policy::navigation_allowed;
 use crate::web::dns::DnsClass;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use url::Url;
 
 /// A cookie in a form that can be serialised into an encrypted blob.
@@ -504,41 +503,6 @@ pub fn ensure_profile_dir(
     Ok(dir)
 }
 
-/// Which site a session belongs to (ownership checks for open/close/wipe).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRef {
-    pub site_id: String,
-    pub host: String,
-}
-
-/// In-memory index of open sessions so `close_site` knows which jar to save.
-#[derive(Debug, Default)]
-pub struct SessionIndex {
-    inner: HashMap<String, SessionRef>,
-}
-
-impl SessionIndex {
-    pub fn insert(&mut self, window_label: String, r: SessionRef) {
-        self.inner.insert(window_label, r);
-    }
-
-    pub fn take(&mut self, window_label: &str) -> Option<SessionRef> {
-        self.inner.remove(window_label)
-    }
-
-    pub fn get(&self, window_label: &str) -> Option<&SessionRef> {
-        self.inner.get(window_label)
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
-
 /// Errors surfaced to the user when a navigation is blocked.
 pub fn block_message(d: &NavDecision) -> Option<String> {
     match d {
@@ -914,24 +878,6 @@ mod tests {
         assert_eq!(profile_dir_name("../../etc/passwd"), "site-etcpasswd");
         assert_eq!(profile_dir_name(""), "site");
         assert_eq!(profile_dir_name("日本語"), "site");
-    }
-
-    #[test]
-    fn session_index_tracks_and_releases() {
-        let mut idx = SessionIndex::default();
-        assert!(idx.is_empty());
-        idx.insert(
-            "w1".into(),
-            SessionRef {
-                site_id: "s1".into(),
-                host: "a.example".into(),
-            },
-        );
-        assert_eq!(idx.len(), 1);
-        assert_eq!(idx.get("w1").unwrap().site_id, "s1");
-        let taken = idx.take("w1").unwrap();
-        assert_eq!(taken.host, "a.example");
-        assert!(idx.take("w1").is_none());
     }
 
     #[test]

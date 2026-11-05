@@ -52,6 +52,7 @@ pub fn run() {
             commands::set_site_hidden,
             commands::open_site,
             commands::close_site,
+            commands::open_external,
             commands::clear_site_data,
             commands::get_settings,
             commands::update_settings,

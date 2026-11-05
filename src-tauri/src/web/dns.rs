@@ -18,10 +18,17 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-/// How long a navigation may wait on the resolver before falling back to the
-/// string policy. Long enough for a cold recursive lookup, short enough that
-/// a hung resolver cannot freeze the WebView thread indefinitely.
+/// Open-path budget: long enough for a cold recursive lookup. The open
+/// command runs this on an async worker (`spawn_blocking`), so a waiting
+/// lookup freezes no UI thread.
 const LOOKUP_TIMEOUT: Duration = Duration::from_millis(1_200);
+
+/// Navigation-guard budget: this lookup blocks the WebView's MAIN navigation
+/// thread, so the freeze window stays short. Rebinding semantics are
+/// unchanged — same shared in-flight map, same never-cache-Unknown rule; only
+/// the per-caller wait until an answer or `Unknown` shrinks
+/// (MAIN_TREE_AUDIT M-07) while the open path keeps the longer budget above.
+const NAV_LOOKUP_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// Public answers are cached briefly. A long cache would itself be a rebinding
 /// window: the second navigation would trust a stale "public" result.
@@ -63,11 +70,31 @@ pub fn answers_are_private(addrs: &[IpAddr]) -> bool {
     addrs.is_empty() || addrs.iter().copied().any(|ip| !is_public_ip(ip))
 }
 
-/// Classify `host` for the navigation guard.
+/// Classify `host` for the site-open gate.
 ///
 /// Literal and suffix-private hosts (`127.0.0.1`, `*.local`, …) never touch
-/// the network. Everything else is resolved with [`LOOKUP_TIMEOUT`].
+/// the network. Everything else is resolved with [`LOOKUP_TIMEOUT`]; the
+/// caller is an async worker ([`crate::commands::open_site`]'s
+/// `spawn_blocking`), not a UI thread.
 pub fn classify_host(host: &str) -> DnsClass {
+    classify_with(host, LOOKUP_TIMEOUT)
+}
+
+/// [`classify_host`] with the short navigation-thread budget.
+///
+/// The `on_navigation` guard runs synchronously on the main thread: it takes
+/// the shorter [`NAV_LOOKUP_TIMEOUT`] and relies on the shared in-flight map
+/// (a concurrent open lookup is joined, not duplicated) plus the page-load
+/// pre-warm in `web/windows.rs` to usually hit the answer cache.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub fn classify_host_nav(host: &str) -> DnsClass {
+    classify_with(host, NAV_LOOKUP_TIMEOUT)
+}
+
+/// Testable core: identical policy for both entry points, only the wait
+/// budget differs. Timed-out lookups still are not cached in either
+/// direction.
+fn classify_with(host: &str, timeout: Duration) -> DnsClass {
     let key = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if key.is_empty() {
         return DnsClass::Unknown;
@@ -92,7 +119,7 @@ pub fn classify_host(host: &str) -> DnsClass {
         return class;
     }
 
-    let class = lookup_with_timeout(&key);
+    let class = lookup_with(&key, timeout, MAX_LOOKUP_THREADS, resolve_ips);
     match class {
         DnsClass::Answered { private: true } => cache_put(key, class, PRIVATE_TTL),
         DnsClass::Answered { private: false } => cache_put(key, class, PUBLIC_TTL),
@@ -114,10 +141,6 @@ fn literal_ip(host: &str) -> Option<IpAddr> {
 
 fn literal_is_private(host: &str) -> bool {
     literal_ip(host).is_some_and(|ip| !is_public_ip(ip))
-}
-
-fn lookup_with_timeout(host: &str) -> DnsClass {
-    lookup_with(host, LOOKUP_TIMEOUT, MAX_LOOKUP_THREADS, resolve_ips)
 }
 
 /// One in-flight lookup that callers can join, so "the same host, again" costs
