@@ -445,8 +445,11 @@ pub fn profile_removal_for(action: crate::android_bridge::SiteProfileAction) -> 
 // thread: this command blocks on the desktop/android session lock, and a sync
 // command would block that thread on the same lock the lifecycle worker holds
 // across main-thread dispatches — a whole-app deadlock.
-#[tauri::command(async)]
-pub fn remove_site(
+// The `.await` lives in the Android offload branch; the desktop branch is
+// synchronous by design, so the desktop compile raises `unused_async`.
+#[allow(clippy::unused_async)]
+#[tauri::command]
+pub async fn remove_site(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
@@ -540,83 +543,95 @@ pub fn remove_site(
     }
     #[cfg(not(desktop))]
     {
-        #[cfg(target_os = "android")]
-        let _android_guard = crate::web::windows::lock_android_session()?;
-        let was_builtin = {
-            let reg = state
-                .registry
-                .lock()
-                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            reg.get(&id).is_some_and(|s| s.builtin)
-        };
-        if was_builtin {
-            let mut reg = state
-                .registry
-                .lock()
-                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            reg.remove(&id)?;
-            drop(reg);
-            persist_registry(&state)?;
-            return Ok(RemoveSiteOutcome {
-                profile: ProfileRemoval::Hidden,
-            });
-        }
-        // Android is the only mobile target left, and it always has a
-        // WebView profile to remove.
-        let profile_outcome;
-        let should_close = {
-            let cur = state
-                .current_site
-                .lock()
-                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            cur.as_ref().is_some_and(|c| c.site_id == id)
-        };
-        if should_close {
-            crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
-        }
-        // Android: the site's data lives in its WebView profile. Delete the
-        // profile *before* the registry mutation so a failure keeps the tile
-        // and the user can retry. `Pending` (profile loaded in this process)
-        // is queued for the next process start and reported as `deferred` —
-        // never as deleted. An `unsupported-multi-profile` refusal (a
-        // provider feature gap) propagates as an error so the record stays
-        // and the UI shows the MULTI_PROFILE guidance; it must not be faked
-        // as deferred-forever success.
-        //
-        // The whole delete → queue → generation bump → quarantine retirement
-        // order lives in ONE host-tested function. Retirement LAST is the
-        // safety property: the ledger for this name may only be dropped once
-        // the bump is durably stored, because a failed bump/write aborts this
-        // command with the registry intact and the next open would derive the
-        // very same name — which must still be blocked while a
-        // `removeAllCookies` deletion may be in flight on it.
-        #[cfg(target_os = "android")]
-        {
-            let action = crate::web::windows::run_mobile_delete_protocol(
-                &state,
-                &id,
-                |profile| crate::android_bridge::site_profile_delete(profile),
-                |profile| crate::android_bridge::site_profile_retire(profile),
-            )?;
-            profile_outcome = profile_removal_for(action);
-        }
-        state.provider.delete_site_session(&id)?;
-        {
-            let mut reg = state
-                .registry
-                .lock()
-                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            if reg.get(&id).is_none() {
+        // The Android drain tears down the live view and deletes the WebView
+        // profile through multi-second blocking JNI bridge calls while the
+        // session lock is held. Run the whole serialized sequence on the
+        // blocking pool instead of an async-runtime worker, with the lock
+        // acquired INSIDE the closure, never across the `.await`
+        // (MAIN_TREE_AUDIT M-06).
+        let _ = &state;
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(target_os = "android")]
+            let _android_guard = crate::web::windows::lock_android_session()?;
+            let state = app.state::<AppState>();
+            let was_builtin = {
+                let reg = state
+                    .registry
+                    .lock()
+                    .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                reg.get(&id).is_some_and(|s| s.builtin)
+            };
+            if was_builtin {
+                let mut reg = state
+                    .registry
+                    .lock()
+                    .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                reg.remove(&id)?;
+                drop(reg);
+                persist_registry(&state)?;
                 return Ok(RemoveSiteOutcome {
-                    profile: profile_outcome,
+                    profile: ProfileRemoval::Hidden,
                 });
             }
-            reg.remove(&id)?;
-        }
-        persist_registry(&state)?;
-        Ok(RemoveSiteOutcome {
-            profile: profile_outcome,
+            // Android is the only mobile target left, and it always has a
+            // WebView profile to remove.
+            let profile_outcome;
+            let should_close = {
+                let cur = state
+                    .current_site
+                    .lock()
+                    .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                cur.as_ref().is_some_and(|c| c.site_id == id)
+            };
+            if should_close {
+                crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
+            }
+            // Android: the site's data lives in its WebView profile. Delete the
+            // profile *before* the registry mutation so a failure keeps the tile
+            // and the user can retry. `Pending` (profile loaded in this process)
+            // is queued for the next process start and reported as `deferred` —
+            // never as deleted. An `unsupported-multi-profile` refusal (a
+            // provider feature gap) propagates as an error so the record stays
+            // and the UI shows the MULTI_PROFILE guidance; it must not be faked
+            // as deferred-forever success.
+            //
+            // The whole delete → queue → generation bump → quarantine retirement
+            // order lives in ONE host-tested function. Retirement LAST is the
+            // safety property: the ledger for this name may only be dropped once
+            // the bump is durably stored, because a failed bump/write aborts this
+            // command with the registry intact and the next open would derive the
+            // very same name — which must still be blocked while a
+            // `removeAllCookies` deletion may be in flight on it.
+            #[cfg(target_os = "android")]
+            {
+                let action = crate::web::windows::run_mobile_delete_protocol(
+                    &state,
+                    &id,
+                    |profile| crate::android_bridge::site_profile_delete(profile),
+                    |profile| crate::android_bridge::site_profile_retire(profile),
+                )?;
+                profile_outcome = profile_removal_for(action);
+            }
+            state.provider.delete_site_session(&id)?;
+            {
+                let mut reg = state
+                    .registry
+                    .lock()
+                    .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                if reg.get(&id).is_none() {
+                    return Ok(RemoveSiteOutcome {
+                        profile: profile_outcome,
+                    });
+                }
+                reg.remove(&id)?;
+            }
+            persist_registry(&state)?;
+            Ok(RemoveSiteOutcome {
+                profile: profile_outcome,
+            })
         })
+        .await
+        .map_err(|_| AppError::Other("site silme görevi başlatılamadı".into()))?
     }
 }
 
@@ -814,8 +829,15 @@ pub async fn close_site(
         .map(|id| crate::diagnostics::begin_operation_with_id("close", id))
         .or_else(|| crate::diagnostics::scope_if_missing("close"));
     // Labels are reused across openings; native close independently validates
-    // that this request still owns the active session.
-    windows::close_site_window_for_session(&app, &label, &session_id)
+    // that this request still owns the active session. Both targets run the
+    // native teardown blocking under their session lock (Android does JNI
+    // flush/destroy): keep the whole close off the async runtime worker
+    // (MAIN_TREE_AUDIT M-06).
+    tauri::async_runtime::spawn_blocking(move || {
+        windows::close_site_window_for_session(&app, &label, &session_id)
+    })
+    .await
+    .map_err(|_| AppError::Other("site kapatma görevi başlatılamadı".into()))?
 }
 
 /// Open a URL in the system browser.
@@ -841,6 +863,9 @@ pub fn open_external(app: AppHandle, url: String) -> AppResult<()> {
 /// target site's profile is cleared in place (profile cookie manager +
 /// web storage) while holding the Android session lock; the launcher's
 /// default profile and its data are never touched.
+// The `.await` lives in the Android offload branch; the desktop branch is
+// synchronous by design, so the desktop compile raises `unused_async`.
+#[allow(clippy::unused_async)]
 #[tauri::command]
 pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u32> {
     let _operation_scope = crate::diagnostics::scope_if_missing("clear");
@@ -850,59 +875,144 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
     let is_all = id.is_none();
     #[cfg(target_os = "android")]
     let all_sites = is_all;
-    let state = app.state::<AppState>();
 
     // Serialize the wipe against open/sync/remove via the lifecycle lock.
     // The lock is taken *before* snapshotting `ids` so the `ids` list is
     // consistent with the registry while the lock is held. This follows the
-    // documented order `DESKTOP/ANDROID → registry → STORE`.
-    #[cfg(target_os = "android")]
-    let _session_guard = windows::lock_android_session()?;
-    #[cfg(desktop)]
-    let _desktop_guard = windows::lock_desktop_session()?;
-
-    let ids: Vec<String> = match id {
-        Some(id) => vec![id],
-        None => {
-            let reg = state
-                .registry
-                .lock()
-                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            reg.sites.iter().map(|s| s.id.clone()).collect()
-        }
-    };
+    // documented order `DESKTOP/ANDROID → registry → STORE`. Android: the
+    // close-live step, the per-site clears and the orphan scan all sit under
+    // that lock across multi-second blocking bridge calls, so the whole
+    // Android drain runs on the blocking pool instead — the Android lock is
+    // acquired INSIDE the closure, never across the `.await`
+    // (MAIN_TREE_AUDIT M-06).
+    //
+    // Android: if the active provider is among the ids being wiped (or
+    // all providers are wiped), close its WebView *without* exporting
+    // live cookies/storage and invalidate `current_site` before deleting
+    // the blobs. This prevents the still-loaded page and its
+    // `spawn_session_sync` worker from recreating the jar after the
+    // wipe. The `ANDROID_SESSION_LOCK` is already held, so the
+    // `*_locked` helper is used to avoid deadlock and to re-check that
+    // `site_id` is still current after acquiring the lock.
     #[cfg(target_os = "android")]
     {
-        // Android: if the active provider is among the ids being wiped (or
-        // all providers are wiped), close its WebView *without* exporting
-        // live cookies/storage and invalidate `current_site` before deleting
-        // the blobs. This prevents the still-loaded page and its
-        // `spawn_session_sync` worker from recreating the jar after the
-        // wipe. The `ANDROID_SESSION_LOCK` is already held, so the
-        // `*_locked` helper is used to avoid deadlock and to re-check that
-        // `site_id` is still current after acquiring the lock.
-        let current_snapshot = {
-            let cur = state
-                .current_site
-                .lock()
-                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            cur.clone()
-        };
-        let clear_live = all_sites
-            || current_snapshot
-                .as_ref()
-                .is_some_and(|site| ids.iter().any(|id| id == &site.site_id));
-        if clear_live {
-            if let Some(active) = current_snapshot {
-                crate::web::windows::close_site_window_for_clear_locked(&app, &active.site_id)?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            let _session_guard = windows::lock_android_session()?;
+            let state = app.state::<AppState>();
+            let ids: Vec<String> = match id {
+                Some(id) => vec![id],
+                None => {
+                    let reg = state
+                        .registry
+                        .lock()
+                        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                    reg.sites.iter().map(|s| s.id.clone()).collect()
+                }
+            };
+            let current_snapshot = {
+                let cur = state
+                    .current_site
+                    .lock()
+                    .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                cur.clone()
+            };
+            let clear_live = all_sites
+                || current_snapshot
+                    .as_ref()
+                    .is_some_and(|site| ids.iter().any(|id| id == &site.site_id));
+            if clear_live {
+                if let Some(active) = current_snapshot {
+                    crate::web::windows::close_site_window_for_clear_locked(
+                        &app, &active.site_id,
+                    )?;
+                }
+                // No `else`: with no active site view there is no shared jar to
+                // clear any more — site cookies live in per-site profiles, and
+                // the launcher's default profile is never part of a site wipe.
             }
-            // No `else`: with no active site view there is no shared jar to
-            // clear any more — site cookies live in per-site profiles, and
-            // the launcher's default profile is never part of a site wipe.
-        }
+            let mut n = 0;
+            for id in &ids {
+                // Android: clear the site's profile in place — its own cookie
+                // manager, web storage and permissions. The profile object itself
+                // survives, so the next open starts logged out without a
+                // delete/recreate race. An absent profile is already clean; a hard
+                // failure aborts so the caller never sees a false success.
+                //
+                // Profile first, encrypted blobs second, as one host-tested
+                // protocol: a wipe failure keeps the jar for a retry, and a success
+                // always reaches `delete_site_session` — including Kotlin's "the
+                // provider deleted nothing because the jar was already empty"
+                // success, which used to fail the whole clear and strand the jar.
+                windows::run_mobile_clear_protocol(&state, id, |profile| {
+                    crate::android_bridge::site_clear_data(profile)
+                })?;
+                n += 1;
+            }
+            // Android orphan sweep for "clear all": profile names that no registered
+            // site currently owns (an interrupted remove, an old generation, an
+            // imported registry). Mirrors the desktop `profiles/site-*` sweep — only
+            // names in our namespace are ever addressed, and the live site view was
+            // closed above.
+            //
+            // The ORDER — durable tombstone, then the provider call, then the permanent
+            // reuse block, then the quarantine ledger — lives in the host-tested
+            // `windows::run_orphan_profile_sweep`, because this block is
+            // `#[cfg(target_os = "android")]` and `cargo test` would never see it here.
+            // This side only decides WHICH names are orphans: it holds the registry.
+            if is_all {
+                let mut owned = std::collections::HashSet::new();
+                {
+                    let reg = state
+                        .registry
+                        .lock()
+                        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                    for site in reg.sites.iter() {
+                        let generation = windows::profile_generation(&state, &site.id)?;
+                        owned.insert(windows::android_profile_name(&site.id, generation));
+                    }
+                }
+                let orphans: Vec<String> = crate::android_bridge::site_profile_names()?
+                    .into_iter()
+                    .filter(|name| {
+                        name.starts_with(windows::ANDROID_PROFILE_PREFIX) && !owned.contains(name)
+                    })
+                    .collect();
+                let report = windows::run_orphan_profile_sweep(
+                    &state,
+                    &orphans,
+                    crate::android_bridge::site_profile_delete,
+                    crate::android_bridge::site_profile_retire,
+                )?;
+                log::info!(
+                    "yetim profil süpürmesi: {} ad kuyruğa alındı, {} kalıcı ad engeli, {} ertelendi, \
+                     {} desteklenmiyor, {} karantina kaydı düştü, {} kayıt düşürülemedi",
+                    report.queued,
+                    report.blocked,
+                    report.deferred,
+                    report.unsupported,
+                    report.retired,
+                    report.retire_failed
+                );
+            }
+            Ok(n)
+        })
+        .await
+        .map_err(|_| AppError::Other("site verisi temizleme görevi başlatılamadı".into()))?;
     }
     #[cfg(desktop)]
     {
+        let state = app.state::<AppState>();
+        let _desktop_guard = windows::lock_desktop_session()?;
+        let ids: Vec<String> = match id {
+            Some(id) => vec![id],
+            None => {
+                let reg = state
+                    .registry
+                    .lock()
+                    .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                reg.sites.iter().map(|s| s.id.clone()).collect()
+            }
+        };
         // If the currently open site is among the ids being wiped, close its
         // WebView *without* exporting its live cookies — otherwise the
         // periodic sync or the normal close path would resurrect the
@@ -930,140 +1040,80 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
         if let Some(label) = current_label {
             crate::web::windows::close_site_window_for_clear(&app, &label)?;
         }
-    }
-    let mut n = 0;
-    for id in &ids {
-        // Android: clear the site's profile in place — its own cookie
-        // manager, web storage and permissions. The profile object itself
-        // survives, so the next open starts logged out without a
-        // delete/recreate race. An absent profile is already clean; a hard
-        // failure aborts so the caller never sees a false success.
-        #[cfg(target_os = "android")]
-        {
-            // Profile first, encrypted blobs second, as one host-tested
-            // protocol: a wipe failure keeps the jar for a retry, and a success
-            // always reaches `delete_site_session` — including Kotlin's "the
-            // provider deleted nothing because the jar was already empty"
-            // success, which used to fail the whole clear and strand the jar.
-            windows::run_mobile_clear_protocol(&state, id, |profile| {
-                crate::android_bridge::site_clear_data(profile)
-            })?;
-        }
-        #[cfg(not(target_os = "android"))]
-        state.provider.delete_site_session(id)?;
-        n += 1;
-    }
-    // Android orphan sweep for "clear all": profile names that no registered
-    // site currently owns (an interrupted remove, an old generation, an
-    // imported registry). Mirrors the desktop `profiles/site-*` sweep — only
-    // names in our namespace are ever addressed, and the live site view was
-    // closed above.
-    //
-    // The ORDER — durable tombstone, then the provider call, then the permanent
-    // reuse block, then the quarantine ledger — lives in the host-tested
-    // `windows::run_orphan_profile_sweep`, because this block is
-    // `#[cfg(target_os = "android")]` and `cargo test` would never see it here.
-    // This side only decides WHICH names are orphans: it holds the registry.
-    #[cfg(target_os = "android")]
-    if is_all {
-        let mut owned = std::collections::HashSet::new();
-        {
-            let reg = state
-                .registry
-                .lock()
-                .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-            for site in reg.sites.iter() {
-                let generation = windows::profile_generation(&state, &site.id)?;
-                owned.insert(windows::android_profile_name(&site.id, generation));
-            }
-        }
-        let orphans: Vec<String> = crate::android_bridge::site_profile_names()?
-            .into_iter()
-            .filter(|name| {
-                name.starts_with(windows::ANDROID_PROFILE_PREFIX) && !owned.contains(name)
-            })
-            .collect();
-        let report = windows::run_orphan_profile_sweep(
-            &state,
-            &orphans,
-            crate::android_bridge::site_profile_delete,
-            crate::android_bridge::site_profile_retire,
-        )?;
-        log::info!(
-            "yetim profil süpürmesi: {} ad kuyruğa alındı, {} kalıcı ad engeli, {} ertelendi, \
-             {} desteklenmiyor, {} karantina kaydı düştü, {} kayıt düşürülemedi",
-            report.queued,
-            report.blocked,
-            report.deferred,
-            report.unsupported,
-            report.retired,
-            report.retire_failed
-        );
-    }
-    // Desktop profile directories hold the real cookie DB. A missing
-    // directory is success; a failed delete is not. This runs only on
-    // desktop — on Android there is no per-site directory to remove.
-    #[cfg(desktop)]
-    {
-        let base = app.path().app_data_dir().map_err(|_| {
-            log::error!("profil dizini bulunamadı");
-            AppError::Storage("profil dizini bulunamadı".into())
-        })?;
+        let mut n = 0;
         for id in &ids {
-            let dir = crate::web::session::profile_dir_path(&base, id);
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    log::error!("profil dizini silinemedi");
-                    return Err(AppError::Storage("site verisi silinemedi".into()));
+            // Session drop on this platform: a direct provider call. Android
+            // runs the host-tested clear protocol above instead.
+            #[cfg(not(target_os = "android"))]
+            state.provider.delete_site_session(id)?;
+            n += 1;
+        }
+        // Desktop profile directories hold the real cookie DB. A missing
+        // directory is success; a failed delete is not. This runs only on
+        // desktop — on Android there is no per-site directory to remove.
+        {
+            let base = app.path().app_data_dir().map_err(|_| {
+                log::error!("profil dizini bulunamadı");
+                AppError::Storage("profil dizini bulunamadı".into())
+            })?;
+            for id in &ids {
+                let dir = crate::web::session::profile_dir_path(&base, id);
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        log::error!("profil dizini silinemedi");
+                        return Err(AppError::Storage("site verisi silinemedi".into()));
+                    }
                 }
             }
-        }
-        // "Tüm site verilerini temizle" (id == None) must also cover orphan
-        // `profiles/site-*` directories left behind by earlier bugs. Those
-        // orphans are not in `ids` (registry) but are still app-owned
-        // profiles. We scan `profiles/` for any remaining `site-*` dirs and
-        // delete them, but only while holding `DESKTOP_SESSION_LOCK` and after
-        // the live WebView was closed above, so no live profile is removed.
-        // Only directories whose name starts with `site-` are touched; other
-        // files/dirs (e.g. logs) are left alone.
-        if is_all {
-            let profiles_dir = base.join("profiles");
-            match std::fs::read_dir(&profiles_dir) {
-                Ok(entries) => {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if !name.starts_with("site-") {
-                            continue;
-                        }
-                        if let Ok(ft) = entry.file_type() {
-                            if !ft.is_dir() {
+            // "Tüm site verilerini temizle" (id == None) must also cover orphan
+            // `profiles/site-*` directories left behind by earlier bugs. Those
+            // orphans are not in `ids` (registry) but are still app-owned
+            // profiles. We scan `profiles/` for any remaining `site-*` dirs and
+            // delete them, but only while holding `DESKTOP_SESSION_LOCK` and after
+            // the live WebView was closed above, so no live profile is removed.
+            // Only directories whose name starts with `site-` are touched; other
+            // files/dirs (e.g. logs) are left alone.
+            if is_all {
+                let profiles_dir = base.join("profiles");
+                match std::fs::read_dir(&profiles_dir) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if !name.starts_with("site-") {
                                 continue;
                             }
-                        }
-                        let orphan_dir = profiles_dir.join(&name);
-                        match std::fs::remove_dir_all(&orphan_dir) {
-                            Ok(()) => {
-                                log::info!("yetim profil dizini temizlendi");
+                            if let Ok(ft) = entry.file_type() {
+                                if !ft.is_dir() {
+                                    continue;
+                                }
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(_) => {
-                                log::error!("yetim profil dizini silinemedi");
-                                return Err(AppError::Storage("site verisi silinemedi".into()));
+                            let orphan_dir = profiles_dir.join(&name);
+                            match std::fs::remove_dir_all(&orphan_dir) {
+                                Ok(()) => {
+                                    log::info!("yetim profil dizini temizlendi");
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(_) => {
+                                    log::error!("yetim profil dizini silinemedi");
+                                    return Err(AppError::Storage(
+                                        "site verisi silinemedi".into(),
+                                    ));
+                                }
                             }
                         }
                     }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    log::error!("profil dizini listelenemedi");
-                    return Err(AppError::Storage("site verisi silinemedi".into()));
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        log::error!("profil dizini listelenemedi");
+                        return Err(AppError::Storage("site verisi silinemedi".into()));
+                    }
                 }
             }
         }
+        return Ok(n);
     }
-    Ok(n)
 }
 
 // The raw cookie-jar commands (`get_site_cookies` / `set_site_cookies`) are
