@@ -842,11 +842,11 @@ pub async fn close_site(
 
 /// Open a URL in the system browser.
 ///
-/// The launcher webview's `opener` capability is protocol-level and broad, so
-/// JS must route every external open through THIS command and the
-/// `opener:openUrl` plugin call stays unused: [`windows::open_externally`]
+/// The launcher webview has NO opener capability: JS must route every
+/// external open through THIS command, [`windows::open_externally`], which
 /// applies the HTTPS-only `validate_site_url` choke point and the blocklist
-/// check before anything leaves the app (MAIN_TREE_AUDIT M-03).
+/// check before anything leaves the app, and the capability is granted to
+/// nothing else (MAIN_TREE_AUDIT M-03).
 #[tauri::command]
 pub fn open_external(app: AppHandle, url: String) -> AppResult<()> {
     windows::open_externally(&app, &url)
