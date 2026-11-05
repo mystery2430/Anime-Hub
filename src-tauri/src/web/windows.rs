@@ -42,7 +42,7 @@ use crate::commands::{lock_recover, AppState, CurrentSite};
 use crate::error::{AppError, AppResult};
 use crate::sites::registry::Site;
 #[cfg(desktop)]
-use crate::web::dns::{classify_host, classify_host_nav};
+use crate::web::dns::classify_host_nav;
 // `CookieJar` backs the one-time Android profile cookie migration and the
 // desktop per-site cookie export. Android site cookies live in their profile
 // and are never snapshotted.

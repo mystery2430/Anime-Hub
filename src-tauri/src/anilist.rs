@@ -2194,11 +2194,12 @@ mod tests {
         );
         assert!(printed.contains("[redacted]"));
 
-        // An absent refresh token still shows up as absent.
+        // An absent refresh token still shows up as absent. `..token.clone()`
+        // (not `..token`): Token implements Drop, so struct-update move is E0509.
         let missing = Token {
             access_token: "atok".into(),
             refresh_token: None,
-            ..token
+            ..token.clone()
         };
         let printed = format!("{missing:?}");
         assert!(!printed.contains("atok"), "{printed}");

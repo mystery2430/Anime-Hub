@@ -1110,7 +1110,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                 }
             }
         }
-        return Ok(n);
+        Ok(n)
     }
 }
 
