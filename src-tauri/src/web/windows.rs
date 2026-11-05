@@ -592,10 +592,14 @@ fn open_in_main_window_inner(
                 .ok()
                 .filter(|landed| landed.scheme() == "https")
                 .and_then(|landed| landed.host_str().map(str::to_string));
+            // Cloned so the offload can move it: `page_load_own_host` is an
+            // outer capture of this `Fn` on_page_load closure, and moving out
+            // of an Fn (rather than a FnOnce local) is a compile error.
+            let warm_own = page_load_own_host.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                crate::web::dns::classify_host(&page_load_own_host);
+                crate::web::dns::classify_host(&warm_own);
                 if let Some(landed) = landed_host {
-                    if landed != page_load_own_host {
+                    if landed != warm_own {
                         crate::web::dns::classify_host(&landed);
                     }
                 }

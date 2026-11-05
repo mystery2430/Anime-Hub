@@ -1097,9 +1097,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                                 Err(_) => {
                                     log::error!("yetim profil dizini silinemedi");
-                                    return Err(AppError::Storage(
-                                        "site verisi silinemedi".into(),
-                                    ));
+                                    return Err(AppError::Storage("site verisi silinemedi".into()));
                                 }
                             }
                         }
