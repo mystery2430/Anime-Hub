@@ -7,11 +7,14 @@
  * Defect A.5 regression cover: the label must survive a pending or failed
  * close (no `finally` clearing), a failed close must surface its reason,
  * a second request must never start a concurrent `close_site`, and
- * `animehub://site-closed` is accepted only for the exact opening it closes.
+ * `animehub://site-closed` is accepted only when it provably belongs to this
+ * session: the legacy typed event by its exact native `sessionId`, the new
+ * `{ siteId, label }` contract (and the legacy bare-string payload) by
+ * naming the tracked label or site id.
  *
- * The last point is subtle: site A closed and reopened still has site id
- * `id-a`, so a delayed event from the FIRST opening must be rejected by its
- * distinct native `sessionId`.
+ * The typed interface is subtle: site A closed and reopened still has site
+ * id and label repeated, so a delayed event from the FIRST opening must be
+ * rejected by its distinct native `sessionId`.
  *
  * Pure state machine + injected `call` fake — no Tauri, no DOM, no new
  * dependencies.
@@ -166,16 +169,13 @@ test("missing or malformed identities leave the active session unchanged", () =>
     null,
     undefined,
     "",
+    // A string that names neither the label nor the site id.
     "open-a-1",
-    "id-a",
     42,
     {},
-    { siteId: "id-a" },
+    { siteId: "" },
     { sessionId: "open-a-1" },
     { siteId: "", sessionId: "open-a-1" },
-    { siteId: "id-a", sessionId: "" },
-    { siteId: "id-a", sessionId: null },
-    { siteId: "id-a", sessionId: 42 },
     { siteId: 42, sessionId: "open-a-1" },
     ["id-a", "open-a-1"],
   ];
@@ -198,9 +198,11 @@ test("missing or malformed identities leave the active session unchanged", () =>
   assert.equal(h.session.statusString(), "idle");
 });
 
-test("a session without an opening identity never accepts a close event", () => {
-  // Fail closed: a launcher that has no native identity to compare against
-  // must not treat an unverifiable event as proof of ownership.
+test("a session without an opening identity never accepts a legacy typed event", () => {
+  // Fail closed for the typed `SiteClosedEvent`: without an owned
+  // `sessionId` there is nothing to verify it against, so it must not treat
+  // the event as proof of ownership. (The label-based contract can still
+  // clear such a session — see the `{ siteId, label }` test below.)
   const h = harness();
   h.session.opened("site-a", "id-a");
   assert.equal(h.session.closedByEvent(closeEvent("id-a", "anything")), false);
@@ -211,6 +213,52 @@ test("a session without an opening identity never accepts a close event", () => 
   h2.session.opened("site-c");
   assert.equal(h2.session.closedByEvent(closeEvent("site-c", "anything")), false);
   assert.equal(h2.session.hasSession(), true);
+});
+
+test("the current { siteId, label } contract clears the tracked session", () => {
+  // The shape the Rust side emits now: ownership is proven by naming the
+  // tracked label (or the tracked site id).
+  const h = harness();
+  h.session.opened("site-a", "id-a", "open-a-1");
+  assert.equal(h.session.closedByEvent({ siteId: "id-a", label: "site-a" }), true);
+  assert.equal(h.session.currentLabel(), null);
+  assert.equal(h.session.hasSession(), false);
+
+  // A foreign session's event must not.
+  const h2 = harness();
+  h2.session.opened("site-b", "id-b", "open-b-1");
+  assert.equal(
+    h2.session.closedByEvent({ siteId: "id-a", label: "site-a" }),
+    false,
+    "another session's identity must be ignored",
+  );
+  assert.equal(h2.session.currentLabel(), "site-b");
+  assert.equal(h2.session.hasSession(), true);
+
+  // A site-id-only payload clears only when it names the tracked site id.
+  const h3 = harness();
+  h3.session.opened("site-a", "id-a", "open-a-1");
+  assert.equal(h3.session.closedByEvent({ siteId: "id-a" }), true);
+  assert.equal(h3.session.currentLabel(), null);
+
+  const h4 = harness();
+  h4.session.opened("site-a", "id-a", "open-a-1");
+  assert.equal(h4.session.closedByEvent({ siteId: "id-z" }), false);
+  assert.equal(h4.session.currentLabel(), "site-a");
+});
+
+test("legacy string payloads (mid-rollout producer) still clear the tracked session", () => {
+  // Pre-v0.4 binaries emitted a bare site id; the shim must keep the back
+  // path alive instead of bricking it.
+  const h = harness();
+  h.session.opened("site-a", "id-a", "open-a-1");
+  assert.equal(h.session.closedByEvent("id-a"), true);
+  assert.equal(h.session.currentLabel(), null);
+
+  const h2 = harness();
+  h2.session.opened("site-a", "id-a", "open-a-1");
+  assert.equal(h2.session.closedByEvent("id-other"), false);
+  assert.equal(h2.session.currentLabel(), "site-a");
 });
 
 test("a delayed event from the previous session cannot clear the new one", () => {

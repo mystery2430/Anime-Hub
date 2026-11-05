@@ -122,12 +122,14 @@ test("capabilities are scoped to the launcher webview only", () => {
   );
   const ids = cap.permissions.map((p) => (typeof p === "string" ? p : p.identifier));
   assert.ok(!ids.includes("shell:allow-execute"), "no shell execution");
-  // Site WebViews must not be able to open arbitrary URLs.
-  const opener = cap.permissions.find(
-    (p) => typeof p === "object" && p.identifier === "opener:allow-open-url",
+  // Site WebViews must not be able to open arbitrary URLs: external opens
+  // are routed through the launcher's `open_external` command (URL policy +
+  // blocklist in Rust), so the opener plugin stays ungranted entirely.
+  assert.equal(
+    ids.some((id) => String(id).startsWith("opener:")),
+    false,
+    "no opener grant — openExternal goes through open_external",
   );
-  assert.ok(opener, "opener permission should be explicitly scoped");
-  assert.deepEqual(opener.allow, [{ url: "https://**" }]);
 });
 
 test("gitignore covers key material and build output", () => {

@@ -1119,7 +1119,12 @@ function wireSettings() {
 
   el.linkAnilistDev.addEventListener("click", async (e) => {
     e.preventDefault();
-    await openExternal("https://anilist.co/settings/developer");
+    try {
+      await openExternal("https://anilist.co/settings/developer");
+    } catch (e) {
+      // The backend may refuse the URL (policy); show it instead of dying.
+      showNotice(errMessage(e));
+    }
   });
 }
 
@@ -1189,17 +1194,14 @@ function errMessage(e) {
 /**
  * Open a link in the system browser rather than inside the app.
  *
- * Falls back to `window.open` in browser-only dev mode.
+ * Tauri: the backend command applies the URL policy (validate + blocklist),
+ * so the launcher webview needs no opener grant. Falls back to `window.open`
+ * in browser-only dev mode.
  */
 async function openExternal(url) {
-  try {
-    if (await isTauri()) {
-      const { openUrl } = await import("@tauri-apps/plugin-opener");
-      await openUrl(url);
-      return;
-    }
-  } catch {
-    /* fall through */
+  if (await isTauri()) {
+    await call("open_external", { url });
+    return;
   }
   window.open(url, "_blank", "noopener,noreferrer");
 }
@@ -1290,13 +1292,12 @@ async function wireBackendEvents() {
     void refreshAniListStatus();
     void refreshHero();
   });
-  // The Rust side emits `{ siteId, sessionId }` when a close actually
-  // finished (including closes started by the Android back hook). Clear the
-  // label ONLY when the event carries the exact identity of this opening.
-  // `siteId` alone is not enough: closing and reopening the same site
-  // reuses it, so a delayed event from the earlier opening would otherwise
-  // orphan the new session. Malformed or identity-less payloads are ignored
-  // by the state machine.
+  // The Rust side emits `{ siteId, label }` when a close actually finished
+  // (including closes started by the Android back hook; a mid-rollout binary
+  // may still send the legacy bare-string or typed-session payloads). Clear
+  // the label ONLY when the payload names the tracked session — by label or
+  // site id. Malformed, foreign or identity-less payloads are ignored by the
+  // state machine, so opening A then B is never undone by a stale A event.
   await on("animehub://site-closed", (payload) => {
     if (backSession.closedByEvent(payload)) openSiteLabel = null;
   });

@@ -18,11 +18,15 @@
  *    A.5: success claimed while Rust/JS disagreed);
  *  * `close_site` failing marks the session `failed:<msg>` instead of
  *    silently going idle, so the next back press retries cleanly;
- *  * the `animehub://site-closed` event clears the session only when its
- *    payload carries the exact opaque `sessionId` returned by THIS
- *    `open_site`. A site id is not an opening identity: closing and reopening
- *    the same site produces two sessions with the same site id, so a delayed
- *    event from the first opening must not clear the second;
+ *  * the `animehub://site-closed` event clears the session only when the
+ *    payload provably belongs to it: the legacy typed event's `sessionId`
+ *    must match exactly, and the current `{ siteId, label }` payload (or the
+ *    legacy bare-string payload) must name the tracked label or site id. A
+ *    site id alone is not an opening identity: closing and reopening the
+ *    same site produces two sessions with the same site id, so a delayed
+ *    event from the first opening must not clear the second (the typed
+ *    `sessionId` contract guards that; a mid-rollout binary may still see a
+ *    repeated label clear, which the user can retry).
  *  * an `open_site` result is committed only while it is still the newest
  *    attempt, so two rapid tile clicks cannot leave the label on the losing
  *    site when their invokes resolve out of order.
@@ -65,25 +69,35 @@ export function createBackSession({ call, notify, errorText }) {
   let lastError = "";
 
   /**
-   * Validate the native close payload.
+   * Validate the native close payload and extract the identity it carries.
    *
-   * The event is a serialized `SiteClosedEvent`: both fields must be
-   * non-empty strings. Anything else is malformed and proves nothing about
-   * ownership. Returning `null` here makes malformed data unable to clear a
-   * live session, which is the fail-closed direction.
+   * Accepted shapes, newest first:
+   *  * `{ siteId, label }` — the contract the Rust side emits now;
+   *  * a bare site-id string — the pre-v0.4 producer (one-line shim, so a
+   *    mid-rollout binary cannot brick the back path);
+   *  * `{ siteId, sessionId }` — the legacy typed `SiteClosedEvent`, verified
+   *    exactly against the opening identity (kept for a mixed rollout).
+   * Anything else is malformed and proves nothing about ownership. Returning
+   * `null` here makes malformed data unable to clear a live session, which is
+   * the fail-closed direction.
    */
   function closeEventIdentity(payload) {
+    if (typeof payload === "string") {
+      // Legacy string payload: compared against both tracked identities.
+      return payload ? { label: payload, siteId: payload } : null;
+    }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
       return null;
     }
-    const { siteId: payloadSiteId, sessionId: payloadSessionId } = payload;
-    if (typeof payloadSiteId !== "string" || payloadSiteId.length === 0) {
-      return null;
+    const { siteId, label, sessionId } = payload;
+    if (typeof sessionId === "string" && sessionId) {
+      if (typeof siteId !== "string" || !siteId) return null;
+      return { siteId, sessionId };
     }
-    if (typeof payloadSessionId !== "string" || payloadSessionId.length === 0) {
-      return null;
-    }
-    return { siteId: payloadSiteId, sessionId: payloadSessionId };
+    const id = typeof siteId === "string" && siteId ? siteId : null;
+    if (typeof label === "string" && label) return { label, siteId: id };
+    if (id) return { siteId: id };
+    return null;
   }
 
   function settle(next, message) {
@@ -179,23 +193,30 @@ export function createBackSession({ call, notify, errorText }) {
 
     /**
      * `animehub://site-closed` bookkeeping. Clears the session only when the
-     * event provably belongs to this exact opening:
-     *  * the session must have an owned opening identity;
-     *  * the payload must be a well-formed native close event with non-empty
-     *    `siteId` and `sessionId` strings;
-     *  * `sessionId` must match EXACTLY, and the payload's site id must match
-     *    when this session has one.
+     * event provably belongs to this session:
+     *  * a legacy typed event must match the owned `sessionId` exactly (and
+     *    the site id, when the session has one);
+     *  * the new `{ siteId, label }` contract (or the legacy string payload)
+     *    must name the tracked label or the tracked site id.
      *
-     * A missing/unknown identity, malformed payload, or an event from a
-     * previous opening of the same site is ignored. It never clears the
-     * active session, including when no identity is owned (fail closed).
+     * A missing/unknown/malformed identity or an event from another session
+     * is ignored. It never clears the active session by accident (fail
+     * closed).
      */
     closedByEvent(payload) {
-      if (!sessionId) return false;
+      if (!label) return false;
       const event = closeEventIdentity(payload);
       if (!event) return false;
-      if (event.sessionId !== sessionId) return false;
-      if (siteId && event.siteId !== siteId) return false;
+      if (event.sessionId) {
+        if (!sessionId || event.sessionId !== sessionId) return false;
+        if (siteId && event.siteId !== siteId) return false;
+      } else {
+        const byLabel = event.label === label;
+        const bySiteId =
+          event.siteId != null &&
+          (event.siteId === siteId || event.siteId === label);
+        if (!byLabel && !bySiteId) return false;
+      }
       label = null;
       siteId = null;
       sessionId = null;
