@@ -69,16 +69,23 @@ test("site-closed producers carry the identity of the session they close", () =>
   // This is a wiring check, not the behavioural guard: native emission needs
   // a running Tauri app. The payload construction itself is covered by Rust
   // unit tests (`closed_event` / `take_current_session_if`); here we pin that
-  // every producer goes through the one typed emitter and no producer emits
-  // a bare site id.
-  const emits = [...windowsRs.matchAll(/app\.emit\(\s*"animehub:\/\/site-closed"\s*,\s*([^;]+?)\)\s*;/g)].map(
-    (m) => m[1].trim(),
-  );
-  assert.deepEqual(emits, ["closed.closed_event()"], "only the typed shared emitter may publish");
+  // every producer goes through the one typed emitter, that the event is
+  // targeted at the launcher webview (M-14), and no producer emits a bare
+  // site id.
   assert.doesNotMatch(
     windowsRs,
-    /app\.emit\(\s*"animehub:\/\/site-closed"\s*,\s*(site_id|closed\.site_id)\b/,
-    "a site id is not an opening identity",
+    /app\.emit\(\s*"animehub:\/\/site-closed"/,
+    "site-closed must be emitted to the launcher only, never broadcast",
+  );
+  assert.match(
+    windowsRs,
+    /app\.emit_to\(\s*LAUNCHER_LABEL,\s*"animehub:\/\/site-closed",\s*closed\.closed_event\(\),?\s*\)/,
+    "the single typed emitter publishes the close snapshot to the launcher only",
+  );
+  assert.match(
+    commandsRs,
+    /pub struct SiteClosedEvent \{[\s\S]*?session_id: String,[\s\S]*?label: String,[\s\S]*?\}/,
+    "the payload carries the session identity and the launcher label",
   );
 
   const producers = [...windowsRs.matchAll(/emit_site_closed\(app,\s*&closed\);/g)];
@@ -476,7 +483,7 @@ test("the desktop DNS gate refuses an unanswered lookup, and only for top-level 
   // that was already checked.
   assert.match(
     windowsRs,
-    /\("https", Some\(host\)\) => dns_decision\(classify_host\(host\)\)/,
-    "only https navigations with a host are classified",
+    /\("https", Some\(host\)\) => dns_decision\(classify_host_nav\(host\)\)/,
+    "only https navigations with a host are classified (nav path, 600ms budget)",
   );
 });
