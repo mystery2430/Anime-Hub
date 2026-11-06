@@ -2194,12 +2194,15 @@ mod tests {
         );
         assert!(printed.contains("[redacted]"));
 
-        // An absent refresh token still shows up as absent. `..token.clone()`
-        // (not `..token`): Token implements Drop, so struct-update move is E0509.
+        // An absent refresh token still shows up as absent. No struct-update
+        // base here: Token implements Drop, so `..base` moves out of a Drop
+        // temporary (E0509) even through clone; spell all five fields.
         let missing = Token {
             access_token: "atok".into(),
             refresh_token: None,
-            ..token.clone()
+            token_type: "Bearer".into(),
+            expires_at: 1_000,
+            scope: Some("PUBLIC".into()),
         };
         let printed = format!("{missing:?}");
         assert!(!printed.contains("atok"), "{printed}");
