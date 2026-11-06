@@ -6,14 +6,15 @@
 
 :root,
 :root[data-theme="dark"] {
-  --bg: #0b0d14;
-  --bg-elev: #12151f;
-  --bg-elev-2: #181c28;
-  --line: #232838;
-  --text: #e8eaf2;
-  --text-dim: #9aa3b8;
-  --accent: #6366f1;
-  --accent-2: #e11d48;
+  --bg: #080F1D;
+  --bg-elev: #1A2638;
+  --bg-elev-2: color-mix(in srgb, #1A2638 82%, #080F1D);
+  --line: #2B3B52;
+  --text: #E9EDF4;
+  --text-dim: #A5B1C5;
+  --accent: #FF174F;
+  --accent-2: #A6083A;
+  --on-accent: #080F1D;
   --danger: #f43f5e;
   --ok: #10b981;
   --radius: 14px;
@@ -27,24 +28,24 @@
    and bypasses both blocks. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
-    --bg: #f5f6fa;
-    --bg-elev: #ffffff;
-    --bg-elev-2: #f0f2f8;
-    --line: #dfe3ee;
-    --text: #141726;
-    --text-dim: #5c6478;
+    --bg: #E9EDF4;
+    --bg-elev: #F7F9FC;
+    --bg-elev-2: #DDE5EF;
+    --line: #C5CFDE;
+    --text: #111827;
+    --text-dim: #536176;
     --shadow: 0 10px 28px rgba(20, 24, 40, 0.12);
     color-scheme: light;
   }
 }
 
 :root[data-theme="light"] {
-  --bg: #f5f6fa;
-  --bg-elev: #ffffff;
-  --bg-elev-2: #f0f2f8;
-  --line: #dfe3ee;
-  --text: #141726;
-  --text-dim: #5c6478;
+  --bg: #E9EDF4;
+  --bg-elev: #F7F9FC;
+  --bg-elev-2: #DDE5EF;
+  --line: #C5CFDE;
+  --text: #111827;
+  --text-dim: #536176;
   --shadow: 0 10px 28px rgba(20, 24, 40, 0.12);
   color-scheme: light;
 }
@@ -104,23 +105,12 @@ body {
   min-width: 0;
 }
 
-.brand h1 {
-  margin: 0;
-  font-size: 17px;
-  font-weight: 650;
-  letter-spacing: 0.2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.brand-mark {
-  width: 22px;
-  height: 22px;
-  border-radius: 7px;
+.brand-logo {
+  display: block;
+  width: clamp(88px, 28vw, 158px);
+  height: auto;
   flex: none;
-  background: linear-gradient(140deg, var(--accent), var(--accent-2));
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  object-fit: contain;
 }
 
 .topbar-actions {
@@ -396,10 +386,10 @@ body::before {
 
 .tile:hover {
   transform: translateY(-4px);
-  border-color: rgb(var(--site, 99 102 241) / 0.55);
+  border-color: rgb(var(--site, 255 23 79) / 0.55);
   box-shadow:
     0 16px 30px rgba(0, 0, 0, 0.3),
-    0 6px 22px rgb(var(--site, 99 102 241) / 0.22);
+    0 6px 22px rgb(var(--site, 255 23 79) / 0.22);
 }
 
 .tile:focus-visible {
@@ -908,8 +898,8 @@ textarea:focus-visible {
 .btn.primary {
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
-  font-weight: 550;
+  color: var(--on-accent);
+  font-weight: 650;
 }
 
 .btn.ghost {
@@ -972,7 +962,18 @@ textarea:focus-visible {
   }
 }
 
-/* Developer panel: the PiP log is plain text, never HTML. */
+/* Developer panel: diagnostics are plain text, never HTML. */
+.dev-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-block: 10px;
+}
+
+.dev-actions button {
+  min-height: 38px;
+}
+
 .dev-log {
   white-space: pre-wrap;
   word-break: break-all;
@@ -984,4 +985,35 @@ textarea:focus-visible {
   padding: 8px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.35);
+}
+
+.hidden-sites {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.hidden-sites:empty {
+  display: none;
+}
+
+.hidden-site {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev-2);
+  font-size: 13px;
+}
+
+.hidden-site span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

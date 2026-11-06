@@ -4,7 +4,7 @@ version = "0.3.4"
 description = "AnimeHub — a launcher for anime sites with encrypted session storage and platform-specific session handling."
 authors = ["AnimeHub contributors"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.89"
 license = "MIT"
 
 # `default-run` keeps `cargo run` unambiguous when the android-plugin
@@ -13,7 +13,7 @@ default-run = "animehub"
 
 [lib]
 name = "animehub_lib"
-# `cdylib` + `staticlib` are required for the Android/iOS mobile entry point.
+# `cdylib` + `staticlib` are required for the Android mobile entry point.
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -96,6 +96,15 @@ tempfile = "3"
 [features]
 # Emitted by `tauri build`; enables the custom protocol / dev server plumbing.
 custom-protocol = ["tauri/custom-protocol"]
+
+# WKWebView has no public per-WebView proxy setting; wry's only bridge is the
+# Network.framework `nw_proxy_config_*` path plus an undocumented
+# `WKWebsiteDataStore` key, which is gated behind this feature and only exists
+# on macOS 14+. Turning it on is what lets a site WebView be pinned on macOS;
+# without it the runtime refuses to open a site instead of opening it
+# unproxied (see `web/windows.rs::start_site_proxy`). Inert off macOS.
+default = ["macos-proxy"]
+macos-proxy = ["tauri/macos-proxy"]
 
 # Release profile for distribution builds.
 #

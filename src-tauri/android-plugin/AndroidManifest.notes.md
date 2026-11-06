@@ -25,7 +25,8 @@ Two things matter:
 ## OAuth deep link
 
 The AniList redirect uses the custom scheme `animehub://anilist/callback`.
-Add an intent filter to the same `<activity>`:
+`scripts/android_prepare.py` adds this filter to the same `<activity>` when the
+generated manifest does not have it yet:
 
 ```xml
 <intent-filter>
@@ -36,15 +37,22 @@ Add an intent filter to the same `<activity>`:
 </intent-filter>
 ```
 
-The scheme must match `OAUTH_SCHEME` in `src-tauri/src/lib.rs` and the
-`plugins.deep-link` block in `src-tauri/tauri.conf.json`. The redirect URI
-registered with AniList must be exactly `animehub://anilist/callback`.
+The scheme matches `OAUTH_SCHEME` in `src-tauri/src/lib.rs`. It is **not** the
+Android OAuth redirect: native AniList login on Android is loopback-only
+(`anilist::mobile_native_login_allowed`), a custom-scheme redirect is refused
+before any pending state or authorization URL exists, and
+`plugins.deep-link.mobile` is `[]`. Nothing in the app sends
+`animehub://anilist/callback` on Android, so the filter is inert: an unsolicited
+intent is parsed against the configured loopback redirect and rejected. It is
+still declared (and pinned by `tests/gaps.test.js`) because removing it is a
+manifest change that needs an Android build and a device check. `DESKTOP` uses
+the scheme for real, registered at startup from
+`plugins.deep-link.desktop.schemes`.
 
-Tauri's deep-link plugin rewrites this filter from
-`plugins.deep-link.mobile` while building for Android. That field is a
-list of domains, not a map — a map fails the plugin build script with
-`invalid type: map, expected a sequence`. `scripts/android_prepare.py`
-still adds the filter if the generated manifest does not have it yet.
+Tauri's deep-link plugin builds its own mobile filter from
+`plugins.deep-link.mobile`. That field is a list of domains, not a map — a map
+fails the plugin build script with `invalid type: map, expected a sequence`. It
+stays empty here.
 
 ## Keystore bridge
 

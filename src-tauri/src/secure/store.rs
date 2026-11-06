@@ -107,7 +107,7 @@ impl SecureStore {
         std::fs::create_dir_all(&self.dir)?;
         let env = self.sealer_for(name).seal(plaintext, &Self::aad(name))?;
         let target = self.path_for(name);
-        atomic_write_locked(&target, &env)
+        atomic_write_locked(&target, &env).map_err(AppError::from)
     }
 
     /// Store an opaque secret (e.g. the AniList token JSON).
@@ -146,7 +146,12 @@ impl SecureStore {
         let _guard = STORE_LOCK
             .lock()
             .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        for kind in ["cookies", "localstorage", "indexeddb"] {
+        // `profilemig` (the one-time Android profile-migration flag) rides
+        // along so a cleared/removed site can never re-import a jar that is
+        // about to be deleted. `profilegen` deliberately does NOT: the
+        // generation counter must outlive the session so a stale registry
+        // backup can never re-open an already-deleted profile name.
+        for kind in ["cookies", "localstorage", "indexeddb", "profilemig"] {
             let name = format!("{kind}-{site_id}");
             Self::delete_secret_locked(self, &name)?;
         }
@@ -196,15 +201,42 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     let _guard = STORE_LOCK
         .lock()
         .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-    atomic_write_locked(path, bytes)
+    atomic_write_locked(path, bytes).map_err(AppError::from)
 }
 
-pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    use std::io::Write as _;
+/// Create the temporary file of an atomic write: exclusive and owner-only.
+///
+/// `File::create` leaves the process umask in charge, so on Unix the temp file
+/// was typically `0644` — readable by every local user, even though the payload
+/// is encrypted. `create_new` also means an existing path is never truncated:
+/// the unique name makes a collision practically impossible, and if it does
+/// happen the safe outcome is an error, not a clobbered file. Windows has no
+/// mode bits to set here and keeps its ACL default from `OpenOptions`.
+fn create_private_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    // Unique temp name so two concurrent writes to the same target never share
-    // the same `.tmp` file: `<name>.tmp.<pid>-<rand>`.
+    let tmp = temp_path_for(path);
+    atomic_write_via(path, &tmp, bytes)
+}
+
+/// The temp path a write will use: `<name>.tmp.<pid>-<rand>`.
+///
+/// Unique so two concurrent writes to the same target never share a `.tmp`
+/// file. Kept as its own function so a test can name the path up front and
+/// collide with it on purpose; the writer itself always passes this value to
+/// [`atomic_write_via`].
+fn temp_path_for(path: &Path) -> PathBuf {
     let unique = {
         use rand::RngCore as _;
         let mut b = [0u8; 8];
@@ -214,21 +246,46 @@ pub(crate) fn atomic_write_locked(path: &Path, bytes: &[u8]) -> AppResult<()> {
     // `with_extension` replaces only the final extension, so
     // `secret.foo.bin` -> `secret.foo.tmp.<unique>`; uniqueness is what
     // matters, not the exact stem.
-    let tmp = path.with_extension(format!("tmp.{unique}"));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    path.with_extension(format!("tmp.{unique}"))
+}
+
+/// Write `bytes` to `path` atomically, through the temp path `tmp`.
+///
+/// Creation is handled apart from the write on purpose. `create_new` fails on
+/// an existing path exactly so a write never clobbers a file it does not own;
+/// deleting that path on the error branch would undo the guarantee, because a
+/// failed open means this call never created it. Only after `create_new`
+/// succeeded does `tmp` belong to this call, and only then does a later
+/// failure clean it up.
+fn atomic_write_via(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = create_private_exclusive(tmp)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    // Close the handle before anything else touches the path: Windows refuses
+    // to unlink an open file, and the cleanup below must not be a no-op there.
+    drop(file);
+    if let Err(e) = written {
+        // The temp file is ours: never leave a half-written one next to the
+        // store. A cleanup failure is ignored so the write error survives.
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(tmp, path) {
+        // The rename is the last step that can fail, and it leaves the temp
+        // file behind. Remove it: the next read must not find a stray copy of
+        // the store next to it, and a retry has to start from a clean
+        // directory. A cleanup failure is ignored on purpose — the error the
+        // caller sees has to be the one that describes why the write failed.
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
     // Ensure the rename is durable: fsync the parent directory where the
     // filesystem supports it. Best-effort — a failure to open/fsync the dir
     // must not hide a successful write.
     if let Ok(dir_file) = std::fs::File::open(dir) {
         let _ = dir_file.sync_all();
     }
-    // If rename failed the tmp remains; otherwise this is a no-op.
-    let _ = std::fs::remove_file(&tmp);
     Ok(())
 }
 
@@ -243,6 +300,110 @@ mod tests {
     fn store_with_dir(dir: &Path) -> SecureStore {
         let key = crate::secure::master_key::load_master_key(dir).expect("key");
         SecureStore::new(&key, dir).expect("store")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_file_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        atomic_write_locked(&path, b"encrypted-bytes").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the store (and its temp file) must not be readable by other local users"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"encrypted-bytes");
+    }
+
+    #[test]
+    fn the_temp_file_is_created_exclusively_and_never_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("already-there");
+        std::fs::write(&existing, b"keep me").unwrap();
+        let opened = create_private_exclusive(&existing);
+        let err = opened.expect_err("an existing path must not be opened");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+    }
+
+    /// A temp path the write did not create is never the write's to delete.
+    ///
+    /// The test picks the path through the same helper the writer uses, then
+    /// creates it, so `create_new` refuses with `AlreadyExists` before the
+    /// write starts. The previous code ran `remove_file(&tmp)` on every
+    /// failure, which deleted this file even though the open had failed.
+    #[test]
+    fn a_temp_collision_is_not_deleted_by_the_write_that_found_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("store.json");
+        std::fs::write(&target, b"old").unwrap();
+        let tmp = temp_path_for(&target);
+        std::fs::write(&tmp, b"not ours").unwrap();
+
+        let err = atomic_write_via(&target, &tmp, b"new").expect_err("the temp path is taken");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"not ours");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    /// The temp file really exists and has been written when `rename` fails.
+    ///
+    /// The target is a non-empty directory, which `rename` refuses; nothing
+    /// before it can fail that way (the parent exists, the temp name is unique
+    /// and the directory is writable), so the error kind is proof that the
+    /// write reached the rename step. `a_failed_write_leaves_the_existing_target_untouched`
+    /// only covers `create_dir_all`, i.e. before a temp file exists at all.
+    #[test]
+    fn a_failed_rename_removes_its_temp_file_and_keeps_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("store.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside"), b"keep").unwrap();
+
+        let err = atomic_write_locked(&target, b"new").expect_err("the target is a directory");
+        // The parent exists and is writable, so the temp file was created and
+        // written and the only step left is the rename — which is exactly the
+        // error below. Linux and macOS report EISDIR for a file-over-directory
+        // rename; on Windows the check only rules out the earlier phases.
+        #[cfg(unix)]
+        {
+            let kind = err.kind();
+            let refused = kind == std::io::ErrorKind::IsADirectory;
+            let refused = refused || kind == std::io::ErrorKind::NotADirectory;
+            assert!(refused, "{err}");
+        }
+        // Windows reports ERROR_ACCESS_DENIED; the earlier phases cannot
+        // produce that kind with a writable parent and an unused temp name.
+        #[cfg(not(unix))]
+        {
+            let kind = err.kind();
+            assert_eq!(kind, std::io::ErrorKind::PermissionDenied, "{err}");
+        }
+
+        // The target is untouched …
+        assert_eq!(std::fs::read(target.join("inside")).unwrap(), b"keep");
+        // … and the temp file that was created and written is gone: the
+        // directory holds the target and nothing else.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["store.json".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_existing_target_untouched() {
+        // The parent is a regular file, so `create_dir_all` fails before the
+        // temp file exists. Nothing about the existing target may change.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"original").unwrap();
+        let target = blocker.join("store.json");
+        assert!(atomic_write_locked(&target, b"new").is_err());
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"original");
     }
 
     #[test]
@@ -588,5 +749,113 @@ mod tests {
         assert!(!d1.exists());
         assert!(d2.exists());
         assert_eq!(std::fs::read(d2.join("Cookies")).unwrap(), b"jar-2");
+    }
+
+    #[test]
+    fn production_secret_keys_are_injective_and_below_the_cap() {
+        // SEC-5 regression gate: the longest production key is currently
+        // localstorage- + 37 = 50 chars. The fixed literals are shorter. All
+        // use only the preserved alphabet, so the filter and the 64-char cut
+        // are identity transforms and the file mapping stays injective.
+        let mut ids = vec![
+            "builtin-openanime".to_string(),
+            "builtin-animecix".to_string(),
+        ];
+        for _ in 0..512 {
+            ids.push(format!("user-{}", uuid::Uuid::new_v4().simple()));
+        }
+        let fixed = [
+            "anilist-token",
+            "android-pending-profile-deletes",
+            "android-pending-profile-deletes-corrupt",
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            for kind in [
+                "cookies",
+                "localstorage",
+                "indexeddb",
+                "profilemig",
+                "profilegen",
+            ] {
+                let key = format!("{kind}-{id}");
+                assert!(
+                    key.len() <= 51,
+                    "production key stem exceeds the 64-char cap budget: {key}"
+                );
+                let file = secret_file_name(&key);
+                assert_eq!(file, format!("secret.{key}.bin"));
+                assert!(
+                    seen.insert(file.clone()),
+                    "two production keys share the secret file {file}"
+                );
+            }
+        }
+
+        for key in fixed {
+            assert_eq!(secret_file_name(key), format!("secret.{key}.bin"));
+            assert!(
+                seen.insert(secret_file_name(key)),
+                "fixed key overlaps the site-derived namespace: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_one_site_session_never_touches_another_site() {
+        // SEC-5 regression gate: the per-site delete list depends on the same
+        // normalization. Reachable IDs must never make one site's wipe reach
+        // a sibling tile or the global AniList token.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_dir(dir.path());
+        let kinds = ["cookies", "localstorage", "indexeddb", "profilemig"];
+        for kind in kinds {
+            store
+                .put_secret(&format!("{kind}-site-a"), b"a-payload")
+                .unwrap();
+            store
+                .put_secret(&format!("{kind}-site-b"), b"b-payload")
+                .unwrap();
+        }
+        store.put_secret("profilegen-site-a", b"7").unwrap();
+        store.put_secret("anilist-token", b"global-token").unwrap();
+
+        store.delete_site_session("site-a").unwrap();
+
+        for kind in kinds {
+            assert!(
+                store
+                    .get_secret(&format!("{kind}-site-a"))
+                    .unwrap()
+                    .is_none(),
+                "{kind}-site-a survived its own delete"
+            );
+            assert_eq!(
+                store
+                    .get_secret(&format!("{kind}-site-b"))
+                    .unwrap()
+                    .expect("site-b must survive")
+                    .as_slice(),
+                b"b-payload"
+            );
+        }
+        assert_eq!(
+            store
+                .get_secret("profilegen-site-a")
+                .unwrap()
+                .expect("generation must outlive a session wipe")
+                .as_slice(),
+            b"7"
+        );
+        assert!(store.get_secret("profilegen-site-b").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_secret("anilist-token")
+                .unwrap()
+                .expect("global token must survive")
+                .as_slice(),
+            b"global-token"
+        );
     }
 }

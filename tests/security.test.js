@@ -122,12 +122,14 @@ test("capabilities are scoped to the launcher webview only", () => {
   );
   const ids = cap.permissions.map((p) => (typeof p === "string" ? p : p.identifier));
   assert.ok(!ids.includes("shell:allow-execute"), "no shell execution");
-  // Site WebViews must not be able to open arbitrary URLs.
-  const opener = cap.permissions.find(
-    (p) => typeof p === "object" && p.identifier === "opener:allow-open-url",
+  // Site WebViews must not be able to open arbitrary URLs: external opens
+  // are routed through the launcher's `open_external` command (URL policy +
+  // blocklist in Rust), so the opener plugin stays ungranted entirely.
+  assert.equal(
+    ids.some((id) => String(id).startsWith("opener:")),
+    false,
+    "no opener grant — openExternal goes through open_external",
   );
-  assert.ok(opener, "opener permission should be explicitly scoped");
-  assert.deepEqual(opener.allow, [{ url: "https://**" }]);
 });
 
 test("gitignore covers key material and build output", () => {
@@ -140,7 +142,44 @@ test("gitignore covers key material and build output", () => {
     "*.jks",
     "gen/schemas",
     "gen/android",
+    "graphify-out/",
+    ".pr30-audit/",
+    ".worktrees/",
+    "ARCHITECTURE_REPORT.md",
+    "SECURITY_BUG_AUDIT.md",
+    "PR30_FIX_REPORT.md",
   ]) {
     assert.ok(gi.includes(needle), `.gitignore must list ${needle}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// IPC surface: no raw cookie-jar authority handed to the launcher WebView.
+// ---------------------------------------------------------------------------
+
+test("the raw cookie-jar commands are not on the IPC surface", () => {
+  const libRs = read(join(ROOT, "src-tauri", "src", "lib.rs"));
+  const commandsRs = read(join(ROOT, "src-tauri", "src", "commands.rs"));
+  const windowsRs = read(join(ROOT, "src-tauri", "src", "web", "windows.rs"));
+  const frontend = walk(join(ROOT, "src"), (p) => /\.(js|html)$/.test(p));
+  assert.ok(frontend.length > 0, "expected to scan some frontend files");
+
+  for (const prefix of ["get", "set"]) {
+    const name = `${prefix}_site_cookies`;
+    assert.ok(!libRs.includes(`commands::${name}`), `${name} is still registered`);
+    assert.ok(!commandsRs.includes(`pub fn ${name}`), `${name} is still defined`);
+    assert.ok(!commandsRs.includes(`fn ${name}`), `${name} has a leftover shim`);
+    for (const file of frontend) {
+      assert.ok(!read(file).includes(name), `${relative(ROOT, file)} refers to ${name}`);
+    }
+  }
+
+  // Removing the commands must not remove the feature they were said to cover:
+  // the one-time 0.3.4 jar import and the mobile protocols still read and write
+  // the per-site key straight through the storage provider.
+  assert.ok(windowsRs.includes("cookies-{"), "windows.rs must keep the per-site jar key");
+  assert.ok(
+    windowsRs.includes("pub struct") || windowsRs.includes("CookieJar"),
+    "windows.rs must still work with CookieJar",
+  );
 });

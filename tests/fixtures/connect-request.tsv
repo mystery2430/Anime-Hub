@@ -1,0 +1,203 @@
+# Shared CONNECT grammar for the desktop (Rust) and Android (Kotlin) proxies.
+#
+# Consumers (both load THIS file, neither keeps its own copy of the vectors):
+#   - src-tauri/src/web/pinned_proxy.rs
+#       connect_request_vectors_match_the_android_parser   (include_str!)
+#   - src-tauri/android-plugin/kotlin/dev/animehub/app/DnsPinnedProxyTest.kt
+#       `connect vectors agree with the rust parser`       (test resource)
+#
+# Format: tab-separated, one vector per line, '#' starts a comment, blank lines
+# are ignored. Three columns:
+#
+#   request<TAB><request-line><TAB>accept|reject
+#   authority<TAB><authority><TAB>accept|reject
+#   hex<TAB><complete-head-as-hex-bytes><TAB>accept|reject
+#
+# `request` rows go through the production request-line parser
+# (`parse_connect` on desktop, `parseConnectHead` on Android). `authority` rows
+# go through the production authority parser: the whole `CONNECT <authority>
+# HTTP/1.1` line on desktop, `parseAuthority` on Android. `hex` rows carry a
+# complete wire head, so framing bytes and bytes a TSV column cannot express
+# (bare LF, bare CR, 0xFF, NUL, 0x01, DEL, missing terminator) are decided by
+# the same production entry point. Android's `readHead` decodes ISO-8859-1, so
+# the test decodes these bytes the same way before calling `parseConnectHead`.
+#
+# One file rather than two keeps the shared rules in one place: a method,
+# version, character, bracket, framing or port rule added to one parser alone
+# fails the other suite.
+#
+# `accept` means the PARSER accepts the line. It does NOT mean the destination
+# is allowed: `127.0.0.1:443` parses and is then refused by the address policy,
+# exactly like an ordinary page requesting loopback. `reject` means the line is
+# refused before any lookup, socket or policy decision.
+#
+# Split of authority between the standard and this app (round 23):
+#   * RFC 9112 §3.1   the method is case-sensitive  -> `connect` is refused
+#   * RFC 9112 §2.3   HTTP-version is `HTTP/DIGIT.DIGIT`, case-sensitive
+#                     -> `HTTP/1.foo`, `HTTP/1.`, `http/1.1` are refused;
+#                        `HTTP/1.2` is valid syntax but refused TOO, because
+#                        this proxy implements HTTP/1.0 and HTTP/1.1 only
+#                        (application choice, identical on both platforms)
+#   * RFC 9112 §3.2.3 authority-form = uri-host ":" port
+#   * RFC 3986 §3.2.3 port = *DIGIT
+#   * application     the port is required and at most five digits; host is
+#                     printable ASCII with no `@ / ? # \ %`; at most 253 bytes;
+#                     no empty label; brackets only around a real IPv6 literal.
+#                     RFC 3986 `reg-name` would also allow sub-delims and
+#                     percent-encoding; both are refused on purpose.
+#
+# A literal ASCII control byte inside a target is not expressible in the
+# tab-separated `request` column; the `hex` rows below carry those, and each
+# suite also asserts them directly.
+
+# =============================================================================
+# request lines
+# =============================================================================
+request	CONNECT example.com:443 HTTP/1.1	accept
+request	CONNECT example.com:443 HTTP/1.0	accept
+request	CONNECT [::1]:443 HTTP/1.1	accept
+request	CONNECT [::ffff:8.8.8.8]:443 HTTP/1.1	accept
+request	CONNECT EXAMPLE.com.:8443 HTTP/1.1	accept
+request	CONNECT 8.8.8.8:443 HTTP/1.1	accept
+request	CONNECT h.example:070 HTTP/1.1	accept
+
+# RFC 9112 §3.1 — the method is case-sensitive.
+request	connect example.com:443 HTTP/1.1	reject
+request	Connect example.com:443 HTTP/1.1	reject
+request	CONNECt example.com:443 HTTP/1.1	reject
+request	CONNEC example.com:443 HTTP/1.1	reject
+request	GET example.com:443 HTTP/1.1	reject
+
+# RFC 9112 §2.3 — version syntax and the app's 1.0/1.1-only contract.
+request	CONNECT example.com:443 HTTP/1.2	reject
+request	CONNECT example.com:443 HTTP/1.foo	reject
+request	CONNECT example.com:443 HTTP/1.	reject
+request	CONNECT example.com:443 HTTP/1.1x	reject
+request	CONNECT example.com:443 HTTP/2	reject
+request	CONNECT example.com:443 HTTP/2.0	reject
+request	CONNECT example.com:443 http/1.1	reject
+
+# Request-line shape: single SP, exactly three fields (RFC 9112 §3).
+request	CONNECT example.com:443	reject
+request	CONNECT  example.com:443 HTTP/1.1	reject
+request	CONNECT example.com:443 HTTP/1.1 extra	reject
+request	 CONNECT example.com:443 HTTP/1.1	reject
+
+# Authority errors surface through the whole line as well.
+request	CONNECT example.com?x=1:443 HTTP/1.1	reject
+request	CONNECT example.com#frag:443 HTTP/1.1	reject
+request	CONNECT example.com\evil:443 HTTP/1.1	reject
+request	CONNECT éxample.com:443 HTTP/1.1	reject
+request	CONNECT foo[bar:443 HTTP/1.1	reject
+request	CONNECT foo]bar:443 HTTP/1.1	reject
+request	CONNECT foo..bar:443 HTTP/1.1	reject
+request	CONNECT example.com:+443 HTTP/1.1	reject
+request	CONNECT example.com:0000443 HTTP/1.1	reject
+request	CONNECT [::::]:443 HTTP/1.1	reject
+request	CONNECT [1:2:3:4:5:6:7:8:9]:443 HTTP/1.1	reject
+request	CONNECT example.com:%34%34%33 HTTP/1.1	reject
+request	CONNECT aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443 HTTP/1.1	reject
+
+# =============================================================================
+# authorities (production authority parser on both sides)
+# =============================================================================
+authority	example.com:443	accept
+authority	EXAMPLE.com.:8443	accept
+authority	h.example:070	accept
+authority	host:1	accept
+authority	host:65535	accept
+authority	8.8.8.8:443	accept
+# Numeric-looking but not valid IPv4. The CONNECT grammar accepts them as
+# hostnames; the destination policy refuses them before the resolver (both
+# suites pin that separately with a resolver counter).
+authority	example.0x7f:443	accept
+authority	foo.123:443	accept
+authority	999.1.1.1:443	accept
+authority	1.2.3.4.5:443	accept
+authority	a.1.2.3.4:443	accept
+authority	127.0.0.1:443	accept
+authority	[::1]:443	accept
+authority	[2001:db8::1]:443	accept
+authority	[::ffff:8.8.8.8]:443	accept
+authority	[::]:443	accept
+authority	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443	accept
+
+authority	example.com	reject
+authority	example.com:	reject
+authority	:443	reject
+authority	example.com:0	reject
+authority	example.com:65536	reject
+authority	example.com:+443	reject
+authority	example.com:0000443	reject
+authority	example.com:-443	reject
+authority	example.com:44 3	reject
+authority	example.com:443?x=1	reject
+authority	example.com:443#f	reject
+authority	user:pw@example.com:443	reject
+authority	example.com:443:443	reject
+authority	[::1]	reject
+authority	[::1]443	reject
+authority	[]:443	reject
+authority	[8.8.8.8]:443	reject
+authority	[not:an:ip]:443	reject
+authority	[fe80::1%25eth0]:443	reject
+authority	[::1]:0	reject
+authority	[v1.foo]:443	reject
+# Round 23: the forms the desktop parser used to hand to the resolver.
+authority	foo[bar:443	reject
+authority	foo]bar:443	reject
+authority	foo..bar:443	reject
+authority	.foo:443	reject
+authority	éxample.com:443	reject
+authority	example.com\evil:443	reject
+authority	example.com%2e:443	reject
+authority	[::::]:443	reject
+authority	[1:2:3:4:5:6:7:8:9]:443	reject
+authority	[::1]:443x	reject
+authority	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443	reject
+
+# -----------------------------------------------------------------------------
+# Round 39: RFC 3986 reserved sub-delims are refused in an authority before DNS
+# resolution or a socket. One authority row per character keeps the Rust and
+# Kotlin sets mirrored; the request rows prove the full CONNECT line is refused
+# too, not just the authority helper. The final authority row is the control.
+# -----------------------------------------------------------------------------
+authority	anime!hub.test:443	reject
+authority	anime$hub.test:443	reject
+authority	anime&hub.test:443	reject
+authority	anime'hub.test:443	reject
+authority	anime(hub.test:443	reject
+authority	anime)hub.test:443	reject
+authority	anime*hub.test:443	reject
+authority	anime+hub.test:443	reject
+authority	anime,hub.test:443	reject
+authority	anime;hub.test:443	reject
+authority	anime=hub.test:443	reject
+authority	animehub.test:443	accept
+request	CONNECT anime!hub.test:443 HTTP/1.1	reject
+request	CONNECT anime&hub.test:443 HTTP/1.1	reject
+request	CONNECT anime;hub.test:443 HTTP/1.1	reject
+request	CONNECT anime=hub.test:443 HTTP/1.1	reject
+
+# =============================================================================
+# complete raw heads (hex bytes) — framing and non-printable bytes
+# =============================================================================
+# The parser sees exactly these bytes, including the terminator. No row below
+# relies on the test appending a CRLFCRLF.
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a486f73743a206578616d706c652e636f6d3a3434330d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e300d0a557365722d4167656e743a2061756469740d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a582d456d7074793a0d0a582d5461623a206109620d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a582d5061643a20616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610d0a0d0a	accept
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310a486f73743a206578616d706c652e636f6d0a0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a486f73743a206578616d706c652e636f6d0a583a20790d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20610d590d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20ff0d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20636166c3a90d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a206100620d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a206101620d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20617f620d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a	reject
+hex		reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a0d0a583a20747261696c696e67	reject
+hex	434f4e4e45435420657861006d706c652e636f6d3a34343320485454502f312e310d0a0d0a	reject
+hex	434f4e4e454354206578616d706c652e636f6d3a34343320485454502f312e310d0a583a20611f620d0a0d0a	reject

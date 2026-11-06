@@ -36,3 +36,11 @@ Thumbs.db
 *.log
 __pycache__/
 *.pyc
+
+# --- local audit/report artifacts (not source) ---
+graphify-out/
+.pr30-audit/
+.worktrees/
+ARCHITECTURE_REPORT.md
+SECURITY_BUG_AUDIT.md
+PR30_FIX_REPORT.md

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// Android half of AnimeHub's Keystore + Picture-in-Picture + cookie +
-// web-storage bridge.
+// Android half of AnimeHub's Keystore + Picture-in-Picture + per-site
+// WebView profile bridge.
 //
 // The PiP commands below delegate to `AnimeHubPipController`, which owns the
 // PiP lifecycle and the WebView preparation handshake; the file next to this
@@ -31,20 +31,28 @@
 // standard Android APIs listed in the imports. The Keystore half predates this
 // note. The controlled PiP chain (this file + `AnimeHubPipController.kt`) was
 // written from the AOSP sources of `Activity`/`PictureInPictureParams` and has
-// NOT been run on a device yet; the CookieManager and localStorage/IndexedDB
-// bridges have not been compiled or run on a device either (the build
-// environment has no Android SDK/NDK). Treat it as unverified until a real
-// `./scripts/build.sh android` / `tauri android build` has been installed on
-// hardware. Only the JS half of PiP has automated tests
-// (`tests/pip_controller.test.js`).
+// NOT been run on a device yet; the site-profile commands (`site_open` and
+// friends, in `AnimeHubSiteController.kt`) were written against the AndroidX
+// WebKit 1.16.0 multi-profile reference and have not been compiled or run on
+// a device either (the build environment has no Android SDK/NDK). Treat it as
+// unverified until a real `./scripts/build.sh android` / `tauri android
+// build` has been installed on hardware. Only the JS half of PiP has
+// automated tests (`tests/pip_controller.test.js`).
 //
-// STORAGE ISOLATION CONTRACT (localStorage/IndexedDB commands)
-// ------------------------------------------------------------
-// The Rust side starts exports only while the site page is loaded and imports
-// after the target page's URL is observed. WebView operations run on Android's
-// UI thread. IndexedDB export/import remains best-effort: the scripts use
-// asynchronous IndexedDB APIs and do not provide full database fidelity.
-// Keep restored payloads JSON-encoded; never interpolate raw page/user strings.
+// STORAGE ISOLATION CONTRACT (site commands)
+// ------------------------------------------
+// Sites open in their own WebView bound to their own androidx.webkit Profile
+// (`AnimeHubSiteController`), so localStorage, IndexedDB, cookies and cache
+// are isolated per site by the provider itself. There is no JSON
+// export/import path any more: the old dump was lossy and never a security
+// boundary. Cookie migration from the pre-profile era is a one-time,
+// profile-scoped import inside the controller; every other cookie operation
+// goes through the site profile's own `Profile.getCookieManager()`, never the
+// static `CookieManager.getInstance()` (that one is the launcher's default
+// profile). When the WebView provider lacks `WebViewFeature.MULTI_PROFILE`,
+// `site_open` fails with a sentinel instead of silently sharing the default
+// profile. WebView operations run on Android's UI thread; blocking cookie
+// flushes run on a background executor.
 
 package dev.animehub.app
 
@@ -59,7 +67,6 @@ import android.util.Log
 import android.widget.Toast
 import java.net.Inet6Address
 import java.net.InetAddress
-import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -76,9 +83,6 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.security.KeyStore
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -88,17 +92,14 @@ import javax.crypto.spec.GCMParameterSpec
 @TauriPlugin
 class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 
-  /** The shared WebView, handed to the plugin by Tauri at startup. */
-  @Volatile
-  private var sharedWebView: WebView? = null
-
   override fun load(webView: WebView) {
-    // On Android the launcher and the sites share this single WebView, so
-    // keeping the reference is all the storage commands need.
-    sharedWebView = webView
+    // The launcher keeps the default profile. Sites open above it in their
+    // own profiled WebViews (AnimeHubSiteController), so this WebView stays
+    // launcher-only: policy guard + IPC restriction as before.
     installNavigationGuard(webView)
     restrictIpcToLauncher(webView)
-    AnimeHubDebugLog.add("app", "WebView ready, api ${Build.VERSION.SDK_INT}")
+    AnimeHubSiteController.bindLauncher(webView)
+    AnimeHubDebugLog.record("app", "start", "ok", count = Build.VERSION.SDK_INT.toLong())
   }
 
   /**
@@ -119,13 +120,13 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val id = (webView as? RustWebView)?.id
     if (id == null) {
       Log.e(LOG_TAG, "launcher IPC is off: WebView is not a RustWebView")
-      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebView is not a RustWebView")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "unavailable", errorClass = "ipc")
       showIpcOffNotice()
       return
     }
     if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
       Log.e(LOG_TAG, "launcher IPC is off: WebMessageListener unsupported")
-      AnimeHubDebugLog.add("ipc", "launcher IPC off: WebMessageListener unsupported")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "unsupported", errorClass = "unsupported")
       showIpcOffNotice()
       return
     }
@@ -136,11 +137,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         LauncherIpc.ORIGINS,
         LauncherIpc(id),
       )
-      AnimeHubDebugLog.add("ipc", "launcher listener installed")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "ok")
     } catch (e: Exception) {
-      AnimeHubDebugLog.add("ipc", "listener failed (${e.javaClass.simpleName}); launcher IPC is off")
+      AnimeHubDebugLog.record("ipc", "ipc_setup", "failed_closed", errorClass = "ipc")
       // Fail closed: the wry object is already gone, so no site page gets an `ipc` object.
-      Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off", e)
+      Log.e(LOG_TAG, "IPC listener could not be installed; launcher IPC is off")
       showIpcOffNotice()
     }
   }
@@ -160,7 +161,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         ).show()
       } catch (e: Exception) {
         // Showing a notice must never break the plugin load.
-        Log.e(LOG_TAG, "could not show the IPC notice", e)
+        Log.e(LOG_TAG, "could not show the IPC notice")
       }
     }
   }
@@ -181,9 +182,9 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   override fun onDestroy(activity: AppCompatActivity) {
-    // Plugin instances can outlive their Activity. Reject later WebView work
-    // rather than keep a reference to the destroyed native View.
-    if (activity === this.activity) sharedWebView = null
+    // Plugin instances can outlive their Activity. The site WebView is torn
+    // down by AnimeHubSiteController.destroy (MainActivity block) before this
+    // runs; no WebView reference is kept on the plugin any more.
   }
 
   /** Reject an async reply if its Android host was destroyed while work was pending. */
@@ -195,6 +196,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     return false
   }
 
+  /** Only generated opaque ids are accepted from Rust; raw arguments are never logged. */
+  private fun operationId(args: JSObject): String =
+    AnimeHubDebugLog.safeOperationId(args.getString("operationId"))
+      ?: AnimeHubDebugLog.newOperationId()
+
   /** Run Activity-bound Android APIs on the UI thread and reject a destroyed host. */
   private fun withLiveActivity(invoke: Invoke, action: () -> Unit) {
     try {
@@ -203,46 +209,11 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
         try {
           action()
         } catch (e: Exception) {
-          invoke.reject("Android işlemi başarısız", e)
+          invoke.reject("Android işlemi başarısız")
         }
       }
     } catch (e: Exception) {
-      invoke.reject("Android Activity artık kullanılamıyor", e)
-    }
-  }
-
-  /** Persist CookieManager state away from Android's UI thread. */
-  private fun flushCookieStoreAsync(manager: CookieManager) {
-    try {
-      COOKIE_FLUSH_EXECUTOR.execute {
-        try {
-          manager.flush()
-        } catch (_: Exception) {
-          Log.w(LOG_TAG, "CookieManager persistence sync failed")
-          AnimeHubDebugLog.add("cookie", "persistence sync failed")
-        }
-      }
-    } catch (_: Exception) {
-      Log.w(LOG_TAG, "CookieManager persistence sync could not be queued")
-    }
-  }
-
-  /** Run WebView work on Android's UI thread and reject stale Activity/View handles. */
-  private fun withLiveWebView(invoke: Invoke, action: (WebView) -> Unit) {
-    val webView = sharedWebView ?: run {
-      invoke.reject("WebView hazır değil")
-      return
-    }
-    withLiveActivity(invoke) {
-      if (sharedWebView !== webView) {
-        invoke.reject("WebView artık kullanılamıyor")
-        return@withLiveActivity
-      }
-      try {
-        action(webView)
-      } catch (e: Exception) {
-        invoke.reject("WebView işlemi başarısız", e)
-      }
+      invoke.reject("Android Activity artık kullanılamıyor")
     }
   }
 
@@ -265,7 +236,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       val combined = cipher.iv + ct
       invoke.resolve(JSObject().put("value", Base64.encodeToString(combined, Base64.NO_WRAP)))
     } catch (e: Exception) {
-      invoke.reject("Keystore şifrelemesi başarısız: ${e.message}", e)
+      invoke.reject("Keystore şifrelemesi başarısız")
     }
   }
 
@@ -293,288 +264,251 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     } catch (e: Exception) {
       // Never leak the plaintext or the key; a decrypt failure is reported
       // as a generic error.
-      invoke.reject("Keystore çözülemedi", e)
+      invoke.reject("Keystore çözülemedi")
     }
   }
 
-  // ------------------------------------------------------- Android cookies
+  // -------------------------------------------------------- Site profiles
+  //
+  // Per-site WebViews with androidx.webkit multi-profile (see the header and
+  // AnimeHubSiteController). Every command resolves with data or rejects with
+  // a message Rust classifies. The open is TWO-PHASED: `site_migrate` (the
+  // one-time legacy jar import, no view) and `site_open` (the view). Both
+  // reject with the exact sentinel `unsupported-multi-profile` when the
+  // WebView provider cannot isolate sites — Rust turns that into the
+  // user-facing guidance, and the site is never opened on the shared default
+  // profile. `site_migrate` additionally rejects with `migration-partial: …`
+  // when the strict import criterion was not met, which Rust retires and
+  // retries on a fresh generation.
 
-  /** Read the current cookie header. Android returns null when there are no cookies. */
+  /**
+   * PHASE 1 of the two-phase open protocol: import the one-time legacy jar
+   * into `profile` WITHOUT creating the site WebView. Rust persists
+   * `profilemig-<site>` only after this resolves, and only then calls
+   * `site_open` — so no view the user sees can exist while the migration
+   * state is not durable, and a failed flag write aborts the open before any
+   * view is built (no orphan WebView, no split Rust/Kotlin ownership).
+   * Rejects with `migration-partial: …` when the import did not strictly
+   * complete (Rust retires that profile name and retries on a fresh
+   * generation), and with `unsupported-multi-profile` when the provider
+   * cannot isolate sites at all.
+   */
   @Command
-  fun webview_cookies_get(invoke: Invoke) {
-    val url = invoke.getArgs().getString("url") ?: run {
-      invoke.reject("url gerekli"); return
-    }
-    val parsed = android.net.Uri.parse(url)
-    if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
-      invoke.reject("HTTP(S) URL gerekli"); return
-    }
-    withLiveActivity(invoke) {
-      try {
-        // CookieManager.getCookie legitimately returns null for an empty jar.
-        val header = CookieManager.getInstance().getCookie(url) ?: ""
-        invoke.resolve(JSObject().put("value", header))
-      } catch (_: Exception) {
-        invoke.reject("Android çerezleri okunamadı")
-      }
-    }
-  }
-
-  /** Replace the shared CookieManager jar; disk persistence is queued off the UI thread. */
-  @Command
-  fun webview_cookies_replace(invoke: Invoke) {
+  fun site_migrate(invoke: Invoke) {
     val args = invoke.getArgs()
     val url = args.getString("url") ?: run {
       invoke.reject("url gerekli"); return
     }
-    val cookieHeaders = try {
-      val array = args.getJSONArray("cookies")
-      ArrayList<String>(array.length()).apply {
-        for (index in 0 until array.length()) add(array.getString(index))
-      }
-    } catch (_: Exception) {
-      invoke.reject("çerez listesi geçersiz"); return
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
     }
-    if (cookieHeaders.isNotEmpty()) {
-      val parsed = android.net.Uri.parse(url)
-      if ((parsed.scheme != "http" && parsed.scheme != "https") || parsed.host.isNullOrBlank()) {
-        invoke.reject("HTTP(S) URL gerekli"); return
+    val cookies = mutableListOf<String>()
+    try {
+      args.optJSONArray("cookies")?.let { array ->
+        for (i in 0 until array.length()) {
+          cookies.add(array.getString(i))
+        }
       }
+    } catch (e: Exception) {
+      invoke.reject("çerez listesi çözümlenemedi")
+      return
     }
-
     withLiveActivity(invoke) {
-      try {
-        val manager = CookieManager.getInstance()
-        val startedAt = android.os.SystemClock.elapsedRealtime()
-        // removeAllCookies is asynchronous; restoring/navigating before its
-        // callback would let the outgoing provider's cookies leak forward.
-        manager.removeAllCookies {
-          if (rejectIfActivityUnavailable(invoke)) return@removeAllCookies
-          var rejected = 0
-          fun setNext(index: Int) {
-            if (index >= cookieHeaders.size) {
-              if (rejected > 0) {
-                Log.w(LOG_TAG, "CookieManager rejected $rejected restored cookie(s)")
-                AnimeHubDebugLog.add("cookie", "rejected $rejected restored cookie(s)")
-              }
-              val elapsedMs = android.os.SystemClock.elapsedRealtime() - startedAt
-              Log.d(
-                LOG_TAG,
-                "Cookie jar ready: ${cookieHeaders.size} cookie(s), ${elapsedMs}ms"
-              )
-              // Durability: flush on a background thread and resolve
-              // only after it completes. `manager.flush()` is blocking I/O
-              // so it must not run on the UI thread, but the Rust
-              // `webview_cookies_replace`/`clear` must not return success
-              // before the jar is durable — otherwise a process kill
-              // immediately after `clear_site_data` could resurrect the old
-              // jar. Errors are propagated as rejections, not silent
-              // success. Even an empty jar is flushed for the same reason.
-              try {
-                COOKIE_FLUSH_EXECUTOR.execute {
-                  try {
-                    manager.flush()
-                  } catch (e: Exception) {
-                    Log.w(LOG_TAG, "CookieManager flush failed", e)
-                    AnimeHubDebugLog.add("cookie", "flush failed: \${e.message}")
-                    activity.runOnUiThread {
-                      if (!rejectIfActivityUnavailable(invoke)) {
-                        invoke.reject("CookieManager kalıcılığı başarısız", e)
-                      }
-                    }
-                    return@execute
-                  }
-                  activity.runOnUiThread {
-                    if (rejectIfActivityUnavailable(invoke)) return@runOnUiThread
-                    invoke.resolve(JSObject().put("ok", true))
-                  }
-                }
-              } catch (e: Exception) {
-                Log.w(LOG_TAG, "CookieManager flush could not be queued", e)
-                invoke.reject("CookieManager kalıcılığı kuyruğa alınamadı", e)
-              }
-              return
-            }
-            try {
-              manager.setCookie(url, cookieHeaders[index]) { accepted ->
-                if (rejectIfActivityUnavailable(invoke)) return@setCookie
-                if (accepted != true) rejected += 1
-                setNext(index + 1)
-              }
-            } catch (_: Exception) {
-              // Avoid leaving a partial target jar available to the page
-              // that was active before the provider switch.
-              try {
-                manager.removeAllCookies {
-                  if (!rejectIfActivityUnavailable(invoke)) {
-                    invoke.reject("Android çerezleri geri yüklenemedi")
-                  }
-                }
-              } catch (_: Exception) {
-                invoke.reject("Android çerezleri geri yüklenemedi")
-              }
-            }
+      val operationId = operationId(args)
+      AnimeHubSiteController.migrate(activity, url, profileName, cookies, operationId) { error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("ok", true))
+        }
+      }
+    }
+  }
+
+  /**
+   * PHASE 2: open the site WebView bound to `profile`. Takes no cookies —
+   * the one-time jar import runs in [site_migrate] before Rust persists the
+   * migration flag, so this call can never migrate behind the flag's back.
+   */
+  @Command
+  fun site_open(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val url = args.getString("url") ?: run {
+      invoke.reject("url gerekli"); return
+    }
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    val initScript = args.getString("initScript") ?: ""
+    val operationId = operationId(args)
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.open(activity, url, profileName, initScript, operationId) { error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("ok", true))
+        }
+      }
+    }
+  }
+
+  /**
+   * Close the active site WebView. `flush=false` is the wipe path: the data
+   * is about to be cleared or deleted, so it must not be re-persisted first.
+   * Idempotent — a stale Rust session resolves `ok` instead of failing.
+   */
+  @Command
+  fun site_close(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val flush = args.optBoolean("flush", true)
+    val operationId = operationId(args)
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.close(activity, flush, operationId) { error ->
+        if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
+      }
+    }
+  }
+
+  /**
+   * Delete one site profile's data. `{deleted:false, pending:true}` means the
+   * provider refused right now (in use / unsupported) and Rust must queue the
+   * name for the next process start; a reject is a hard failure the caller
+   * must not interpret as success.
+   */
+  @Command
+  fun site_profile_delete(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    val operationId = operationId(args)
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.deleteProfileData(profileName, operationId) { deleted, pending, error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          val payload = JSObject()
+          payload.put("deleted", deleted)
+          payload.put("pending", pending)
+          invoke.resolve(payload)
+        }
+      }
+    }
+  }
+
+  /**
+   * Retire one profile name's quarantine ledger.
+   *
+   * Rust calls this ONLY after the site's generation bump is durably stored
+   * (`run_mobile_delete_protocol`), which is what makes the name underivable
+   * forever; retiring earlier would leave a name both reachable and unblocked
+   * when the bump or its write fails. Replies `{dropped}` — how many
+   * outstanding operation records went with it — or rejects with the refusal
+   * decided by the pure `ProfileRetirement` rule.
+   */
+  @Command
+  fun site_profile_retire(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    val operationId = operationId(args)
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.retireProfileQuarantine(profileName, operationId) { dropped, error ->
+        if (error != null) {
+          invoke.reject(error)
+        } else {
+          invoke.resolve(JSObject().put("dropped", dropped))
+        }
+      }
+    }
+  }
+
+  /** Clear one site profile in place (cookies, web storage, permissions). */
+  @Command
+  fun site_clear_data(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val profileName = args.getString("profile") ?: run {
+      invoke.reject("profile gerekli"); return
+    }
+    val operationId = operationId(args)
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.clearProfileData(activity, profileName, operationId) { error ->
+        if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
+      }
+    }
+  }
+
+  /** Periodic durability hook: flush the active site profile's cookies. */
+  @Command
+  fun site_flush(invoke: Invoke) {
+    val operationId = operationId(invoke.getArgs())
+    withLiveActivity(invoke) {
+      AnimeHubSiteController.flush(activity, operationId) { error ->
+        if (error != null) invoke.reject(error) else invoke.resolve(JSObject().put("ok", true))
+      }
+    }
+  }
+
+  /**
+   * Every profile name the provider store knows (for the "clear all" orphan
+   * sweep). An unsupported provider resolves an empty list with
+   * `unsupported=true`: Rust skips the sweep and logs instead of guessing.
+   */
+  /**
+   * Replace the user blocklist snapshot used by the site WebView.
+   *
+   * Rust calls this before every site open and after every settings change or
+   * reset. The snapshot is process-wide and atomic, so a live WebView sees the
+   * replacement at its next navigation/request checkpoint. The WebView never
+   * reads Rust state directly.
+   *
+   * A failure BEFORE this command (bridge unavailable/activity gone) is handled
+   * fail-closed by Rust: no new open, and an active site is closed. Kotlin must
+   * not be described as making that failure safe, because it never observes it.
+   */
+  @Command
+  fun site_blocklist_update(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val operationId = operationId(args)
+    val array = args.optJSONArray("rules")
+    val rules =
+      buildList {
+        if (array != null) {
+          for (i in 0 until array.length()) {
+            val value = array.optString(i, "")
+            if (value.isNotBlank()) add(value)
           }
-          setNext(0)
         }
-      } catch (_: Exception) {
-        invoke.reject("Android çerezleri temizlenemedi")
       }
-    }
+    SiteBlocklist.update(rules)
+    AnimeHubDebugLog.record("site", "gate", "ok", operationId, count = rules.size.toLong())
+    val payload = JSObject()
+    payload.put("ok", true)
+    invoke.resolve(payload)
   }
 
-  // ------------------------------------------------- localStorage / IndexedDB
-
-  /**
-   * Dump the loaded page's `localStorage` and resolve with the Keystore-sealed
-   * base64 blob.
-   *
-   * The script returns the object itself (not a `JSON.stringify` string), so
-   * the `evaluateJavascript` callback receives exactly the JSON text we want
-   * to encrypt — no double encoding to undo.
-   */
   @Command
-  fun localstorage_export(invoke: Invoke) {
-    val purpose = invoke.getArgs().getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
-    }
-    withLiveWebView(invoke) { webView ->
-      webView.evaluateJavascript(
-        "(function(){var o={};for(var i=0;i<localStorage.length;i++){" +
-          "var k=localStorage.key(i);o[k]=localStorage.getItem(k);}return o;})()"
-      ) { result ->
-        if (rejectIfActivityUnavailable(invoke)) return@evaluateJavascript
-        if (result == null || result == "null") {
-          // Context torn down mid-evaluation (navigation won the race): report
-          // an empty payload rather than half a jar.
-          invoke.resolve(JSObject().put("value", ""))
-          return@evaluateJavascript
-        }
-        try {
-          invoke.resolve(JSObject().put("value", seal(purpose, result)))
-        } catch (e: Exception) {
-          invoke.reject("localStorage şifrelemesi başarısız: ${e.message}", e)
-        }
+  fun site_profile_names(invoke: Invoke) {
+    val operationId = operationId(invoke.getArgs())
+    withLiveActivity(invoke) {
+      val names = AnimeHubSiteController.allProfileNames()
+      val payload = JSObject()
+      val array = org.json.JSONArray()
+      if (names == null) {
+        AnimeHubDebugLog.record(
+          "profile", "capability", "unsupported_provider", operationId, errorClass = "unsupported",
+        )
+        payload.put("unsupported", true)
+      } else {
+        names.forEach { array.put(it) }
+        AnimeHubDebugLog.record(
+          "profile", "profile_list", "ok", operationId, count = names.size.toLong(),
+        )
       }
+      payload.put("names", array)
+      invoke.resolve(payload)
     }
-  }
-
-  /** Restore a [`localstorage_export`] blob into the loaded page. */
-  @Command
-  fun localstorage_import(invoke: Invoke) {
-    val args = invoke.getArgs()
-    val purpose = args.getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
-    }
-    val sealed = args.getString("value") ?: run {
-      invoke.reject("value gerekli"); return
-    }
-    try {
-      val json = openSealed(purpose, sealed)
-      if (json.isEmpty()) {
-        invoke.resolve(JSObject().put("ok", true)); return
-      }
-      // Valid JSON is a valid JS object literal, so the payload is embedded
-      // directly — never interpolated as source text.
-      val js = "(function(){try{var d=$json;localStorage.clear();" +
-        "for(var k in d){localStorage.setItem(k,d[k]);}}catch(e){}})();"
-      withLiveWebView(invoke) { webView ->
-        webView.evaluateJavascript(js, null)
-        invoke.resolve(JSObject().put("ok", true))
-      }
-    } catch (e: Exception) {
-      invoke.reject("localStorage çözülemedi", e)
-    }
-  }
-
-  /**
-   * Dump the loaded page's IndexedDB databases (best effort) and resolve with
-   * the Keystore-sealed base64 blob.
-   *
-   * Fidelity notes, by design: document *values* are captured via
-   * `getAll`/`getAllKeys` pairs, so original keys survive; secondary indexes,
-   * key paths and auto-increment counters are **not** reconstructed, and
-   * structured-clone-only values (Blob, etc.) are dropped by
-   * `JSON.stringify`. Good enough for the auth/setting state sites in scope
-   * keep in IndexedDB; anything richer is a documented limitation.
-   */
-  @Command
-  fun indexeddb_export(invoke: Invoke) {
-    val purpose = invoke.getArgs().getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
-    }
-    // Keep the existing export script and callback contract, but run the
-    // WebView call on Android's required UI thread.
-    withLiveWebView(invoke) { webView ->
-      webView.evaluateJavascript(EXPORT_IDB_JS) { result ->
-        if (rejectIfActivityUnavailable(invoke)) return@evaluateJavascript
-        if (result == null || result == "null") {
-          invoke.resolve(JSObject().put("value", ""))
-          return@evaluateJavascript
-        }
-        try {
-          invoke.resolve(JSObject().put("value", seal(purpose, result)))
-        } catch (e: Exception) {
-          invoke.reject("IndexedDB şifrelemesi başarısız: ${e.message}", e)
-        }
-      }
-    }
-  }
-
-  /** Restore an [`indexeddb_export`] blob into the loaded page. */
-  @Command
-  fun indexeddb_import(invoke: Invoke) {
-    val args = invoke.getArgs()
-    val purpose = args.getString("purpose") ?: run {
-      invoke.reject("purpose gerekli"); return
-    }
-    val sealed = args.getString("value") ?: run {
-      invoke.reject("value gerekli"); return
-    }
-    try {
-      val json = openSealed(purpose, sealed)
-      if (json.isEmpty()) {
-        invoke.resolve(JSObject().put("ok", true)); return
-      }
-      // Same no-interpolation rule: the payload becomes a parsed literal.
-      val js = "(async function(){try{var d=$json;" +
-        "for(var name in d){var spec=d[name];" +
-        "var db=await new Promise(function(res,rej){var r=indexedDB.open(name,spec.version||1);" +
-        "r.onupgradeneeded=function(){var b=r.result;" +
-        "for(var sn in spec.stores){if(!b.objectStoreNames.contains(sn))b.createObjectStore(sn);}};" +
-        "r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)}});" +
-        "for(var sn in spec.stores){await new Promise(function(res,rej){" +
-        "var tx=db.transaction(sn,'readwrite');var st=tx.objectStore(sn);" +
-        "spec.stores[sn].forEach(function(row){st.put(row.value,row.key);});" +
-        "tx.oncomplete=function(){res()};tx.onerror=function(){rej(tx.error)}});}" +
-        "db.close();}}catch(e){}})();"
-      withLiveWebView(invoke) { webView ->
-        webView.evaluateJavascript(js, null)
-        invoke.resolve(JSObject().put("ok", true))
-      }
-    } catch (e: Exception) {
-      invoke.reject("IndexedDB çözülemedi", e)
-    }
-  }
-
-  /** Seal a JSON payload with the Keystore key for `purpose` (IV-prefixed b64). */
-  private fun seal(purpose: String, plaintext: String): String {
-    val cipher = Cipher.getInstance(TRANSFORMATION)
-    cipher.init(Cipher.ENCRYPT_MODE, keyFor(purpose))
-    val ct = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
-    return Base64.encodeToString(cipher.iv + ct, Base64.NO_WRAP)
-  }
-
-  /** Open a [`seal`] blob; an empty payload short-circuits to `""`. */
-  private fun openSealed(purpose: String, sealed: String): String {
-    if (sealed.isEmpty()) return ""
-    val combined = Base64.decode(sealed, Base64.NO_WRAP)
-    if (combined.size <= GCM_IV_LENGTH) return ""
-    val iv = combined.copyOfRange(0, GCM_IV_LENGTH)
-    val ct = combined.copyOfRange(GCM_IV_LENGTH, combined.size)
-    val cipher = Cipher.getInstance(TRANSFORMATION)
-    cipher.init(Cipher.DECRYPT_MODE, keyFor(purpose), GCMParameterSpec(GCM_TAG_BITS, iv))
-    return String(cipher.doFinal(ct), Charsets.UTF_8)
   }
 
   // ------------------------------------------------------------------- PiP
@@ -598,6 +532,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
     val args = invoke.getArgs()
     val num = args.getInteger("num", 16)
     val den = args.getInteger("den", 9)
+    val operationId = operationId(args)
     try {
       var answered = false
       fun answer(ok: Boolean) {
@@ -613,6 +548,7 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       val claimed = AnimeHubPipController.requestEnter(
         activity,
         "command",
+        operationId = operationId,
         onResult = { entered -> answer(entered) },
         fallbackNum = num,
         fallbackDen = den,
@@ -620,7 +556,8 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
       // Unsupported device: no callback will ever fire.
       if (!claimed) answer(false)
     } catch (e: Exception) {
-      invoke.reject("PiP başlatılamadı: ${e.message}", e)
+      AnimeHubDebugLog.record("pip", "pip_enter", "failed", operationId, errorClass = "provider")
+      invoke.reject("PiP başlatılamadı")
     }
   }
 
@@ -635,72 +572,71 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
    */
   @Command
   fun set_pip_auto_enter(invoke: Invoke) {
-    val enabled = invoke.getArgs().getBoolean("enabled", false)
+    val args = invoke.getArgs()
+    val enabled = args.getBoolean("enabled", false)
+    val operationId = operationId(args)
     try {
-      val applied = AnimeHubPipController.applyAutoEnter(activity, enabled)
+      val applied = AnimeHubPipController.applyAutoEnter(activity, enabled, operationId)
       invoke.resolve(JSObject().put("ok", applied))
     } catch (e: Exception) {
-      invoke.reject("PiP ayarlanamadı: ${e.message}", e)
+      AnimeHubDebugLog.record("pip", "capability", "failed", operationId, errorClass = "provider")
+      invoke.reject("PiP ayarlanamadı")
     }
   }
 
-  /** Developer panel: the last Android lines, so no logcat is needed on a device. */
+  /** Developer panel: the merged Rust caller reads this bounded Kotlin ring. */
   @Command
   fun debug_log(invoke: Invoke) {
-    val lines = org.json.JSONArray()
-    AnimeHubDebugLog.snapshot().forEach { lines.put(it) }
-    invoke.resolve(JSObject().put("lines", lines))
+    // Rust checks the persisted developer_options setting and drives
+    // set_debug_logging before it reads the snapshot.
+    val snapshot = AnimeHubDebugLog.snapshot()
+    val events = org.json.JSONArray()
+    snapshot.events.forEach { event ->
+      val row = JSObject()
+      row.put("sequence", event.sequence)
+      row.put("timestampMs", event.timestampMs)
+      row.put("source", event.source)
+      row.put("area", event.area)
+      row.put("phase", event.phase)
+      row.put("result", event.result)
+      event.operationId?.let { row.put("operationId", it) }
+      event.durationMs?.let { row.put("durationMs", it) }
+      event.watchdog?.let { row.put("watchdog", it) }
+      event.errorClass?.let { row.put("errorClass", it) }
+      event.count?.let { row.put("count", it) }
+      event.stepId?.let { row.put("stepId", it) }
+      events.put(row)
+    }
+    val payload = JSObject()
+    payload.put("events", events)
+    payload.put("droppedEvents", snapshot.droppedEvents)
+    payload.put("capacity", snapshot.capacity)
+    invoke.resolve(payload)
+  }
+
+  /** User-triggered, in-memory reset; the Rust command enforces the setting gate. */
+  @Command
+  fun debug_log_reset(invoke: Invoke) {
+    AnimeHubDebugLog.reset()
+    invoke.resolve(JSObject().put("ok", true))
+  }
+
+  /** Rust mirrors developer_options here so collection itself is opt-in. */
+  @Command
+  fun set_debug_logging(invoke: Invoke) {
+    val enabled = invoke.getArgs().getBoolean("enabled", false)
+    AnimeHubDebugLog.setEnabled(enabled)
+    invoke.resolve(JSObject().put("ok", true))
   }
 
   companion object {
     private const val LOG_TAG = "AnimeHubPlugin"
-    private val COOKIE_FLUSH_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
-      Thread(runnable, "AnimeHubCookieFlush").apply { isDaemon = true }
-    }
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val KEY_ALIAS_PREFIX = "animehub_"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_IV_LENGTH = 12
     private const val GCM_TAG_BITS = 128
 
-    /**
-     * Best-effort dump of every IndexedDB database on the current origin:
-     * `{ "<db>": { "version": n, "stores": { "<store>": [ {key, value} ] } } }`.
-     * Returns `"{}"` (never `null`) on any internal failure so the caller can
-     * treat a missing dump and an empty one identically.
-     */
-    private val EXPORT_IDB_JS = """
-        (async function(){
-          var out={};
-          function openDb(name,version){return new Promise(function(res,rej){
-            var r=indexedDB.open(name,version||undefined);
-            r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)};});}
-          try{
-            var dbs=await indexedDB.databases();
-            for(var i=0;i<dbs.length;i++){
-              var name=dbs[i].name;if(!name)continue;
-              var db=await openDb(name,dbs[i].version);
-              var stores={};
-              for(var j=0;j<db.objectStoreNames.length;j++){
-                var sn=db.objectStoreNames[j];
-                var rows=await new Promise(function(res,rej){
-                  var tx=db.transaction(sn,'readonly');
-                  var st=tx.objectStore(sn);
-                  var keys=st.getAllKeys();var vals=st.getAll();
-                  var failed=function(){rej(keys.error||vals.error||new Error('getAll'))};
-                  keys.onsuccess=function(){vals.onsuccess=function(){
-                    res(vals.result.map(function(v,k){return{key:keys.result[k],value:v}}))};
-                    vals.onerror=failed};
-                  keys.onerror=failed;vals.onerror=failed;});
-                stores[sn]=rows;
-              }
-              out[name]={version:db.version,stores:stores};
-              db.close();
-            }
-          }catch(e){return '{}';}
-          return out;
-        })()
-    """.trimIndent().replace("\n", "")
 
     /** Return the existing key for `purpose`, generating one on first use. */
     private fun keyFor(purpose: String): SecretKey {
@@ -735,66 +671,6 @@ class AnimeHubPlugin(private val activity: Activity) : Plugin(activity) {
 }
 
 /**
- * Top-level navigation guard for the shared site WebView (Android only).
- *
- * Desktop enforces the site policy in Tauri's `on_navigation` hook. Android has
- * no equivalent for the single launcher WebView: wry's navigation handler is
- * fixed when the WebView is created and is not reachable from app code. So this
- * class wraps wry's `WebViewClient` and cancels the navigations that the desktop
- * policy would refuse.
- *
- * Scope (verified against wry 0.55.1 source and the Android WebView docs, not on
- * a device):
- *  - Covered: top-level navigations that the WebView routes through
- *    `shouldOverrideUrlLoading` (link clicks, `location` changes, main-frame
- *    redirects as delivered by the WebView).
- *  - Not covered: `WebView.loadUrl` calls made by the app itself (the app's
- *    `open_on_mobile` already validates the first URL), subframes, and
- *    sub-resources.
- *  - Not covered: the blocklist and DNS rebinding checks. Those live in Rust;
- *    running DNS on the UI thread from this callback is not acceptable.
- *
- * Every other callback is forwarded unchanged, so wry's custom-protocol
- * handling, the IPC page-started tracking and the error recovery keep working.
- */
-class SiteNavigationGuard(private val inner: WebViewClient) : WebViewClient() {
-
-  override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-    val uri = request.url
-    if (!SiteNavigationPolicy.allows(uri)) {
-      // Host and scheme only: paths and queries can carry tokens.
-      Log.w(LOG_TAG, "navigation blocked: ${uri.scheme}://${uri.host}")
-      // Scheme only in the in-app log: the host can identify the site.
-      AnimeHubDebugLog.add("nav", "blocked scheme=${uri.scheme}")
-      return true
-    }
-    return inner.shouldOverrideUrlLoading(view, request)
-  }
-
-  override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
-    inner.shouldInterceptRequest(view, request)
-
-  override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) =
-    inner.onPageStarted(view, url, favicon)
-
-  override fun onPageFinished(view: WebView, url: String) =
-    inner.onPageFinished(view, url)
-
-  override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-    // Error code and frame only: the description and URL are left out.
-    if (request.isForMainFrame) {
-      AnimeHubDebugLog.add("web", "main frame error code=${error.errorCode}")
-    }
-    inner.onReceivedError(view, request, error)
-  }
-
-  companion object {
-    private const val LOG_TAG = "AnimeHubNavGuard"
-  }
-}
-
-
-/**
  * Receives `window.ipc.postMessage` from the launcher only. The origin rules
  * stop the object being injected into site pages at all; the main-frame check
  * is a second, cheap guard. `Rust.ipc` gets the same arguments as wry's object:
@@ -809,11 +685,7 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     replyProxy: JavaScriptReplyProxy,
   ) {
     if (!isMainFrame) return
-    if (!isAllowedOrigin(sourceOrigin)) {
-      Log.w(LOG_TAG, "IPC blocked: unexpected origin ${sourceOrigin.scheme}")
-      AnimeHubDebugLog.add("ipc", "blocked origin scheme=${sourceOrigin.scheme}")
-      return
-    }
+    if (!isAllowedOrigin(sourceOrigin)) return
     val body = message.data ?: return
     val url = view.url ?: "about:blank"
     // onPostMessage runs on the UI thread. Rust runs blocking commands inline, and
@@ -824,12 +696,12 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
       IPC_EXECUTOR.execute {
         try {
           Rust.ipc(webViewId, url, body)
-        } catch (e: Exception) {
-          AnimeHubDebugLog.add("ipc", "dispatch failed (${e.javaClass.simpleName})")
+        } catch (_: Exception) {
+          // Per-message failures are intentionally not recorded in the flow log.
         }
       }
-    } catch (e: Exception) {
-      AnimeHubDebugLog.add("ipc", "dispatch could not be queued (${e.javaClass.simpleName})")
+    } catch (_: Exception) {
+      // Dispatch is per-message; omit it from high-volume diagnostics.
     }
   }
 
@@ -855,25 +727,4 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     const val OBJECT_NAME = "ipc"
     val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
   }
-}
-
-/**
- * In-app diagnostics for the launcher's developer panel, read through the
- * `debug_log` plugin command. Holds the last 200 lines of status text only:
- * a short area tag, the outcome, and error codes. Never site URLs or hosts,
- * and never message bodies or cookie values.
- */
-object AnimeHubDebugLog {
-  private const val MAX_LINES = 200
-  private val lines = ArrayDeque<String>()
-  private val stamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
-
-  @Synchronized
-  fun add(area: String, message: String) {
-    if (lines.size >= MAX_LINES) lines.removeFirst()
-    lines.addLast(stamp.format(Date()) + " [" + area + "] " + message)
-  }
-
-  @Synchronized
-  fun snapshot(): List<String> = lines.toList()
 }

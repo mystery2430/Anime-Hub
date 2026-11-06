@@ -34,7 +34,13 @@ Tauri 2 (Rust + native WebView) ile yazılmış bir **başlatıcı**: ikon ızga
 site masaüstünde kendi WebView profiliyle açılır; Android tek WebView kullanır
 ve sağlayıcı çerez kavanozlarını değiştirir. Android'de aynı kaynaklı
 `localStorage`/IndexedDB için gerçek sağlayıcı yalıtımı henüz çözülmedi.
-Android birincil, Windows/Linux ikincil hedef; macOS/iOS kapsam dışı.
+Android birincil, Windows/Linux ikincil hedef. **macOS (round 17):** masaüstü
+hedefi artık macOS'u da kapsar — site vekili `macos-proxy` özelliğiyle
+bağlanır ve 14 (Darwin 23) altındaki sürümlerde site **korunmasız açılmaz**,
+açıkça reddedilir. iOS desteği kaldırıldı: iOS'a özgü paylaşılan WebView,
+çerez içe/dışa aktarma ve paketleme yolları artık kod tabanında yok; desteklenen
+hedefler Windows, Linux, macOS (masaüstü) ve Android'dir. macOS üzerinde
+paket/notarization ve gerçek WKWebView doğrulaması yapılmadı.
 
 Paket kimliği `dev.animehub.app`. GPLv3 lisanslı Dantotsu'dan **hiç kod
 taşınmadı** (temiz oda); ayrıntı `NOTICES.md` içinde.
@@ -90,7 +96,187 @@ gezinti ve site açılışı artık alan adını kısa bir zaman aşımıyla ç�
 zaman aşımına uğrarsa metin politikası geçerli kalır (DNS kesintisi siteleri
 kapatmasın diye). Sayfa yüklendikten sonra WebView'ın kendi çözümleyicisiyle
 giden alt istekler (`fetch` / XHR) hâlâ bu kontrolden geçmez — onu kapatmak
-filtreleyen bir vekil ister, v1'de yok. Karar `HANDOFF` bölüm 6.D'de.
+filtreleyen bir vekil ister. **Round 17 güncellemesi:** o vekil artık var —
+Android'de `SiteProxyController` + `DnsPinnedProxy` (round 16), masaüstünde
+`src-tauri/src/web/pinned_proxy.rs` (round 17, Windows/Linux `proxy_url`,
+macOS `macos-proxy`). İkisi de **cihazda doğrulanmadı**; ayrıca yalnızca TCP
+`CONNECT` taşırlar, WebRTC/ICE/STUN/TURN/UDP kapsam dışıdır. Karar geçmişi
+`HANDOFF` bölüm 6.D'de.
+
+**Round 23 — CONNECT istek satırı dilbilgisi iki platformda eşitlendi.**
+Round 22 yalnızca *authority* yarısını hizaladı; satır yarısı hizasız kalmıştı
+ve kaynakta dört gerçek fark vardı. (1) **Masaüstü yanlıştı:** `parse_connect`
+metodu `eq_ignore_ascii_case("CONNECT")` ile karşılaştırıyordu, yani RFC 9112
+§3.1'e göre CONNECT **olmayan** `connect`/`Connect`/`CONNECt` satırlarını
+tünelliyordu. Ayrıca `?`, `#`, `\`, ASCII dışı bayt, tek köşeli parantez
+(`foo[bar`, `foo]bar`), boş etiket (`foo..bar`), 253 bayttan uzun host ve hedef
+içindeki ham HTAB parser'dan geçip **çözümleyiciye** ulaşıyordu — yani
+"parser hatası çözümleyiciye düşmez" değişmezi masaüstünde doğru değildi.
+(2) **Android yanlıştı:** sürüm kontrolü `startsWith("HTTP/1.")` idi; RFC 9112
+§2.3'e göre `HTTP/1.foo`, `HTTP/1.`, `HTTP/1.1x`, `http/1.1` geçerli sürüm
+değilken kabul ediliyordu; köşeli parantez dalı da yalnızca *şekle* bakıyordu,
+yani `[::::]` ve 9 gruplu literal parser'dan geçiyordu. (3) İkisi de özel
+adrese ulaşan bir yol değildi (hedef politikası her durumda çalışıyordu); fark,
+güvenlik yüzeyi ve aynı satırın bir platformda tünel diğerinde ret olmasıydı.
+**Düzeltme:** metot tam olarak `CONNECT` (RFC 9112 §3.1), sürüm tam olarak
+`HTTP/1.0|1.1` (RFC 9112 §2.3; `HTTP/1.2` sözdizimsel olarak geçerli ama bu vekil
+yalnızca 1.x tünelliyor — bu bir **uygulama kararı**, iki tarafta aynı), hedef
+yalnızca yazdırılabilir ASCII ve `@ / ? # \ %` yok (RFC 3986 `reg-name` alt-sınır
+karakterlerine ve yüzde kodlamaya izin verir; ikisi de **bilerek** reddediliyor),
+köşeli parantez yalnızca gerçek IPv6 literalini sarar (Android'de JVM
+`getByName`, öncesinde hex/`:`/`.` filtresi sayesinde DNS'e çıkmaz), host
+≤253 bayt ve boş etiket yok, port 1–5 rakam. **Fixture tek kaynak:**
+`connect-authority.tsv` → **`connect-request.tsv`** (80 vektör: 36 `request`,
+44 `authority`); Rust `include_str!`, Kotlin test classpath'ten okuyor, CI
+kopyalamayı zorunlu tutuyor, iki taraf da **her iki satır türünü** işlemek
+zorunda (JS pini). `h.example:070` **kabul** (beş hane, sıfır dolgulu, değer 70)
+ile `example.com:0000443` **ret** (yedi hane) bilinçli olarak ayrı kurallar:
+yalnızca beş-hane sınırı kaldırıldığında testi kıran tam olarak iki vektör
+`0000443` olanlar, `070` değil. Mutation kontrolü (model düzeyinde, üretim kodu
+değişmeden): metot geri alınınca 3, Android sürüm kontrolü geri alınınca 4,
+masaüstü karakter/uzunluk doğrulaması kaldırılınca 16, Android köşeli parantez
+dalı şekil-only olunca 6, yalnız beş-hane sınırı kaldırılınca 2, yalnız boş
+etiket kuralı kaldırılınca 3 vektör düşüyor. 252.442 satırlık üretilmiş korpusta
+nihai iki dilbilgisi **0** sapma veriyor; Round 22 parser'ları 480 satırlık alt
+matriste 92 sapma veriyordu. **Dokunulmayanlar:** ret **durum kodları** hâlâ
+farklı (masaüstü her parse hatasına 405; Android metot için 405, hedef için 403,
+çözümleme için 502) — ikisi de ret, WebView 200 dışını hata sayıyor, RFC 9112
+§2.2'nin önerdiği 400'e geçmek parser'ın dönüş tipini kozmetik için
+genişletmek olurdu. Round 21/22'nin açık maddeleri (P1 ilk istek, loopback
+kimlik doğrulaması, DNS TOCTOU, cihaz listesi 36–42, WebRTC/UDP, AniList E2E,
+bağımsız inceleme) **aynen açık**. Yerel: `npm test` 284/284, build ve audit
+temiz; **yerelde cargo/JVM yok**, Rust ve Kotlin kanıtı CI'dan.
+
+**Round 22 — IP sınıflandırması ve CONNECT hedef doğrulaması denetlendi;
+iki vekilin authority dilbilgisi eşitlendi.** (1) Adres sınıflandırması
+**değiştirilmedi**: Rust `ip_is_public` ile Kotlin `IpPolicy` kural kural IANA
+IPv4/IPv6 special-purpose kayıtlarıyla (ikisi de 2025-10-09 güncellemeli) ve
+birbirleriyle karşılaştırıldı; 205.472 IPv6 adresi üzerinde model düzeyinde
+diferansiyel **0 sapma** verdi. Kayıtlardaki istisnalar korunuyor
+(`192.0.0.9/.10`, `192.31.196/24`, `192.52.193/24`, `192.175.48/24`,
+`2001:1::1-3`, `2001:3::/32`, `2001:4:112::/48`, ORCHIDv2, DETs); `2001::/23`
+"daha özel atama yoksa engelle" kuralıyla işleniyor, `64:ff9b:1::/48` içine
+gömülü **genel** IPv4 ile bile engelli. Ortak fixture'a 19 `ip` + 9 `host`
+vektörü eklendi (yazarken bir vektör yanlıştı — `5eff::1` `2000::/3` dışında,
+yani private; model kontrolü CI'dan önce yakaladı). (2) **Gerçek kusur:**
+masaüstü `parse_connect` üç biçimi kabul edip tünelliyordu, Android'in
+`parseAuthority`'si reddediyordu: `host:+443` (`u16::from_str` işareti kabul
+eder), `[8.8.8.8]:443` (köşeli parantezli IPv4) ve `example.com:443:443`
+(köşesiz `a:b` host). Özel adrese ulaşan bir yol değildi (hedef politikası yine
+çalışıyordu) ama aynı istek satırı bir platformda tünel, diğerinde 403'tü.
+Düzeltme yalnızca masaüstünde ve fail-closed: port artık yalnızca 1–5 ASCII rakam
+(RFC 3986 §3.2.3), köşeli parantez yalnızca geçerli IPv6 adresi sarabilir,
+köşesiz host `:` içeremez. `tests/fixtures/connect-authority.tsv` (32 vektör)
+artık **ortak**: Rust `include_str!`, Kotlin test classpath'ten okuyor, CI
+kopyalamayı zorunlu tutuyor; mutation kontrolünde round-21 parser'ı bu
+vektörlerin 8'inde düşüyor. (3) Ek test boşlukları: CONNECT düzeyinde WHATWG
+sayı biçimleri (`0177.0.0.1`, `0x7f000001`, `2130706433`, `127.1`) — betikli
+çözümleyici bilerek **public** cevap veriyor, böylece `is_private_host`
+kaldırılırsa test kırmızıya döner; ve `start()`'ın üretim politikasını
+(`PUBLIC_ONLY` + `Limits::DEFAULT`) hiçbir test sabitlemiyordu, JS kaynak pini
+eklendi. (4) Bilerek dokunulmayanlar: ASCII dışı/`?`/`#` host toleransı,
+253 bayttan uzun host ve boş etiketler (ikisi de fail-closed, WebView bunları
+göndermiyor) ve masaüstünün `\r\n\r\n` sonrası baytları atması (Android
+bayt bayt okuyup koruyor; RFC 9110 istemcinin 2xx beklemesini şart koşuyor) —
+güvenlik kazancı olmayan tünel çerçeveleme değişikliği yapılmadı, SRR'ye not
+düşüldü. Round 21'in açık maddeleri (P1 ilk istek, loopback kimlik doğrulaması,
+DNS TOCTOU, cihaz listesi 36–42, WebRTC/UDP, AniList E2E, bağımsız inceleme)
+**aynen açık**. Yerel: `npm test` 284/284, build ve audit temiz; **yerelde
+cargo/JVM yok**, Rust ve Kotlin kanıtı CI'dan.
+
+**Round 21 — masaüstü yerel vekil erişimi doğrulandı (açık), DNS `Unknown`
+fail-open yolu kapatıldı.** İki bulgu kaynak üzerinden kontrol edildi. (1) P3'ün
+kapsamı masaüstünü de içeriyor: `pinned_proxy.rs` `127.0.0.1` üzerinde efemer bir
+porta bağlanır (ağdan erişilemez) ama istemciyi **kimlik doğrulamaz**
+(`accept_loop` peer adresini `_peer` olarak alır), `parse_connect` sıfır olmayan
+her portu kabul eder ve tek sınır hedef politikasıdır (`PUBLIC_ONLY`). Yani site
+oturumu açıkken yerel bir süreç portu bulup **herkese açık** hedeflere, ürünün
+izin verdiği her porttan tünel açabilir; özel/loopback hedefler reddedildiği için
+LAN'a/cihaza pivot değildir, TLS uçtan uca olduğu için bu uygulamanın trafiğini
+okuyamaz, tavanlar (48 bağlantı, 10 s el sıkışma, 5 s çözümleme, 10 s bağlanma)
+nedeniyle yalnızca sınırlı hizmet reddi üretebilir. Kimlik doğrulama **sevk
+edilmedi**: WebView2'de `BasicAuthenticationRequested` gerçek bir 407 akışı
+sunuyor ve proxy URI'sini veriyor, WebKitGTK'da `authenticate` +
+`is_for_proxy` (2.2+) var, ama **wry 0.55.1 hiçbir masaüstü arka ucunda auth
+işlemez ve Tauri 2.11.6 dışa açmaz**; macOS'ta belgelenmiş kimlik bilgisi yolu
+yok, ayrıca Chromium `--proxy-server` içindeki kimlik bilgisini zaten yok sayar.
+Port sınırlaması (yalnızca 443) **uygulanmadı**: `validate_site_url` özel HTTPS
+portlarını kabul ediyor, 443 kısıtı ürünü bozardı. (2) Masaüstünde üst düzey
+gezinmede DNS `Unknown` artık **reddediliyor** (`session::dns_decision`): bu
+değer yalnızca bir kesinti değil, `MAX_LOOKUP_THREADS` dolduğunda **anında**
+dönen değerdir — yani bir sayfa dört sorguyu askıda tutup kontrolü atlatabiliyordu
+ve masaüstünde ilk istek vekilden geçmediği için (P1) geriye WebView'un kendi
+çözümlemesi kalıyordu. Ayrı bir mesaj (`DNS_UNKNOWN_BLOCK`) kullanılır, rebinding
+iddia edilmez, hiçbir şey önbelleğe/engel listesine yazılmaz, tekrar denenebilir.
+Kapsam **yalnızca üst düzey gezinme**: `blob:`/`about:blank` DNS'e hiç gitmez
+(MSE oynatma ve oyuncu popup'ları bozulmasın diye), `open_site` bu reddi yalnızca
+masaüstünde uygular (Android'de `DnsPinnedProxy` bağlantı anında yeniden çözer).
+TOCTOU/rebinding, alt kaynaklar ve R-01(b) **açık** kalır. Testler:
+`navigation_blocks_a_private_answer_and_an_unanswered_lookup`,
+`a_rejected_url_is_not_rescued_by_a_public_dns_answer`,
+`the_listener_binds_loopback_only`,
+`a_local_client_is_served_without_authentication` ve `command_wiring` içindeki
+kaynak-metni pini. Ayrıntı: `docs/security-residual-risks.md` round 21.
+
+**Round 20 — masaüstü ön-uçuş (preflight) fikri değerlendirildi, uygulanmadı.**
+Amaç, site WebView'ı gerçek siteye gitmeden önce yalnızca uygulamanın denetlediği
+bir adrese yönlendirilip "CONNECT vekile mi geldi, yoksa doğrudan dinleyiciye mi
+düştü?" sorusuyla proxy'nin gerçekten uygulandığını kanıtlamaktı. Kaynak
+incelemesi bunun güvenilir bir kapı olmadığını gösterdi. (a) Loopback taraması
+aynı anda iki politikayı ölçer: ayarın uygulanması **ve** motorun loopback'i
+proxy dışında tutup tutmadığı. İkincisini uygulama yalnızca Windows'ta
+(`--proxy-bypass-list=<-loopback>`) denetleyebilir; Linux'ta WebKit'in
+`GSimpleProxyResolver` ignore listesi boş geçilir ama motorun kendi politikası
+belgelenmemiştir, macOS'ta `proxyConfigurations` için de bir belge yoktur. Yani
+"doğrudan isabet" iki platformda belirsizdir; yanlış alarmın bedeli siteyi hiç
+açmamaktır. (b) wry 0.55.1'in macOS gezinme delegesi `didFail*` uygulamaz:
+başarısız bir gezinme hiçbir sayfa-yükleme olayı üretmez, dolayısıyla
+"tamamlandı" koşulu üç platformda üç ayrı şey olurdu (WebView2 ve WebKitGTK'da
+`Finished` hata durumunda da gelir). (c) Loopback'e hiç bağlı olmayan
+`https://<nonce>.probe.invalid/` varyantı daha temizdir (Chromium proxy'yi DNS'ten
+önce çözer) ama reddetme yolu yine bir zaman aşımıdır ve site açma yolunu
+asenkron, fail-closed bir kapıya çevirir; yanlış kurulursa masaüstünde hiçbir
+site açılmaz ve bunu hiçbir CI işi göremez. **Karar: kod değişmedi.** P1'in
+ilk-istek riski **açık**, masaüstü bağlama "uygulandı, cihaz doğrulaması
+bekliyor". Platform kanıt tabloları, uygulamadan önce yapılması gereken ölçüm
+deneyi ve gelecekteki bir uygulamanın uyması gereken koşullar
+`docs/security-residual-risks.md` round 20'de.
+
+**Round 19 — adapter hatası düzeltildi ve watchdog sınırı adlandırıldı.** Üretim
+adapter'ı (`PlatformDnsLookup`) iptal ile "platform rapor verdi" durumunu **aynı**
+bayrakta tutuyordu: `Cancel` bayrağı önce `true` yapıyordu, dolayısıyla iptalden
+sonra gelen `onAnswer`/`onError` aşağıya iletilmiyor, `AsyncDnsResolver.complete()`
+hiç çalışmıyor ve gerçekten bitmiş bir sorgunun yuvası ancak 60 s'lik watchdog ile
+düşüyordu. JVM testleri fake lookup her callback'i ilettiği için bunu göremiyordu.
+Düzeltme: teslim kuralı ayrı ve saf-JVM `DnsAnswerDelivery` sınıfına taşındı
+(ilk rapor **her zaman** iletilir; iptal teslim mandalını temizlemez), testlerdeki
+`AdapterLikeLookup` üretimdeki aynı sınıfı sürer. **60 s nedir:** platformun
+durduğunun kanıtı değil, yalnızca bizim muhasebemizin watchdog'u — genel API
+tamamlanma sinyali vermez; AOSP (API 30 kaynakları) `cancelQuery` içinde fd
+dinleyicisini kaldırıp fd'yi kapatır, ama kuyruğa alınmış bir callback yine
+çalışabilir. Bu yüzden "en fazla 8 çalışan platform sorgusu" denmez, "en fazla 8
+**izlenen** sorgu" denir. Masaüstü ilk istek sorusunun platform bazlı yanıtı
+`docs/security-residual-risks.md` round 19 §3'te; hiçbir platformda bu uygulamanın
+kullanabileceği, tüm trafiği kapsayan destekli bir ön-istek vetosu yok — risk
+**açık** kalır. Cihaz doğrulaması hâlâ yapılmadı.
+
+**Round 18 (doğrulama turu) — durum, etiketli.** D1 masaüstü vekili
+**uygulandı, cihaz doğrulaması bekliyor**: Windows'ta wry 0.55.1'in kendi
+varsayılan argüman dizisine `--proxy-server=http://127.0.0.1:<port>` +
+`--proxy-bypass-list=<-loopback>` eklenir (ikisi birlikte; `proxy_url` ile
+cfg-dışlayıcı). Linux'ta vekil `WebContext`'in website-data-manager'ına,
+macOS'ta `WKWebsiteDataStore`'a **ilk gezinmeden önce** kurulur; ikisi de
+görünüm başına değil, context/data-store kapsamlıdır ve macOS 14 (Darwin 23)
+gerektirir. "Sıfır CONNECT" kontrolü **yalnızca `PageLoadEvent::Finished`'da**
+çalışır: yüklenmiş bir sayfayı kapatır, ilk isteği engellemez — bu yüzden
+ilk-istek garantisi olarak sunulmaz, risk **açık** kalır. D2 Android çözümleyici
+**uygulandı, cihaz doğrulaması bekliyor**: `DnsResolver.query` +
+`CancellationSignal`, çağıran kendi 10 s son tarihinde serbest, geç yinelenen
+yanıt kazanamaz, iki ayrı 8'lik tavan (mantıksal uçuşlar / platform sorguları),
+`rcode != 0` ret; kanıt **yalnızca JVM** (fake lookup), gerçek sağlayıcının
+iptali cihazda doğrulanmadı. D3 döngü vekili kimlik doğrulaması **açık, ürün
+kararı** (407 yok). D4 WebRTC/UDP: yalnızca JS API'si kısıtlı, UDP/QUIC
+**açık**. D5 OAuth: **uygulama düzeltildi, AniList kaydı/E2E bekliyor**.
 
 ---
 
@@ -135,14 +321,16 @@ Bunlar **eksik**, "çalışıyor" diye sunulmamalı:
 | **Android localStorage/IndexedDB** | Dışa/içe aktarma köprüleri ve şifreli anlık görüntüler bulunur; bunlar gerçek sağlayıcı yalıtımı sağlamaz. Android tek WebView'ı yeniden kullandığı için aynı kaynaklı `localStorage`/IndexedDB izolasyonu çözülmemiştir ve güvenlik sınırı olarak sunulmamalıdır. IndexedDB aktarımı en iyi çabadır (ikincil indeks/key path/Blob kaybı mümkündür) |
 | **Kotlin köprüsü** | v0.3.2 release workflow'u Activity/WebView yaşam döngüsü kontrolleri ve asenkron cookie kalıcılaştırması içeren köprüyü üç Android ABI'sinde derleyip imzaladı. Yerelde Android SDK/Gradle yok; asenkron kalıcılaştırmanın gerçek cihaz performansı doğrulanmadı |
 | **PiP duraklatma** | 6f28b13'teki 2 saniyelik otomatik oynatma yeniden denemesi kaldırıldı (`c4a260b`). Sayfanın gördüğü bir duraklatma geri alınmaz. Kullanıcı ile WebView duraklatması ayırt edilemediğinden, PiP sırasındaki oynatma sürekliliği **cihazda doğrulanmadı** ve bir sınır olarak kalıyor |
-| **Android site gezinme koruması** | `SiteNavigationGuard` (`470e7b8`) yalnızca üst düzey gezinmeleri denetler: düz `http`, https dışı şemalar, yerel/özel hostlar. Blocklist, DNS rebinding, alt çerçeveler ve uygulamanın `loadUrl` çağrıları kapsam dışı. Kotlin derlenmedi, cihazda denenmedi. Ayrıntı: `docs/android-navigation.md` |
+| **Android site gezinme koruması** | `SiteNavigationGuard` (`470e7b8`) yalnızca üst düzey gezinmeleri denetler: düz `http`, https dışı şemalar, yerel/özel hostlar. **Round 16/17 güncellemesi:** blocklist aktarımı fail-closed, `NavigationDnsGate` üst düzey + `shouldInterceptRequest` kontrolleri, ve bağlantı zamanında pinleme (`SiteProxyController` `PROXY_OVERRIDE` + `DnsPinnedProxy`, asenkron `AsyncDnsResolver`) eklendi. Kotlin **CI'da derleniyor ve JVM testleri koşuyor**; buna karşın gerçek sağlayıcı davranışı (proxy override'ın uygulanması, iptalin platform iş parçacığını bırakması, WebRTC belge-başı betiği) **cihazda denenmedi** — `docs/android-dns-pinning-device-checklist.md`. Alt çerçeveler ve WebRTC/UDP hâlâ kapsam dışı. Ayrıntı: `docs/android-navigation.md` |
 | **Android `ipc` kısıtı** | wry'nin her sayfaya açtığı `ipc` nesnesi kaldırıldı; launcher origin'lerine ana çerçevede yalnızca `WebMessageListener` verildi (`a864bad`). Kurulamazsa hata loglanır ve IPC kapalı kalır (fail closed). CI Android derlemesi (`5ef743f`, run 38047701321) geçti. **Cihazda doğrulanmadı**: launcher IPC'si çalışmalı, bir site sayfasında `typeof window.ipc` `"undefined"` olmalı |
 | **Linux anahtar kaynağı (keyring)** | Anahtar kaynağı `key-source` kaydında tutulur (`e001705`). Kilitli/erişilemeyen keyring'de yeni anahtar oluşturulmaz, kayıtlı keyring anahtarı varken dosya anahtarına geçilmez. CI `cargo test --all` Linux, Windows ve macOS'ta geçti (`a21b0ec`, run 38045901411). Gerçek Secret Service ile test edilmedi |
 | **PiP çalışma zamanı (gerçek cihaz)** | Sistem PiP API'si emülatörde bile davranış farklılığı gösterir; bu ortamda cihaz yok. Kontrollü zincir testlerden geçti ve PR #19'un CI koşusunda (`6f28b13` için run 37985547812, tüm işler yeşil) Android aarch64 **derlendi, debug APK üretildi** (`animehub-android-aarch64-debug`). Bu tarihten sonraki commit'ler için CI sonucu ayrıca kontrol edilmelidir. Yani "derleniyor" doğrulandı, "cihazda çalışıyor" **doğrulanmadı**: PiP geçişi, oynatıcı seçimi, geri yükleme ve API seviyesi farkları hâlâ cihazda denenmeli (`docs/android-pip.md` §12'deki 15 maddelik liste) |
 | **Windows NSIS** | v0.3.2 Release Desktop workflow'u Windows üzerinde geçti ve `AnimeHub_0.3.2_x64-setup.exe` üretti. Windows imzalama sırrı tanımlı olmadığı için paket imzasız; README'de uyarısı var |
-| **macOS** | Hedef değil. `cargo test` `77f5e7c`'de geçti; anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
+| **macOS** | **Round 17: hedef kapsamına alındı** (site vekili `macos-proxy` + Darwin ≥ 23 kapısı; alt sürümlerde açılış reddedilir). CI'da `Tests (macos-latest)` işi derleyip test ediyor; **gerçek WKWebView üzerinde proxy/pin davranışı ve notarization doğrulanmadı**. Anahtar Linux yedeğiyle aynı `0600` dosya, Keychain yok |
 | **İmzalı yayın APK** | ✅ Keystore secret'ları (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) repository secrets'a eklendi; workflow imzalı üretiyor |
 | **`.deb` / AppImage / rpm** | v0.3.2 Release Desktop Ubuntu işi geçti ve üç Linux paketini yayımladı (`.deb`, `.rpm`, AppImage) |
+| **Masaüstü loopback vekili — istemci kimlik doğrulaması** | Round 21'de kaynakta doğrulandı: `pinned_proxy.rs` yalnızca `127.0.0.1`'e bağlanır (ağdan erişilemez) ama istemciyi doğrulamaz; site oturumu açıkken yerel bir süreç efemer portu bulup **herkese açık** hedeflere tünel açabilir. Kimlik doğrulama sevk edilmedi (wry 0.55.1 / Tauri 2.11.6 platformun `407` yolunu dışa açmıyor; macOS'ta belgelenmiş yol yok) ve 443 kısıtı özel portlu siteleri bozacağı için uygulanmadı. **Açık; ürün kararı gerekir.** `docs/security-residual-risks.md` round 21 |
+| **Masaüstü DNS kapısı (round 21)** | `DnsClass::Unknown` artık masaüstünde üst düzey gezinmeyi ve site açılışını reddediyor; birim testleri ve JS kaynak pini var. **Gerçek WebView2 / WebKitGTK / WKWebView çalıştırması yapılmadı** (bu ortamda WebView yok); TOCTOU/rebinding, `fetch`/XHR/iframe ve ilk isteğin vekilden geçtiği kanıtı kapsam dışı ve açık kalıyor |
 | **AniList canlı OAuth** | Geçerli `client_id`/`client_secret` yok; akış birim testleriyle doğrulandı, gerçek sunucuya karşı değil |
 | **Gerçek sitelerin yüklenmesi** | Uygulama GUI'si başsız ortamda açılmıyor; WebView'da `openani.me`'nin gerçekten render olduğu görülmedi |
 | **Site logoları** | OpenAnime ve Animecix karoları yerel dosya kullanır (`public/logos/`). İkisi de sitelerin kendi işaretleri; uydurma oynat simgesi kaldırıldı. Fotoğraf ekleme arayüzü yazıldı |
@@ -214,8 +402,12 @@ Seçenek (1), eşzamanlı tutularak: `on_navigation` ve `open_site` alan adını
 1200 ms zaman aşımıyla çözer; herhangi bir cevap özel/yerelse keser.
 Zaman aşımı / NXDOMAIN seçenek (3) gibi metin politikasına düşer — aksi halde
 DNS kesintisi bütün siteleri kapatır. Seçenek (2) (bağlantı katmanında vekil)
-yapılmadı: WebView alt isteklerini kendi çözer, vekil olmadan TOCTOU kapanmaz,
-ve vekil burada doğrulanamazdı. Kalan sınır README'de ve bölüm 3'te yazılı.
+o tarihte yapılmadı: WebView alt isteklerini kendi çözer, vekil olmadan TOCTOU
+kapanmaz, ve vekil burada doğrulanamazdı. **Round 17: bu karar iki parça
+hâlinde uygulandı** — Android `PROXY_OVERRIDE` (round 16) ve masaüstü Rust
+`CONNECT` vekili (round 17). TOCTOU, sınıflandırılan IP'ye bağlanıldığı ve
+soket eşinin doğrulandığı için kapanıyor; ama **gerçek WebView'da denenmedi**
+ve WebRTC/UDP hâlâ pinlenmiyor. Kalan sınır README'de ve bölüm 3'te yazılı.
 
 ### E. Depoyu yayınlarken — yapıldı
 

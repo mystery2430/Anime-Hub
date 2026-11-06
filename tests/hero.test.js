@@ -56,10 +56,10 @@ test("bannerStyle builds a verifiable hex-only gradient", () => {
   // 3-digit hex expands correctly.
   assert.ok(bannerStyle("#f00").includes("rgb(255 0 0)"));
   // Garbage falls back to the accent, never throws.
-  assert.ok(bannerStyle("nope").includes("rgb(99 102 241)"));
+  assert.ok(bannerStyle("nope").includes("rgb(255 23 79)"));
 });
 
 test("bannerRgb emits a space-separated triple", () => {
   assert.equal(bannerRgb("#0ea5e9"), "14 165 233");
-  assert.equal(bannerRgb(undefined), "99 102 241");
+  assert.equal(bannerRgb(undefined), "255 23 79");
 });
