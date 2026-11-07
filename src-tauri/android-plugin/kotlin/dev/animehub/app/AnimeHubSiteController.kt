@@ -1369,11 +1369,11 @@ object AnimeHubSiteController {
         WebViewCompat.getProfile(view)
       } catch (_: Exception) {
         AnimeHubDebugLog.record("flush", "flush", "failed", operationId, errorClass = "provider")
-        onResult("profile could not be resolved")
+        onResult("profil çözümlenemedi")
         return
       }
     SiteFlushWorker.submit(activity, "sync", { profile.cookieManager.flush() }, operationId) { error ->
-      onResult(if (error == null) null else "profile flush failed")
+      onResult(if (error == null) null else "profil yazılamadı")
     }
   }
 

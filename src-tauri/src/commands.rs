@@ -1412,7 +1412,7 @@ fn client(state: &AppState) -> AppResult<(AniListClient, AniListConfig)> {
     }
     let cfg = s.anilist.clone();
     drop(s);
-    Ok((AniListClient::new(cfg.clone()), cfg))
+    Ok((AniListClient::new(cfg.clone())?, cfg))
 }
 
 fn load_token_unlocked(state: &AppState) -> AppResult<Option<Token>> {
@@ -2158,7 +2158,7 @@ pub fn debug_log(app: AppHandle) -> AppResult<animehub_android::DebugLogSnapshot
     crate::diagnostics::set_enabled(true);
     #[cfg(target_os = "android")]
     crate::android_bridge::set_debug_logging(true)
-        .map_err(|_| AppError::Other("diagnostic setting could not be applied".into()))?;
+        .map_err(|_| AppError::Other("tanılama ayarı uygulanamadı".into()))?;
     crate::android_bridge::debug_log()
 }
 

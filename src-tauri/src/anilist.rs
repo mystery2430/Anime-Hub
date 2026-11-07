@@ -472,7 +472,10 @@ pub fn take_pending_state(
         Some(false) => Ok(PendingState::Mismatched),
         Some(true) => {
             let generation = guard.generation;
-            let state = guard.pending.take().expect("matched pending state");
+            let state = guard
+                .pending
+                .take()
+                .ok_or_else(|| AppError::AniList("yetkilendirme durumu zaten kullanıldı".into()))?;
             Ok(PendingState::Consumed { state, generation })
         }
     }
@@ -1016,16 +1019,14 @@ pub struct AniListClient {
 }
 
 impl AniListClient {
-    pub fn new(cfg: AniListConfig) -> Self {
-        AniListClient {
-            http: reqwest::Client::builder()
-                .user_agent(concat!("AnimeHub/", env!("CARGO_PKG_VERSION")))
-                .https_only(true) // defence in depth: no plaintext fallback
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .expect("valid client config"),
-            cfg,
-        }
+    pub fn new(cfg: AniListConfig) -> AppResult<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("AnimeHub/", env!("CARGO_PKG_VERSION")))
+            .https_only(true) // defence in depth: no plaintext fallback
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|_| AppError::AniList("istek istemcisi oluşturulamadı".into()))?;
+        Ok(AniListClient { http, cfg })
     }
 
     /// Exchange an authorization code for a token.
@@ -1414,7 +1415,8 @@ impl LoopbackListener {
                 Ok(Ok(Accepted::Callback(target))) => return Ok(target),
                 Ok(Ok(Accepted::Ignored)) => continue,
                 Ok(Err(e)) => {
-                    return Err(AppError::AniList(format!("geri çağırma dinlenemedi: {e}")));
+                    log::warn!("loopback geri çağrı kabulü başarısız: {e}");
+                    return Err(AppError::AniList("geri çağrı dinlenemedi".into()));
                 }
                 Err(_) => {
                     return Err(AppError::AniList(
@@ -2349,7 +2351,7 @@ mod tests {
 
     #[test]
     fn client_builder_is_https_only() {
-        let c = AniListClient::new(cfg());
+        let c = AniListClient::new(cfg()).unwrap();
         assert_eq!(c.config().client_id, "1234");
     }
 

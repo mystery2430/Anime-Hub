@@ -768,7 +768,9 @@ fn ensure_close_session_identity(
             current.as_ref().map(|site| site.session_id.as_str()),
             expected,
         ) {
-            return Err(AppError::Other("site session changed before close".into()));
+            return Err(AppError::Other(
+                "site oturumu değişti, kapatma reddedildi".into(),
+            ));
         }
     }
     Ok(())
@@ -2053,7 +2055,7 @@ fn run_mobile_open_protocol_inner<O: MobileOpenOps>(
                 None,
                 None,
             );
-            AppError::Other("site migration state could not be stored; site was not opened".into())
+            AppError::Other("site geçiş durumu kaydedilemedi; site açılmadı".into())
         })?;
         crate::diagnostics::record_current(
             "migration",

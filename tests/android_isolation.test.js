@@ -267,7 +267,7 @@ test("migration is one-time, profile-scoped, and ordered before first navigation
   );
   // A failed flag write ABORTS the open — never the old log-and-continue,
   // which left a shown profile with a missing flag and got it retired.
-  assert.match(body, /site migration state could not be stored; site was not opened/,
+  assert.match(body, /site geçiş durumu kaydedilemedi; site açılmadı/,
     "a failed flag write must abort before opening the view");
   assert.doesNotMatch(
     body,

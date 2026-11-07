@@ -530,12 +530,20 @@ pub fn snapshot(kotlin: DebugLogSnapshot) -> DebugLogSnapshot {
             .then_with(|| source_rank(&left.source).cmp(&source_rank(&right.source)))
             .then_with(|| left.source_sequence.cmp(&right.source_sequence))
     });
+    // A miscounting Kotlin side must not inflate the advertised capacity:
+    // the merged timeline stays at CAP and the overflow counts as dropped.
+    let mut dropped_events = rust_dropped.saturating_add(kotlin.dropped_events);
+    if events.len() > COMBINED_CAPACITY as usize {
+        let overflow = events.len() - COMBINED_CAPACITY as usize;
+        dropped_events += overflow as u32;
+        events.drain(..overflow);
+    }
     for (index, event) in events.iter_mut().enumerate() {
         event.sequence = (index as u64).saturating_add(1);
     }
     DebugLogSnapshot {
         events,
-        dropped_events: rust_dropped.saturating_add(kotlin.dropped_events),
+        dropped_events,
         capacity: COMBINED_CAPACITY,
     }
 }
@@ -698,6 +706,25 @@ mod tests {
         assert!(merged.events.is_empty());
         assert_eq!(merged.dropped_events, 0);
         assert_eq!(merged.capacity, COMBINED_CAPACITY);
+    }
+
+    #[test]
+    fn the_merged_snapshot_is_clamped_to_the_combined_capacity() {
+        let _guard = lock_tests();
+        set_enabled(false);
+        set_enabled(true);
+        let total = COMBINED_CAPACITY as usize + 3;
+        let foreign: Vec<_> = (0..total)
+            .map(|i| event("kotlin", i as u64, now_ms(), &format!("k-clamp-{i}")))
+            .collect();
+        let merged = snapshot(DebugLogSnapshot {
+            events: foreign,
+            dropped_events: 0,
+            capacity: DEBUG_LOG_CAPACITY,
+        });
+        assert_eq!(merged.events.len(), COMBINED_CAPACITY as usize);
+        assert_eq!(merged.dropped_events, 3);
+        set_enabled(false);
     }
 
     #[test]

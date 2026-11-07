@@ -22,7 +22,7 @@ pub fn keystore_seal(purpose: &str, plaintext: &[u8]) -> AppResult<String> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(plaintext);
     let r = animehub_android::keystore_seal(purpose.into(), b64)
-        .map_err(|_| AppError::Keyring("Android Keystore operation failed".into()))?;
+        .map_err(|_| AppError::Keyring("Android Keystore işlemi başarısız".into()))?;
     Ok(r.value)
 }
 
@@ -31,7 +31,7 @@ pub fn keystore_seal(purpose: &str, plaintext: &[u8]) -> AppResult<String> {
 pub fn keystore_open(purpose: &str, sealed: &str) -> AppResult<Vec<u8>> {
     use base64::Engine as _;
     let r = animehub_android::keystore_open(purpose.into(), sealed.to_string())
-        .map_err(|_| AppError::Keyring("Android Keystore operation failed".into()))?;
+        .map_err(|_| AppError::Keyring("Android Keystore işlemi başarısız".into()))?;
     base64::engine::general_purpose::STANDARD
         .decode(r.value)
         .map_err(|_| AppError::Crypto("base64 çözülemedi".into()))
@@ -95,11 +95,11 @@ pub fn classify_site_open_error(error: animehub_android::Error) -> AppError {
         // profile and retry exactly once. Keep the code, discard the provider
         // text: it can contain cookie/header details.
         AppError::Other(format!(
-            "{}: site cookie migration did not complete",
+            "{}: site çerezi geçişi tamamlanamadı",
             animehub_android::MIGRATION_RETRY_SENTINEL
         ))
     } else {
-        AppError::Other("Android site profile operation failed".into())
+        AppError::Other("site profili işlemi başarısız".into())
     }
 }
 
@@ -293,7 +293,7 @@ pub fn site_close(flush: bool) -> AppResult<()> {
                 "failed",
                 Some(class),
             );
-            Err(AppError::Other("site close did not complete".into()))
+            Err(AppError::Other("site kapatma tamamlanamadı".into()))
         }
     }
 }
@@ -353,7 +353,7 @@ pub fn site_profile_delete(profile: &str) -> AppResult<SiteProfileAction> {
                 "failed",
                 Some(class),
             );
-            Err(AppError::Other("site profile deletion failed".into()))
+            Err(AppError::Other("site profili silinemedi".into()))
         }
     }
 }
@@ -469,7 +469,7 @@ pub fn site_flush() -> AppResult<()> {
                 "failed",
                 Some(class),
             );
-            Err(AppError::Other("site profile flush failed".into()))
+            Err(AppError::Other("site profili yazılamadı".into()))
         }
     }
 }
@@ -484,7 +484,7 @@ pub fn site_blocklist_update(entries: &[String]) -> AppResult<()> {
     {
         let operation_id = crate::diagnostics::current_or_new_operation_id();
         animehub_android::site_blocklist_update(operation_id.as_str().to_owned(), entries.to_vec())
-            .map_err(|_| AppError::Other("Android blocklist could not be updated".into()))
+            .map_err(|_| AppError::Other("Android engel listesi güncellenemedi".into()))
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -542,7 +542,7 @@ pub fn site_profile_names() -> AppResult<Vec<String>> {
                 "failed",
                 Some(class),
             );
-            Err(AppError::Other("site profile enumeration failed".into()))
+            Err(AppError::Other("site profilleri listelenemedi".into()))
         }
     }
 }
@@ -659,7 +659,7 @@ pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> AppResult<bool> {
                 "failed",
                 Some(class),
             );
-            Err(AppError::Other("PiP entry failed".into()))
+            Err(AppError::Other("PiP geçişi başlatılamadı".into()))
         }
     }
 }
@@ -706,7 +706,7 @@ pub fn set_pip_auto_enter(enabled: bool) -> AppResult<bool> {
                 "failed",
                 Some(class),
             );
-            Err(AppError::Other("PiP auto-enter setting failed".into()))
+            Err(AppError::Other("PiP otomatik geçişi ayarlanamadı".into()))
         }
     }
 }
@@ -720,7 +720,7 @@ pub fn set_pip_auto_enter(_enabled: bool) -> AppResult<bool> {
 #[cfg(target_os = "android")]
 pub fn debug_log() -> AppResult<animehub_android::DebugLogSnapshot> {
     let kotlin = animehub_android::debug_log()
-        .map_err(|_| AppError::Other("diagnostic bridge read failed".into()))?;
+        .map_err(|_| AppError::Other("tanılama okuması başarısız".into()))?;
     Ok(crate::diagnostics::snapshot(kotlin))
 }
 
@@ -732,7 +732,7 @@ pub fn debug_log() -> AppResult<animehub_android::DebugLogSnapshot> {
 #[cfg(target_os = "android")]
 pub fn debug_log_reset() -> AppResult<()> {
     animehub_android::debug_log_reset()
-        .map_err(|_| AppError::Other("diagnostic reset failed".into()))
+        .map_err(|_| AppError::Other("tanılama sıfırlama başarısız".into()))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -743,7 +743,7 @@ pub fn debug_log_reset() -> AppResult<()> {
 #[cfg(target_os = "android")]
 pub fn set_debug_logging(enabled: bool) -> AppResult<()> {
     animehub_android::set_debug_logging(enabled)
-        .map_err(|_| AppError::Other("diagnostic setting could not be applied".into()))
+        .map_err(|_| AppError::Other("tanılama ayarı uygulanamadı".into()))
 }
 
 #[cfg(not(target_os = "android"))]
