@@ -1781,25 +1781,6 @@ pub fn set_window_theme(window: tauri::WebviewWindow, theme: ThemePref) -> AppRe
     })
 }
 
-/// Manual Picture-in-Picture entry.
-///
-/// The native side runs the *same* controlled chain the Activity callbacks use
-/// — prepare the WebView (`window.__animehubPreparePip()`), wait for its
-/// answer, then `enterPictureInPictureMode()` with the detected aspect ratio —
-/// so the PiP window only ever shows the active player, and the preparation
-/// exists once instead of once per entry point.
-///
-/// `num`/`den` are clamped here and passed on as a fallback for the case where
-/// no player ratio can be measured. Resolves `false` when PiP is unavailable,
-/// nothing playable was found, or the Activity could not enter PiP.
-// `async` runs the body on Tauri's async runtime, not on the IPC dispatch
-// thread. These commands wait for a Kotlin reply through the plugin bridge.
-#[tauri::command(async)]
-pub fn enter_pip(num: Option<u32>, den: Option<u32>) -> AppResult<bool> {
-    let (n, d) = crate::android_bridge::clamp_aspect(num.unwrap_or(16), den.unwrap_or(9));
-    crate::android_bridge::enter_pip(n, d)
-}
-
 /// Store the "enter PiP automatically" preference.
 ///
 /// On Android this only *allows* the controlled paths — API 30+
@@ -2390,10 +2371,6 @@ mod tests {
         fn delete_secret(&self, name: &str) -> AppResult<()> {
             self.gate.block_until_released();
             self.inner.delete_secret(name)
-        }
-
-        fn wipe_secrets(&self) -> AppResult<usize> {
-            self.inner.wipe_secrets()
         }
 
         fn delete_site_session(&self, site_id: &str) -> AppResult<()> {

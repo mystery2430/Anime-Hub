@@ -157,23 +157,6 @@ impl SecureStore {
         }
         Ok(())
     }
-
-    /// Wipe every encrypted document (used by "clear site data").
-    pub fn wipe_secrets(&self) -> AppResult<usize> {
-        let _guard = STORE_LOCK
-            .lock()
-            .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
-        let mut n = 0;
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("secret.") {
-                std::fs::remove_file(entry.path())?;
-                n += 1;
-            }
-        }
-        Ok(n)
-    }
 }
 
 /// Secret names are attacker-influenced only insofar as the app defines them,
@@ -521,18 +504,6 @@ mod tests {
             s.get_secret("beta").unwrap_err().code() == "crypto",
             "AAD must bind a secret to its name"
         );
-    }
-
-    #[test]
-    fn wipe_secrets_leaves_registry_intact() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store_with_dir(dir.path());
-        s.save_registry(&Registry::new_default()).unwrap();
-        s.put_secret("anilist", b"x").unwrap();
-        s.put_secret("other", b"y").unwrap();
-        assert_eq!(s.wipe_secrets().unwrap(), 2);
-        assert!(s.get_secret("anilist").unwrap().is_none());
-        assert!(dir.path().join("registry.bin").exists());
     }
 
     #[test]

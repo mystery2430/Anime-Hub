@@ -264,12 +264,12 @@ pub fn is_private_host(host: &str) -> bool {
     // If it looks like an IP literal but fails to parse, treat as private (fail-closed).
     if bare.contains(':') {
         return match bare.parse::<std::net::IpAddr>() {
-            Ok(ip) => !ip_is_public(&ip),
+            Ok(ip) => !is_public_ip(ip),
             Err(_) => true,
         };
     }
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return !ip_is_public(&ip);
+        return !is_public_ip(ip);
     }
 
     // A host that "ends in a number" (`0x7f000001`, `2130706433`, `127.1`,
@@ -282,8 +282,8 @@ pub fn is_private_host(host: &str) -> bool {
     if ends_in_a_number(bare) {
         return match Url::parse(&format!("https://{bare}/")) {
             Ok(parsed) => match parsed.host() {
-                Some(url::Host::Ipv4(v4)) => !ip_is_public(&std::net::IpAddr::V4(v4)),
-                Some(url::Host::Ipv6(v6)) => !ip_is_public(&std::net::IpAddr::V6(v6)),
+                Some(url::Host::Ipv4(v4)) => !is_public_ip(std::net::IpAddr::V4(v4)),
+                Some(url::Host::Ipv6(v6)) => !is_public_ip(std::net::IpAddr::V6(v6)),
                 // Not an IP literal the parser accepted (`example.0x7f`).
                 _ => true,
             },
@@ -313,10 +313,6 @@ pub fn is_private_host(host: &str) -> bool {
 /// Shared with the DNS-rebinding check: a hostname is refused when **any**
 /// of its answers fails this test.
 pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
-    ip_is_public(&ip)
-}
-
-fn ip_is_public(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let [a, b, c, d] = v4.octets();
@@ -431,7 +427,7 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
             // These are outside 2000::/3 but are handled as special cases:
             // allow only if embedded IPv4 is public, otherwise block.
             if let Some(m) = v6.to_ipv4_mapped() {
-                return ip_is_public(&std::net::IpAddr::V4(m));
+                return is_public_ip(std::net::IpAddr::V4(m));
             } else if seg[0] == 0
                 && seg[1] == 0
                 && seg[2] == 0
@@ -446,7 +442,7 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                     ((seg[7] >> 8) & 0xff) as u8,
                     (seg[7] & 0xff) as u8,
                 );
-                return ip_is_public(&std::net::IpAddr::V4(v4));
+                return is_public_ip(std::net::IpAddr::V4(v4));
             }
             // 64:ff9b::/96 translation – globally reachable true per IANA,
             // but the embedded IPv4 must itself be globally reachable (RFC 6052).
@@ -465,7 +461,7 @@ fn ip_is_public(ip: &std::net::IpAddr) -> bool {
                     ((seg[7] >> 8) & 0xff) as u8,
                     (seg[7] & 0xff) as u8,
                 );
-                if !ip_is_public(&std::net::IpAddr::V4(v4)) {
+                if !is_public_ip(std::net::IpAddr::V4(v4)) {
                     return false;
                 }
             }

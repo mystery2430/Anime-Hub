@@ -841,7 +841,7 @@ test("plugin-calling commands use the async runtime, not the IPC dispatch thread
   // Static check. Tauri runs a blocking command inline on the dispatch thread;
   // these three wait for a Kotlin reply, so they must be marked async.
   const rs = read(join(ROOT, "src-tauri/src/commands.rs"));
-  for (const name of ["enter_pip", "set_pip_auto_enter", "debug_log"]) {
+  for (const name of ["set_pip_auto_enter", "debug_log"]) {
     assert.match(rs, new RegExp(`#\\[tauri::command\\(async\\)\\]\\npub fn ${name}\\(`), name);
   }
 });

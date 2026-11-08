@@ -26,7 +26,6 @@ pub trait SecretProvider: Send + Sync {
     fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()>;
     fn get_secret(&self, name: &str) -> AppResult<Option<Zeroizing<Vec<u8>>>>;
     fn delete_secret(&self, name: &str) -> AppResult<()>;
-    fn wipe_secrets(&self) -> AppResult<usize>;
     fn delete_site_session(&self, site_id: &str) -> AppResult<()>;
 
     // -- provided JSON helpers -------------------------------------------
@@ -103,10 +102,6 @@ impl SecretProvider for store::SecureStore {
 
     fn delete_secret(&self, name: &str) -> AppResult<()> {
         self.delete_secret(name)
-    }
-
-    fn wipe_secrets(&self) -> AppResult<usize> {
-        self.wipe_secrets()
     }
 
     fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
@@ -315,21 +310,6 @@ impl SecretProvider for AndroidStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
-    }
-
-    fn wipe_secrets(&self) -> AppResult<usize> {
-        let _guard = crate::secure::store::STORE_LOCK
-            .lock()
-            .map_err(|_| crate::error::AppError::Storage("kilit alınamadı".into()))?;
-        let mut n = 0;
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("secret.") {
-                std::fs::remove_file(entry.path())?;
-                n += 1;
-            }
-        }
-        Ok(n)
     }
 
     fn delete_site_session(&self, site_id: &str) -> AppResult<()> {

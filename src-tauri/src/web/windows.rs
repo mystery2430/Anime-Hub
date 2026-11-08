@@ -1331,6 +1331,10 @@ pub fn profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
 /// `checked_add` — at `u32::MAX` the name space is exhausted. The old
 /// `saturating_add` would have pinned the counter and reused the exact name
 /// whose deletion was just queued, forever.
+///
+/// shortcut: no production caller yet — the counter is advanced only through
+/// this helper (tests use it as fixture); wire it into the restore/delete
+/// flow or delete it together with those tests.
 pub fn bump_profile_generation(state: &AppState, site_id: &str) -> AppResult<u32> {
     let current = profile_generation(state, site_id)?;
     let next = current
@@ -3689,15 +3693,6 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
     Ok(())
 }
 
-/// Android wipe-close for `remove_site` / `clear_site_data` when the target
-/// site is currently open. Holds `ANDROID_SESSION_LOCK` so a concurrent sync
-/// tick cannot flush the doomed profile between the close and the wipe.
-#[cfg(target_os = "android")]
-pub fn close_site_window_for_clear(app: &AppHandle, site_id: &str) -> AppResult<()> {
-    let _guard = lock_android_session()?;
-    close_site_window_for_clear_locked(app, site_id)
-}
-
 /// Locked variant: caller must hold `ANDROID_SESSION_LOCK` (on Android).
 /// Checks that `site_id` is still the current site before closing, so a
 /// concurrent site switch does not close the wrong session.
@@ -3735,17 +3730,6 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
         emit_site_closed(app, &closed);
     }
     Ok(())
-}
-
-/// Close a site session, persisting its cookies first.
-///
-/// Desktop: remove the child webview; the launcher underneath reappears.
-/// Uses `Webview::close` / `set_fullscreen`, which do not exist on mobile.
-#[cfg(desktop)]
-pub fn close_site_window(app: &AppHandle, label: &str) -> AppResult<()> {
-    let _operation_scope = crate::diagnostics::scope_if_missing("close");
-    let _guard = lock_desktop_session()?;
-    close_site_window_locked(app, label, None)
 }
 
 #[cfg(desktop)]
@@ -4763,15 +4747,10 @@ mod tests {
             self.inner.delete_secret(name)
         }
 
-        fn wipe_secrets(&self) -> AppResult<usize> {
-            self.inner.wipe_secrets()
-        }
-
         fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
             self.inner.delete_site_session(site_id)
         }
     }
-
     /// State over a real store whose migration-flag writes can be failed and
     /// healed from the test.
     fn failing_flag_state() -> (
@@ -5246,10 +5225,6 @@ mod tests {
             self.inner.delete_secret(name)
         }
 
-        fn wipe_secrets(&self) -> AppResult<usize> {
-            self.inner.wipe_secrets()
-        }
-
         fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
             self.session_deletes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5495,10 +5470,6 @@ mod tests {
 
         fn delete_secret(&self, name: &str) -> AppResult<()> {
             self.inner.delete_secret(name)
-        }
-
-        fn wipe_secrets(&self) -> AppResult<usize> {
-            self.inner.wipe_secrets()
         }
 
         fn delete_site_session(&self, site_id: &str) -> AppResult<()> {

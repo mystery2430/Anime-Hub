@@ -106,7 +106,7 @@ fn classify_with(host: &str, timeout: Duration) -> DnsClass {
 
     // The string policy already knows these. Resolving them would only give
     // a rebinding attacker a timeout-shaped hole (`Unknown` falls open).
-    if is_private_host(&key) || literal_is_private(&key) {
+    if is_private_host(&key) {
         let class = DnsClass::Answered { private: true };
         cache_put(key, class, PRIVATE_TTL);
         return class;
@@ -137,10 +137,6 @@ fn literal_ip(host: &str) -> Option<IpAddr> {
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host);
     bare.parse().ok()
-}
-
-fn literal_is_private(host: &str) -> bool {
-    literal_ip(host).is_some_and(|ip| !is_public_ip(ip))
 }
 
 /// One in-flight lookup that callers can join, so "the same host, again" costs

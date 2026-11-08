@@ -578,37 +578,6 @@ impl MediaListStatus {
     }
 }
 
-/// One row of the user's library.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LibraryEntry {
-    pub entry_id: i64,
-    pub media_id: i64,
-    pub status: MediaListStatus,
-    pub progress: u32,
-    pub title: String,
-    #[serde(default)]
-    pub cover: Option<String>,
-    #[serde(default)]
-    pub total_episodes: Option<u32>,
-    #[serde(default)]
-    pub average_score: Option<u32>,
-}
-
-/// A search hit, used by the "add to library" flow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchResult {
-    pub media_id: i64,
-    pub title: String,
-    #[serde(default)]
-    pub cover: Option<String>,
-    #[serde(default)]
-    pub episodes: Option<u32>,
-    #[serde(default)]
-    pub format: Option<String>,
-}
-
 /// Raw GraphQL envelope: `data` **or** `errors`, never both required.
 ///
 /// `Deserialize` is hand-written rather than derived so that `T` needs no
@@ -702,62 +671,6 @@ query ViewerStats {
   }
 }"#;
 
-pub const Q_LIBRARY: &str = r#"
-query Library($status: MediaListStatus, $page: Int) {
-  Page(page: $page, perPage: 50) {
-    pageInfo { hasNextPage }
-    mediaList(status: $status, sort: UPDATED_TIME_DESC) {
-      id
-      status
-      progress
-      media {
-        id
-        averageScore
-        episodes
-        coverImage { large }
-        title { romaji english native }
-      }
-    }
-  }
-}"#;
-
-pub const Q_SEARCH: &str = r#"
-query Search($q: String) {
-  Page(page: 1, perPage: 20) {
-    media(search: $q, type: ANIME, sort: SEARCH_MATCH) {
-      id
-      episodes
-      format
-      coverImage { large }
-      title { romaji english native }
-    }
-  }
-}"#;
-
-pub const M_SAVE: &str = r#"
-mutation Save($mediaId: Int, $status: MediaListStatus, $progress: Int) {
-  SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress) {
-    id
-    status
-    progress
-  }
-}"#;
-
-pub const M_DELETE: &str = r#"
-mutation Delete($id: Int) {
-  DeleteMediaListEntry(id: $id) { deleted }
-}"#;
-
-/// Pick the best available title from AniList's three fields.
-pub fn best_title(romaji: &str, english: &str, native: &str) -> String {
-    [english, romaji, native]
-        .into_iter()
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or("(başlıksız)")
-        .to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Raw wire shapes -> domain types
 // ---------------------------------------------------------------------------
@@ -814,98 +727,6 @@ mod wire {
         #[serde(default)]
         pub large: Option<String>,
     }
-
-    // Two concrete page shapes rather than one generic `Page<T>`: `Vec<T>`
-    // is `Default`, but `#[serde(default)]` on the field still makes serde's
-    // derive demand `T: Default`, which drags the bound into every caller.
-    // Keeping them concrete avoids the phantom type parameter entirely.
-    #[derive(Deserialize)]
-    pub struct LibraryPage {
-        #[serde(rename = "Page")]
-        pub page: LibraryPageInner,
-    }
-    #[derive(Deserialize)]
-    pub struct LibraryPageInner {
-        // Same trap as `hasNextPage` below: serde does not map snake_case
-        // fields to camelCase keys, so this needs an explicit rename.
-        #[serde(default, rename = "pageInfo")]
-        pub page_info: Option<PageInfo>,
-        // `default` because AniList omits the key entirely for an empty list
-        // rather than returning `[]`. `Vec<T>` is `Default`, so unlike a
-        // generic parameter this adds no bound to callers.
-        #[serde(default, rename = "mediaList")]
-        pub media_list: Vec<MediaListEntry>,
-    }
-    #[derive(Deserialize)]
-    pub struct SearchPage {
-        #[serde(rename = "Page")]
-        pub page: SearchPageInner,
-    }
-    #[derive(Deserialize)]
-    pub struct SearchPageInner {
-        pub media: Vec<Media>,
-    }
-    #[derive(Deserialize)]
-    pub struct PageInfo {
-        // Named for the wire key explicitly: serde has no automatic
-        // snake->camel mapping, so without this the field silently fell back
-        // to its `default` and every page looked like the last one.
-        #[serde(default, rename = "hasNextPage")]
-        pub has_next_page: bool,
-    }
-    #[derive(Deserialize)]
-    pub struct MediaListEntry {
-        pub id: i64,
-        pub status: crate::anilist::MediaListStatus,
-        #[serde(default)]
-        pub progress: u32,
-        pub media: Media,
-    }
-    #[derive(Deserialize)]
-    pub struct Media {
-        pub id: i64,
-        #[serde(default, rename = "averageScore")]
-        pub average_score: Option<u32>,
-        #[serde(default)]
-        pub episodes: Option<u32>,
-        #[serde(default, rename = "coverImage")]
-        pub cover_image: Option<Avatar>,
-        #[serde(default)]
-        pub format: Option<String>,
-        pub title: Title,
-    }
-    #[derive(Deserialize)]
-    pub struct Title {
-        #[serde(default)]
-        pub romaji: Option<String>,
-        #[serde(default)]
-        pub english: Option<String>,
-        #[serde(default)]
-        pub native: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct SaveData {
-        #[serde(rename = "SaveMediaListEntry")]
-        pub entry: SavedEntry,
-    }
-    #[derive(Deserialize)]
-    pub struct SavedEntry {
-        pub id: i64,
-        pub status: crate::anilist::MediaListStatus,
-        #[serde(default)]
-        pub progress: u32,
-    }
-    #[derive(Deserialize)]
-    pub struct DeleteData {
-        #[serde(rename = "DeleteMediaListEntry")]
-        pub entry: DeletedEntry,
-    }
-    #[derive(Deserialize)]
-    pub struct DeletedEntry {
-        #[serde(default)]
-        pub deleted: bool,
-    }
 }
 
 /// Convert the viewer payload.
@@ -944,50 +765,6 @@ pub fn map_viewer_stats(d: wire::ViewerStatsData) -> ViewerStats {
         current,
         completed,
     }
-}
-
-/// Convert a library page.
-pub fn map_library(d: wire::LibraryPage) -> (Vec<LibraryEntry>, bool) {
-    let has_next = d.page.page_info.map(|p| p.has_next_page).unwrap_or(false);
-    let entries = d
-        .page
-        .media_list
-        .into_iter()
-        .map(|e| LibraryEntry {
-            entry_id: e.id,
-            media_id: e.media.id,
-            status: e.status,
-            progress: e.progress,
-            title: best_title(
-                e.media.title.romaji.as_deref().unwrap_or_default(),
-                e.media.title.english.as_deref().unwrap_or_default(),
-                e.media.title.native.as_deref().unwrap_or_default(),
-            ),
-            cover: e.media.cover_image.and_then(|c| c.large),
-            total_episodes: e.media.episodes,
-            average_score: e.media.average_score,
-        })
-        .collect();
-    (entries, has_next)
-}
-
-/// Convert a search page.
-pub fn map_search(d: wire::SearchPage) -> Vec<SearchResult> {
-    d.page
-        .media
-        .into_iter()
-        .map(|m| SearchResult {
-            media_id: m.id,
-            title: best_title(
-                m.title.romaji.as_deref().unwrap_or_default(),
-                m.title.english.as_deref().unwrap_or_default(),
-                m.title.native.as_deref().unwrap_or_default(),
-            ),
-            cover: m.cover_image.and_then(|c| c.large),
-            episodes: m.episodes,
-            format: m.format,
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,46 +911,6 @@ impl AniListClient {
             .gql(token, Q_VIEWER_STATS, serde_json::json!({}))
             .await?;
         Ok(map_viewer_stats(d))
-    }
-
-    pub async fn library(
-        &self,
-        token: &Token,
-        status: Option<MediaListStatus>,
-        page: u32,
-    ) -> AppResult<(Vec<LibraryEntry>, bool)> {
-        let vars = serde_json::json!({ "status": status, "page": page.max(1) });
-        let d: wire::LibraryPage = self.gql(token, Q_LIBRARY, vars).await?;
-        Ok(map_library(d))
-    }
-
-    pub async fn search(&self, token: &Token, query: &str) -> AppResult<Vec<SearchResult>> {
-        let vars = serde_json::json!({ "q": query });
-        let d: wire::SearchPage = self.gql(token, Q_SEARCH, vars).await?;
-        Ok(map_search(d))
-    }
-
-    pub async fn save_entry(
-        &self,
-        token: &Token,
-        media_id: i64,
-        status: MediaListStatus,
-        progress: u32,
-    ) -> AppResult<(i64, MediaListStatus, u32)> {
-        let vars = serde_json::json!({
-            "mediaId": media_id,
-            "status": status,
-            "progress": progress,
-        });
-        let d: wire::SaveData = self.gql(token, M_SAVE, vars).await?;
-        Ok((d.entry.id, d.entry.status, d.entry.progress))
-    }
-
-    pub async fn delete_entry(&self, token: &Token, entry_id: i64) -> AppResult<bool> {
-        let d: wire::DeleteData = self
-            .gql(token, M_DELETE, serde_json::json!({ "id": entry_id }))
-            .await?;
-        Ok(d.entry.deleted)
     }
 
     pub fn config(&self) -> &AniListConfig {
@@ -1555,11 +1292,6 @@ pub fn absolute_callback(redirect_uri: &str, target: &str) -> AppResult<String> 
     let base = url::Url::parse(redirect_uri)?;
     let joined = base.join(target)?;
     Ok(joined.to_string())
-}
-
-/// Zeroing wrapper for the config's secret.
-pub fn zeroize_secret(s: &mut String) {
-    let _ = Zeroizing::new(std::mem::take(s));
 }
 
 #[cfg(test)]
@@ -2246,14 +1978,6 @@ mod tests {
     }
 
     #[test]
-    fn title_prefers_english_then_romaji_then_native() {
-        assert_eq!(best_title("Romaji", "English", "Native"), "English");
-        assert_eq!(best_title("Romaji", "", "Native"), "Romaji");
-        assert_eq!(best_title("", "", "Native"), "Native");
-        assert_eq!(best_title("", "  ", ""), "(başlıksız)");
-    }
-
-    #[test]
     fn status_labels_and_serde_agree() {
         let json = serde_json::to_string(&MediaListStatus::Current).unwrap();
         assert_eq!(json, "\"CURRENT\"");
@@ -2271,66 +1995,6 @@ mod tests {
         assert_eq!(v.id, 42);
         assert_eq!(v.name, "user");
         assert_eq!(v.avatar_large.as_deref(), Some("http://x/a.png"));
-    }
-
-    #[test]
-    fn maps_library_payload() {
-        let json = r#"{"Page":{"pageInfo":{"hasNextPage":true},"mediaList":[
-            {"id":1,"status":"CURRENT","progress":3,
-             "media":{"id":99,"averageScore":80,"episodes":12,
-                      "coverImage":{"large":"c.png"},
-                      "title":{"romaji":"R","english":"E","native":"N"}}}
-        ]}}"#;
-        let d: wire::LibraryPage = serde_json::from_str(json).unwrap();
-        let (entries, next) = map_library(d);
-        assert!(next);
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
-        assert_eq!(e.entry_id, 1);
-        assert_eq!(e.media_id, 99);
-        assert_eq!(e.status, MediaListStatus::Current);
-        assert_eq!(e.progress, 3);
-        assert_eq!(e.title, "E");
-        assert_eq!(e.total_episodes, Some(12));
-        assert_eq!(e.average_score, Some(80));
-    }
-
-    #[test]
-    fn maps_empty_library() {
-        let json = r#"{"Page":{}}"#;
-        let d: wire::LibraryPage = serde_json::from_str(json).unwrap();
-        let (entries, next) = map_library(d);
-        assert!(entries.is_empty());
-        assert!(!next);
-    }
-
-    #[test]
-    fn maps_search_payload() {
-        let json = r#"{"Page":{"media":[
-            {"id":5,"episodes":24,"format":"TV",
-             "coverImage":{"large":"c.png"},
-             "title":{"romaji":"R","english":null,"native":null}}
-        ]}}"#;
-        let d: wire::SearchPage = serde_json::from_str(json).unwrap();
-        let r = map_search(d);
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].title, "R");
-        assert_eq!(r[0].episodes, Some(24));
-        assert_eq!(r[0].format.as_deref(), Some("TV"));
-    }
-
-    #[test]
-    fn maps_save_and_delete_payloads() {
-        let s: wire::SaveData = serde_json::from_str(
-            r#"{"SaveMediaListEntry":{"id":7,"status":"PLANNING","progress":0}}"#,
-        )
-        .unwrap();
-        assert_eq!(s.entry.id, 7);
-        assert_eq!(s.entry.status, MediaListStatus::Planning);
-
-        let d: wire::DeleteData =
-            serde_json::from_str(r#"{"DeleteMediaListEntry":{"deleted":true}}"#).unwrap();
-        assert!(d.entry.deleted);
     }
 
     #[test]

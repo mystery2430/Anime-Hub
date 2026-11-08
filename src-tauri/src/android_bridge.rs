@@ -622,53 +622,6 @@ pub fn site_profile_names() -> AppResult<Vec<String>> {
     ))
 }
 
-/// Enter Picture-in-Picture mode.
-///
-/// On Android the Kotlin side runs the controlled chain: it prepares the
-/// WebView with the site's `window.__animehubPreparePip()` (player-only view,
-/// detected aspect ratio, player rect as `sourceRectHint`), waits for the JS
-/// answer and only then calls `enterPictureInPictureMode()`. The `num`/`den`
-/// passed here are the fallback ratio, already clamped by `clamp_aspect`.
-///
-/// On desktop there is no system PiP for an arbitrary WebView, so the command
-/// reports unsupported rather than faking a floating window.
-#[cfg(target_os = "android")]
-pub fn enter_pip(aspect_num: u32, aspect_den: u32) -> AppResult<bool> {
-    let operation_id = crate::diagnostics::current_or_new_operation_id();
-    record_bridge_start(&operation_id, "bridge", "pip_prepare");
-    let started = std::time::Instant::now();
-    match animehub_android::enter_pip(operation_id.as_str().to_owned(), aspect_num, aspect_den) {
-        Ok(entered) => {
-            record_bridge_result(
-                &operation_id,
-                "bridge",
-                "pip_enter",
-                started,
-                if entered { "entered" } else { "not_entered" },
-                None,
-            );
-            Ok(entered)
-        }
-        Err(error) => {
-            let class = plugin_error_class(&error);
-            record_bridge_result(
-                &operation_id,
-                "bridge",
-                "pip_enter",
-                started,
-                "failed",
-                Some(class),
-            );
-            Err(AppError::Other("PiP geçişi başlatılamadı".into()))
-        }
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn enter_pip(_aspect_num: u32, _aspect_den: u32) -> AppResult<bool> {
-    Ok(false)
-}
-
 /// Allow or deny the *controlled* PiP paths.
 ///
 /// On Android the Kotlin side stores the preference and uses it for
@@ -751,49 +704,9 @@ pub fn set_debug_logging(_enabled: bool) -> AppResult<()> {
     Ok(())
 }
 
-/// Clamp a video aspect ratio into the range Android accepts for PiP.
-///
-/// The platform rejects ratios outside roughly 1:2.39 .. 2.39:1, and a
-/// rejected ratio silently disables PiP, so we clamp defensively.
-pub fn clamp_aspect(num: u32, den: u32) -> (u32, u32) {
-    if den == 0 || num == 0 {
-        return (16, 9);
-    }
-    let ratio = num as f64 / den as f64;
-    const MIN: f64 = 1.0 / 2.39;
-    const MAX: f64 = 2.39;
-    if ratio < MIN {
-        (100, 239)
-    } else if ratio > MAX {
-        (239, 100)
-    } else {
-        (num, den)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clamp_leaves_normal_video_ratios_alone() {
-        assert_eq!(clamp_aspect(16, 9), (16, 9));
-        assert_eq!(clamp_aspect(4, 3), (4, 3));
-        assert_eq!(clamp_aspect(21, 9), (21, 9));
-    }
-
-    #[test]
-    fn clamp_rejects_degenerate_input() {
-        assert_eq!(clamp_aspect(0, 0), (16, 9));
-        assert_eq!(clamp_aspect(16, 0), (16, 9));
-        assert_eq!(clamp_aspect(0, 9), (16, 9));
-    }
-
-    #[test]
-    fn clamp_bounds_extreme_ratios() {
-        assert_eq!(clamp_aspect(1, 100), (100, 239), "too tall");
-        assert_eq!(clamp_aspect(100, 1), (239, 100), "too wide");
-    }
 
     #[test]
     fn open_refusals_are_classified_into_user_facing_errors() {
@@ -908,7 +821,6 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     #[test]
     fn desktop_stubs_report_unsupported() {
-        assert!(!enter_pip(16, 9).unwrap());
         assert!(!set_pip_auto_enter(true).unwrap());
         assert_eq!(keystore_seal("p", b"x").unwrap_err().code(), "keyring");
         assert_eq!(keystore_open("p", "x").unwrap_err().code(), "keyring");
