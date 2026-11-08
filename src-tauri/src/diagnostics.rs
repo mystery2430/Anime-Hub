@@ -535,7 +535,7 @@ pub fn snapshot(kotlin: DebugLogSnapshot) -> DebugLogSnapshot {
     let mut dropped_events = rust_dropped.saturating_add(kotlin.dropped_events);
     if events.len() > COMBINED_CAPACITY as usize {
         let overflow = events.len() - COMBINED_CAPACITY as usize;
-        dropped_events += overflow as u32;
+        dropped_events += overflow as u64;
         events.drain(..overflow);
     }
     for (index, event) in events.iter_mut().enumerate() {

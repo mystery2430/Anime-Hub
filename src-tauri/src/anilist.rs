@@ -14,7 +14,7 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 pub const ANILIST_GRAPHQL: &str = "https://graphql.anilist.co";
 pub const ANILIST_AUTHORIZE: &str = "https://anilist.co/api/v2/oauth/authorize";
