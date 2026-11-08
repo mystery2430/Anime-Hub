@@ -11,7 +11,7 @@
  * normal `close_site` flow — pending / closed / failed:<reason> — so a failed
  * close is surfaced (a Toast above the site view) and a slow flush is simply
  * waited for instead of double-closed. The launcher must therefore keep its
- * `openSiteLabel` bookkeeping honest across that handshake:
+ * close-session bookkeeping honest across that handshake:
  *
  *  * the label is NOT cleared in a `finally` after issuing `close_site` —
  *    the close may still be pending or may have failed (that was defect
@@ -65,8 +65,6 @@ export function createBackSession({ call, notify, errorText }) {
   let openGeneration = 0;
   /** idle | pending | closed | failed:<message> */
   let state = "idle";
-  /** Reason of the last failure (kept for diagnostics/retry messages). */
-  let lastError = "";
 
   /**
    * Validate the native close payload and extract the identity it carries.
@@ -118,7 +116,6 @@ export function createBackSession({ call, notify, errorText }) {
       if (label === target && sessionId === targetSessionId) settle("closed");
     } catch (e) {
       const message = errorText ? errorText(e) : String(e);
-      lastError = message;
       if (label === target && sessionId === targetSessionId) {
         settle("failed", message);
         if (typeof notify === "function") notify(message);
@@ -153,13 +150,7 @@ export function createBackSession({ call, notify, errorText }) {
       siteId = newSiteId ?? null;
       sessionId = typeof newSessionId === "string" && newSessionId ? newSessionId : null;
       state = "idle";
-      lastError = "";
       return true;
-    },
-
-    /** Whether a close can be started right now (the Kotlin hook's value). */
-    hasSession() {
-      return Boolean(label);
     },
 
     /**
@@ -184,11 +175,6 @@ export function createBackSession({ call, notify, errorText }) {
     /** The exact string Kotlin's `SiteBackStatus.decide` consumes. */
     statusString() {
       return state;
-    },
-
-    /** Last failure reason ("" when none). */
-    lastError() {
-      return lastError;
     },
 
     /**
@@ -221,30 +207,7 @@ export function createBackSession({ call, notify, errorText }) {
       siteId = null;
       sessionId = null;
       state = "idle";
-      lastError = "";
       return true;
-    },
-
-    /**
-     * Clear regardless of ownership — used where the caller has already
-     * awaited the close outcome itself (never as a `finally` shortcut).
-     */
-    reset() {
-      label = null;
-      siteId = null;
-      sessionId = null;
-      state = "idle";
-      lastError = "";
-    },
-
-    /** The label the session owns (null when idle) — for main.js sync. */
-    currentLabel() {
-      return label;
-    },
-
-    /** The opening identity this session owns (null when idle). */
-    currentSessionId() {
-      return sessionId;
     },
   };
 }

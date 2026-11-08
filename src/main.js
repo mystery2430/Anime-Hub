@@ -143,14 +143,12 @@ const gridFor = (category) =>
 
 /** Site currently being edited, or `null` when adding. */
 let editingId = null;
-/** Last site opened, so "back" knows what to close. */
-let openSiteLabel = null;
 
 /**
  * Close session driving the Android back handshake
- * (`window.__animehubBackToLauncher` / `__animehubBackStatus`). Keeps
- * `openSiteLabel` honest across pending/failed closes — see
- * `logic/back_close.js` for the contract with Kotlin's `SiteBackStatus`.
+ * (`window.__animehubBackToLauncher` / `__animehubBackStatus`). Keeps the
+ * close state honest across pending/failed closes —
+ * see `logic/back_close.js` for the contract with Kotlin's `SiteBackStatus`.
  */
 const backSession = createBackSession({
   call,
@@ -344,9 +342,7 @@ async function openSite(tile) {
     const opened = await call("open_site", { id: tile.id });
     // A newer click may have started while this invoke was in flight. Only the
     // newest attempt may own the label; a stale success must not overwrite it.
-    if (backSession.opened(opened.label, tile.id, opened.sessionId, opening)) {
-      openSiteLabel = opened.label;
-    }
+    backSession.opened(opened.label, tile.id, opened.sessionId, opening);
   } catch (e) {
     showNotice(errMessage(e));
   }
@@ -1299,7 +1295,7 @@ async function wireBackendEvents() {
   // site id. Malformed, foreign or identity-less payloads are ignored by the
   // state machine, so opening A then B is never undone by a stale A event.
   await on("animehub://site-closed", (payload) => {
-    if (backSession.closedByEvent(payload)) openSiteLabel = null;
+    backSession.closedByEvent(payload);
   });
 }
 

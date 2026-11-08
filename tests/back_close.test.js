@@ -75,13 +75,13 @@ test("native close call carries the exact opening identity", () => {
   });
 });
 
-test("opened() registers the label, site id and opening identity", () => {
+test("opened() registers the opening identity: idle, closable only by its own event", () => {
   const h = harness();
   h.session.opened("site-a", "id-a", "open-a-1");
-  assert.equal(h.session.hasSession(), true);
-  assert.equal(h.session.currentLabel(), "site-a");
-  assert.equal(h.session.currentSessionId(), "open-a-1");
   assert.equal(h.session.statusString(), "idle");
+  // The registered owner identity is exactly what the close event must match.
+  assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-2")), false);
+  assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-1")), true);
 });
 
 test("first requestClose starts exactly one close and reports pending", async () => {
@@ -114,7 +114,7 @@ test("the matching close identity closes the active session normally", async () 
   const h = harness();
   h.session.opened("site-a", "id-a", "open-a-1");
   h.session.requestClose();
-  assert.equal(h.session.currentLabel(), "site-a", "label must survive the in-flight close");
+  assert.equal(h.session.statusString(), "pending", "label must survive the in-flight close");
   h.resolveClose();
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(h.session.statusString(), "closed");
@@ -122,8 +122,8 @@ test("the matching close identity closes the active session normally", async () 
   assert.equal(h.session.statusString(), "closed");
   // The event performs the actual clear.
   assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-1")), true);
-  assert.equal(h.session.currentLabel(), null);
-  assert.equal(h.session.currentSessionId(), null);
+  // Cleared: a repeat finds no live session and is ignored.
+  assert.equal(h.session.closedByEvent({ siteId: "id-a", label: "site-a" }), false);
   assert.equal(h.session.statusString(), "idle");
 });
 
@@ -135,11 +135,10 @@ test("failed close surfaces the reason, keeps the label, and is retryable", asyn
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   assert.equal(h.session.statusString(), "failed:disk patladı");
-  assert.equal(h.session.lastError(), "disk patladı");
   assert.deepEqual(h.notices, ["disk patladı"], "the failure must be surfaced");
-  assert.equal(h.session.currentLabel(), "site-a", "label must NOT be cleared on failure");
 
-  // Retry: a fresh attempt is started and pending again.
+  // Retry proves the session survived the failure (A.5): a fresh attempt is
+  // started and pending again.
   assert.deepEqual(h.session.requestClose(), { accepted: true });
   assert.equal(h.session.statusString(), "pending");
   assert.equal(h.calls.length, 2);
@@ -156,10 +155,8 @@ test("a stale close identity cannot clear someone else's session", () => {
     false,
     "another opening's event must be ignored",
   );
-  assert.equal(h.session.currentLabel(), "site-b");
-  assert.equal(h.session.currentSessionId(), "open-b-1");
   assert.equal(h.session.closedByEvent(closeEvent("id-b", "open-b-1")), true);
-  assert.equal(h.session.currentLabel(), null);
+  assert.equal(h.session.statusString(), "idle");
 });
 
 test("missing or malformed identities leave the active session unchanged", () => {
@@ -185,16 +182,11 @@ test("missing or malformed identities leave the active session unchanged", () =>
       false,
       `payload ${JSON.stringify(payload) ?? "undefined"} must not clear an owned session`,
     );
-    assert.equal(h.session.currentLabel(), "site-a");
-    assert.equal(h.session.currentSessionId(), "open-a-1");
-    assert.equal(h.session.hasSession(), true);
   }
   // A well-formed event naming the wrong opening is equally stale.
   assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-0")), false);
-  assert.equal(h.session.hasSession(), true);
   // The exact owner identity still clears.
   assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-1")), true);
-  assert.equal(h.session.currentLabel(), null);
   assert.equal(h.session.statusString(), "idle");
 });
 
@@ -206,13 +198,10 @@ test("a session without an opening identity never accepts a legacy typed event",
   const h = harness();
   h.session.opened("site-a", "id-a");
   assert.equal(h.session.closedByEvent(closeEvent("id-a", "anything")), false);
-  assert.equal(h.session.hasSession(), true);
-  assert.equal(h.session.currentLabel(), "site-a");
 
   const h2 = harness();
   h2.session.opened("site-c");
   assert.equal(h2.session.closedByEvent(closeEvent("site-c", "anything")), false);
-  assert.equal(h2.session.hasSession(), true);
 });
 
 test("the current { siteId, label } contract clears the tracked session", () => {
@@ -221,8 +210,8 @@ test("the current { siteId, label } contract clears the tracked session", () => 
   const h = harness();
   h.session.opened("site-a", "id-a", "open-a-1");
   assert.equal(h.session.closedByEvent({ siteId: "id-a", label: "site-a" }), true);
-  assert.equal(h.session.currentLabel(), null);
-  assert.equal(h.session.hasSession(), false);
+  // Cleared: the same payload now finds no live session.
+  assert.equal(h.session.closedByEvent({ siteId: "id-a", label: "site-a" }), false);
 
   // A foreign session's event must not.
   const h2 = harness();
@@ -232,19 +221,15 @@ test("the current { siteId, label } contract clears the tracked session", () => 
     false,
     "another session's identity must be ignored",
   );
-  assert.equal(h2.session.currentLabel(), "site-b");
-  assert.equal(h2.session.hasSession(), true);
 
   // A site-id-only payload clears only when it names the tracked site id.
   const h3 = harness();
   h3.session.opened("site-a", "id-a", "open-a-1");
   assert.equal(h3.session.closedByEvent({ siteId: "id-a" }), true);
-  assert.equal(h3.session.currentLabel(), null);
 
   const h4 = harness();
   h4.session.opened("site-a", "id-a", "open-a-1");
   assert.equal(h4.session.closedByEvent({ siteId: "id-z" }), false);
-  assert.equal(h4.session.currentLabel(), "site-a");
 });
 
 test("legacy string payloads (mid-rollout producer) still clear the tracked session", () => {
@@ -253,12 +238,10 @@ test("legacy string payloads (mid-rollout producer) still clear the tracked sess
   const h = harness();
   h.session.opened("site-a", "id-a", "open-a-1");
   assert.equal(h.session.closedByEvent("id-a"), true);
-  assert.equal(h.session.currentLabel(), null);
 
   const h2 = harness();
   h2.session.opened("site-a", "id-a", "open-a-1");
   assert.equal(h2.session.closedByEvent("id-other"), false);
-  assert.equal(h2.session.currentLabel(), "site-a");
 });
 
 test("a delayed event from the previous session cannot clear the new one", () => {
@@ -273,15 +256,11 @@ test("a delayed event from the previous session cannot clear the new one", () =>
     false,
     "stale opening identity must be ignored",
   );
-  assert.equal(h.session.currentLabel(), "site-b");
-  assert.equal(h.session.currentSessionId(), "open-b-1");
   assert.equal(h.session.statusString(), "idle");
   // An identity-less payload from the stale producer is ignored just the same.
   assert.equal(h.session.closedByEvent(null), false);
-  assert.equal(h.session.currentLabel(), "site-b");
   // The new owner's own event clears.
   assert.equal(h.session.closedByEvent(closeEvent("id-b", "open-b-1")), true);
-  assert.equal(h.session.currentLabel(), null);
 });
 
 test("closing and reopening the SAME site survives its old close event", async () => {
@@ -296,21 +275,17 @@ test("closing and reopening the SAME site survives its old close event", async (
   // Reopen the same site before the delayed event from opening 1 arrives.
   // This mints a NEW native identity even though site id and label repeat.
   h.session.opened("site-a", "id-a", "open-a-2");
-  assert.equal(h.session.currentSessionId(), "open-a-2");
 
   assert.equal(
     h.session.closedByEvent(closeEvent("id-a", "open-a-1")),
     false,
     "the previous opening's delayed event must not close the new session",
   );
-  assert.equal(h.session.hasSession(), true);
-  assert.equal(h.session.currentLabel(), "site-a");
-  assert.equal(h.session.currentSessionId(), "open-a-2");
   assert.equal(h.session.statusString(), "idle");
 
-  // The reopened session closes normally on its own event.
+  // The reopened session closes normally on its own event; a repeat is ignored.
   assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-2")), true);
-  assert.equal(h.session.hasSession(), false);
+  assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-2")), false);
 });
 
 test("a delayed event from opening 1 cannot close opening 2 even if opening 1 is still pending", () => {
@@ -320,9 +295,8 @@ test("a delayed event from opening 1 cannot close opening 2 even if opening 1 is
   // Reopen before the close resolves; the old event is still in flight.
   h.session.opened("site-a", "id-a", "open-a-2");
   assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-1")), false);
-  assert.equal(h.session.hasSession(), true);
-  assert.equal(h.session.currentLabel(), "site-a");
-  assert.equal(h.session.currentSessionId(), "open-a-2");
+  // Opening 2 still closes on its own identity.
+  assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-2")), true);
 });
 
 test("a late close result for opening 1 does not settle the reopened same site", async () => {
@@ -333,8 +307,6 @@ test("a late close result for opening 1 does not settle the reopened same site",
   h.session.opened("site-a", "id-a", "open-a-2");
   h.resolveClose();
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(h.session.currentLabel(), "site-a");
-  assert.equal(h.session.currentSessionId(), "open-a-2");
   assert.equal(h.session.statusString(), "idle", "the new opening starts clean");
 
   h.session.requestClose();
@@ -349,9 +321,9 @@ test("opened() resets leftover failure state for the next opening", () => {
   h.rejectClose("eski hata");
   h.session.opened("site-a", "id-a", "open-a-2");
   assert.equal(h.session.statusString(), "idle");
-  assert.equal(h.session.lastError(), "");
-  assert.equal(h.session.currentLabel(), "site-a");
-  assert.equal(h.session.currentSessionId(), "open-a-2");
+  // The new opening identity is the one that closes now.
+  assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-1")), false);
+  assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-2")), true);
 });
 
 test("requestClose after a settled close does not re-invoke (event pending)", async () => {
@@ -365,15 +337,6 @@ test("requestClose after a settled close does not re-invoke (event pending)", as
   assert.equal(h.calls.length, 1, "closed state must not start a second flow");
 });
 
-test("reset() clears unconditionally", () => {
-  const h = harness();
-  h.session.opened("site-a", "id-a", "open-a-1");
-  h.session.reset();
-  assert.equal(h.session.hasSession(), false);
-  assert.equal(h.session.currentSessionId(), null);
-  assert.equal(h.session.statusString(), "idle");
-});
-
 test("an out-of-order open result cannot overwrite a newer opening", () => {
   const h = harness();
   // Two rapid tile clicks: each starts an attempt before either resolves.
@@ -382,13 +345,12 @@ test("an out-of-order open result cannot overwrite a newer opening", () => {
 
   // The newer invoke resolves first and owns the label.
   assert.equal(h.session.opened("site-b", "id-b", "open-b-1", second), true);
-  assert.equal(h.session.currentLabel(), "site-b");
 
   // The older invoke resolves later. It must not resurrect its label/session.
   assert.equal(h.session.opened("site-a", "id-a", "open-a-1", first), false);
-  assert.equal(h.session.currentLabel(), "site-b");
-  assert.equal(h.session.currentSessionId(), "open-b-1");
-  assert.equal(h.session.hasSession(), true);
+  // The newer session still owns: only its event clears.
+  assert.equal(h.session.closedByEvent(closeEvent("id-a", "open-a-1")), false);
+  assert.equal(h.session.closedByEvent(closeEvent("id-b", "open-b-1")), true);
   assert.equal(h.session.statusString(), "idle");
 });
 

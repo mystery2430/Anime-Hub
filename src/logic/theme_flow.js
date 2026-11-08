@@ -99,10 +99,5 @@ export function createThemeFlow(deps) {
     return enqueue(pref);
   }
 
-  // For tests: expose queue state
-  function _seq() {
-    return seq;
-  }
-
-  return { setTheme, _seq };
+  return { setTheme };
 }

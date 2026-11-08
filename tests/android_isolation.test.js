@@ -1259,8 +1259,12 @@ test("back navigation: fullscreen first, then site history, then the launcher ho
     /window\.__animehubBackToLauncher = \(operationId\) => backSession\.requestClose\(operationId\)\.accepted;/,
   );
   assert.match(mainJs, /window\.__animehubBackStatus = \(\) => backSession\.statusString\(\);/);
-  // A.5: the label must not be dropped in a finally after invoking close.
-  assert.doesNotMatch(mainJs, /finally \{\s*\n\s*openSiteLabel = null;/);
+  // A.5: close progress is owned by the session state machine — main.js must
+  // not claim or reset it in a `finally` after invoking close.
+  assert.doesNotMatch(
+    mainJs,
+    /finally\s*\{[\s\S]{0,120}?backSession\.(reset|opened|closedByEvent)\(/,
+  );
   // No site-facing close-scheme ever appears on Android.
   assert.doesNotMatch(controllerKt, /animehub:\/\/close-site/);
 });
