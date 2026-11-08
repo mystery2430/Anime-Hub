@@ -59,7 +59,6 @@ reqwest = { version = "0.12", default-features = false, features = [
   "http2",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time"] }
-futures-util = "0.3"
 
 [dependencies.uuid]
 version = "1"
