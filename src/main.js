@@ -876,6 +876,9 @@ function renderDevLog(snapshot) {
 
 function canUseDeveloperLog() {
   return (
+    // Desktop answers with an empty stub snapshot (android_bridge.rs): the
+    // panel would render a fake ring, so Android only.
+    currentPlatform === "android" &&
     Boolean(currentSettings?.developerOptions) &&
     !el.modalSettings.hidden &&
     !el.dev.panel.hidden
@@ -894,7 +897,8 @@ function setDeveloperPanel(open) {
 }
 
 developerLogReader = createDeveloperLogReader({
-  isEnabled: () => Boolean(currentSettings?.developerOptions),
+  isEnabled: () =>
+    currentPlatform === "android" && Boolean(currentSettings?.developerOptions),
   isVisible: () => !el.modalSettings.hidden && !el.dev.panel.hidden,
   read: () => call("debug_log"),
   reset: () => call("debug_log_reset"),
@@ -914,9 +918,9 @@ developerLogReader = createDeveloperLogReader({
   },
 });
 
-/** Read only while the saved gate is enabled and the settings panel is visible. */
+/** Read only while the saved gate is enabled and the platform can own it. */
 async function refreshDevLog() {
-  if (!currentSettings?.developerOptions) {
+  if (!(currentPlatform === "android" && currentSettings?.developerOptions)) {
     setDeveloperPanel(false);
     return false;
   }
