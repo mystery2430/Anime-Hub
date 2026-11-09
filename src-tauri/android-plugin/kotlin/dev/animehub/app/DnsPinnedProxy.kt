@@ -1235,7 +1235,7 @@ class DnsPinnedProxy(
       // IPv4 (JVM normalisation, see isIpv6Literal); the public/private
       // verdict then comes from IpPolicy on the normalised text, same as
       // desktop dns.rs.
-      try {
+      return try {
         InetAddress.getByName(host)
       } catch (_: Exception) {
         null

@@ -619,7 +619,11 @@ fn open_in_main_window_inner(
     // `WebsiteDataManager` and WKWebView's proxy configuration consume.
     // Installed last, right before `add_child`: every fallible step above
     // already refused with no listener left behind in the slot.
+    // Windows names the port (browser args); other targets consume the hoisted URL.
+    #[cfg(windows)]
     let proxy_port = install_site_proxy(proxy);
+    #[cfg(all(desktop, not(windows)))]
+    let _proxy_port = install_site_proxy(proxy);
     #[cfg(windows)]
     let builder = builder.additional_browser_args(&windows_browser_args(proxy_port));
     #[cfg(all(desktop, not(windows)))]

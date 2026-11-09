@@ -1242,8 +1242,8 @@ mod windows {
         let a = load(dir.path()).unwrap();
         let b = load(dir.path()).unwrap();
         assert_eq!(
-            &*a.key.as_ref().unwrap(),
-            &*b.key.as_ref().unwrap(),
+            a.key.as_deref().unwrap(),
+            b.key.as_deref().unwrap(),
             "the on-disk blob must be adopted, never replaced"
         );
     }
