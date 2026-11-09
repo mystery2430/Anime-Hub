@@ -5,12 +5,14 @@
 //! address (the DNS-rebinding case the string policy cannot see) is therefore
 //! resolved here, on a worker thread, with a hard timeout.
 //!
-//! What this does **not** do: the WebView resolves subresources on its own
-//! stack after the top-level navigation has been allowed. A name that is
-//! public at check time and private a TTL later can still be reached by
-//! `fetch` inside the already-loaded page. Closing that requires a filtering
-//! proxy in front of the WebView, which v1 does not ship. The decision is
-//! recorded in `HANDOFF.md`.
+//! What this does **not** do alone: the WebView resolves subresources on its
+//! own stack after the top-level navigation has been allowed. A name that is
+//! public at check time and private a TTL later re-meets this check on its
+//! next navigation, and traffic the WebView tunnels through the pinning
+//! proxy (`web/pinned_proxy.rs` on desktop, `DnsPinnedProxy` on Android) is
+//! re-resolved and re-screened per connection; a load that bypasses the
+//! proxy keeps this first-look-only window. The decision is recorded in
+//! `HANDOFF.md`.
 
 use crate::sites::url_policy::{is_private_host, is_public_ip};
 use std::collections::HashMap;

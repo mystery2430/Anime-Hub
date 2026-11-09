@@ -313,6 +313,10 @@ async fn handle_connection(
         return;
     }
     let mut upstream = upstream;
+    // No idle deadline on desktop, unlike the Android proxy (`DnsPinnedProxy`
+    // bounds both sockets with `Limits.idleMs`, 180 s): the tunnel ends only
+    // on EOF, a copy error or the session stop, so a silently mute peer holds
+    // its public-destination connection until one of those fires.
     tokio::select! {
         _ = tokio::io::copy_bidirectional(stream, &mut upstream) => {}
         _ = stop.changed() => {}
