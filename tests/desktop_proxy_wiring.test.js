@@ -72,9 +72,11 @@ test("the inner open installs that proxy before any WebView and cannot start its
   assert.ok(install > 0, "the handle must become the session proxy");
   assert.ok(builder > 0 && addChild > builder, "the WebView is built and then attached");
   assert.ok(
-    install < builder,
-    "the proxy must be listening before the WebView is created (ordering only: " +
-      "whether the provider applies it is a device question)",
+    install < addChild,
+    "the proxy must be listening before the WebView is attached (ordering only: " +
+      "whether the provider applies it is a device question). The builder object is " +
+      "inert settings, so the ordering anchor is `add_child`, where the WebView " +
+      "actually exists; the fallible prep runs before the slot fill either way",
   );
   // The already-open early return happens before the install: the freshly
   // bound listener is dropped there instead of leaking a port.
@@ -97,7 +99,14 @@ test("installing a new proxy stops the previous handle", () => {
 });
 
 test("the WebView is pointed at this session's port on every desktop target", () => {
-  assert.match(OPEN_PATH, /builder\.proxy_url\(site_proxy_url\(proxy_port\)\?\)/);
+  // Non-Windows consumes the HOISTED fallible URL: `site_proxy_url` runs in
+  // the prep block, BEFORE the slot fill, so a bad URL refuses the open while
+  // the slot still holds no listener.
+  assert.match(
+    OPEN_PATH,
+    /#\[cfg\(all\(desktop, not\(windows\)\)\)\]\s*let proxy_url = site_proxy_url\(proxy\.port\(\)\)\?;/,
+  );
+  assert.match(OPEN_PATH, /builder\.proxy_url\(proxy_url\)/);
   assert.match(OPEN_PATH, /builder\.additional_browser_args\(&windows_browser_args\(proxy_port\)\)/);
   // Exactly one of the two applies per target; setting both would let wry
   // ignore the proxy (its `--proxy-server` lives in the branch that an
@@ -110,6 +119,11 @@ test("the WebView is pointed at this session's port on every desktop target", ()
     OPEN_PATH,
     /#\[cfg\(all\(desktop, not\(windows\)\)\)\]\s*let builder = builder\.proxy_url/,
   );
+  // Prep-before-install is the E2 guarantee: a late fallible Err must never
+  // leave a bound listener in the slot with no WebView to use it.
+  const hoist = OPEN_PATH.indexOf("let proxy_url = site_proxy_url(proxy.port())?;");
+  const install = OPEN_PATH.indexOf("install_site_proxy(proxy)");
+  assert.ok(hoist > 0 && install > 0 && hoist < install, "prep precedes the slot fill");
 });
 
 test("the Windows argument string keeps the proxy and removes the loopback bypass", () => {

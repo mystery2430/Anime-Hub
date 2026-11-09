@@ -445,14 +445,13 @@ fn open_in_main_window_inner(
     close_current_child_locked(app)?;
 
     // Pin every request this session makes. The handle was bound BEFORE this
-    // function ran (and before the lock) and it is installed before the WebView
-    // is created, so every navigation this view starts is meant to go through
-    // the proxy. Whether the provider actually applies the setting cannot be
-    // known from here: `on_page_load` closes the session when the proxy saw no
-    // CONNECT at all, and that check can only run once the load has finished.
-    // There is no branch that opens a site without a bound proxy: a failed bind
-    // returned `Err` from `open_in_main_window` before reaching this point.
-    let proxy_port = install_site_proxy(proxy);
+    // function ran (and before the lock), and it is installed only after all
+    // fallible, proxy-independent preparation below: an Err on a later leg
+    // must not leave the slot owning a bound listener with no WebView to use
+    // it. `on_page_load` closes the session when the proxy saw no CONNECT,
+    // which bounds how long an ignored provider setting survives.
+    #[cfg(all(desktop, not(windows)))]
+    let proxy_url = site_proxy_url(proxy.port())?;
 
     // Per-site profile directory: WebKitGTK's data directory on Linux, and on
     // Windows the WebView2 user-data folder. This is what makes cookies,
@@ -463,6 +462,18 @@ fn open_in_main_window_inner(
     })?;
     let data_dir = crate::web::session::ensure_profile_dir(&base, &site.id)?;
 
+    let size = window.inner_size().map_err(|_| {
+        log::error!("pencere boyutu okunamadı");
+        AppError::Other("pencere boyutu okunamadı".into())
+    })?;
+
+    // `add_child` lives on the bare `Window`, not on `WebviewWindow`; same
+    // window, different handle type. A missing host window is an open
+    // refusal, not something to install the proxy for.
+    let host_window = app
+        .get_window(LAUNCHER_LABEL)
+        .ok_or_else(|| AppError::Other("ana pencere bulunamadı".into()))?;
+
     let nav_host = host.clone();
     let nav_label = label.clone();
     let nav_session_id = session_id.clone();
@@ -471,11 +482,6 @@ fn open_in_main_window_inner(
     // A separate clone for each callback: the builder borrows `app` for its
     // own lifetime, and both callbacks must keep this WebView's identity.
     let nav_app = app.clone();
-
-    let size = window.inner_size().map_err(|_| {
-        log::error!("pencere boyutu okunamadı");
-        AppError::Other("pencere boyutu okunamadı".into())
-    })?;
 
     // `add_child` takes the *builder* and constructs the WebView on the main
     // thread; `WebviewBuilder` has no standalone `build`.
@@ -611,16 +617,14 @@ fn open_in_main_window_inner(
     // (the only way to also override the implicit loopback bypass); the other
     // desktop targets use wry's proxy setting, which is what WebKitGTK's
     // `WebsiteDataManager` and WKWebView's proxy configuration consume.
+    // Installed last, right before `add_child`: every fallible step above
+    // already refused with no listener left behind in the slot.
+    let proxy_port = install_site_proxy(proxy);
     #[cfg(windows)]
     let builder = builder.additional_browser_args(&windows_browser_args(proxy_port));
     #[cfg(all(desktop, not(windows)))]
-    let builder = builder.proxy_url(site_proxy_url(proxy_port)?);
+    let builder = builder.proxy_url(proxy_url);
 
-    // `add_child` lives on the bare `Window`, not on `WebviewWindow`; same
-    // window, different handle type.
-    let host_window = app
-        .get_window(LAUNCHER_LABEL)
-        .ok_or_else(|| AppError::Other("ana pencere bulunamadı".into()))?;
     host_window
         .add_child(
             builder,
@@ -659,7 +663,12 @@ fn open_in_main_window_inner(
 
     // Live-session sync: snapshot the session into the encrypted store on a
     // fixed interval until the site is closed or another site takes over.
-    spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
+    spawn_session_sync(
+        app.clone(),
+        label.clone(),
+        site.id.clone(),
+        session_id.clone(),
+    );
 
     Ok((label, session_id))
 }
@@ -727,15 +736,20 @@ pub fn install_main_window_handlers(app: &AppHandle) {
 // Live-session sync: periodic encrypted snapshots while a site is open.
 // ---------------------------------------------------------------------------
 
-/// `true` while `site_id` still owns the live session.
+/// `true` while the exact opening (`site_id`, `session_id`) owns the session.
 ///
 /// Shared by the sync loop and the mobile restore path: every background
 /// write into a site's blob must re-derive ownership from the *current* state
 /// rather than trust a value captured when the thread was spawned, so a stale
 /// thread can never write one site's session data into another site's blob.
-fn session_is_current(state: &AppState, site_id: &str) -> bool {
+/// The site id alone is not enough: a quick close + reopen of the SAME site
+/// reuses the site id, so a retired loop would otherwise survive forever —
+/// leaking one thread per reopen cycle.
+fn session_is_current(state: &AppState, site_id: &str, session_id: &str) -> bool {
     let current = lock_recover(&state.current_site);
-    current.as_ref().is_some_and(|c| c.site_id == site_id)
+    current
+        .as_ref()
+        .is_some_and(|c| c.site_id == site_id && c.session_id == session_id)
 }
 
 /// Take the tracked session only when it is still the exact opening named by
@@ -805,7 +819,7 @@ fn emit_site_closed(app: &AppHandle, closed: &CurrentSite) {
 /// the ownership check so the check and the subsequent write are atomic with
 /// respect to a concurrent wipe.
 #[cfg(desktop)]
-fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: String) {
+fn spawn_session_sync(app: AppHandle, label: String, site_id: String, session_id: String) {
     std::thread::spawn(move || {
         // No lifetime cap: the session-ownership check below is the only stop
         // condition, so an open site keeps persisting for as long as it lives.
@@ -828,7 +842,7 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
             };
             {
                 let state = app.state::<AppState>();
-                if !session_is_current(&state, &site_id) {
+                if !session_is_current(&state, &site_id, &session_id) {
                     return;
                 }
             }
@@ -852,7 +866,7 @@ fn spawn_session_sync(app: AppHandle, label: String, site_id: String, _host: Str
 /// can never flush after another site took over — and never touches the
 /// launcher's default profile.
 #[cfg(target_os = "android")]
-fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: String) {
+fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, session_id: String) {
     std::thread::spawn(move || {
         // No lifetime cap: the session-ownership check below is the only stop
         // condition, so an open site keeps flushing for as long as it lives.
@@ -869,7 +883,7 @@ fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: St
             };
             {
                 let state = app.state::<AppState>();
-                if !session_is_current(&state, &site_id) {
+                if !session_is_current(&state, &site_id, &session_id) {
                     return;
                 }
             }
@@ -3544,7 +3558,12 @@ fn open_on_mobile(
     });
 
     // Periodic profile-cookie flush: an Android process kill skips close.
-    spawn_session_sync(app.clone(), label.clone(), site.id.clone(), site.host());
+    spawn_session_sync(
+        app.clone(),
+        label.clone(),
+        site.id.clone(),
+        session_id.clone(),
+    );
 
     Ok((label, session_id))
 }
@@ -4033,13 +4052,17 @@ mod tests {
     fn session_ownership_gates_every_background_write() {
         // No session: nothing is current, sync and restore must both refuse.
         let state = state_with_current_site(None);
-        assert!(!session_is_current(&state, "s1"));
+        assert!(!session_is_current(&state, "s1", "session-s1"));
 
         // Live session: only its own site matches; a stale thread holding a
         // different site id is rejected.
         let state = state_with_current_site(Some("s1"));
-        assert!(session_is_current(&state, "s1"));
-        assert!(!session_is_current(&state, "s2"));
+        assert!(session_is_current(&state, "s1", "session-s1"));
+        assert!(!session_is_current(&state, "s2", "session-s1"));
+        // Close + reopen of the same site mints a NEW opening identity: a
+        // thread for the old opening must retire, or the site would leak one
+        // sync thread per reopen cycle.
+        assert!(!session_is_current(&state, "s1", "session-s0"));
     }
 
     #[test]
@@ -4560,7 +4583,7 @@ mod tests {
                 let _guard = lock_desktop_session();
                 started_clone.store(true, Ordering::SeqCst);
                 // Simulate sync's ownership check + export under the lock.
-                assert!(session_is_current(&state_clone, "s1"));
+                assert!(session_is_current(&state_clone, "s1", "session-s1"));
                 // Hold the lock only once the wipe is committed to contending
                 // for it. The loop is bounded so a panicked test cannot wedge
                 // this thread forever.
@@ -4590,7 +4613,7 @@ mod tests {
                 );
                 // While holding the wipe lock, simulate clearing current_site.
                 *state.current_site.lock().unwrap() = None;
-                assert!(!session_is_current(&state, "s1"));
+                assert!(!session_is_current(&state, "s1", "session-s1"));
             }
             handle.join().unwrap();
             assert!(sync_done.load(Ordering::SeqCst));
