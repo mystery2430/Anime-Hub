@@ -30,6 +30,7 @@ import {
   bannerStyle,
   bannerRgb,
 } from "./logic/hero.js";
+import { buildAnilistPatch } from "./logic/settings_patch.js";
 import {
   bindSwitch,
   createSettingsFlow,
@@ -1084,14 +1085,23 @@ function wireSettings() {
     }
   });
 
+  // Only keys the user actually touched are re-sent: the backend keeps the
+  // stored value for a blank sub-field, so untouched fields cannot look
+  // accidentally-wiped (each visit re-loads the inputs empty).
+  const anilistTouched = new Set();
+  const anilistFields = [
+    [el.settings.anilistId, "clientId"],
+    [el.settings.anilistSecret, "clientSecret"],
+    [el.settings.anilistRedirect, "redirectUri"],
+  ];
+  for (const [node, key] of anilistFields) {
+    node.addEventListener("input", () => anilistTouched.add(key));
+  }
   el.btnSaveAnilist.addEventListener("click", () => {
-    const patch = {
-      anilist: {
-        clientId: el.settings.anilistId.value.trim(),
-        clientSecret: el.settings.anilistSecret.value,
-        redirectUri: el.settings.anilistRedirect.value.trim(),
-      },
-    };
+    const patch = buildAnilistPatch(
+      anilistFields.map(([node, key]) => [key, node.value]),
+      anilistTouched,
+    );
     saveSettings(patch, "AniList ayarları kaydedildi.").then(refreshAniListStatus);
   });
 
