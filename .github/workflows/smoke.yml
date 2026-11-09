@@ -51,6 +51,12 @@ jobs:
         run: cargo build --locked
 
       - name: Boot for 20 s under a virtual display
+        env:
+          # Headless WebKit tends to die on GPU-buffer allocation at boot:
+          # force the software paths so the smoke measures "does the app
+          # start", not the display driver.
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
         shell: bash
         run: |
           xvfb-run -a ./target/debug/animehub &
