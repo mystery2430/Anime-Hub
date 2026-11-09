@@ -701,7 +701,9 @@ class DnsPinnedProxy(
    * Rust `pinned_proxy` bounds each phase with a select deadline; this gate is
    * the Android-side bound for the whole pre-200 life of a CONNECT. It is
    * checked before the resolver and before each connector attempt, so the
-   * pre-200 phases cannot stretch past the sum of their own deadlines.
+   * pre-200 phases cannot stretch past the sum of their own deadlines. The
+   * desktop connect loop goes further: its budget is shared ACROSS address
+   * attempts (connect_first's shared deadline).
    */
   internal val prePhaseBudgetNanos: Long
     get() =

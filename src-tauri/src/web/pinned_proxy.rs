@@ -34,7 +34,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -366,10 +366,22 @@ async fn classify(host: &str, port: u16, context: &Context) -> Result<Vec<IpAddr
     Ok(resolved)
 }
 
+/// Connect to the first address that answers inside one shared budget.
+///
+/// `timeout` is the TOTAL for the whole loop, not per attempt: a slow first
+/// dial eats into what the remaining addresses get, so N addresses cost at
+/// most the one budget instead of N budgets. Android bounds the same
+/// pre-200 life with its total gate (`DnsPinnedProxy.prePhaseExpired`);
+/// per-attempt spend differs there and that is accepted parity.
 async fn connect_first(addrs: &[IpAddr], port: u16, timeout: Duration) -> Option<TcpStream> {
+    let deadline = Instant::now() + timeout;
     for ip in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
         let addr = SocketAddr::new(*ip, port);
-        let Ok(Ok(stream)) = tokio::time::timeout(timeout, TcpStream::connect(addr)).await else {
+        let Ok(Ok(stream)) = tokio::time::timeout(remaining, TcpStream::connect(addr)).await else {
             continue;
         };
         // Belt and braces: the socket must have reached the address that was
