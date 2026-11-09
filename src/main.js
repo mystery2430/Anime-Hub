@@ -122,13 +122,20 @@ function applyHero(model) {
   el.hero.cta.hidden = model.loggedIn;
 }
 
+// Last known AniList sign-in state: a hero fetch failure must not flip a
+// logged-in user into the "connect" CTA; it only tires the numbers.
+let lastHeroLoggedIn = false;
+
 async function refreshHero() {
   try {
     const stats = await call("anilist_hero_stats");
     applyHero(heroModel(stats));
+    lastHeroLoggedIn = true;
   } catch {
-    // Offline ya da rate limit: bağlı görünüm bozmasın diye sadece tireler.
-    applyHero(heroModel(null));
+    // Offline ya da rate limit: sayılar tirelenir. Bağlanma durumu son
+    // bilinen değerde kalır; geçici bir ağ hatası bağlı kullanıcıyı
+    // "AniList'i bağla" düğmesine geri döndürmesin.
+    applyHero({ ...heroModel(null), loggedIn: lastHeroLoggedIn });
   }
 }
 
@@ -1107,6 +1114,7 @@ function wireSettings() {
       await call("anilist_logout");
       el.settings.anilistStatus.textContent = "Oturum kapatıldı.";
       el.settings.anilistStatus.dataset.state = "";
+      lastHeroLoggedIn = false;
       applyHero(heroModel(null));
     } catch (e) {
       showNotice(errMessage(e));
