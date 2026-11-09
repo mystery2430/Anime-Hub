@@ -855,7 +855,7 @@ pub struct OpenedSite {
 pub async fn close_site(
     app: AppHandle,
     label: String,
-    session_id: String,
+    session_id: Option<String>,
     operation_id: Option<String>,
 ) -> AppResult<()> {
     let _operation_scope = operation_id
@@ -868,6 +868,10 @@ pub async fn close_site(
     // flush/destroy): keep the whole close off the async runtime worker
     // (MAIN_TREE_AUDIT M-06).
     tauri::async_runtime::spawn_blocking(move || {
+        // A close without a session id cannot pass the identity check (E1);
+        // refusing legibly beats the wire layer's raw missing-arg error.
+        let session_id = session_id
+            .ok_or_else(|| AppError::Other("site oturumu bilinmiyor; kapatma reddedildi".into()))?;
         windows::close_site_window_for_session(&app, &label, &session_id)
     })
     .await

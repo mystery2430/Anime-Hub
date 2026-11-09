@@ -53,7 +53,7 @@ test("every command the launcher invokes is registered", () => {
 test("close_site requires a session id and delegates to guarded native close", () => {
   assert.match(
     commandsRs,
-    /pub async fn close_site\([\s\S]*?session_id: String[\s\S]*?windows::close_site_window_for_session\(&app, &label, &session_id\)/,
+    /pub async fn close_site\([\s\S]*?session_id: Option<String>[\s\S]*?windows::close_site_window_for_session\(&app, &label, &session_id\)/,
   );
   assert.match(
     windowsRs,
