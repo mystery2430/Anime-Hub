@@ -435,6 +435,19 @@ class DnsPinnedProxyTest {
   }
 
   @Test
+  fun the_pre_phase_budget_gate_is_deterministic() {
+    val proxy = DnsPinnedProxy()
+    val budget = proxy.prePhaseBudgetNanos
+    assertTrue("budget must be positive", budget > 0)
+    // A start that has burned exactly the whole budget is not yet expired;
+    // one nanosecond more is. This is the only timing gate in the proxy a
+    // unit test can drive deterministically — everything real (connects,
+    // tunnelling) is exercised against live sockets elsewhere.
+    assertTrue(!proxy.prePhaseExpired(0L, nowNanos = budget))
+    assertTrue(proxy.prePhaseExpired(0L, nowNanos = budget + 1))
+  }
+
+  @Test
   fun the_production_connector_pins_and_verifies_on_real_sockets() {
     val origin = EchoOrigin()
     try {

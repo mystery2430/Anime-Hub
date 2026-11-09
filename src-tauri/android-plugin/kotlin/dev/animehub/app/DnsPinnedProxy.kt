@@ -585,6 +585,7 @@ class DnsPinnedProxy(
   private fun handle(client: Socket) {
     var remote: Socket? = null
     var established = false
+    val startNanos = System.nanoTime()
     try {
       accepted.incrementAndGet()
       client.soTimeout = limits.handshakeMs
@@ -612,6 +613,10 @@ class DnsPinnedProxy(
       // parser) and classified from the literal answer below.
       if (hostIsRejectedWithoutDns(target.host)) {
         refuse(client, Refusal.NON_PUBLIC)
+        return
+      }
+      if (prePhaseExpired(startNanos)) {
+        refuse(client, Refusal.HANDSHAKE)
         return
       }
       val addresses = try {
@@ -647,6 +652,14 @@ class DnsPinnedProxy(
       // One tunnel attempt per allowed address, each pinned to that address.
       var mismatch = false
       for (address in allowed) {
+        // Pre-200 budget: the connector would otherwise spend connectMs once
+        // per allowed address with no total bound. Past the budget the client
+        // socket is closed (a refusal of THIS connect, not a verdict on the
+        // host).
+        if (prePhaseExpired(startNanos)) {
+          refuse(client, Refusal.HANDSHAKE)
+          return
+        }
         val socket = try {
           connector(address, target.port, limits.connectMs)
         } catch (_: Exception) {
@@ -681,6 +694,22 @@ class DnsPinnedProxy(
       active.decrementAndGet()
     }
   }
+
+  /**
+   * Pre-200 total budget: handshake + resolve + one CONNECT timeout.
+   *
+   * Rust `pinned_proxy` bounds each phase with a select deadline; this gate is
+   * the Android-side bound for the whole pre-200 life of a CONNECT. It is
+   * checked before the resolver and before each connector attempt, so the
+   * pre-200 phases cannot stretch past the sum of their own deadlines.
+   */
+  internal val prePhaseBudgetNanos: Long
+    get() =
+      (limits.handshakeMs.toLong() + limits.resolveMs + limits.connectMs) *
+        1_000_000L
+
+  internal fun prePhaseExpired(startNanos: Long, nowNanos: Long = System.nanoTime()): Boolean =
+    nowNanos - startNanos > prePhaseBudgetNanos
 
   /**
    * True when the shared host policy refuses [host] without asking DNS.
@@ -1200,12 +1229,14 @@ class DnsPinnedProxy(
       if (!host.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }) {
         return null
       }
-      return try {
-        val address = InetAddress.getByName(host)
-        // A v6-shaped literal must parse as v6; anything else is refused
-        // rather than silently resolved (getByName would otherwise fall back
-        // to a lookup for a malformed literal).
-        if (address.address.size == 16) address else null
+      // Accept whatever getByName parses: the char filter above leaves no
+      // name-shaped host, so the call can never fall back to a DNS lookup —
+      // the result is always the literal itself. `::ffff:` forms arrive as
+      // IPv4 (JVM normalisation, see isIpv6Literal); the public/private
+      // verdict then comes from IpPolicy on the normalised text, same as
+      // desktop dns.rs.
+      try {
+        InetAddress.getByName(host)
       } catch (_: Exception) {
         null
       }
