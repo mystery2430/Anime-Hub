@@ -234,28 +234,13 @@ impl AndroidStore {
         let _guard = crate::secure::store::STORE_LOCK
             .lock()
             .map_err(|_| crate::error::AppError::Storage("kilit alınamadı".into()))?;
-        std::fs::create_dir_all(&self.dir)?;
         let envelope = self.sealer_for(file_name).seal(plaintext, aad)?;
         let wrapped = crate::android_bridge::keystore_seal(file_name, &envelope)?;
         let target = self.path_for(file_name);
-        let unique = {
-            use rand::RngCore as _;
-            let mut b = [0u8; 8];
-            rand::thread_rng().fill_bytes(&mut b);
-            format!("{}-{}", std::process::id(), hex::encode(b))
-        };
-        let tmp = target.with_extension(format!("tmp.{unique}"));
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(wrapped.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &target)?;
-        if let Ok(dir_file) = std::fs::File::open(&self.dir) {
-            let _ = dir_file.sync_all();
-        }
-        let _ = std::fs::remove_file(&tmp);
+        // The same temp+rename scheme as the store (dirs created, dir
+        // fsynced, temp cleaned on the error legs), reusing the shared
+        // helper under the STORE_LOCK this call already holds.
+        crate::secure::store::atomic_write_locked(&target, wrapped.as_bytes())?;
         Ok(())
     }
 
@@ -355,24 +340,9 @@ where
     }
     let key = crypto::generate_key();
     let wrapped = seal(&key)?;
-    use std::io::Write as _;
-    let unique = {
-        use rand::RngCore as _;
-        let mut b = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut b);
-        format!("{}-{}", std::process::id(), hex::encode(b))
-    };
-    let tmp = path.with_extension(format!("tmp.{unique}"));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(wrapped.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    if let Ok(dir_file) = std::fs::File::open(dir) {
-        let _ = dir_file.sync_all();
-    }
-    let _ = std::fs::remove_file(&tmp);
+    // The shared store write (temp+rename+dir fsync+error cleanup); the
+    // caller keeps holding `STORE_LOCK`, so check+create stays atomic.
+    crate::secure::store::atomic_write_locked(path, wrapped.as_bytes())?;
     Ok(key)
 }
 
