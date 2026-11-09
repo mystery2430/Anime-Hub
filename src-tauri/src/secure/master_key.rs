@@ -1101,18 +1101,55 @@ mod windows {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(DPAPI_FILE_NAME);
 
-        if path.exists() {
-            let blob = std::fs::read(&path)?;
-            let key = dpapi_unprotect(&blob)?;
-            return Ok(MasterKey {
-                backend: Backend::WindowsDpapi,
-                key: Some(key),
-            });
+        // Serialise check-then-create against the store writers (the same
+        // `STORE_LOCK` they hold while sealing): two concurrent loads must
+        // adopt, not last-write-win — a silently replaced master key would
+        // strand everything the first load already sealed.
+        let _guard = crate::secure::store::STORE_LOCK
+            .lock()
+            .map_err(|_| AppError::Storage("anahtar kilidi alınamadı".into()))?;
+
+        match std::fs::read(&path) {
+            Ok(blob) => {
+                // Adoption is the validation: a blob from another Windows
+                // user (or an unreadable one) fails unprotect instead of
+                // being silently replaced with a fresh key.
+                let key = dpapi_unprotect(&blob)?;
+                return Ok(MasterKey {
+                    backend: Backend::WindowsDpapi,
+                    key: Some(key),
+                });
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
         }
 
         let key = generate_key();
         let blob = dpapi_protect(&key)?;
-        std::fs::write(&path, blob)?;
+
+        // `create_new` is the Windows stand-in for the unix fallback's
+        // O_EXCL: a concurrent loader that slipped between the check and the
+        // open already wrote a valid blob — adopt theirs.
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let their = std::fs::read(&path)?;
+                return Ok(MasterKey {
+                    backend: Backend::WindowsDpapi,
+                    key: Some(dpapi_unprotect(&their)?),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        {
+            use std::io::Write as _;
+            file.write_all(&blob)?;
+            file.sync_all()?;
+        }
         Ok(MasterKey {
             backend: Backend::WindowsDpapi,
             key: Some(Zeroizing::new(key)),
@@ -1197,5 +1234,17 @@ mod windows {
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&plain);
         Ok(key)
+    }
+
+    #[test]
+    fn load_adopts_the_existing_blob_and_is_stable_across_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = load(dir.path()).unwrap();
+        let b = load(dir.path()).unwrap();
+        assert_eq!(
+            &*a.key.as_ref().unwrap(),
+            &*b.key.as_ref().unwrap(),
+            "the on-disk blob must be adopted, never replaced"
+        );
     }
 }
