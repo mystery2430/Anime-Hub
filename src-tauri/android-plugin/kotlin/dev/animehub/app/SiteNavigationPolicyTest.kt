@@ -382,20 +382,20 @@ class SiteNavigationPolicyTest {
         val gate = NavigationDnsGate()
         gate.decide("pub.example", 0L)
         gate.record("pub.example", listOf("93.184.216.34"), 10L)
-        // Fresh right up to the 15 s dns.rs PUBLIC_TTL parity window.
+        // Fresh across the whole window (checkedAt = 10): [10, 10 + 15_000).
         assertEquals(
             NavigationDnsGate.Verdict.PUBLIC,
-            gate.cachedVerdict("pub.example", 15_000L - 1L),
+            gate.cachedVerdict("pub.example", 14_999L),
         )
-        // Stale just after it: the next navigation must resolve again.
-        assertNull(gate.cachedVerdict("pub.example", 15_000L))
-        // A private answer may keep blocking for the full cache window.
+        // Closed exactly at the budget: the next navigation re-resolves.
+        assertNull(gate.cachedVerdict("pub.example", 15_010L))
+        // A private answer may keep blocking for its full window.
         gate.record("priv.example", listOf("127.0.0.1"), 10L)
         assertEquals(
             NavigationDnsGate.Verdict.PRIVATE,
             gate.cachedVerdict("priv.example", 59_999L),
         )
-        assertNull(gate.cachedVerdict("priv.example", 60_000L))
+        assertNull(gate.cachedVerdict("priv.example", 60_010L))
     }
 
     @Test
