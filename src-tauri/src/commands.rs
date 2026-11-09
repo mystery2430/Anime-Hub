@@ -371,7 +371,7 @@ pub fn list_hidden_sites(state: State<'_, AppState>) -> AppResult<Vec<SiteView>>
     Ok(reg.hidden().iter().map(|s| to_view(s, false)).collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_site(state: State<'_, AppState>, draft: SiteDraft) -> AppResult<SiteView> {
     let site = {
         let mut reg = state
@@ -384,7 +384,7 @@ pub fn add_site(state: State<'_, AppState>, draft: SiteDraft) -> AppResult<SiteV
     Ok(to_view(&site, false))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_site(
     state: State<'_, AppState>,
     id: String,
@@ -474,6 +474,20 @@ pub async fn remove_site(
             reg.get(&id).is_some_and(|s| s.builtin)
         };
         if was_builtin {
+            // A hidden builtin can still be OPEN: run the same close leg as
+            // the user path so the live WebView does not outlive its tile.
+            let label = crate::web::windows::label_for(&id);
+            let should_close = {
+                let cur = state
+                    .current_site
+                    .lock()
+                    .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                cur.as_ref()
+                    .is_some_and(|c| c.window_label == label || c.site_id == id)
+            };
+            if should_close {
+                crate::web::windows::close_site_window_for_clear(&app, &label)?;
+            }
             let mut reg = state
                 .registry
                 .lock()
@@ -562,6 +576,18 @@ pub async fn remove_site(
                 reg.get(&id).is_some_and(|s| s.builtin)
             };
             if was_builtin {
+                // A hidden builtin can still be OPEN: the same close leg as
+                // the user path, so the live view does not outlive its tile.
+                let should_close = {
+                    let cur = state
+                        .current_site
+                        .lock()
+                        .map_err(|_| AppError::Storage("kilit alınamadı".into()))?;
+                    cur.as_ref().is_some_and(|c| c.site_id == id)
+                };
+                if should_close {
+                    crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
+                }
                 let mut reg = state
                     .registry
                     .lock()
@@ -635,7 +661,7 @@ pub async fn remove_site(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_site_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> AppResult<()> {
     {
         let mut reg = state
@@ -659,12 +685,20 @@ pub fn set_site_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> 
 /// `MULTI_PROFILE`).
 #[tauri::command]
 pub async fn open_site(app: AppHandle, id: String) -> AppResult<OpenedSite> {
-    let state = app.state::<AppState>();
     // The WebView policy needs the current user rules BEFORE any navigation,
-    // and a failed push must abort the open (fail-closed). If a previous site
-    // WebView is still open, sync_android_blocklist destroys it before returning
-    // the error: otherwise that view would keep enforcing the old snapshot.
-    sync_android_blocklist(&app, &state)?;
+    // and a failed push must abort the open (fail-closed). The push runs
+    // multi-runtime blocking work (profile/file IO, Android JNI), so it is
+    // folded off the async worker like every other plugin-calling command.
+    // If a previous site WebView is still open, sync_android_blocklist
+    // destroys it before returning the error: otherwise that view would keep
+    // enforcing the old snapshot.
+    let push_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = push_app.state::<AppState>();
+        sync_android_blocklist(&push_app, &state)
+    })
+    .await
+    .map_err(|_| AppError::BlocklistUnavailable)??;
     let (site, settings) = {
         let state = app.state::<AppState>();
         let reg = state
@@ -1200,7 +1234,7 @@ fn merge_anilist_patch(stored: &AniListConfig, patch: &AniListConfig) -> AniList
     merged
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_settings(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1374,7 +1408,7 @@ pub fn take_startup_warning(state: State<'_, AppState>) -> AppResult<Option<Stri
     Ok(w.take())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn reset_blocklist(app: AppHandle, state: State<'_, AppState>) -> AppResult<usize> {
     {
         let mut live = state
@@ -1619,7 +1653,11 @@ async fn fresh_anilist_session(state: &AppState) -> AppResult<Option<(AniListCli
     let (cli, _) = match client(state) {
         Ok(c) => c,
         // Not configured any more: report signed-out rather than erroring.
-        Err(_) => return Ok(None),
+        // Only a client-configuration error means signed-out — a poisoned
+        // settings lock or a storage failure is a real error and must
+        // surface, not masquerade as an expired login.
+        Err(AppError::AniList(_)) => return Ok(None),
+        Err(other) => return Err(other),
     };
 
     let Some(token) = refresh_session_token(state, |refresh_token| {

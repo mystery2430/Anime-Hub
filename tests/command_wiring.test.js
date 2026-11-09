@@ -144,12 +144,17 @@ test("blocklist sync is fail-closed for opens, settings and reset", () => {
     /fn sync_android_blocklist\(app: &AppHandle, state: &AppState\) -> AppResult<\(\)>/,
     "sync must take the app handle (to close a live view) and return a result",
   );
-  const callSites = commandsRs.match(/sync_android_blocklist\(&app, &state\)\??;/g) ?? [];
-  assert.equal(callSites.length, 3, "open, settings and reset must all transfer the snapshot");
+  // Direct (settings, reset) call sites transfer with `?;` — counted so a
+  // dropped producer fails loudly regardless of line endings.
   assert.equal(
-    callSites.some((line) => line.endsWith(");")),
-    false,
-    "no call site may ignore the transfer result",
+    (commandsRs.match(/sync_android_blocklist\(&app, &state\)\?;/g) || []).length,
+    2,
+    "settings and reset transfer directly and propagate the error",
+  );
+  assert.match(
+    commandsRs,
+    /sync_android_blocklist\(&push_app, &state\)\s*\}\s*\)\s*\.await\s*\.map_err\(\|_\| AppError::BlocklistUnavailable\)\?\?/,
+    "the open-path transfer stays inside the blocking closure and the join maps to a visible error",
   );
   assert.match(commandsRs, /fn transfer_blocklist_snapshot/);
   assert.match(commandsRs, /Err\(push_error\) => match close\(\)/);
@@ -352,12 +357,19 @@ test("blocklist transfers are serialized and generation-guarded (PR #27 follow-u
     "sync_android_blocklist must not call the unguarded helper directly",
   );
 
-  // All three commands still propagate the failure (`?`), so a refused
-  // transfer can never be reported as success.
+  // All three commands still surface the failure: two direct `?;` calls and
+  // one through the awaited blocking closure (its join maps join and inner
+  // errors onto a visible one), so a refused transfer can never be reported
+  // as success.
   assert.equal(
-    (commandsRs.match(/sync_android_blocklist\(&app, &state\)\?;/g) || []).length,
+    (commandsRs.match(/sync_android_blocklist\(&\w+, &state\)/g) || []).length,
     3,
     "open_site, update_settings and reset_blocklist must all propagate",
+  );
+  assert.match(
+    commandsRs,
+    /sync_android_blocklist\(&push_app, &state\)\s*\}\s*\)\s*\.await\s*\.map_err\(\|_\| AppError::BlocklistUnavailable\)\?\?/,
+    "the open-path transfer propagates join and inner errors",
   );
 
   // The generation is bumped while the matcher lock is held, otherwise a reader

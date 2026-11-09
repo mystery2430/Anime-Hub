@@ -342,7 +342,7 @@ test("the legacy JSON storage/cookie-swap machinery is gone", () => {
   assert.doesNotMatch(pluginKt, /fun localstorage_|fun indexeddb_|fun webview_cookies_|EXPORT_IDB_JS|flushCookieStoreAsync/);
   // The periodic sync no longer exports anything on Android: it flushes the
   // active profile's cookies instead.
-  const syncStart = windowsRs.indexOf('fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, _host: String)');
+  const syncStart = windowsRs.indexOf('fn spawn_session_sync(app: AppHandle, _label: String, site_id: String, session_id: String)');
   assert.ok(syncStart > 0, "android flush-only sync missing");
   const syncBody = windowsRs.slice(syncStart, windowsRs.indexOf("\n}\n", syncStart));
   assert.match(syncBody, /site_flush\(\)/);
@@ -377,6 +377,12 @@ test("remove_site deletes the profile, queues refusals, bumps the generation", (
   assert.ok(
     body.slice(builtinAt, deleteAt).includes("return Ok(RemoveSiteOutcome"),
     "builtin must return its outcome before deletion",
+  );
+  // D3: hiding a builtin also closes an open view — no WebView may outlive
+  // its (now hidden) tile.
+  assert.ok(
+    body.slice(builtinAt, deleteAt).includes("close_site_window_for_clear_locked"),
+    "the builtin-hide branch must run the close leg before hiding",
   );
   // The outcome flows from the pure mapping: Pending → deferred.
   assert.ok(
@@ -2033,7 +2039,10 @@ test("the user blocklist is pushed from Rust into the Android WebView", () => {
     commandsRs,
     /fn push_android_blocklist\(entries: &\[String\]\)[\s\S]{0,220}site_blocklist_update\(entries\)/,
   );
-  const syncCalls = commandsRs.match(/sync_android_blocklist\(&app, &state\)/g) || [];
+  // Three live producers, but the OPEN port runs inside its spawn_blocking
+  // closure with a re-cloned app handle (`&push_app`), while settings and
+  // reset call it directly.
+  const syncCalls = commandsRs.match(/sync_android_blocklist\(&\w+, &state\)/g) || [];
   assert.ok(syncCalls.length >= 3, "open/settings/reset must all transfer the snapshot");
   assert.match(
     commandsRs,
