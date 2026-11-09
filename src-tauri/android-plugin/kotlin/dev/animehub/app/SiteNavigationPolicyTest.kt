@@ -378,6 +378,27 @@ class SiteNavigationPolicyTest {
     }
 
     @Test
+    fun `a public verdict expires at the short public window while a private one stays fresh`() {
+        val gate = NavigationDnsGate()
+        gate.decide("pub.example", 0L)
+        gate.record("pub.example", listOf("93.184.216.34"), 10L)
+        // Fresh right up to the 15 s dns.rs PUBLIC_TTL parity window.
+        assertEquals(
+            NavigationDnsGate.Verdict.PUBLIC,
+            gate.cachedVerdict("pub.example", 15_000L - 1L),
+        )
+        // Stale just after it: the next navigation must resolve again.
+        assertNull(gate.cachedVerdict("pub.example", 15_000L))
+        // A private answer may keep blocking for the full cache window.
+        gate.record("priv.example", listOf("127.0.0.1"), 10L)
+        assertEquals(
+            NavigationDnsGate.Verdict.PRIVATE,
+            gate.cachedVerdict("priv.example", 59_999L),
+        )
+        assertNull(gate.cachedVerdict("priv.example", 60_000L))
+    }
+
+    @Test
     fun `unknown hosts fail open once and are probed once`() {
         val gate = NavigationDnsGate()
         assertEquals(NavigationDnsGate.Decision.ALLOW_AND_PROBE, gate.decide("a.example", 0L))

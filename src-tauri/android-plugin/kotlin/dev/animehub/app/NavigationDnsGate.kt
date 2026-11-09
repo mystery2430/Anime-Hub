@@ -45,6 +45,7 @@ import java.util.LinkedHashMap
  */
 class NavigationDnsGate(
   private val cacheMs: Long = CACHE_MS,
+  private val publicCacheMs: Long = PUBLIC_CACHE_MS,
   private val maxHosts: Int = MAX_HOSTS,
   private val maxProbing: Int = MAX_PROBING,
 ) {
@@ -74,7 +75,7 @@ class NavigationDnsGate(
   fun cachedVerdict(rawHost: String?, now: Long): Verdict? {
     val host = normalize(rawHost) ?: return null
     val entry = entries[host] ?: return null
-    if (!isFresh(entry.checkedAt, now)) return null
+    if (!isFresh(entry, now)) return null
     return entry.verdict
   }
 
@@ -88,7 +89,7 @@ class NavigationDnsGate(
   fun decide(rawHost: String?, now: Long): Decision {
     val host = normalize(rawHost) ?: return Decision.BLOCK
     val entry = entries[host]
-    if (entry != null && isFresh(entry.checkedAt, now)) {
+    if (entry != null && isFresh(entry, now)) {
       return when (entry.verdict) {
         Verdict.PUBLIC -> Decision.ALLOW
         Verdict.PRIVATE, Verdict.CHANGED -> Decision.BLOCK
@@ -154,7 +155,7 @@ class NavigationDnsGate(
       // let the next navigation probe again.
       return Decision.ALLOW
     }
-    val previous = entries[host]?.takeIf { isFresh(it.checkedAt, now) }?.pinned
+    val previous = entries[host]?.takeIf { isFresh(it, now) }?.pinned
     val verdict = SiteNavigationPolicy.ResolvedHostPolicy.classify(previous, answer)
     val decision =
       when (verdict) {
@@ -194,11 +195,30 @@ class NavigationDnsGate(
   @Synchronized
   fun probingCount(): Int = probing.size
 
-  private fun isFresh(checkedAt: Long, now: Long): Boolean =
-    now >= checkedAt && now - checkedAt < cacheMs
+  /**
+   * Freshness is per verdict: a PUBLIC answer is trusted only for
+   * [publicCacheMs] (the desktop dns.rs PUBLIC_TTL parity — a long-cached
+   * "public" is itself a rebinding window), while PRIVATE/CHANGED keep
+   * blocking for the full [cacheMs], where waiting it out buys an attacker
+   * nothing.
+   */
+  private fun isFresh(entry: Entry, now: Long): Boolean {
+    val budget = if (entry.verdict == Verdict.PUBLIC) publicCacheMs else cacheMs
+    return now >= entry.checkedAt && now - entry.checkedAt < budget
+  }
 
   companion object {
     const val CACHE_MS: Long = 60_000L
+
+    /**
+     * How long a PUBLIC verdict stays trusted before the host is resolved
+     * again: 15 s, matching the desktop dns.rs `PUBLIC_TTL`. A cached
+     * "public" answer is itself a rebinding window, so public knowledge must
+     * go stale quickly; PRIVATE/CHANGED verdicts have no such reason to
+     * shrink and keep the full [CACHE_MS].
+     */
+    const val PUBLIC_CACHE_MS: Long = 15_000L
+
     const val MAX_HOSTS: Int = 256
 
     /**
