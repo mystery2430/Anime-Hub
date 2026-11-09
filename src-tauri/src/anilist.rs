@@ -642,6 +642,34 @@ pub fn unwrap_gql<T>(resp: GqlResponse<T>) -> AppResult<T> {
     }
 }
 
+/// Hard cap on GraphQL response bodies. AniList answers are tiny; the cap
+/// turns a confused or hostile upstream into a refusal instead of an
+/// unbounded read, keyed on the declared length and re-checked against the
+/// real byte count.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Deserialize a response body after the size cap above.
+async fn read_capped_json<T>(resp: reqwest::Response) -> AppResult<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_RESPONSE_BYTES {
+            return Err(AppError::AniList(
+                "AniList yanıtı beklenenden büyük.".into(),
+            ));
+        }
+    }
+    let body = resp.bytes().await?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(AppError::AniList(
+            "AniList yanıtı beklenenden büyük.".into(),
+        ));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| AppError::AniList("AniList yanıtı biçimlenemedi.".into()))
+}
+
 // ---------------------------------------------------------------------------
 // Queries (kept as constants so they are trivially auditable)
 // ---------------------------------------------------------------------------
@@ -897,7 +925,7 @@ impl AniListClient {
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(AppError::Unauthorized);
         }
-        let env: GqlResponse<T> = resp.json().await?;
+        let env: GqlResponse<T> = read_capped_json(resp).await?;
         unwrap_gql(env)
     }
 
