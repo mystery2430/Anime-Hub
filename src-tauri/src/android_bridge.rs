@@ -800,7 +800,7 @@ mod tests {
         assert_eq!(other.code(), "other");
         assert_eq!(
             other.to_string(),
-            "Beklenmeyen hata: Android site profile operation failed"
+            "Beklenmeyen hata: site profili işlemi başarısız"
         );
         assert!(!other.to_string().contains("private.example"));
         assert!(!other.to_string().contains("secret"));

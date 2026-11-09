@@ -3870,7 +3870,7 @@ mod tests {
             .expect_err("a close for a different opening must be refused");
         assert!(matches!(
             refused,
-            AppError::Other(ref message) if message.contains("session changed")
+            AppError::Other(ref message) if message.contains("oturumu değişti")
         ));
 
         // The refusal is not a teardown: the live session is still recorded.
@@ -4842,7 +4842,7 @@ mod tests {
         assert!(matches!(err, AppError::Other(_)), "{err:?}");
         assert!(
             err.to_string()
-                .contains("site migration state could not be stored; site was not opened"),
+                .contains("site geçiş durumu kaydedilemedi; site açılmadı"),
             "error must report the safe migration-state persistence failure: {err}"
         );
         // The view was NEVER built: phase 1 ran, phase 2 did not. In

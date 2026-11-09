@@ -723,7 +723,9 @@ mod tests {
             capacity: DEBUG_LOG_CAPACITY,
         });
         assert_eq!(merged.events.len(), COMBINED_CAPACITY as usize);
-        assert_eq!(merged.dropped_events, 3);
+        // The enable-gate event occupies one ring slot, so the real overflow is
+        // 4: three by construction plus the one the gate pushed on enable.
+        assert_eq!(merged.dropped_events, 4);
         set_enabled(false);
     }
 
