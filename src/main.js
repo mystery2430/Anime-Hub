@@ -1085,9 +1085,10 @@ function wireSettings() {
     }
   });
 
-  // Only keys the user actually touched are re-sent: the backend keeps the
-  // stored value for a blank sub-field, so untouched fields cannot look
-  // accidentally-wiped (each visit re-loads the inputs empty).
+  // Touch gate: saving with nothing touched sends no patch at all (the old
+  // behaviour re-affirmed an invisible no-op save); any edit sends the whole
+  // object — the untouched fields carry their preloaded stored values, and a
+  // blank secret keeps the stored one (M-11, no clearing sentinel).
   const anilistTouched = new Set();
   const anilistFields = [
     [el.settings.anilistId, "clientId"],
@@ -1102,6 +1103,7 @@ function wireSettings() {
       anilistFields.map(([node, key]) => [key, node.value]),
       anilistTouched,
     );
+    if (!Object.keys(patch).length) return;
     saveSettings(patch, "AniList ayarları kaydedildi.").then(refreshAniListStatus);
   });
 

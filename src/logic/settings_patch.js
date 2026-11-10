@@ -1,18 +1,21 @@
 /**
  * AniList ayar yaması üretimi.
  *
- * Alt alanlar boş gönderildiğinde backend kayıtlı değeri korur; alan her
- * açılışta yine boş yüklenir, dolayısıyla dokunulmamış bir anahtarın
- * yeniden gönderilmesi boş bir değer yollamak olur. Bu yüzden sadece
- * kullanıcının gerçekten dokunduğu anahtarlar gönderilir.
+ * Kayıt formu her açılışta boş yüklenmez: client id/redirect kayıtlı değerle
+ * doludur, secret boştur. Backend yamayı TÜM nesne olarak alır (eksik
+ * zorunlu alan red emer), dolayısıyla kapı şudur: hiçbir alana
+ * dokunulmadıysa `anilist` anahtarı hiç gönderilmez (anlamsız no-op kayıt
+ * olmaz); en az bir alana dokunulduysa üç alan birlikte gönderilir —
+ * dokunulmamışlar kendi önceden-load edilmiş değerlerini taşır, boş secret
+ * backend'de kayıtlı değeri korur (M-11).
  */
 
 /**
- * Build the settings patch sub-object for touched AniList fields.
+ * Build the AniList sub-object of the settings patch.
  *
- * `touched` empty → returns `{}`: the `anilist` key is omitted entirely and
- * the backend keeps every stored value. Secrets are value-preserved (never
- * trimmed); identity fields (clientId, redirectUri) are trimmed.
+ * `touched` empty → `{}`: the `anilist` key is omitted entirely. Any touch →
+ * all three entries are sent; secrets stay value-preserved (never trimmed),
+ * identity fields are trimmed.
  */
 export function buildAnilistPatch(fields, touched) {
   if (!(touched instanceof Set) || touched.size === 0) {
@@ -20,7 +23,6 @@ export function buildAnilistPatch(fields, touched) {
   }
   const anilist = {};
   for (const [key, value] of fields) {
-    if (!touched.has(key)) continue;
     anilist[key] =
       key === "clientSecret" ? value ?? "" : String(value ?? "").trim();
   }

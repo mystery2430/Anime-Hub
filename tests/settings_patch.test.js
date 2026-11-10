@@ -1,9 +1,11 @@
 /**
- * AniList settings patch (docs here, real behaviour in settings_patch.js).
+ * AniList settings patch gate.
  *
- * F1: the save button used to re-send all three AniList sub-fields on every
- * save — a field that re-loads empty would therefore send blanks for values
- * the user never touched.
+ * F1: the save button used to fire a no-op save every time it was pressed
+ * without any edit. The Rust patch type takes the WHOLE AniListConfig
+ * object (required String fields), so the gate is binary: nothing touched →
+ * no `anilist` key at all; any touch → all three fields, exactly as the
+ * pre-merge backend contract expects.
  */
 
 import test from "node:test";
@@ -15,7 +17,7 @@ test("untouched fields produce no anilist key at all", () => {
   const patch = buildAnilistPatch(
     [
       ["clientId", "abc"],
-      ["clientSecret", "s"],
+      ["clientSecret", ""],
       ["redirectUri", "r"],
     ],
     new Set(),
@@ -23,34 +25,24 @@ test("untouched fields produce no anilist key at all", () => {
   assert.deepEqual(patch, {});
 });
 
-test("only touched keys are sent, and the secret is never trimmed", () => {
+test("any touch sends the whole object: secret raw, identity trimmed", () => {
   const patch = buildAnilistPatch(
     [
       ["clientId", " abc "],
       ["clientSecret", "  sp  "],
-      ["redirectUri", "u "],
+      ["redirectUri", "https://ex.example/cb "],
     ],
     new Set(["clientSecret"]),
   );
-  assert.deepEqual(patch, { anilist: { clientSecret: "  sp  " } });
-});
-
-test("touched identity fields are trimmed and coexist in one patch", () => {
-  const patch = buildAnilistPatch(
-    [
-      ["clientId", " abc "],
-      ["redirectUri", "https://ex.example/cb "],
-    ],
-    new Set(["clientId", "redirectUri"]),
-  );
   assert.deepEqual(patch, {
-    anilist: { clientId: "abc", redirectUri: "https://ex.example/cb" },
+    anilist: {
+      clientId: "abc",
+      clientSecret: "  sp  ",
+      redirectUri: "https://ex.example/cb",
+    },
   });
 });
 
 test("a non-Set touched argument yields nothing (defensive)", () => {
-  assert.deepEqual(
-    buildAnilistPatch([["clientId", "abc"]], undefined),
-    {},
-  );
+  assert.deepEqual(buildAnilistPatch([["clientId", "abc"]], undefined), {});
 });
