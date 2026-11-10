@@ -685,7 +685,7 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     replyProxy: JavaScriptReplyProxy,
   ) {
     if (!isMainFrame) return
-    if (!isAllowedOrigin(sourceOrigin)) return
+    if (!isAllowedOrigin(view.url, sourceOrigin)) return
     val body = message.data ?: return
     val url = view.url ?: "about:blank"
     // onPostMessage runs on the UI thread. Rust runs blocking commands inline, and
@@ -705,18 +705,34 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
     }
   }
 
-  private fun isAllowedOrigin(origin: Uri): Boolean {
+  private fun isAllowedOrigin(viewUrl: String?, origin: Uri): Boolean {
     val scheme = origin.scheme?.lowercase() ?: return false
     if (scheme != "http" && scheme != "https") return false
     val host = origin.host?.lowercase() ?: return false
-    if (host != "tauri.localhost") return false
-    if (origin.port != -1) return false
     // Origin must be bare: no path, query, fragment or userInfo beyond "/".
     val path = origin.path
     if (!path.isNullOrEmpty() && path != "/") return false
     if (!origin.query.isNullOrEmpty() || !origin.fragment.isNullOrEmpty()) return false
     if (!origin.userInfo.isNullOrEmpty()) return false
-    return true
+    // The launcher document's own origin is the trust anchor: wherever the
+    // app is served from (release scheme or the dev server), an origin-equal
+    // source may post. Anything else must be a listed rule.
+    val view = viewUrl?.let { Uri.parse(it) } ?: return false
+    val viewScheme = view.scheme?.lowercase() ?: return false
+    val viewHost = view.host?.lowercase() ?: return false
+    if (scheme == viewScheme && host == viewHost &&
+      effectivePort(origin, scheme) == effectivePort(view, viewScheme)
+    ) {
+      return true
+    }
+    val originRule = "$scheme://$host" + if (origin.port == -1) "" else ":${origin.port}"
+    return ORIGINS.contains(originRule)
+  }
+
+  /** A missing port means the scheme's default port (http 80, https 443). */
+  private fun effectivePort(uri: Uri, scheme: String): Int {
+    if (uri.port != -1) return uri.port
+    return if (scheme == "https") 443 else 80
   }
 
   companion object {
@@ -725,6 +741,12 @@ class LauncherIpc(private val webViewId: String) : WebViewCompat.WebMessageListe
       Thread(runnable, "AnimeHubLauncherIpc").apply { isDaemon = true }
     }
     const val OBJECT_NAME = "ipc"
-    val ORIGINS: Set<String> = setOf("http://tauri.localhost", "https://tauri.localhost")
+    val ORIGINS: Set<String> = setOf(
+      "http://tauri.localhost",
+      "https://tauri.localhost",
+      // Dev listener only: `tauri dev` serves the launcher from Vite on 1420.
+      // In release nothing runs on that origin, so the rule is inert there.
+      "http://localhost:1420",
+    )
   }
 }
