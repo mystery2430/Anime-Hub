@@ -734,8 +734,16 @@ test("Android IPC is limited to the launcher origins and main frame, never a sit
   const remove = kt.indexOf("removeJavascriptInterface(LauncherIpc");
   const add = kt.indexOf("WebViewCompat.addWebMessageListener(");
   assert.ok(remove > 0 && add > remove, "remove must run before addWebMessageListener");
-  // Only the launcher origins may receive the object.
-  assert.match(kt, /setOf\("http:\/\/tauri\.localhost", "https:\/\/tauri\.localhost"\)/);
+  // Keyed origin rules receive the object: the launcher scheme always, the
+  // Vite dev origin only for `tauri dev` (nothing serves it in release).
+  assert.match(kt, /val ORIGINS: Set<String> = setOf\(/);
+  assert.match(kt, /"http:\/\/tauri\.localhost",/);
+  assert.match(kt, /"https:\/\/tauri\.localhost",/);
+  assert.match(kt, /"http:\/\/localhost:1420",/);
+  // Runtime gate: the trust anchor is the launcher document's own origin
+  // (wherever the app is served from), then the static rules above.
+  assert.match(kt, /private fun isAllowedOrigin\(viewUrl: String\?, origin: Uri\)/);
+  assert.match(kt, /if \(!isAllowedOrigin\(view\.url, sourceOrigin\)\) return/);
   // Main-frame guard on the message path.
   assert.match(kt, /if \(!isMainFrame\) return/);
   // The object is removed on every path, before any early return, so an
