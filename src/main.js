@@ -1104,7 +1104,13 @@ function wireSettings() {
       anilistTouched,
     );
     if (!Object.keys(patch).length) return;
-    saveSettings(patch, "AniList ayarları kaydedildi.").then(refreshAniListStatus);
+    saveSettings(patch, "AniList ayarları kaydedildi.").then(() => {
+      // Stored values now match the fields: a later untouched save is a
+      // no-op again. Cleared only on success — a failed save keeps the set
+      // so the retry still sends the whole form.
+      anilistTouched.clear();
+      return refreshAniListStatus();
+    });
   });
 
   el.btnAnilistLogin.addEventListener("click", async () => {
