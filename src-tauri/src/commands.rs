@@ -586,7 +586,9 @@ pub async fn remove_site(
                     cur.as_ref().is_some_and(|c| c.site_id == id)
                 };
                 if should_close {
-                    crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
+                    // Hiding keeps the profile: flush pending cookie writes
+                    // before the view dies so an unhide cannot lose them.
+                    crate::web::windows::close_site_window_for_clear_locked(&app, &id, true)?;
                 }
                 let mut reg = state
                     .registry
@@ -610,7 +612,7 @@ pub async fn remove_site(
                 cur.as_ref().is_some_and(|c| c.site_id == id)
             };
             if should_close {
-                crate::web::windows::close_site_window_for_clear_locked(&app, &id)?;
+                crate::web::windows::close_site_window_for_clear_locked(&app, &id, false)?;
             }
             // Android: the site's data lives in its WebView profile. Delete the
             // profile *before* the registry mutation so a failure keeps the tile
@@ -961,7 +963,7 @@ pub async fn clear_site_data(app: AppHandle, id: Option<String>) -> AppResult<u3
             if clear_live {
                 if let Some(active) = current_snapshot {
                     crate::web::windows::close_site_window_for_clear_locked(
-                        &app, &active.site_id,
+                        &app, &active.site_id, false,
                     )?;
                 }
                 // No `else`: with no active site view there is no shared jar to

@@ -3720,13 +3720,19 @@ pub fn close_site_window_for_clear(app: &AppHandle, label: &str) -> AppResult<()
 /// Checks that `site_id` is still the current site before closing, so a
 /// concurrent site switch does not close the wrong session.
 ///
-/// Android destroys the site WebView with `flush=false`: its data is about
-/// to be cleared or deleted, so re-persisting cookie writes first would only
-/// give the deletion a chance to lose the race. The launcher WebView is
+/// `flush` picks the destroy semantics: a wipe caller (`false`) is about to
+/// clear or delete the profile right after, so re-persisting cookie writes
+/// first would only give the deletion a chance to lose the race. A caller
+/// that KEEPS the profile (hiding a built-in site) passes `true` so pending
+/// cookie writes are flushed before the view dies. The launcher WebView is
 /// untouched (its data is the default profile and is never part of a site
 /// wipe).
 #[cfg(target_os = "android")]
-pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> AppResult<()> {
+pub fn close_site_window_for_clear_locked(
+    app: &AppHandle,
+    site_id: &str,
+    flush: bool,
+) -> AppResult<()> {
     let current = {
         let state = app.state::<AppState>();
         let value = lock_recover(&state.current_site).clone();
@@ -3742,8 +3748,8 @@ pub fn close_site_window_for_clear_locked(app: &AppHandle, site_id: &str) -> App
         return Ok(());
     };
 
-    // Destroy without flushing — the caller wipes right after.
-    crate::android_bridge::site_close(false)?;
+    // Destroy — the caller picked whether pending cookie writes are flushed.
+    crate::android_bridge::site_close(flush)?;
 
     let closed = {
         let state = app.state::<AppState>();
