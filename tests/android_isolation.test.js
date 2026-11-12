@@ -1955,7 +1955,8 @@ test("docs describe the profile architecture, migration and what survives", () =
   // Verification honesty: no device claim.
   assert.match(doc, /cihazda test edilmedi|not device-tested|device-test/i);
   const changelog = read("CHANGELOG.md");
-  assert.match(changelog, /Unreleased/i);
+  // Everything since 0.3.4 ships under the [0.3.5] heading.
+  assert.match(changelog, /\[0\.3\.5\]/);
   assert.match(changelog, /profil/i);
 });
 

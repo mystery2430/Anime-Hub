@@ -1,4 +1,8 @@
-## [Unreleased] — PR #27 review follow-ups
+# Changelog
+
+Notable user-facing changes are recorded here. Production assets are built and checked before the matching tag and public release are created.
+
+## [0.3.5] — 2026-11-12
 
 ### Security
 
@@ -22,12 +26,6 @@
 - All external GitHub Actions pinned to commit SHAs with a test guard.
 - `android_prepare.py` validates unique Gradle pins; CI verifies the resolved
   dependency graph.
-
-# Changelog
-
-Notable user-facing changes are recorded here. Production assets are built and checked before the matching tag and public release are created.
-
-## [Unreleased]
 
 ### Real per-site WebView profiles on Android
 

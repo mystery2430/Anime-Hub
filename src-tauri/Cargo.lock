@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "animehub"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "aes-gcm",
  "animehub-android",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "animehub-android"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "log",
  "serde",
