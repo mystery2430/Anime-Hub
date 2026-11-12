@@ -30,13 +30,6 @@ export function attributeFor(theme) {
   return t === "system" ? null : t;
 }
 
-/** Effective rendering scheme for a preference. Pure; media arrives mocked in tests. */
-export function resolveTheme(theme, prefersDark) {
-  const t = normalizeTheme(theme);
-  if (t === "system") return prefersDark ? "dark" : "light";
-  return t;
-}
-
 /** Human-readable label for the three-switch control. */
 export function themeLabel(theme) {
   switch (normalizeTheme(theme)) {

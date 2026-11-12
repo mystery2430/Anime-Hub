@@ -26,7 +26,6 @@ pub trait SecretProvider: Send + Sync {
     fn put_secret(&self, name: &str, plaintext: &[u8]) -> AppResult<()>;
     fn get_secret(&self, name: &str) -> AppResult<Option<Zeroizing<Vec<u8>>>>;
     fn delete_secret(&self, name: &str) -> AppResult<()>;
-    fn wipe_secrets(&self) -> AppResult<usize>;
     fn delete_site_session(&self, site_id: &str) -> AppResult<()>;
 
     // -- provided JSON helpers -------------------------------------------
@@ -105,10 +104,6 @@ impl SecretProvider for store::SecureStore {
         self.delete_secret(name)
     }
 
-    fn wipe_secrets(&self) -> AppResult<usize> {
-        self.wipe_secrets()
-    }
-
     fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
         store::SecureStore::delete_site_session(self, site_id)
     }
@@ -164,7 +159,7 @@ impl AndroidStore {
             // as corrupt rather than as \"no key yet\" so we do not silently
             // replace a key that sealed existing data.
             if wrapped.trim().is_empty() {
-                let has_data = Self::sealed_data_present(dir)?;
+                let has_data = sealed_data_present(dir)?;
                 if has_data {
                     return Err(crate::error::AppError::Keyring(
                         "sarmalanmış anahtar dosyası bozuk; yeni anahtar oluşturulmadı, veriler açılmadı.".into(),
@@ -179,7 +174,7 @@ impl AndroidStore {
                         return Ok(k);
                     }
                     Ok(_) => {
-                        let has_data = Self::sealed_data_present(dir)?;
+                        let has_data = sealed_data_present(dir)?;
                         if has_data {
                             return Err(crate::error::AppError::Keyring(
                                 "sarmalanmış anahtar beklenmeyen uzunlukta; yeni anahtar oluşturulmadı, veriler açılmadı.".into(),
@@ -193,7 +188,7 @@ impl AndroidStore {
                         // Keystore failures (locked, missing alias, etc.) must
                         // not silently create a second key that would orphan
                         // the existing encrypted documents.
-                        let has_data = Self::sealed_data_present(dir)?;
+                        let has_data = sealed_data_present(dir)?;
                         if has_data {
                             return Err(crate::error::AppError::Keyring(format!(
                                 "sarmalanmış anahtar açılamadı; yeni anahtar oluşturulmadı: {e}"
@@ -207,46 +202,9 @@ impl AndroidStore {
             }
         }
 
-        let key = crypto::generate_key();
-        let wrapped = crate::android_bridge::keystore_seal(Self::KEY_PURPOSE, &key)?;
-        // The outer `STORE_LOCK` is already held, so this write is atomic
-        // and durable without re-locking.
-        {
-            use std::io::Write as _;
-            let unique = {
-                use rand::RngCore as _;
-                let mut b = [0u8; 8];
-                rand::thread_rng().fill_bytes(&mut b);
-                format!("{}-{}", std::process::id(), hex::encode(b))
-            };
-            let tmp = path.with_extension(format!("tmp.{unique}"));
-            {
-                let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(wrapped.as_bytes())?;
-                f.sync_all()?;
-            }
-            std::fs::rename(&tmp, &path)?;
-            if let Ok(dir_file) = std::fs::File::open(dir) {
-                let _ = dir_file.sync_all();
-            }
-            let _ = std::fs::remove_file(&tmp);
-        }
-        Ok(key)
-    }
-
-    fn sealed_data_present(dir: &std::path::Path) -> AppResult<bool> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries {
-            let name = entry?.file_name().to_string_lossy().to_string();
-            if name.ends_with(".bin") {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        create_key_guarded(dir, &path, |key| {
+            crate::android_bridge::keystore_seal(Self::KEY_PURPOSE, key)
+        })
     }
 
     fn aad(name: &str) -> Vec<u8> {
@@ -276,28 +234,13 @@ impl AndroidStore {
         let _guard = crate::secure::store::STORE_LOCK
             .lock()
             .map_err(|_| crate::error::AppError::Storage("kilit alınamadı".into()))?;
-        std::fs::create_dir_all(&self.dir)?;
         let envelope = self.sealer_for(file_name).seal(plaintext, aad)?;
         let wrapped = crate::android_bridge::keystore_seal(file_name, &envelope)?;
         let target = self.path_for(file_name);
-        let unique = {
-            use rand::RngCore as _;
-            let mut b = [0u8; 8];
-            rand::thread_rng().fill_bytes(&mut b);
-            format!("{}-{}", std::process::id(), hex::encode(b))
-        };
-        let tmp = target.with_extension(format!("tmp.{unique}"));
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(wrapped.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &target)?;
-        if let Ok(dir_file) = std::fs::File::open(&self.dir) {
-            let _ = dir_file.sync_all();
-        }
-        let _ = std::fs::remove_file(&tmp);
+        // The same temp+rename scheme as the store (dirs created, dir
+        // fsynced, temp cleaned on the error legs), reusing the shared
+        // helper under the STORE_LOCK this call already holds.
+        crate::secure::store::atomic_write_locked(&target, wrapped.as_bytes())?;
         Ok(())
     }
 
@@ -354,26 +297,15 @@ impl SecretProvider for AndroidStore {
         }
     }
 
-    fn wipe_secrets(&self) -> AppResult<usize> {
-        let _guard = crate::secure::store::STORE_LOCK
-            .lock()
-            .map_err(|_| crate::error::AppError::Storage("kilit alınamadı".into()))?;
-        let mut n = 0;
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("secret.") {
-                std::fs::remove_file(entry.path())?;
-                n += 1;
-            }
-        }
-        Ok(n)
-    }
-
     fn delete_site_session(&self, site_id: &str) -> AppResult<()> {
         let _guard = crate::secure::store::STORE_LOCK
             .lock()
             .map_err(|_| crate::error::AppError::Storage("kilit alınamadı".into()))?;
-        for kind in ["cookies", "localstorage", "indexeddb"] {
+        // Keep the kind list in step with `SecureStore::delete_site_session`:
+        // legacy blobs plus the profile-migration flag; the generation
+        // counter (`profilegen-*`) intentionally survives so a stale registry
+        // can never re-open an already-deleted profile name.
+        for kind in ["cookies", "localstorage", "indexeddb", "profilemig"] {
             let name = format!("{kind}-{site_id}");
             let path = self.path_for(&store::secret_file_name(&name));
             match std::fs::remove_file(&path) {
@@ -383,5 +315,87 @@ impl SecretProvider for AndroidStore {
             }
         }
         Ok(())
+    }
+}
+
+/// Create and persist a fresh wrapped key, refusing when sealed documents
+/// would be orphaned by the new key.
+///
+/// Split out of `AndroidStore` so the missing-key guard is testable on a
+/// host; production passes the Android Keystore seal function. The caller
+/// holds `STORE_LOCK` for the check+create.
+#[cfg(any(target_os = "android", test))]
+fn create_key_guarded<F>(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    seal: F,
+) -> AppResult<[u8; 32]>
+where
+    F: FnOnce(&[u8; 32]) -> AppResult<String>,
+{
+    if sealed_data_present(dir)? {
+        return Err(crate::error::AppError::Keyring(
+            "sarmalanmış anahtar dosyası yok; şifreli veriler mevcut, yeni anahtar oluşturulmadı ve veriler açılmadı.".into(),
+        ));
+    }
+    let key = crypto::generate_key();
+    let wrapped = seal(&key)?;
+    // The shared store write (temp+rename+dir fsync+error cleanup); the
+    // caller keeps holding `STORE_LOCK`, so check+create stays atomic.
+    crate::secure::store::atomic_write_locked(path, wrapped.as_bytes())?;
+    Ok(key)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn sealed_data_present(dir: &std::path::Path) -> AppResult<bool> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let name = entry?.file_name().to_string_lossy().to_string();
+        if name.ends_with(".bin") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod android_key_guard_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        use rand::RngCore as _;
+        let mut b = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut b);
+        let dir = std::env::temp_dir().join(format!(
+            "animehub-key-guard-{tag}-{}-{}",
+            std::process::id(),
+            hex::encode(b)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_key_with_sealed_data_is_refused() {
+        let dir = temp_dir("sealed");
+        std::fs::write(dir.join("secret.test.bin"), b"sealed").unwrap();
+        let path = dir.join("animehub.key.wrapped");
+        let err = create_key_guarded(&dir, &path, |_| panic!("must not seal")).unwrap_err();
+        assert!(matches!(err, crate::error::AppError::Keyring(_)));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_key_without_sealed_data_creates_one() {
+        let dir = temp_dir("empty");
+        let path = dir.join("animehub.key.wrapped");
+        let key = create_key_guarded(&dir, &path, |k| Ok(hex::encode(k))).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), hex::encode(key));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

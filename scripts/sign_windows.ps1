@@ -18,9 +18,14 @@
 #                            forwarded in the workflow env block.
 #   2. WINDOWS_CERTIFICATE - base64-encoded .pfx plus
 #                            WINDOWS_CERTIFICATE_PASSWORD, signed with
-#                            signtool. Only works when the certificate private
-#                            key is exportable; post-2023 CA/B hardware-token
-#                            certificates usually need mode 1 instead.
+#                            signtool. The PFX is imported into the scoped
+#                            Cert:\CurrentUser\My store (the password is used
+#                            in-process by Import-PfxCertificate, never passed
+#                            on the command line) and signtool references it
+#                            by thumbprint. Only works when the certificate
+#                            private key is exportable; post-2023 CA/B
+#                            hardware-token certificates usually need mode 1
+#                            instead.
 #
 # Timestamping always uses WINDOWS_TIMESTAMP_URL (RFC 3161, default DigiCert)
 # so signatures stay valid after the certificate expires.
@@ -38,6 +43,13 @@ $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path -LiteralPath $FilePath)) {
     throw "sign target does not exist: $FilePath"
+}
+
+# Resolve the target once, here: everything below (signtool, the validity
+# checks) uses an absolute path and no longer depends on the bundler's
+# process working directory for a relative %1 argument.
+if (-not [System.IO.Path]::IsPathRooted($FilePath)) {
+    $FilePath = (Resolve-Path -LiteralPath $FilePath).Path
 }
 
 $TimestampUrl = if ($env:WINDOWS_TIMESTAMP_URL) { $env:WINDOWS_TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
@@ -93,20 +105,30 @@ function Invoke-CustomSign([string]$Target) {
 function Invoke-PfxSign([string]$Target) {
     $signtool = Find-SignTool
     $pfxPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('animehub-sign-' + [Guid]::NewGuid().ToString('N') + '.pfx')
+    $cert = $null
     try {
         $bytes = [System.Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
         [System.IO.File]::WriteAllBytes($pfxPath, $bytes)
-        $signArgs = @('sign', '/fd', 'SHA256', '/tr', $TimestampUrl, '/td', 'SHA256', '/d', 'AnimeHub', '/f', $pfxPath)
-        if ($env:WINDOWS_CERTIFICATE_PASSWORD) {
-            $signArgs += @('/p', $env:WINDOWS_CERTIFICATE_PASSWORD)
+        # The password is consumed in-process by Import-PfxCertificate and never
+        # reaches a command line: signtool then picks the certificate up from
+        # the store by thumbprint, with no /f and no /p on argv.
+        $cert = if ($env:WINDOWS_CERTIFICATE_PASSWORD) {
+            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation 'Cert:\CurrentUser\My' `
+                -Password (ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force)
+        } else {
+            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation 'Cert:\CurrentUser\My'
         }
-        $signArgs += @($Target)
-        Write-Host "[sign_windows] signtool sign for $Target"
+        $signArgs = @('sign', '/fd', 'SHA256', '/tr', $TimestampUrl, '/td', 'SHA256', '/d', 'AnimeHub', '/sha1', $cert.Thumbprint, $Target)
+        Write-Host "[sign_windows] signtool sign for $Target (certificate from Cert:\CurrentUser\My)"
         & $signtool @signArgs
         if ($LASTEXITCODE -ne 0) {
             throw "signtool failed with exit code $LASTEXITCODE"
         }
     } finally {
+        if ($cert) {
+            # Leave nothing in the store between two sign targets.
+            Remove-Item -LiteralPath $cert.PSPath -Force -ErrorAction SilentlyContinue
+        }
         if (Test-Path -LiteralPath $pfxPath) {
             Remove-Item -LiteralPath $pfxPath -Force
         }

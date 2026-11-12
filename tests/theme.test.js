@@ -10,7 +10,6 @@ import {
   THEME_CACHE_KEY,
   normalizeTheme,
   attributeFor,
-  resolveTheme,
   themeLabel,
   applyThemeToDom,
 } from "../src/logic/theme.js";
@@ -32,13 +31,6 @@ test("system is represented by removing data-theme so the media query drives", (
   // Removing the attribute (not a "system" value) is what lets a live OS
   // change reach the CSS without any listener.
   assert.ok(!THEMES.includes(""));
-});
-
-test("resolveTheme delegates system to the media result", () => {
-  assert.equal(resolveTheme("system", true), "dark");
-  assert.equal(resolveTheme("system", false), "light");
-  assert.equal(resolveTheme("dark", false), "dark", "explicit dark wins over light OS");
-  assert.equal(resolveTheme("light", true), "light", "explicit light wins over dark OS");
 });
 
 test("themeLabel covers the three preferences in Turkish", () => {

@@ -145,11 +145,28 @@ export async function stub(cmd, args) {
   switch (cmd) {
     case "list_sites":
       return stubState.sites.filter((s) => !s.hidden);
+    case "list_hidden_sites":
+      return stubState.sites.filter((s) => s.hidden);
+    case "set_site_hidden": {
+      const target = stubState.sites.find((s) => s.id === args.id);
+      if (!target) throw new ApiError("site_not_found", "Site bulunamadı.");
+      target.hidden = Boolean(args.hidden);
+      return null;
+    }
     case "add_site":
       return stubState.sites.push(makeStubSite(args.draft)) && stubState.sites.at(-1);
-    case "remove_site":
+    case "remove_site": {
+      // Mirrors the Rust rule: a built-in is HIDDEN, never deleted, so the
+      // browser-mode stub cannot lose a shipped tile either.
+      const target = stubState.sites.find((s) => s.id === args.id);
+      if (!target) return null;
+      if (target.builtin) {
+        target.hidden = true;
+        return { profile: "hidden" };
+      }
       stubState.sites = stubState.sites.filter((s) => s.id !== args.id);
-      return null;
+      return { profile: "deleted" };
+    }
     case "get_settings":
       return stubState.settings;
     case "update_settings":

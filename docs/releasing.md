@@ -1,4 +1,10 @@
-# Production release procedure (v0.3.3)
+# Production release procedure
+
+Version-agnostic: substitute the target version wherever `vX.Y.Z` appears.
+**Last executed:** v0.3.4 (published; eight assets, seven installers plus
+`SHA256SUMS`). The asset counts live in `publish-release.yml` and are the
+authority — this document does not pin them, so it cannot drift the way a
+version-frozen runbook does.
 
 1. Update npm/Tauri/Rust versions and both lockfiles together. Preserve old tags.
 2. Run `npm ci`, `npm test`, `npm run build`, `npm audit` locally.
@@ -17,10 +23,12 @@
 7. The publish job downloads only production artifacts from its own run, checks
    an exact seven-installer allowlist, and generates `SHA256SUMS`. It creates a
    draft at the verified SHA, checks the eight assets, then publishes latest,
-   non-prerelease. The CI debug APK cannot pass the allowlist. Existing v0.3.3
-   tags are skipped, never overwritten. This pipeline is scoped to v0.3.3.
+   non-prerelease. The CI debug APK cannot pass the allowlist. An existing
+   `vX.Y.Z` tag is skipped, never overwritten, and the publish job is scoped to
+   that one version: nothing in the pipeline republishes an older release.
 8. Verify public metadata, assets and tag target; report CI/build URLs and risks.
-   Preserve v0.3.2. If draft upload fails, inspect manually; do not overwrite tags.
+   Preserve every earlier tag. If draft upload fails, inspect manually; do not
+   overwrite tags.
 
 The Actions-based publisher avoids downloading artifacts through this sandbox,
 which cannot reach GitHub's external artifact storage. Workflow dispatch also
@@ -29,11 +37,21 @@ a maintainer. Publication runs only on successful main CI, never on PR code.
 
 ## Required release disclosures
 
-No physical Android test was performed for v0.3.3. Compile/test success does not
-prove PiP, IPC, navigation, persistence or performance on a device. Android
-provider-to-provider same-origin localStorage/IndexedDB isolation is **not
-guaranteed**; best-effort transfer is not a security boundary or lossless backup.
-Android navigation lacks blocklist/DNS-rebinding/subframe/app-load coverage.
+No physical Android test was performed for v0.3.3 or the per-site-profile
+change that followed it. Compile/test success does not prove PiP, IPC,
+navigation, persistence or performance on a device, including the releases
+after it. Android isolation now runs
+on per-site WebView profiles (`WebViewFeature.MULTI_PROFILE`, runtime-checked;
+unsupported providers refuse the open — see
+`docs/android-storage-isolation.md` for what migrates and what a device must
+still verify: A-write/B-absent at the same origin, cookie non-mixing,
+clear/delete leaving the launcher untouched, back/PiP ladders). Android
+navigation covers the scheme and host rules for top-level navigations AND for
+sub-resources/subframes (`shouldInterceptRequest`), but still has no DNS check
+(a hostname resolving to a private address is not caught) and does not enforce
+the user blocklist; `WebView.loadUrl` calls made by the app itself bypass the
+guard (Rust validates the first URL). See `docs/android-storage-isolation.md`
+for the full top-level/sub-resource matrix.
 Windows packages remain unsigned without signing credentials. Real Linux Secret
 Service behavior still needs manual validation. Cargo advisory warnings, if any,
 must be reported separately from a successful audit exit status.

@@ -16,18 +16,45 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-import { createFakeDom, add, addDiv, addIframe, addVideo, place } from "./helpers/fake_dom.js";
+import {
+  createFakeDom,
+  add,
+  addDiv,
+  addIframe,
+  addVideo,
+  place,
+  asSubframe,
+  asOpaqueFrame,
+} from "./helpers/fake_dom.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CONTROLLER_PATH = join(ROOT, "src-tauri", "src", "web", "pip_controller.js");
 const CONTROLLER_SRC = readFileSync(CONTROLLER_PATH, "utf8");
+const WEBRTC_GUARD_PATH = join(ROOT, "src-tauri", "src", "web", "webrtc_guard.js");
+const WEBRTC_GUARD_SRC = readFileSync(WEBRTC_GUARD_PATH, "utf8");
+
+/** Run shipped JavaScript in one frame and return the same dom object. */
+function runSource(dom, source, filename) {
+  const sandbox = { window: dom.window, document: dom.document, console };
+  vm.createContext(sandbox);
+  new vm.Script(source, { filename }).runInContext(sandbox);
+  return dom;
+}
+
+/** Run the shipped controller in a frame and return the same dom object. */
+function runController(dom) {
+  return runSource(dom, CONTROLLER_SRC, "pip_controller.js");
+}
+
+/** Run the shipped WebRTC/WebTransport guard in a frame. */
+function runWebRtcGuard(dom) {
+  return runSource(dom, WEBRTC_GUARD_SRC, "webrtc_guard.js");
+}
 
 // Phone-like defaults: a 360x800 CSS viewport at devicePixelRatio 3.
 function phone(extra = {}) {
   const dom = createFakeDom({ width: 360, height: 800, devicePixelRatio: 3, ...extra });
-  const sandbox = { window: dom.window, document: dom.document, console };
-  vm.createContext(sandbox);
-  new vm.Script(CONTROLLER_SRC, { filename: "pip_controller.js" }).runInContext(sandbox);
+  runController(dom);
   dom.prepare = () => plain(dom.window.__animehubPreparePip());
   dom.pip = (active) => dom.window.__animehubPip(active);
   return dom;
@@ -38,6 +65,124 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 
 const styleOf = (el) => el.getAttribute("style") || "";
 const hasInline = (el, prop) => styleOf(el).includes(`${prop}:`);
+
+// 0 - frame scope (AH-P2) --------------------------------------------------
+//
+// Android registers the injected script with
+// `WebViewCompat.addDocumentStartJavaScript(webView, initScript, setOf("*"))`,
+// so it runs in EVERY frame of EVERY origin. The origin rule set cannot
+// honestly be narrowed: the players these sites embed and the ad frames that
+// call `window.open` are third-party origins, and the API has no "top frame
+// only" rule. What is narrowed instead is what a subframe gets: the PiP
+// controller returns early unless it is the top frame, because the native side
+// only ever calls it through `WebView.evaluateJavascript` (main frame) and a
+// copy inside a third-party frame would do nothing but advertise
+// `window.__animehubPip*` to that origin. The popup guard and the cosmetic
+// rules deliberately stay frame-agnostic - see tests/init_script.test.js.
+
+const PIP_GLOBALS = [
+  "__animehubPreparePip",
+  "__animehubPip",
+  "__animehubPipReport",
+  "__animehubPipPlayback",
+  "__animehubPipVersion",
+];
+
+test("a cross-origin subframe installs none of the PiP entry points", () => {
+  const sub = asSubframe(createFakeDom({ width: 360, height: 800, devicePixelRatio: 3 }));
+  // Even with a real, playing video in the frame: the gate is about who may
+  // call the controller, not about whether the frame looks like a player.
+  addVideo(sub.document, sub.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+
+  runController(sub);
+
+  for (const name of PIP_GLOBALS) {
+    assert.equal(sub.window[name], undefined, `a subframe must not get ${name}`);
+  }
+  // And it left the frame's document exactly as it was - no inline styles, no
+  // lifted ancestors, no fullscreen bookkeeping.
+  assert.equal(sub.document.body.getAttribute("style"), null);
+  assert.equal(sub.document.documentElement.getAttribute("style"), null);
+  assert.equal(sub.window.__animehubInstalled, undefined);
+});
+
+test("an opaque-origin frame whose window.top read throws gets nothing either", () => {
+  // A sandboxed frame can make the comparison throw. The gate fails CLOSED:
+  // do not install. PiP still works in the top document, because
+  // AnimeHubPipController embeds this same file and installs it in the main
+  // frame on demand before entering PiP.
+  const opaque = asOpaqueFrame(createFakeDom({ width: 360, height: 800, devicePixelRatio: 3 }));
+  addVideo(opaque.document, opaque.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+
+  runController(opaque); // must not propagate the SecurityError
+
+  for (const name of PIP_GLOBALS) {
+    assert.equal(opaque.window[name], undefined, `an opaque frame must not get ${name}`);
+  }
+  assert.equal(opaque.document.body.getAttribute("style"), null);
+});
+
+test("the top frame installs the controller and still prepares a player", () => {
+  // createFakeDom models a top-level browsing context: self === top === window.
+  const dom = createFakeDom({ width: 360, height: 800, devicePixelRatio: 3 });
+  assert.equal(dom.window.self, dom.window.top);
+  addVideo(dom.document, dom.document.body, { rect: { x: 0, y: 80, width: 360, height: 203 } });
+
+  runController(dom);
+
+  assert.equal(typeof dom.window.__animehubPreparePip, "function", "top frame installs prepare");
+  assert.equal(dom.window.__animehubPipVersion, 2);
+  const result = plain(dom.window.__animehubPreparePip());
+  assert.equal(result.ok, true, "and the controller still works there");
+  assert.equal(result.kind, "video");
+});
+
+test("blocking WebRTC does not disable PiP or MSE media", () => {
+  // BEHAVIOUR in a fake DOM, not a device test. The guard and controller are
+  // shipped files; no real <video>, MediaSource pipeline or PiP window exists.
+  const dom = createFakeDom({ width: 360, height: 800, devicePixelRatio: 3 });
+  const video = addVideo(dom.document, dom.document.body, {
+    rect: { x: 0, y: 80, width: 360, height: 203 },
+  });
+  const NativePeerConnection = function NativePeerConnection() {};
+  const MediaSource = function MediaSource() {};
+  const SourceBuffer = function SourceBuffer() {};
+  dom.window.RTCPeerConnection = NativePeerConnection;
+  dom.window.MediaSource = MediaSource;
+  dom.window.SourceBuffer = SourceBuffer;
+
+  runWebRtcGuard(dom);
+  runController(dom);
+
+  assert.notEqual(dom.window.RTCPeerConnection, NativePeerConnection, "WebRTC is denied");
+  assert.throws(() => new dom.window.RTCPeerConnection(), (e) => e.name === "NotSupportedError");
+  assert.equal(dom.window.MediaSource, MediaSource, "MSE is not replaced");
+  assert.equal(dom.window.SourceBuffer, SourceBuffer, "SourceBuffer is not replaced");
+  assert.equal(video.paused, false, "the existing video element was not paused or replaced");
+  assert.equal(dom.window.__animehubPipVersion, 2, "PiP controller still installed");
+  const result = plain(dom.window.__animehubPreparePip());
+  assert.equal(result.ok, true, "PiP can still prepare the playing video");
+  assert.equal(result.kind, "video");
+});
+
+test("a subframe gets the WebRTC denial but never the PiP API", () => {
+  // Both guards are shipped files. The frame gate belongs to the PiP
+  // controller; the WebRTC denial deliberately applies to every frame.
+  const sub = asSubframe(createFakeDom({ width: 360, height: 800, devicePixelRatio: 3 }));
+  addVideo(sub.document, sub.document.body, { rect: { x: 0, y: 0, width: 360, height: 203 } });
+  sub.window.RTCPeerConnection = function NativePeerConnection() {};
+  sub.window.WebTransport = function NativeWebTransport() {};
+
+  runWebRtcGuard(sub);
+  runController(sub);
+
+  assert.throws(() => new sub.window.RTCPeerConnection(), (e) => e.name === "NotSupportedError");
+  assert.throws(() => new sub.window.WebTransport(), (e) => e.name === "NotSupportedError");
+  for (const name of PIP_GLOBALS) {
+    assert.equal(sub.window[name], undefined, `a subframe must not get ${name}`);
+  }
+  assert.equal(sub.document.body.getAttribute("style"), null);
+});
 
 test("installs the documented window API", () => {
   const dom = phone();

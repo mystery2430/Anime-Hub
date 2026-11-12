@@ -5,23 +5,32 @@
 //! address (the DNS-rebinding case the string policy cannot see) is therefore
 //! resolved here, on a worker thread, with a hard timeout.
 //!
-//! What this does **not** do: the WebView resolves subresources on its own
-//! stack after the top-level navigation has been allowed. A name that is
-//! public at check time and private a TTL later can still be reached by
-//! `fetch` inside the already-loaded page. Closing that requires a filtering
-//! proxy in front of the WebView, which v1 does not ship. The decision is
-//! recorded in `HANDOFF.md`.
+//! What this does **not** do alone: the WebView resolves subresources on its
+//! own stack after the top-level navigation has been allowed. A name that is
+//! public at check time and private a TTL later re-meets this check on its
+//! next navigation, and traffic the WebView tunnels through the pinning
+//! proxy (`web/pinned_proxy.rs` on desktop, `DnsPinnedProxy` on Android) is
+//! re-resolved and re-screened per connection; a load that bypasses the
+//! proxy keeps this first-look-only window. The decision is recorded in
+//! `HANDOFF.md`.
 
 use crate::sites::url_policy::{is_private_host, is_public_ip};
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-/// How long a navigation may wait on the resolver before falling back to the
-/// string policy. Long enough for a cold recursive lookup, short enough that
-/// a hung resolver cannot freeze the WebView thread indefinitely.
+/// Open-path budget: long enough for a cold recursive lookup. The open
+/// command runs this on an async worker (`spawn_blocking`), so a waiting
+/// lookup freezes no UI thread.
 const LOOKUP_TIMEOUT: Duration = Duration::from_millis(1_200);
+
+/// Navigation-guard budget: this lookup blocks the WebView's MAIN navigation
+/// thread, so the freeze window stays short. Rebinding semantics are
+/// unchanged — same shared in-flight map, same never-cache-Unknown rule; only
+/// the per-caller wait until an answer or `Unknown` shrinks
+/// (MAIN_TREE_AUDIT M-07) while the open path keeps the longer budget above.
+const NAV_LOOKUP_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// Public answers are cached briefly. A long cache would itself be a rebinding
 /// window: the second navigation would trust a stale "public" result.
@@ -31,15 +40,27 @@ const PUBLIC_TTL: Duration = Duration::from_secs(15);
 /// get a second chance by waiting out a short cache.
 const PRIVATE_TTL: Duration = Duration::from_secs(60);
 
+/// How many DNS lookups may hold a thread at the same time.
+///
+/// `ToSocketAddrs` is blocking and cannot be cancelled, so a lookup that never
+/// returns keeps its thread. A launcher navigates rarely, but a page can steer
+/// many navigations, and a resolver stuck on one name used to leave one
+/// detached thread behind *per navigation* — nothing bounded them. Four
+/// concurrent lookups is far more than a single-window launcher needs, and the
+/// bound is what makes a stuck resolver cost four threads instead of an
+/// unbounded number.
+const MAX_LOOKUP_THREADS: usize = 4;
+
 /// Result of classifying a host before a navigation or a site open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsClass {
     /// The resolver answered. `private` is true when **any** address is
     /// non-public, or when the answer was empty (no routable address to pin).
     Answered { private: bool },
-    /// Timeout, NXDOMAIN, or a resolver error. Callers must fall back to the
-    /// string policy rather than failing closed: a DNS outage must not make
-    /// every site unopenable.
+    /// Timeout, NXDOMAIN, a resolver error, or every lookup slot busy. It says
+    /// nothing about the name, so it must never be read as "public": the
+    /// desktop top-level gate refuses it ([`crate::web::session::dns_decision`],
+    /// round 21) and it is never cached.
     Unknown,
 }
 
@@ -51,11 +72,31 @@ pub fn answers_are_private(addrs: &[IpAddr]) -> bool {
     addrs.is_empty() || addrs.iter().copied().any(|ip| !is_public_ip(ip))
 }
 
-/// Classify `host` for the navigation guard.
+/// Classify `host` for the site-open gate.
 ///
 /// Literal and suffix-private hosts (`127.0.0.1`, `*.local`, …) never touch
-/// the network. Everything else is resolved with [`LOOKUP_TIMEOUT`].
+/// the network. Everything else is resolved with [`LOOKUP_TIMEOUT`]; the
+/// caller is an async worker ([`crate::commands::open_site`]'s
+/// `spawn_blocking`), not a UI thread.
 pub fn classify_host(host: &str) -> DnsClass {
+    classify_with(host, LOOKUP_TIMEOUT)
+}
+
+/// [`classify_host`] with the short navigation-thread budget.
+///
+/// The `on_navigation` guard runs synchronously on the main thread: it takes
+/// the shorter [`NAV_LOOKUP_TIMEOUT`] and relies on the shared in-flight map
+/// (a concurrent open lookup is joined, not duplicated) plus the page-load
+/// pre-warm in `web/windows.rs` to usually hit the answer cache.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub fn classify_host_nav(host: &str) -> DnsClass {
+    classify_with(host, NAV_LOOKUP_TIMEOUT)
+}
+
+/// Testable core: identical policy for both entry points, only the wait
+/// budget differs. Timed-out lookups still are not cached in either
+/// direction.
+fn classify_with(host: &str, timeout: Duration) -> DnsClass {
     let key = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if key.is_empty() {
         return DnsClass::Unknown;
@@ -67,7 +108,7 @@ pub fn classify_host(host: &str) -> DnsClass {
 
     // The string policy already knows these. Resolving them would only give
     // a rebinding attacker a timeout-shaped hole (`Unknown` falls open).
-    if is_private_host(&key) || literal_is_private(&key) {
+    if is_private_host(&key) {
         let class = DnsClass::Answered { private: true };
         cache_put(key, class, PRIVATE_TTL);
         return class;
@@ -80,10 +121,13 @@ pub fn classify_host(host: &str) -> DnsClass {
         return class;
     }
 
-    let class = lookup_with_timeout(&key);
+    let class = lookup_with(&key, timeout, MAX_LOOKUP_THREADS, resolve_ips);
     match class {
         DnsClass::Answered { private: true } => cache_put(key, class, PRIVATE_TTL),
         DnsClass::Answered { private: false } => cache_put(key, class, PUBLIC_TTL),
+        // A timeout is never cached in either direction: caching it would turn
+        // one slow answer into a permanent verdict about a host, and the next
+        // navigation has to be free to see a real answer.
         DnsClass::Unknown => {}
     }
     class
@@ -97,25 +141,117 @@ fn literal_ip(host: &str) -> Option<IpAddr> {
     bare.parse().ok()
 }
 
-fn literal_is_private(host: &str) -> bool {
-    literal_ip(host).is_some_and(|ip| !is_public_ip(ip))
+/// One in-flight lookup that callers can join, so "the same host, again" costs
+/// no extra thread.
+///
+/// The entry lives in [`in_flight`] from the moment the lookup starts until the
+/// resolver returns, **including after the caller has given up**. That is what
+/// bounds the work: a navigation that times out and retries joins the lookup
+/// that is already running instead of starting another stuck thread.
+#[derive(Default)]
+struct Pending {
+    answer: Mutex<Option<DnsClass>>,
+    done: Condvar,
 }
 
-fn lookup_with_timeout(host: &str) -> DnsClass {
-    let host = host.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    // Detach: on timeout the lookup thread exits on its own when the
-    // resolver finally returns. A launcher does not navigate often enough
-    // for a stuck resolver to pile these up, and the cache lock below
-    // serialises callers so they share one in-flight miss.
-    std::thread::spawn(move || {
-        let _ = tx.send(resolve_ips(&host));
-    });
-    match rx.recv_timeout(LOOKUP_TIMEOUT) {
-        Ok(Ok(ips)) => DnsClass::Answered {
-            private: answers_are_private(&ips),
-        },
-        Ok(Err(_)) | Err(_) => DnsClass::Unknown,
+fn in_flight() -> &'static Mutex<HashMap<String, Arc<Pending>>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashMap<String, Arc<Pending>>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // A panic in a resolver thread must not disable DNS for the process: the
+    // data behind these locks is a plain map and a plain Option.
+    let guard = mutex.lock();
+    guard.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Join the running lookup for `host`, or claim the slot to start one.
+///
+/// `None` means every lookup thread is busy: the caller gets [`DnsClass::Unknown`]
+/// immediately instead of queueing another thread. That is the same answer a
+/// timeout produces and the caller must treat it as "no answer" — since round
+/// 21 the desktop gate refuses it. Before that it was a way to *skip* the DNS
+/// check: a page only had to keep four lookups in flight.
+fn join_in_flight(host: &str, budget: usize) -> Option<(Arc<Pending>, bool)> {
+    let mut map = lock(in_flight());
+    if let Some(existing) = map.get(host) {
+        return Some((Arc::clone(existing), false));
+    }
+    if map.len() >= budget {
+        return None;
+    }
+    let entry = Arc::new(Pending::default());
+    map.insert(host.to_string(), Arc::clone(&entry));
+    Some((entry, true))
+}
+
+/// Resolve `host` with at most `budget` lookups in flight and a bounded wait.
+///
+/// Testable form: `resolve` is the only thing that touches the network, and
+/// the timeout/budget are parameters so the bounded-wait and bounded-thread
+/// behaviour can be measured without a real resolver.
+fn lookup_with<F>(host: &str, timeout: Duration, budget: usize, resolve: F) -> DnsClass
+where
+    F: Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + 'static,
+{
+    let Some((entry, owner)) = join_in_flight(host, budget) else {
+        return DnsClass::Unknown;
+    };
+    if owner {
+        let owned_host = host.to_string();
+        let for_thread = Arc::clone(&entry);
+        let spawned = std::thread::Builder::new()
+            .name("animehub-dns".into())
+            .spawn(move || {
+                let class = match resolve(owned_host.as_str()) {
+                    Ok(ips) => DnsClass::Answered {
+                        private: answers_are_private(&ips),
+                    },
+                    Err(_) => DnsClass::Unknown,
+                };
+                publish(&owned_host, &for_thread, class);
+            });
+        if spawned.is_err() {
+            // No thread available at all: publish "no answer" so joined callers
+            // wake up instead of waiting out their timeout, and free the slot.
+            publish(host, &entry, DnsClass::Unknown);
+        }
+    }
+    wait_for(&entry, timeout)
+}
+
+/// Hand the answer to everyone waiting on this lookup and free its slot.
+///
+/// The answer is delivered to waiters only. It is deliberately **not** written
+/// into the cache: a caller that already timed out must not turn a late answer
+/// into a security decision, and the next navigation resolves again.
+fn publish(host: &str, entry: &Arc<Pending>, class: DnsClass) {
+    {
+        let mut answer = lock(&entry.answer);
+        *answer = Some(class);
+    }
+    entry.done.notify_all();
+    let _ = lock(in_flight()).remove(host);
+}
+
+/// Wait for the answer, at most `timeout`; anything else is [`DnsClass::Unknown`].
+fn wait_for(entry: &Arc<Pending>, timeout: Duration) -> DnsClass {
+    let deadline = Instant::now() + timeout;
+    let mut answer = lock(&entry.answer);
+    loop {
+        if let Some(class) = *answer {
+            return class;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return DnsClass::Unknown;
+        }
+        let (guard, _) = entry
+            .done
+            .wait_timeout(answer, deadline - now)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        answer = guard;
     }
 }
 
@@ -179,6 +315,65 @@ fn cache_put(key: String, class: DnsClass, ttl: Duration) {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PUBLIC: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+    const PRIVATE: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+
+    /// A resolver call that blocks until the test opens the gate, and counts
+    /// how many times it was entered. This is what makes "a stuck lookup" and
+    /// "one lookup per host" measurable instead of anecdotal.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        cv: Condvar,
+        entered: AtomicUsize,
+    }
+
+    impl Gate {
+        fn enter(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut open = lock(&self.open);
+            while !*open {
+                open = self.cv.wait(open).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+
+        fn release(&self) {
+            *lock(&self.open) = true;
+            self.cv.notify_all();
+        }
+
+        fn entered(&self) -> usize {
+            self.entered.load(Ordering::SeqCst)
+        }
+    }
+
+    fn wait_until(condition: impl Fn() -> bool, millis: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(millis);
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        condition()
+    }
+
+    fn no_lookup(host: &str) -> bool {
+        lock(in_flight()).get(host).is_none()
+    }
+
+    /// `in_flight` and its budget are process-global, which is what production
+    /// needs and what makes these tests interfere: two of them would spend the
+    /// same budget and each would see the other's lookups. So the tests that
+    /// touch it take this lock and run one at a time (cargo runs test threads
+    /// in parallel by default).
+    static DNS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn exclusive() -> MutexGuard<'static, ()> {
+        lock(&DNS_TEST_LOCK)
+    }
 
     #[test]
     fn empty_answer_is_private() {
@@ -235,5 +430,154 @@ mod tests {
     #[test]
     fn literal_classification_is_cached() {
         assert_eq!(classify_host("1.1.1.1"), classify_host("1.1.1.1"));
+    }
+
+    #[test]
+    fn a_resolver_answer_is_classified_and_an_error_is_unknown() {
+        let _exclusive = exclusive();
+        let limit = Duration::from_millis(500);
+        let answered = lookup_with("public.test", limit, 2, |_| Ok(vec![PUBLIC]));
+        assert_eq!(answered, DnsClass::Answered { private: false });
+
+        let mixed = |_: &str| -> std::io::Result<Vec<IpAddr>> { Ok(vec![PUBLIC, PRIVATE]) };
+        let answered = lookup_with("private.test", limit, 2, mixed);
+        assert_eq!(answered, DnsClass::Answered { private: true });
+
+        let not_found = std::io::ErrorKind::NotFound;
+        let failed = lookup_with("error.test", limit, 2, move |_| {
+            Err(std::io::Error::new(not_found, "nx"))
+        });
+        assert_eq!(failed, DnsClass::Unknown);
+    }
+
+    #[test]
+    fn concurrent_callers_for_one_host_share_a_single_lookup() {
+        let _exclusive = exclusive();
+        // The old code spawned one detached thread per call, and the comment
+        // claimed the cache lock de-duplicated them. It never did: the lock is
+        // only held for the map access, not across the lookup.
+        let gate: Arc<Gate> = Arc::new(Gate::default());
+        let callers: Vec<_> = (0..6)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    let timeout = Duration::from_millis(200);
+                    lookup_with("shared.test", timeout, 4, move |_| {
+                        gate.enter();
+                        Ok(vec![PUBLIC])
+                    })
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap(), DnsClass::Unknown);
+        }
+        // Six navigations for one host must cost one lookup, not six threads.
+        // A slow runner can take a moment to schedule the resolver thread, so
+        // wait for the lookup to be entered before counting it.
+        assert!(wait_until(|| gate.entered() == 1, 2_000));
+        let entered = gate.entered();
+        assert_eq!(entered, 1);
+        gate.release();
+        assert!(wait_until(|| no_lookup("shared.test"), 2_000));
+    }
+
+    #[test]
+    fn hung_hosts_cannot_exceed_the_lookup_budget() {
+        let _exclusive = exclusive();
+        // Four distinct names whose resolver never returns must cost at most
+        // `budget` threads; everything after that is refused immediately rather
+        // than queued behind them.
+        let gate: Arc<Gate> = Arc::new(Gate::default());
+        let callers: Vec<_> = (0..8)
+            .map(|index| {
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    let host = format!("hung{index}.test");
+                    let timeout = Duration::from_millis(150);
+                    lookup_with(&host, timeout, 2, move |_| {
+                        gate.enter();
+                        Ok(vec![PUBLIC])
+                    })
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap(), DnsClass::Unknown);
+        }
+        // The budget is a thread bound, not a hint: two lookups may be inside
+        // the resolver (never more), and the other six were refused without one.
+        assert!(wait_until(|| gate.entered() == 2, 2_000));
+        let entered = gate.entered();
+        assert_eq!(entered, 2);
+
+        // Once the stuck lookups return, the slots come back: the refusal is
+        // about threads that are really alive, not about a remembered verdict.
+        gate.release();
+        let freed = || no_lookup("hung0.test") && no_lookup("hung1.test");
+        assert!(wait_until(freed, 2_000));
+        let usable = || {
+            let timeout = Duration::from_millis(300);
+            let class = lookup_with("after-release.test", timeout, 2, |_| Ok(vec![PUBLIC]));
+            class == DnsClass::Answered { private: false }
+        };
+        assert!(wait_until(usable, 2_000));
+    }
+
+    #[test]
+    fn a_timed_out_lookup_never_classifies_its_late_answer() {
+        let _exclusive = exclusive();
+        // The caller times out, THEN the resolver answers with a public address.
+        // That answer must not reach the caller (it timed out) and must not be
+        // cached: the next navigation has to resolve again.
+        let gate: Arc<Gate> = Arc::new(Gate::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first_gate = Arc::clone(&gate);
+        let first_calls = Arc::clone(&calls);
+        let first = lookup_with("late.test", Duration::from_millis(120), 4, move |_| {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            first_gate.enter();
+            Ok(vec![PUBLIC])
+        });
+        // A timeout is a refusal, not a verdict.
+        assert_eq!(first, DnsClass::Unknown);
+
+        gate.release();
+        let finished = || no_lookup("late.test");
+        assert!(wait_until(finished, 2_000));
+
+        let second_calls = Arc::clone(&calls);
+        let second = lookup_with("late.test", Duration::from_millis(500), 4, move |_| {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![PUBLIC])
+        });
+        assert_eq!(second, DnsClass::Answered { private: false });
+        // The second navigation must resolve again, not reuse the late answer.
+        let total = calls.load(Ordering::SeqCst);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn a_lookup_never_writes_the_answer_cache_itself() {
+        let _exclusive = exclusive();
+        // `classify_host` caches answers, never `Unknown` (see its match), and
+        // the lookup below writes nothing at all. Caching a timeout would turn
+        // one slow lookup into a permanent verdict about a host, which a
+        // rebinding name could then keep alive.
+        let answer_cache = cache();
+        let key = "no-negative-cache.test";
+        lock(answer_cache).remove(key);
+        // Drive the same path `classify_host` uses for an unanswerable name.
+        let class = lookup_with(key, Duration::from_millis(60), 2, |_| {
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(vec![PUBLIC])
+        });
+        assert_eq!(class, DnsClass::Unknown);
+        assert!(
+            lock(answer_cache).get(key).is_none(),
+            "a timeout must not enter the answer cache"
+        );
+        assert!(wait_until(|| no_lookup(key), 2_000));
     }
 }

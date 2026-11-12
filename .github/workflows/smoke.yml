@@ -1,0 +1,71 @@
+# Non-gating boot smoke. The gating CI (ci.yml) proves compile/test parity
+# across three OSes before a merge; this workflow answers the one thing no
+# test suite can prove for a GUI app: the built desktop binary BOOTS and
+# stays alive with a real (virtual) display. `continue-on-error` is
+# deliberate: a red X here is a signal to read, never a gate (the gaps test
+# forbids masking only inside ci.yml).
+name: Smoke
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop-boot:
+    name: Desktop boot smoke (ubuntu)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # `frontendDist` is embedded by tauri-build at compile time, so the
+      # bundle must exist before the debug binary is built.
+      - name: Build the frontend bundle
+        run: npm run build
+
+      - name: Build the app (debug)
+        working-directory: src-tauri
+        run: cargo build --locked
+
+      - name: Boot for 20 s under a virtual display
+        env:
+          # Headless WebKit tends to die on GPU-buffer allocation at boot:
+          # force the software paths so the smoke measures "does the app
+          # start", not the display driver.
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        shell: bash
+        run: |
+          xvfb-run -a ./target/debug/animehub &
+          pid=$!
+          sleep 20
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::desktop app exited before the smoke window ended"
+            exit 1
+          fi
+          echo "boot survived the 20 s smoke window"
+          kill -TERM "$pid"
+          wait "$pid" || true
