@@ -1,6 +1,6 @@
 [package]
 name = "animehub-android"
-version = "0.3.4"
+version = "0.3.5"
 description = "Android-side bridges for AnimeHub: CookieManager sessions, Keystore-backed encryption, and Picture-in-Picture."
 edition = "2021"
 rust-version = "1.89"
